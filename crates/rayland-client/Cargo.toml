@@ -1,0 +1,22 @@
+# The C ("client") side: builds a command stream and sends it. A BINARY crate, so per
+# policy GPL-3.0-or-later.
+[package]
+name = "rayland-client"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+description = "Rayland client: emits a triangle command stream to a Rayland server (SP0)."
+license = "GPL-3.0-or-later"
+repository = "https://github.com/perpetualbits/rayland"
+
+[[bin]]
+name = "rayland-client"
+path = "src/main.rs"
+
+[lib]
+name = "rayland_client"
+path = "src/lib.rs"
+
+[dependencies]
+rayland-wire = { path = "../rayland-wire" }   # message types + framing
+anyhow = { workspace = true }                 # top-level errors in main

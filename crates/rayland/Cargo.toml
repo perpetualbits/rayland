@@ -1,0 +1,15 @@
+# The marquee `rayland` crate. Still a placeholder that holds the crates.io name;
+# it will become the workspace facade once real functionality exists.
+[package]
+name = "rayland"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+description = "Native remote GPU rendering for Wayland: run an app on one machine, render it on another machine's GPU and display, over a command stream rather than a pixel stream. Early work in progress."
+license = "GPL-3.0-or-later"          # the project is an application
+repository = "https://github.com/perpetualbits/rayland"
+readme = "README.md"
+keywords = ["wayland", "vulkan", "gpu", "remote-desktop", "rendering"]
+categories = ["rendering"]
+
+[dependencies]

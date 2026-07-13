@@ -1,0 +1,28 @@
+# The S ("server") side: receives commands and replays them on a real GPU. A BINARY
+# crate (it has a main), so per policy it is GPL-3.0-or-later.
+[package]
+name = "rayland-server"                                                        # crates.io / workspace package name
+version = "0.0.1"                                                              # pre-release; SP0 is a walking skeleton, not a stable API
+edition = "2024"                                                               # Rust 2024 edition, per repo convention
+rust-version = "1.85"                                                          # minimum toolchain that supports edition 2024
+description = "Rayland server: replays a command stream on a real GPU and writes the result (SP0)." # one-line purpose for crates.io/tooling
+license = "GPL-3.0-or-later"                                                   # binary crate → GPL per repo license policy
+repository = "https://github.com/perpetualbits/rayland"                       # upstream source location
+
+[lib]
+name = "rayland_server"        # library target name, used by `use rayland_server::...`
+path = "src/lib.rs"            # library entry point
+
+[[bin]]
+name = "rayland-server"        # binary target name, the executable produced by `cargo build`
+path = "src/main.rs"           # binary entry point
+
+[dependencies]
+rayland-wire = { path = "../rayland-wire" }   # the shared command/protocol types
+ash = { workspace = true }                    # Vulkan bindings for the off-screen renderer
+image = { workspace = true }                  # PNG encoding for the binary
+anyhow = { workspace = true }                 # top-level error handling
+
+[dev-dependencies]
+# rayland-wire is already a normal dependency (above), so tests see it without re-listing.
+rayland-client = { path = "../rayland-client" } # integration test builds a real command stream

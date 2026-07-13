@@ -1,22 +1,21 @@
-# Cargo manifest for the marquee `rayland` crate.
+# Rayland workspace root.
 #
-# At this stage the crate exists only to CLAIM THE NAME on crates.io while the
-# project is designed and built out. It is an honest work-in-progress placeholder
-# (it points at the real repository and design docs), not a name-squat. The crate
-# will grow real content in sub-project SP0 and beyond; expect the shape below to
-# change substantially (very likely into a Cargo workspace with several crates).
+# This is a *virtual* manifest: it has no [package] of its own, only a list of
+# member crates. The published name-holder crate now lives at crates/rayland.
+[workspace]
+resolver = "3"                       # resolver 3 is the default for edition 2024; stated explicitly for clarity
+members = [
+    "crates/rayland",                # the published placeholder / future facade
+    "crates/rayland-wire",           # shared wire protocol (this task)
+    "crates/rayland-server",         # off-screen Vulkan renderer (this task)
+    "crates/rayland-client",         # client: builds and sends the triangle stream (this task)
+]
 
-[package]
-name = "rayland"                                   # the reserved crates.io name
-version = "0.0.1"                                   # 0.0.x deliberately signals "not usable yet"
-edition = "2024"                                    # newest Rust edition (stable since 1.85)
-rust-version = "1.85"                               # minimum toolchain that understands edition 2024
-description = "Native remote GPU rendering for Wayland: run an app on one machine, render it on another machine's GPU and display, over a command stream rather than a pixel stream. Early work in progress."
-license = "GPL-3.0-or-later"                        # project is an application; per the author's license policy apps are GPL-3.0-or-later
-repository = "https://github.com/perpetualbits/rayland"  # canonical source of truth
-readme = "README.md"                               # rendered on the crates.io landing page
-keywords = ["wayland", "vulkan", "gpu", "remote-desktop", "rendering"]  # discovery hints (max 5)
-categories = ["rendering"]                         # valid crates.io category slug
-
-[dependencies]
-# (none yet — the placeholder has no functionality to depend on anything)
+# Dependency versions shared across member crates, so every crate agrees on one version.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }   # (de)serialization derives for wire types
+postcard = { version = "1", features = ["use-std"] }  # compact, deterministic, pure-Rust wire format
+thiserror = "2"                      # precise error enums for library crates
+anyhow = "1"                         # ergonomic top-level errors for binary crates
+ash = "0.38"                         # thin Vulkan bindings (used by the server)
+image = "0.25"                       # PNG encoding (used by the server)
