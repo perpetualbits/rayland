@@ -10,3 +10,8 @@
 mod message;
 // Re-export them at the crate root so callers write `rayland_wire::Message`.
 pub use message::{Message, PROTOCOL_VERSION, Vertex};
+
+// Length-prefixed framing over byte streams (Task 2).
+mod frame;
+// Re-export the framing API at the crate root.
+pub use frame::{WireError, read_message, write_message};
