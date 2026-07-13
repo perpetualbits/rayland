@@ -1,0 +1,89 @@
+# Rayland — working conventions
+
+This file governs how code and documentation are written in this repository. It is
+binding: follow it exactly. If a change makes any statement here false, update this file
+in the same change.
+
+## What Rayland is
+
+Rayland provides **native remote GPU rendering for Wayland**: an application runs on one
+machine but is rendered and displayed on another machine — the one with the capable GPU
+and the monitor the user is looking at — by sending a **command stream** across the
+network rather than a **pixel stream**.
+
+The full architecture is in [`docs/design/2026-07-13-native-remote-wayland-gpu.md`](docs/design/2026-07-13-native-remote-wayland-gpu.md).
+Read it before making non-trivial changes; it explains why Wayland deliberately made
+remoteness hard and which ecosystem pieces must grow.
+
+## The S / C vocabulary (do not get this backwards)
+
+Rayland uses X11-era terms, which are the *reverse* of cloud usage:
+
+- **S ("server" side)** — where the **user sits**: keyboard, mouse, **display, GPU**,
+  the Wayland compositor, working drivers. The strong machine.
+- **C ("client" side)** — where the **application executable runs**. May be weak,
+  a different CPU architecture (e.g. RISC-V), or headless. No good display path.
+
+The app on **C** emits rendering commands; **S's GPU** does the drawing and shows the
+result on **S's** display. Primary mode ships **commands, not pixels**. A video-encode
+fallback exists but is not the goal (in the target setup, C is the wrong place to encode).
+
+## Locked decisions
+
+- **Language: Rust for all code Rayland writes.** The Vulkan command
+  serialization/replay engine is *reused* from the virtual-machine world
+  (Venus / virglrenderer) via Rust FFI, behind a clean Rust trait boundary, rather than
+  reinvented — it already exists and is hardened against our exact threat model (an
+  untrusted party driving the host GPU). "All Rust" therefore means: our code is 100%
+  Rust; the borrowed engine is an external dependency like any linked C library. The
+  trait boundary must stay clean enough that the engine could later be Rustified or
+  swapped without touching the rest.
+
+## Code conventions
+
+Write code as if a human reviewer — possibly one not deeply versed in
+Wayland/Vulkan/GPU-remoting — must painstakingly verify **every line** for correctness.
+
+- **A doc-comment block (`///` or `//!`) on every function**, describing in detail what
+  it does, its inputs and outputs, its failure modes, and any domain pitfalls. Same for
+  every type, trait, and module.
+- **An intent comment on every non-trivial line.** The comment explains the *why* or the
+  *domain meaning* ("advance the timeline semaphore so the compositor may composite this
+  frame") — **never** a restatement of the syntax ("increment i"). Comments must **add
+  value**, not noise. Genuinely trivial lines (a bare `}`, an obvious `use`) get no
+  comment.
+- **Code and comments must always agree.** A stale or contradicting comment is a bug and
+  is fixed in the same edit as the code it describes.
+- **Super-clear, super-clean code.** Prefer small, focused functions and files that a
+  reader can hold in their head at once. If a file grows large or a function does several
+  things, that is a signal to split it.
+- Prefer explicit over clever. Name things for what they mean in the problem domain.
+
+## Documentation conventions
+
+- Documentation is **top-notch and readable for people not already familiar** with the
+  problem space (this explicitly includes the repository owner).
+- Explain the **pitfalls** of the domain, not just the happy path.
+- **Never omit information for the sake of brevity.** Be clear *and* complete; if a
+  concept needs 300 words to be understood correctly, use them.
+
+## Repository status and layout
+
+Currently a single placeholder crate (`rayland` v0.0.x) that reserves the crates.io name;
+no functionality yet. The work is decomposed into sub-projects, each getting its own
+design spec → implementation plan → build cycle, sequenced as a "walking skeleton" (get
+something rendering end-to-end first, then harden):
+
+- **SP0 — First light:** trivial Vulkan triangle on C → serialized commands over
+  plain TCP/localhost → replay on S's real GPU → write a PNG. Proves the core loop.
+- **SP1 — Onto the screen:** replace PNG-dump with a live Wayland window on S.
+- **SP2 — Real transport:** TCP → QUIC across two machines; first cross-architecture run.
+- **SP3 — Sibling protocol:** mapped-memory coherence, then content-addressed assets.
+- **SP4 — Adaptive L3 + session/security:** RTT-adaptive policy, SSH-bootstrap, sandboxing.
+- **SP5 — Proxy completeness:** full Sommelier/waypipe-grade Wayland coverage.
+- **Audio:** a later, separate track (transport reservations already made in the design).
+
+## License
+
+Rayland is an application: **GPL-3.0-or-later**. Library crates that emerge from the
+project may be **LGPL-3.0-or-later**; each crate declares its own license in its manifest.
