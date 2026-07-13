@@ -1,0 +1,22 @@
+# Cargo manifest for the marquee `rayland` crate.
+#
+# At this stage the crate exists only to CLAIM THE NAME on crates.io while the
+# project is designed and built out. It is an honest work-in-progress placeholder
+# (it points at the real repository and design docs), not a name-squat. The crate
+# will grow real content in sub-project SP0 and beyond; expect the shape below to
+# change substantially (very likely into a Cargo workspace with several crates).
+
+[package]
+name = "rayland"                                   # the reserved crates.io name
+version = "0.0.1"                                   # 0.0.x deliberately signals "not usable yet"
+edition = "2024"                                    # newest Rust edition (stable since 1.85)
+rust-version = "1.85"                               # minimum toolchain that understands edition 2024
+description = "Native remote GPU rendering for Wayland: run an app on one machine, render it on another machine's GPU and display, over a command stream rather than a pixel stream. Early work in progress."
+license = "GPL-3.0-or-later"                        # project is an application; per the author's license policy apps are GPL-3.0-or-later
+repository = "https://github.com/perpetualbits/rayland"  # canonical source of truth
+readme = "README.md"                               # rendered on the crates.io landing page
+keywords = ["wayland", "vulkan", "gpu", "remote-desktop", "rendering"]  # discovery hints (max 5)
+categories = ["rendering"]                         # valid crates.io category slug
+
+[dependencies]
+# (none yet — the placeholder has no functionality to depend on anything)
