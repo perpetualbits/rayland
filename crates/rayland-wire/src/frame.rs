@@ -13,6 +13,18 @@ use std::io::{Read, Write};
 // The message type being framed.
 use crate::Message;
 
+/// The largest length prefix `read_message` will accept before allocating a body buffer.
+///
+/// The length prefix on the wire is an untrusted `u32` supplied by whatever is on the
+/// other end of the stream. Without a bound, a corrupt or malicious peer could send a
+/// length near `u32::MAX` and force `read_message` to attempt a multi-gigabyte
+/// allocation; in Rust, allocation failure aborts the process rather than returning an
+/// error, so an unbounded length prefix is a denial-of-service / crash vector. 64 MiB is
+/// enormously generous for SP0, whose messages are a handful of tiny fixed-size structs
+/// and small vertex lists — the bound exists purely to keep a bad C→S length prefix from
+/// aborting S, not because SP0 traffic is expected to approach it.
+pub const MAX_FRAME_BYTES: u32 = 64 * 1024 * 1024;
+
 /// Everything that can go wrong while framing or deframing a message.
 #[derive(Debug, thiserror::Error)]
 pub enum WireError {
@@ -22,6 +34,9 @@ pub enum WireError {
     /// The bytes could not be (de)serialized as a valid message.
     #[error("message (de)serialization failed")]
     Codec(#[from] postcard::Error),
+    /// The length prefix exceeded [`MAX_FRAME_BYTES`]; the frame is refused before allocating.
+    #[error("frame length {len} exceeds the maximum of {} bytes", MAX_FRAME_BYTES)]
+    FrameTooLarge { len: u32 },
 }
 
 /// Serialize `msg` and write it to `w` as a length-prefixed frame.
@@ -53,14 +68,29 @@ pub fn write_message<W: Write>(w: &mut W, msg: &Message) -> Result<(), WireError
 /// Reads the 4-byte little-endian length, then exactly that many body bytes, then
 /// decodes them. Returns an error if the stream ends early or the bytes are not a valid
 /// message.
+///
+/// **Pitfall:** the length prefix is untrusted input — it comes straight off the wire
+/// before anything about the sender is verified. Naively trusting it (e.g.
+/// `vec![0u8; len]` with `len` taken directly from the prefix) lets a corrupt or
+/// malicious peer request an allocation of up to ~4 GiB (`u32::MAX`); since Rust aborts
+/// the process on allocation failure rather than returning an error, that is a
+/// denial-of-service / crash vector, not merely a slow path. To close it, `len` is
+/// checked against [`MAX_FRAME_BYTES`] and rejected with [`WireError::FrameTooLarge`]
+/// *before* the body buffer is allocated.
 pub fn read_message<R: Read>(r: &mut R) -> Result<Message, WireError> {
     // Read the 4-byte length prefix; a short read here means the stream ended.
     let mut len_bytes = [0u8; 4];
     r.read_exact(&mut len_bytes)?;
-    // Interpret the prefix as a little-endian u32, then widen to usize for allocation.
-    let len = u32::from_le_bytes(len_bytes) as usize;
-    // Allocate a buffer of exactly that size and fill it from the stream.
-    let mut body = vec![0u8; len];
+    // Interpret the prefix as a little-endian u32; kept as u32 (not widened yet) so it
+    // can be compared directly against MAX_FRAME_BYTES before it drives any allocation.
+    let len = u32::from_le_bytes(len_bytes);
+    // Refuse implausibly large frames up front: an untrusted peer must not be able to
+    // force a huge allocation (which would abort the process on failure) via this value.
+    if len > MAX_FRAME_BYTES {
+        return Err(WireError::FrameTooLarge { len });
+    }
+    // Allocate a buffer of exactly that size (now bounded) and fill it from the stream.
+    let mut body = vec![0u8; len as usize];
     r.read_exact(&mut body)?;
     // Decode the body bytes into a Message.
     let message = postcard::from_bytes(&body)?;
@@ -110,5 +140,42 @@ mod tests {
 
         // The sequence read back must equal the sequence written.
         assert_eq!(received, sent);
+    }
+
+    #[test]
+    fn truncated_stream_is_an_error() {
+        // Write one valid message so we have a real, well-formed length-prefixed frame.
+        let message = Message::EndFrame;
+        let mut buffer: Vec<u8> = Vec::new();
+        write_message(&mut buffer, &message).expect("writing to a Vec cannot fail");
+
+        // Cut the body short by a few bytes while keeping the full 4-byte length prefix
+        // intact, so read_message believes more body bytes are coming than are present.
+        let truncated_len = buffer.len().saturating_sub(3);
+        let truncated = &buffer[..truncated_len];
+        let mut cursor = std::io::Cursor::new(truncated);
+
+        // The short body read must surface as a WireError::Io, not a panic or silent
+        // wrong result.
+        let result = read_message(&mut cursor);
+        assert!(
+            matches!(result, Err(WireError::Io(_))),
+            "expected WireError::Io from a truncated stream, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn oversized_length_is_rejected() {
+        // Craft a frame whose length prefix claims a ~4 GiB body (u32::MAX), far beyond
+        // MAX_FRAME_BYTES. No body bytes are needed: read_message must reject the frame
+        // from the length prefix alone, before it ever tries to allocate or read a body.
+        let bytes = u32::MAX.to_le_bytes();
+        let mut cursor = std::io::Cursor::new(bytes);
+
+        let result = read_message(&mut cursor);
+        assert!(
+            matches!(result, Err(WireError::FrameTooLarge { .. })),
+            "expected WireError::FrameTooLarge from an oversized length prefix, got {result:?}"
+        );
     }
 }
