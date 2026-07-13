@@ -14,9 +14,10 @@ use std::net::{TcpListener, TcpStream};
 ///
 /// A background thread plays the server: it binds an ephemeral port, accepts exactly one
 /// connection, and renders the frame the client sends. The test thread plays the client:
-/// it connects, sends the triangle stream, and half-closes its write side so the server's
-/// framed-read loop sees a clean end of stream. Finally we join the server thread to recover
-/// the rendered frame and check two pixels prove the triangle actually landed.
+/// it connects, sends the triangle stream (which ends with `EndFrame` — that is what makes
+/// the server return, not the socket closing), and half-closes its write side as tidy
+/// hygiene. Finally we join the server thread to recover the rendered frame and check two
+/// pixels prove the triangle actually landed.
 #[test]
 fn client_to_server_over_tcp_renders_the_triangle() {
     // Bind to port 0 so the OS hands us a free ephemeral port, avoiding collisions.
@@ -34,7 +35,8 @@ fn client_to_server_over_tcp_renders_the_triangle() {
     let mut stream = TcpStream::connect(address).expect("client connects");
     // Send a 64x64 frame on a blue clear colour so corners stay blue and the centre goes red.
     send_triangle(&mut stream, 64, 64, [0.0, 0.0, 1.0, 1.0]).expect("client sends");
-    // Half-close the write half so the server's read loop sees EOF and stops cleanly.
+    // Half-close the write side as hygiene: the server has already stopped at EndFrame, so
+    // this only matters to a hypothetical server still reading — it would then see clean EOF.
     stream
         .shutdown(std::net::Shutdown::Write)
         .expect("shutdown write");

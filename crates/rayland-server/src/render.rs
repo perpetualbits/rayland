@@ -350,7 +350,11 @@ unsafe fn render_triangle_inner(request: &FrameRequest) -> anyhow::Result<Render
     unsafe { device.unmap_memory(vbuf_mem) };
 
     // --- Readback buffer (host-visible, holds the tightly-packed image after the copy) ---
-    let readback_size = (request.width * request.height * 4) as u64;
+    // Compute the size in u64 arithmetic. width/height arrive from an untrusted client
+    // BeginFrame; multiplying them as u32 first could wrap (e.g. 46341*46341*4), silently
+    // sizing the buffer too small in release builds. Widening each factor before the
+    // multiply makes the arithmetic correct by construction regardless of the inputs.
+    let readback_size = request.width as u64 * request.height as u64 * 4;
     let rbuf_info = vk::BufferCreateInfo::default()
         .size(readback_size)
         .usage(vk::BufferUsageFlags::TRANSFER_DST)

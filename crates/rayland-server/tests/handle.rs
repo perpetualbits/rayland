@@ -54,3 +54,37 @@ fn end_frame_without_begin_frame_is_a_clean_error() {
         "EndFrame before a valid BeginFrame must be rejected, got {outcome:?}"
     );
 }
+
+#[test]
+fn absurdly_large_dimensions_are_rejected_before_the_gpu() {
+    // An untrusted client can put any u32 in BeginFrame. A target far beyond any sane limit
+    // must be refused with a clear error before it ever drives GPU allocation — never a
+    // panic (from overflowing arithmetic) and never an opaque driver failure.
+    let mut stream: Vec<u8> = Vec::new();
+    write_message(
+        &mut stream,
+        &Message::Hello {
+            version: PROTOCOL_VERSION,
+        },
+    )
+    .expect("writing to a Vec cannot fail");
+    // 65535x65535 is within the 64 MiB frame bound as a message yet vastly over the limit.
+    write_message(
+        &mut stream,
+        &Message::BeginFrame {
+            width: 65535,
+            height: 65535,
+            clear_color: [0.0, 0.0, 0.0, 1.0],
+        },
+    )
+    .expect("writing to a Vec cannot fail");
+    write_message(&mut stream, &Message::EndFrame).expect("writing to a Vec cannot fail");
+
+    // The dimension guard must reject this; it errors before touching the renderer.
+    let mut cursor = std::io::Cursor::new(stream);
+    let outcome = handle_connection(&mut cursor).map(|_| ());
+    assert!(
+        outcome.is_err(),
+        "an over-limit BeginFrame must be rejected, got {outcome:?}"
+    );
+}

@@ -14,6 +14,15 @@ use rayland_wire::{Message, PROTOCOL_VERSION, read_message};
 // The renderer and its request/result types.
 use render::{FrameRequest, RenderedFrame, render_triangle};
 
+/// The largest render target dimension the server will accept, in pixels per side.
+///
+/// The client's requested width and height are untrusted (CLAUDE.md's threat model treats
+/// C as an untrusted party driving the host GPU). This ceiling rejects an absurd
+/// `BeginFrame` with a clear error *before* it reaches the driver, rather than relying on
+/// the GPU's own `maxImageDimension2D` to surface an opaque failure. 16384 is the common
+/// hardware limit and is vastly more than SP0's walking-skeleton triangle needs.
+const MAX_DIMENSION: u32 = 16384;
+
 /// Read a full SP0 command stream from `reader`, replay it, and return the rendered frame.
 ///
 /// The handler is deliberately permissive about ordering: it accumulates state as messages
@@ -80,6 +89,12 @@ pub fn handle_connection<R: std::io::Read>(reader: &mut R) -> anyhow::Result<Ren
                 anyhow::ensure!(
                     width > 0 && height > 0,
                     "EndFrame before a valid BeginFrame (target is {width}x{height})"
+                );
+                // Reject an absurdly large target with a clear error rather than letting an
+                // untrusted dimension drive GPU allocation (see MAX_DIMENSION).
+                anyhow::ensure!(
+                    width <= MAX_DIMENSION && height <= MAX_DIMENSION,
+                    "requested target {width}x{height} exceeds the {MAX_DIMENSION}px limit"
                 );
                 // Likewise a zero-length vertex buffer is invalid (VkBufferCreateInfo::size
                 // must be > 0) and there would be nothing to draw regardless.
