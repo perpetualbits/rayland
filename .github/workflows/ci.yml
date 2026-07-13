@@ -1,0 +1,79 @@
+# Continuous integration for Rayland.
+#
+# The GitHub-hosted runners have no GPU, so the render pipeline is exercised on Mesa's
+# "lavapipe" — a CPU software implementation of Vulkan. We install it, point the Vulkan
+# loader at exactly that driver, and then the full pipeline (including the pixel-assertion
+# tests) runs on the CPU, byte-for-byte as it would on a real GPU.
+name: CI
+
+# Run on pushes to the default branch and on every pull request.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      # Check out the repository at the commit under test.
+      - uses: actions/checkout@v4
+
+      # Install a stable Rust toolchain, including rustfmt and clippy for the lint steps.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # Cache the cargo registry and build artifacts so CI does not recompile the world
+      # (ash and its dependencies) on every run.
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # Key on the lockfile so the cache invalidates when dependencies change.
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      # Install the Vulkan loader and Mesa's software drivers. mesa-vulkan-drivers ships
+      # lavapipe; vulkan-tools provides `vulkaninfo` for the diagnostic step below.
+      - name: Install Vulkan loader + lavapipe (software Vulkan)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers libvulkan1 vulkan-tools
+
+      # Point the loader at the lavapipe ICD *by discovery*, not by a hardcoded filename.
+      # The manifest is named lvp_icd.json on some distributions and lvp_icd.x86_64.json on
+      # others (an architecture suffix Mesa adds inconsistently), so we glob for it and fail
+      # loudly if it is genuinely absent rather than silently falling back to no GPU.
+      - name: Point the Vulkan loader at lavapipe
+        run: |
+          icd=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -n1)
+          if [ -z "$icd" ]; then
+            echo "lavapipe ICD not found in /usr/share/vulkan/icd.d/ — contents:"
+            ls -1 /usr/share/vulkan/icd.d/ || true
+            exit 1
+          fi
+          echo "Using lavapipe ICD: $icd"
+          # Restrict the loader to this one driver so the CPU implementation is what runs.
+          echo "VK_ICD_FILENAMES=$icd" >> "$GITHUB_ENV"
+
+      # Print what Vulkan sees, so a future driver/loader regression is diagnosable from the
+      # CI log alone. Non-fatal: never let a diagnostic break the build.
+      - name: Vulkan sanity check (diagnostic)
+        run: vulkaninfo --summary || true
+
+      # Formatting must match rustfmt exactly.
+      - name: Format check
+        run: cargo fmt --check
+
+      # Clippy must be clean; warnings are treated as errors.
+      - name: Clippy
+        run: cargo clippy --workspace -- -D warnings
+
+      # The full test suite, including the deterministic pixel assertions, on lavapipe.
+      - name: Test
+        run: cargo test --workspace
