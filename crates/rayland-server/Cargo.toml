@@ -9,6 +9,14 @@ description = "Rayland server: replays a command stream on a real GPU and writes
 license = "GPL-3.0-or-later"                                                   # binary crate → GPL per repo license policy
 repository = "https://github.com/perpetualbits/rayland"                       # upstream source location
 
+[lib]
+name = "rayland_server"        # library target name, used by `use rayland_server::...`
+path = "src/lib.rs"            # library entry point
+
+[[bin]]
+name = "rayland-server"        # binary target name, the executable produced by `cargo build`
+path = "src/main.rs"           # binary entry point
+
 [dependencies]
 rayland-wire = { path = "../rayland-wire" }   # the shared command/protocol types
 ash = { workspace = true }                    # Vulkan bindings for the off-screen renderer
@@ -16,4 +24,5 @@ image = { workspace = true }                  # PNG encoding for the binary
 anyhow = { workspace = true }                 # top-level error handling
 
 [dev-dependencies]
-rayland-wire = { path = "../rayland-wire" }   # tests construct Vertex/FrameRequest
+rayland-wire = { path = "../rayland-wire" }     # tests construct Vertex/FrameRequest
+rayland-client = { path = "../rayland-client" } # integration test builds a real command stream
