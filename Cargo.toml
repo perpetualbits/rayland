@@ -7,7 +7,8 @@ resolver = "3"                       # resolver 3 is the default for edition 202
 members = [
     "crates/rayland",                # the published placeholder / future facade
     "crates/rayland-wire",           # shared wire protocol (this task)
-    # rayland-client and rayland-server are added by their own tasks
+    "crates/rayland-server",         # off-screen Vulkan renderer (this task)
+    # rayland-client is added by its own task
 ]
 
 # Dependency versions shared across member crates, so every crate agrees on one version.
