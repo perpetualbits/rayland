@@ -16,13 +16,20 @@ use render::{FrameRequest, RenderedFrame, render_triangle};
 
 /// Read a full SP0 command stream from `reader`, replay it, and return the rendered frame.
 ///
-/// Processes messages in order: verifies the `Hello` version, accumulates the frame
-/// parameters and vertices, and renders when `EndFrame` arrives. Any message arriving out
-/// of the expected order, or a version mismatch, is an error.
+/// The handler is deliberately permissive about ordering: it accumulates state as messages
+/// arrive (a `Hello` checks the protocol version, `BeginFrame` records the target size and
+/// clear colour, `UploadVertices` records the geometry, `DrawTriangles` validates the draw
+/// count against the uploaded vertices) and only actually renders when `EndFrame` arrives.
+/// Messages may appear in any order and later ones of the same kind overwrite earlier ones;
+/// SP0 does not police a strict message sequence. What it *does* reject is a stream that is
+/// internally inconsistent or incomplete (see Errors).
 ///
 /// # Errors
-/// Returns an error on a protocol-version mismatch, a malformed/out-of-order stream, an
-/// early end of stream, or a rendering failure.
+/// Returns an error on: a protocol-version mismatch (`Hello`); a `DrawTriangles` count that
+/// disagrees with the number of uploaded vertices; an `EndFrame` reached without a valid
+/// `BeginFrame` (zero width or height) or without any uploaded vertices; a stream that ends
+/// before `EndFrame` (early end of stream, surfaced by [`read_message`]); or a failure in
+/// the GPU render itself.
 pub fn handle_connection<R: std::io::Read>(reader: &mut R) -> anyhow::Result<RenderedFrame> {
     // Frame parameters, filled in by BeginFrame.
     let mut width = 0u32;
@@ -66,7 +73,18 @@ pub fn handle_connection<R: std::io::Read>(reader: &mut R) -> anyhow::Result<Ren
                 );
             }
             Message::EndFrame => {
-                // Everything is gathered; render and return.
+                // Guard against a truncated or malformed stream reaching the GPU: an
+                // EndFrame with no valid BeginFrame leaves width/height at zero, and
+                // Vulkan rejects a zero-extent image (VkImageCreateInfo::extent must be
+                // > 0), yielding an opaque driver error instead of a clear one.
+                anyhow::ensure!(
+                    width > 0 && height > 0,
+                    "EndFrame before a valid BeginFrame (target is {width}x{height})"
+                );
+                // Likewise a zero-length vertex buffer is invalid (VkBufferCreateInfo::size
+                // must be > 0) and there would be nothing to draw regardless.
+                anyhow::ensure!(!vertices.is_empty(), "EndFrame with no uploaded vertices");
+                // Everything is gathered and validated; render and return.
                 let request = FrameRequest {
                     width,
                     height,
