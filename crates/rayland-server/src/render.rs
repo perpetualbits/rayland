@@ -164,9 +164,31 @@ unsafe fn render_triangle_inner(request: &FrameRequest) -> anyhow::Result<Render
         .color_attachments(&color_refs);
     let attachments = [color_attachment];
     let subpasses = [subpass];
+    // Vulkan gives NO ordering or visibility guarantee between a render pass's
+    // attachment writes and whatever comes after it unless we say so explicitly. Our
+    // `vkCmdCopyImageToBuffer` readback (issued right after `cmd_end_render_pass`, see
+    // below) runs at the TRANSFER stage and reads the very same image the fragment
+    // shader just wrote via COLOR_ATTACHMENT_OUTPUT. Without a dependency chaining those
+    // two, the driver is free to start the transfer read before the colour write is
+    // even visible — some drivers happen to serialize enough work that this is never
+    // observed (e.g. Intel anv in casual testing), but that is luck, not a spec
+    // guarantee, and it is a likely, real failure on other drivers (e.g. lavapipe). This
+    // dependency makes the colour-attachment writes from subpass 0 visible to the
+    // transfer-stage read that follows the render pass, so the copy is guaranteed to see
+    // the finished pixels.
+    let dependency = vk::SubpassDependency::default()
+        .src_subpass(0)
+        .dst_subpass(vk::SUBPASS_EXTERNAL)
+        .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+        .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+        .dst_stage_mask(vk::PipelineStageFlags::TRANSFER)
+        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+        .dependency_flags(vk::DependencyFlags::BY_REGION); // same image region on both sides
+    let dependencies = [dependency];
     let render_pass_info = vk::RenderPassCreateInfo::default()
         .attachments(&attachments)
-        .subpasses(&subpasses);
+        .subpasses(&subpasses)
+        .dependencies(&dependencies);
     let render_pass = unsafe { device.create_render_pass(&render_pass_info, None) }?;
 
     // Framebuffer binding the image view to the render pass.
@@ -207,12 +229,18 @@ unsafe fn render_triangle_inner(request: &FrameRequest) -> anyhow::Result<Render
             .location(0)
             .binding(0)
             .format(vk::Format::R32G32_SFLOAT)
-            .offset(0), // position at byte 0
+            // `Vertex` is `#[repr(Rust)]`, so the compiler is free to reorder or pad its
+            // fields however it likes — a hardcoded byte offset here would silently
+            // assume a layout that isn't guaranteed. `offset_of!` asks the compiler for
+            // the real offset of `position` in whatever layout it actually chose.
+            .offset(std::mem::offset_of!(Vertex, position) as u32),
         vk::VertexInputAttributeDescription::default()
             .location(1)
             .binding(0)
             .format(vk::Format::R32G32B32_SFLOAT)
-            .offset(8), // colour at byte 8
+            // Same reasoning as `position` above: ask for `color`'s real offset rather
+            // than assuming it immediately follows `position` with no padding.
+            .offset(std::mem::offset_of!(Vertex, color) as u32),
     ];
     let bindings = [binding];
     let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
