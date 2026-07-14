@@ -79,8 +79,9 @@ Two independent facts must both hold before the dmabuf path is used:
    still sent — see "Known SP3 limitations" below) and doing a protocol roundtrip to collect
    every `(format, modifier)` pair it advertises.
 
-If (1) is false, the server does not even attempt to connect probing (2) meaningfully — the
-export could never succeed regardless of what the compositor supports. If (1) is true but (2)
+If (1) is false, the server still connects to the compositor but skips probe (2) — a dmabuf
+export could never succeed regardless of what the compositor supports, so it goes straight to
+the `wl_shm` path. If (1) is true but (2)
 is false — the compositor exists but does not support this exact format+modifier combination
 (some compositors only support NVIDIA-style vendor modifiers, or only expose the format
 without the LINEAR modifier, or run at an older protocol version) — the server falls back to
