@@ -19,5 +19,8 @@ thiserror = "2"                      # precise error enums for library crates
 anyhow = "1"                         # ergonomic top-level errors for binary crates
 ash = "0.38"                         # thin Vulkan bindings (used by the server)
 image = "0.25"                       # PNG encoding (used by the server)
-smithay-client-toolkit = "0.20"                    # Wayland client toolkit: xdg-shell + wl_shm + calloop (reexported)
+# Wayland client toolkit: xdg-shell + wl_shm + calloop (reexported). default-features = false
+# drops SCTK's default `xkbcommon` feature, which would link system libxkbcommon via
+# pkg-config at build time — we do no keyboard/seat handling, so we need only `calloop`.
+smithay-client-toolkit = { version = "0.20", default-features = false, features = ["calloop"] }
 wayland-client = { version = "0.31", features = ["dlopen"] }  # dlopen: load libwayland at runtime so CI needs no libwayland package
