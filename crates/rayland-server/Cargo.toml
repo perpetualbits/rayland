@@ -22,6 +22,8 @@ rayland-wire = { path = "../rayland-wire" }   # the shared command/protocol type
 ash = { workspace = true }                    # Vulkan bindings for the off-screen renderer
 image = { workspace = true }                  # PNG encoding for the binary
 anyhow = { workspace = true }                 # top-level error handling
+smithay-client-toolkit = { workspace = true }   # the Wayland window + wl_shm + calloop event loop
+wayland-client = { workspace = true }            # enables the dlopen backend for the whole tree
 
 [dev-dependencies]
 # rayland-wire is already a normal dependency (above), so tests see it without re-listing.
