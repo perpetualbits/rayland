@@ -77,6 +77,10 @@ fn main() -> anyhow::Result<()> {
         // Default path: show the frame in a window until it or the client closes.
         None => {
             println!("presenting in a window; close it (or stop the client) to exit");
+            // `run_window` requires its disconnect source to already be non-blocking (it is
+            // no longer TCP-specific, so it cannot call `set_nonblocking` itself); set it
+            // here before handing the socket over so the liveness callback never stalls.
+            stream.set_nonblocking(true)?;
             // Hand the socket to the window so it can watch for client disconnect.
             run_window(frame, stream)?;
             println!("window closed; exiting");
