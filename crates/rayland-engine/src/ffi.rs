@@ -138,11 +138,10 @@ pub struct VirglRendererCallbacks {
     pub get_egl_display: Option<unsafe extern "C" fn(cookie: *mut c_void) -> *mut c_void>,
 }
 
-// virglrenderer only ever reads the callbacks struct's function pointers (it never mutates it),
-// and function pointers are themselves `Sync`, so a single shared `'static` instance is safe to
-// hand out. This lets us store the callbacks in a `static` whose address stays valid for the
-// whole process — exactly what virglrenderer requires.
-unsafe impl Sync for VirglRendererCallbacks {}
+// The struct's fields (a `c_int` and function pointers) are all `Sync`, so it auto-derives
+// `Sync` — no manual `unsafe impl` is needed. That auto-`Sync` is what lets us keep the
+// callbacks in a `static` (§ below) whose address stays valid for the whole process, which is
+// exactly what virglrenderer requires (it retains the pointer past `init` and only ever reads it).
 
 /// `struct virgl_renderer_resource_create_args` — arguments to `virgl_renderer_resource_create`.
 /// Not used in Task 1; declared now to pin the exact layout (11 × `u32`, 44 bytes) for the Task 3
