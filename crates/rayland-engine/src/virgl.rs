@@ -102,6 +102,40 @@ pub enum EngineError {
         /// Human-readable errno name for `rc`.
         reason: String,
     },
+
+    /// A context id does not fit in the C API's `int`. `virgl_renderer_submit_cmd` takes `ctx_id`
+    /// as an `int`; ids come from the (untrusted) vtest client, so an id above `INT_MAX` would
+    /// wrap to a negative context under a bare `as c_int` cast. We reject it up front instead.
+    #[error("context id {ctx_id} does not fit in a C int and cannot be submitted to")]
+    SubmitCtxIdOutOfRange {
+        /// The offending context id.
+        ctx_id: u32,
+    },
+
+    /// The renderer reports no Venus capset, so the vtest handshake cannot answer `VCMD_GET_CAPSET`
+    /// with real capability data (typically: no GPU, or this build/host lacks Venus support).
+    #[error("no Venus capset available to answer the vtest handshake (Venus unsupported here)")]
+    NoVenusCapset,
+
+    /// The stream carrying the vtest protocol failed (peer closed mid-message, socket error, ...).
+    #[error("vtest stream I/O failed")]
+    VtestIo(#[from] std::io::Error),
+
+    /// A vtest length prefix exceeded [`crate::vtest::MAX_VTEST_PAYLOAD_BYTES`]; the message is
+    /// refused before any buffer is allocated (an untrusted peer must not force a huge allocation).
+    #[error("vtest message payload of {len} bytes exceeds the maximum allowed")]
+    VtestFrameTooLarge {
+        /// The offending declared payload length in bytes.
+        len: u64,
+    },
+
+    /// A vtest message was malformed or an opcode arrived that this server does not implement.
+    /// Carries a human-readable description; the server never silently drops an unhandled message.
+    #[error("vtest protocol error: {detail}")]
+    VtestProtocol {
+        /// What was wrong (bad length, unknown/unsupported opcode, out-of-range offset, ...).
+        detail: String,
+    },
 }
 
 /// Maps a C return code (an errno, possibly returned as a positive value) to a short readable
@@ -291,6 +325,13 @@ impl RenderEngine for VirglEngine {
         let ndw =
             c_int::try_from(ndw).map_err(|_| EngineError::CommandTooLarge { len: cmd.len() })?;
 
+        // Guard the context id the same way. `virgl_renderer_submit_cmd` takes `ctx_id` as a C
+        // `int`, and the id originates from the untrusted vtest client; a bare `as c_int` cast on
+        // a value above `INT_MAX` would silently wrap to a negative (wrong) context. Convert
+        // fallibly and reject out-of-range ids instead of wrapping (Task 1 review follow-up).
+        let ctx_id_c =
+            c_int::try_from(ctx_id).map_err(|_| EngineError::SubmitCtxIdOutOfRange { ctx_id })?;
+
         // Copy into a `u32` buffer to guarantee 4-byte alignment regardless of the caller's slice.
         // `Vec<u32>`'s allocation is 4-byte aligned by construction.
         let mut words: Vec<u32> = vec![0; cmd.len() / 4];
@@ -301,9 +342,9 @@ impl RenderEngine for VirglEngine {
         byte_view.copy_from_slice(cmd);
 
         // Submit. SAFETY: `words` is a live, 4-byte-aligned buffer of `ndw` dwords; virglrenderer
-        // never mutates it; `ctx_id` fits an `int` in practice (caller-assigned small ids).
+        // never mutates it; `ctx_id_c` was range-checked above to fit a C `int`.
         let rc = unsafe {
-            ffi::virgl_renderer_submit_cmd(words.as_mut_ptr() as *mut c_void, ctx_id as c_int, ndw)
+            ffi::virgl_renderer_submit_cmd(words.as_mut_ptr() as *mut c_void, ctx_id_c, ndw)
         };
         if rc != 0 {
             return Err(EngineError::SubmitFailed {
@@ -313,6 +354,51 @@ impl RenderEngine for VirglEngine {
             });
         }
         Ok(())
+    }
+
+    /// Returns the real Venus capset blob for the vtest `VCMD_GET_CAPSET` handshake step.
+    ///
+    /// Two C calls: `virgl_renderer_get_cap_set(VENUS, &max_ver, &max_size)` learns the blob size,
+    /// then `virgl_renderer_fill_caps(VENUS, version, buf)` writes exactly `max_size` bytes into a
+    /// buffer we allocate. A `max_size` of 0 means Venus is unsupported here, which we surface as
+    /// `NoVenusCapset` (the client would then fail its own init — the honest outcome on a host
+    /// without Venus).
+    ///
+    /// # Failure modes
+    /// - `NoVenusCapset`: the renderer reports no Venus capset (no GPU / Venus unavailable).
+    fn venus_capset(&mut self, version: u32) -> Result<Vec<u8>, EngineError> {
+        // Learn the capset blob size (and max version) from the renderer. `get_cap_set` writes both
+        // out-params; a zero `max_size` means the capset is unsupported on this host.
+        let mut max_ver: u32 = 0;
+        let mut max_size: u32 = 0;
+        // SAFETY: both out-params are valid, writable locals; the call only writes through them.
+        unsafe {
+            ffi::virgl_renderer_get_cap_set(
+                ffi::VIRGL_RENDERER_CAPSET_VENUS,
+                &mut max_ver,
+                &mut max_size,
+            )
+        };
+        // No Venus capability advertised → we cannot answer the handshake with real data.
+        if max_size == 0 {
+            return Err(EngineError::NoVenusCapset);
+        }
+
+        // Allocate exactly the blob the renderer will fill. The vtest wire framing counts the
+        // capset in dwords, and `max_size` from virglrenderer is always a multiple of 4, so this
+        // buffer frames cleanly; we do not need to pad.
+        let mut caps = vec![0u8; max_size as usize];
+        // Fill the buffer with the capset for the requested version. SAFETY: `caps` is a live,
+        // writable allocation of exactly `max_size` bytes, which is what `fill_caps` writes for
+        // this `(set, version)` per the size just returned by `get_cap_set`.
+        unsafe {
+            ffi::virgl_renderer_fill_caps(
+                ffi::VIRGL_RENDERER_CAPSET_VENUS,
+                version,
+                caps.as_mut_ptr() as *mut c_void,
+            )
+        };
+        Ok(caps)
     }
 }
 

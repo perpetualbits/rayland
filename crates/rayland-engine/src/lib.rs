@@ -34,6 +34,8 @@
 mod ffi;
 // The engine, error type, and availability probe.
 mod virgl;
+// The vtest wire-protocol server: parses what Mesa's Venus ICD emits and drives a `RenderEngine`.
+pub mod vtest;
 
 // Re-export the public API so consumers use `rayland_engine::{VirglEngine, EngineError, ...}`.
 pub use virgl::{EngineError, VirglEngine, virgl_available};
@@ -56,4 +58,18 @@ pub trait RenderEngine {
     /// counts commands in 4-byte words). Returns an error if the buffer is malformed or the
     /// renderer rejects it (see [`EngineError`]).
     fn submit(&mut self, ctx_id: u32, cmd: &[u8]) -> Result<(), EngineError>;
+
+    /// Return the raw Venus capability-set blob the vtest handshake must hand back to the client.
+    ///
+    /// Mesa's Venus ICD, during connection setup, sends `VCMD_GET_CAPSET` and refuses to proceed
+    /// until it receives a valid Venus capset (a `struct virgl_renderer_capset_venus`) carrying the
+    /// wire-format and protocol-spec versions it will negotiate against. The vtest server
+    /// ([`vtest::serve_vtest`]) routes that request here so the answer comes from the *real*
+    /// renderer rather than a guess.
+    ///
+    /// # Inputs / outputs
+    /// - `version`: the capset version the client asked for (`VCMD_GET_CAPSET`'s version field).
+    /// - Returns the capset bytes (length is a multiple of 4, as the wire framing requires), or an
+    ///   [`EngineError`] if the renderer reports no Venus capset (e.g. no GPU / Venus unsupported).
+    fn venus_capset(&mut self, version: u32) -> Result<Vec<u8>, EngineError>;
 }

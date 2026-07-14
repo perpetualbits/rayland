@@ -225,6 +225,15 @@ unsafe extern "C" {
     /// is unsupported. Used to probe Venus (capset 4) availability. Safe to call without init.
     pub fn virgl_renderer_get_cap_set(set: u32, max_ver: *mut u32, max_size: *mut u32);
 
+    /// `void virgl_renderer_fill_caps(uint32_t set, uint32_t version, void *caps)`. Fills `caps`
+    /// with the capability-set blob for `(set, version)`. The caller must first learn the required
+    /// buffer size from `virgl_renderer_get_cap_set` (the `max_size` out-param) and provide a
+    /// buffer of at least that many bytes — `fill_caps` writes exactly that many. Used by the
+    /// vtest server's `VCMD_GET_CAPSET` handler to answer Mesa's Venus ICD with the real Venus
+    /// capset (its `struct virgl_renderer_capset_venus`, which carries the wire-format/protocol
+    /// versions the client needs before it will proceed past the handshake).
+    pub fn virgl_renderer_fill_caps(set: u32, version: u32, caps: *mut c_void);
+
     /// `int virgl_renderer_context_create_with_flags(uint32_t ctx_id, uint32_t ctx_flags,
     /// uint32_t nlen, const char *name)`. Creates a rendering context; the low 8 bits of
     /// `ctx_flags` select the capset (4 = Venus). `name`/`nlen` is a debug label (not

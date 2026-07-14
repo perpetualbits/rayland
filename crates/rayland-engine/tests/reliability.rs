@@ -121,6 +121,41 @@ fn many_contexts_within_one_engine() {
     );
 }
 
+/// The vtest handshake's capset step, validated against the real renderer: `venus_capset` must
+/// return a non-empty, dword-aligned Venus capset blob. This is the one engine method Task 2 added
+/// that the no-GPU framing unit tests can only exercise with a mock; here we prove the real
+/// `virgl_renderer_get_cap_set` + `virgl_renderer_fill_caps` path produces the bytes the vtest
+/// `VCMD_GET_CAPSET` reply will carry to Mesa's Venus ICD.
+#[test]
+fn venus_capset_returns_real_dword_aligned_blob() {
+    // Serialize against the other GPU tests (shared global renderer + singleton guard).
+    let _serialize = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Gate: skip cleanly without a usable Venus render node.
+    let node = Path::new(RENDER_NODE);
+    if !virgl_available(node) {
+        eprintln!(
+            "SKIP venus_capset_returns_real_dword_aligned_blob: no usable Venus render node at {RENDER_NODE}"
+        );
+        return;
+    }
+
+    // Bring up the engine and ask for the Venus capset (version 0, exactly as Mesa's ICD requests).
+    let mut engine = VirglEngine::new(node).expect("VirglEngine::new should succeed on a GPU host");
+    let caps = engine
+        .venus_capset(0)
+        .expect("venus_capset should succeed on a Venus-capable host");
+
+    // The wire framing counts the capset in dwords, so its length must be a non-zero multiple of 4.
+    assert!(!caps.is_empty(), "Venus capset should not be empty");
+    assert_eq!(caps.len() % 4, 0, "capset length must be a multiple of 4");
+    eprintln!(
+        "OK: venus_capset returned {} bytes (dword-aligned)",
+        caps.len()
+    );
+}
+
 /// The single-instance invariant: while one `VirglEngine` is live, a second `new` must fail with
 /// `AlreadyActive` (virglrenderer is a process-global singleton) rather than corrupt global state.
 /// This runs even without a GPU — but only meaningfully once the first engine constructs, so it
