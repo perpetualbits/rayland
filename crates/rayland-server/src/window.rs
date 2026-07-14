@@ -60,9 +60,9 @@ pub fn pack_xrgb8888(frame: &RenderedFrame, dst: &mut [u8]) {
 // registry/xdg-shell/wl_shm handshake in handler traits: we implement the few our window
 // needs (compositor, shm, xdg window) and leave the rest to SCTK's delegate macros.
 
-// Standard networking + io for the liveness socket.
+// `Read` is used generically in `run_window`'s bound and callback (the concrete disconnect
+// source — `TcpStream` in SP1, the QUIC `Liveness` in SP2 — is supplied by the caller).
 use std::io::Read;
-use std::net::TcpStream;
 
 // calloop and the Wayland event source, reexported by SCTK so versions always match.
 use smithay_client_toolkit::reexports::calloop::{
@@ -71,7 +71,7 @@ use smithay_client_toolkit::reexports::calloop::{
     LoopHandle, // the event loop and a handle to register sources on it
     Mode,
     PostAction,       // how a file-descriptor source is polled and what to do after
-    generic::Generic, // wraps an arbitrary fd (our TCP socket) as a calloop source
+    generic::Generic, // wraps an arbitrary fd (the disconnect source) as a calloop source
 };
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource; // Wayland fd -> calloop
 // wl_output is imported as a module (not just its WlOutput type) because
@@ -292,18 +292,36 @@ delegate_xdg_window!(RaylandWindow);
 delegate_registry!(RaylandWindow);
 
 /// Open a Wayland window showing `frame`, and keep it up until the window is closed or the
-/// client on `stream` disconnects — whichever comes first.
+/// remote peer disconnects — whichever comes first.
+///
+/// `disconnect` is any source that (a) provides a file descriptor via [`AsFd`](std::os::fd::AsFd)
+/// and (b) reaches end-of-file when the peer disconnects. SP1 passed a `TcpStream`; SP2
+/// passes a QUIC `Liveness`. **The source MUST already be non-blocking** — `run_window` does
+/// not set this itself, because `TcpStream::set_nonblocking` is a TCP-specific call that does
+/// not exist on every possible source; callers are responsible for constructing (or
+/// configuring) `disconnect` as non-blocking before passing it in. On return, `disconnect` is
+/// dropped, which — for the QUIC `Liveness` — closes the connection so the client also exits.
 ///
 /// This runs one `calloop` event loop with two sources: the Wayland connection (window
-/// events) and the TCP socket (liveness). Closing the window sets the exit flag; the client
-/// disconnecting is seen as end-of-stream on the socket and also sets it. On return the loop
-/// and its sources drop, closing the socket, which the client observes as EOF.
+/// events) and `disconnect` (liveness). Closing the window sets the exit flag; the peer
+/// disconnecting is seen as end-of-stream on `disconnect` and also sets it. On return the loop
+/// and its sources drop, dropping `disconnect`, which the peer observes as its side of the
+/// connection closing.
 ///
 /// # Errors
 /// Returns an error if the compositor is unreachable (`WAYLAND_DISPLAY` unset or invalid), a
 /// required global (`wl_compositor`, `wl_shm`, `xdg_wm_base`) is missing, buffer allocation
 /// fails, or the event loop errors.
-pub fn run_window(frame: RenderedFrame, stream: TcpStream) -> anyhow::Result<()> {
+pub fn run_window<S>(frame: RenderedFrame, disconnect: S) -> anyhow::Result<()>
+where
+    // `disconnect` must expose a raw fd so calloop's `Generic` source can register it for
+    // readability polling — this is the trait that makes the source watchable at all.
+    S: std::os::fd::AsFd,
+    // calloop's `Generic` callback only ever hands the source back through a shared
+    // reference (see the registration below), so reading must work through `&S`, not `S`
+    // itself. Both `TcpStream` and the QUIC `Liveness` implement `Read for &Self`.
+    for<'a> &'a S: std::io::Read,
+{
     // Connect to the compositor named by WAYLAND_DISPLAY.
     let conn = Connection::connect_to_env()
         .map_err(|e| anyhow::anyhow!("cannot connect to a Wayland compositor: {e}"))?;
@@ -339,8 +357,8 @@ pub fn run_window(frame: RenderedFrame, stream: TcpStream) -> anyhow::Result<()>
     let surface = compositor.create_surface(&qh);
     let window = xdg_shell.create_window(surface, WindowDecorations::RequestServer, &qh);
     // A human-readable title and a stable app id (provisional).
-    window.set_title("Rayland — SP1");
-    window.set_app_id("nl.rayland.Sp1");
+    window.set_title("Rayland — SP2");
+    window.set_app_id("nl.rayland.Sp2");
     // Request a fixed size by pinning min == max to the frame's dimensions; compositors
     // commonly honour this by floating the window at exactly that size.
     window.set_min_size(Some((frame.width, frame.height)));
@@ -349,34 +367,32 @@ pub fn run_window(frame: RenderedFrame, stream: TcpStream) -> anyhow::Result<()>
     // we draw.
     window.commit();
 
-    // Register the TCP socket as a liveness source: readable-then-zero-bytes means the
-    // client disconnected. Non-blocking so the callback never stalls the loop.
-    stream
-        .set_nonblocking(true)
-        .map_err(|e| anyhow::anyhow!("failed to set the socket non-blocking: {e}"))?;
+    // Register `disconnect` as a liveness source: readable-then-zero-bytes means the peer
+    // disconnected. The source must already be non-blocking (see the doc comment above) so
+    // the callback never stalls the loop.
     loop_handle
         .insert_source(
-            Generic::new(stream, Interest::READ, Mode::Level),
-            |_readiness, socket, state: &mut RaylandWindow| {
-                // Drain whatever is readable; we only care whether the stream has ended.
-                // NoIoDrop derefs to the wrapped TcpStream; std's `impl Read for &TcpStream` lets us
-                // read through a shared reference, so no unsafe access to the fd is needed here.
-                let mut socket: &std::net::TcpStream = socket;
+            Generic::new(disconnect, Interest::READ, Mode::Level),
+            |_readiness, source, state: &mut RaylandWindow| {
+                // `source` is `&mut NoIoDrop<S>`, which derefs to `&S`; reading through `&S`
+                // (rather than `S`) is exactly what the `for<'a> &'a S: Read` bound buys us,
+                // and it avoids any unsafe access to the underlying fd.
+                let mut reader: &S = source;
                 let mut sink = [0u8; 256];
                 loop {
-                    match socket.read(&mut sink) {
-                        // EOF: the client is gone. Ask the loop to stop and remove this source.
+                    match reader.read(&mut sink) {
+                        // EOF: the peer is gone. Ask the loop to stop and remove this source.
                         Ok(0) => {
                             state.exit = true;
                             return Ok(PostAction::Remove);
                         }
-                        // Unexpected bytes in SP1: ignore and keep draining.
+                        // Unexpected bytes in SP1/SP2: ignore and keep draining.
                         Ok(_) => continue,
                         // Nothing more to read right now: leave the source in place.
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             return Ok(PostAction::Continue);
                         }
-                        // A real socket error: treat like a disconnect and stop.
+                        // A real error: treat like a disconnect and stop.
                         Err(_) => {
                             state.exit = true;
                             return Ok(PostAction::Remove);
@@ -385,7 +401,7 @@ pub fn run_window(frame: RenderedFrame, stream: TcpStream) -> anyhow::Result<()>
                 }
             },
         )
-        .map_err(|e| anyhow::anyhow!("failed to watch the client socket: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("failed to watch the disconnect source: {e}"))?;
 
     // Assemble the state and run the loop until either trigger sets `exit`.
     let mut state = RaylandWindow {

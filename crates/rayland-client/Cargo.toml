@@ -19,4 +19,5 @@ path = "src/lib.rs"
 
 [dependencies]
 rayland-wire = { path = "../rayland-wire" }   # message types + framing
+rayland-transport = { path = "../rayland-transport" } # QUIC connect() (SP2)
 anyhow = { workspace = true }                 # top-level errors in main

@@ -1,0 +1,23 @@
+# The Rayland transport: hides QUIC's async behind synchronous stream adapters. A LIBRARY
+# crate, so per policy it is LGPL-3.0-or-later.
+[package]
+name = "rayland-transport"                                                     # workspace/crates.io package name
+version = "0.0.1"                                                              # pre-release; SP2 walking skeleton
+edition = "2024"                                                              # Rust 2024 edition, per repo convention
+rust-version = "1.85"                                                         # minimum toolchain for edition 2024
+description = "Rayland transport: synchronous stream adapters over a QUIC connection (SP2)." # crates.io/tooling purpose
+license = "LGPL-3.0-or-later"                                                 # library crate → LGPL per repo policy
+repository = "https://github.com/perpetualbits/rayland"                       # upstream source location
+
+[dependencies]
+quinn = { workspace = true }              # QUIC endpoints, connections, streams
+# `features = ["ring"]` at the workspace level: the pure-Rust `rustls-rustcrypto` provider
+# was tried first (SP2 Task 1 spike) but cannot drive quinn's QUIC packet crypto — see the
+# provider note atop tls.rs and the Task 1 report. `ring` is the working fallback.
+rustls = { workspace = true }             # TLS configuration underlying QUIC (provider: ring)
+rcgen = { workspace = true }              # ephemeral self-signed certificate
+tokio = { workspace = true }              # the confined async runtime that drives QUIC
+anyhow = { workspace = true }             # contextual errors for setup paths returned to binaries (the transport wraps heterogeneous quinn/rustls/tokio errors; the hot Read/Write paths return std::io::Error directly, so no typed thiserror enum is needed yet)
+# Non-blocking pipe for `Liveness`'s disconnect fd; pure-Rust syscall bindings, already in the
+# dependency tree (via SCTK) so this adds no new C dependency.
+rustix = { version = "1", features = ["pipe"] }
