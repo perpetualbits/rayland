@@ -2,8 +2,8 @@
 
 // The message types, framing writer, and version constant.
 use rayland_wire::{Message, PROTOCOL_VERSION, Vertex, WireError, write_message};
-// Write is the trait for anything we can send bytes to (a Vec in tests, a TcpStream in main).
-use std::io::Write;
+// Read and Write are the traits for anything we can read/send bytes to (a Vec in tests, a TcpStream in main).
+use std::io::{Read, Write};
 
 /// Build the SP0 triangle command stream and write it to `w`.
 ///
@@ -62,6 +62,32 @@ pub fn send_triangle<W: Write>(
     Ok(())
 }
 
+/// Block until the peer closes the connection, discarding anything it sends.
+///
+/// In SP1 the client sends one frame and then holds the connection open purely as a
+/// *liveness channel*: as long as the socket is open, the server keeps the window on screen.
+/// When the user closes the window, the server drops the socket; the read here then returns
+/// end-of-stream and the client exits. The SP1 server sends no bytes back, so any received
+/// data is unexpected and simply discarded rather than interpreted.
+///
+/// # Errors
+/// Returns any I/O error other than a clean end of stream (which is the normal, successful
+/// termination and yields `Ok(())`).
+pub fn wait_until_closed<R: Read>(reader: &mut R) -> std::io::Result<()> {
+    // A small scratch buffer; we never keep what we read — only watch for the stream to end.
+    let mut sink = [0u8; 256];
+    loop {
+        match reader.read(&mut sink) {
+            // Zero bytes read means the peer closed the connection: the window was closed.
+            Ok(0) => return Ok(()),
+            // Any bytes are unexpected in SP1; discard them and keep watching for the close.
+            Ok(_) => continue,
+            // A genuine I/O failure propagates to the caller.
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,5 +133,13 @@ mod tests {
         );
         assert_eq!(messages[3], Message::DrawTriangles { vertex_count: 3 });
         assert_eq!(messages[4], Message::EndFrame);
+    }
+
+    #[test]
+    fn wait_until_closed_returns_at_end_of_stream() {
+        // A reader that yields a few bytes and then EOF models a server that sends nothing
+        // and later closes the connection. wait_until_closed must drain and return Ok.
+        let mut reader = std::io::Cursor::new(vec![1u8, 2, 3]);
+        wait_until_closed(&mut reader).expect("reaching end of stream is success, not error");
     }
 }
