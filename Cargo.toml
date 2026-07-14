@@ -9,6 +9,7 @@ members = [
     "crates/rayland-wire",           # shared wire protocol (this task)
     "crates/rayland-server",         # off-screen Vulkan renderer (this task)
     "crates/rayland-client",         # client: builds and sends the triangle stream (this task)
+    "crates/rayland-transport",      # QUIC transport foundation + loopback spike (SP2 Task 1)
 ]
 
 # Dependency versions shared across member crates, so every crate agrees on one version.
@@ -24,3 +25,14 @@ image = "0.25"                       # PNG encoding (used by the server)
 # pkg-config at build time — we do no keyboard/seat handling, so we need only `calloop`.
 smithay-client-toolkit = { version = "0.20", default-features = false, features = ["calloop"] }
 wayland-client = { version = "0.31", features = ["dlopen"] }  # dlopen: load libwayland at runtime so CI needs no libwayland package
+quinn = "0.11"                                          # QUIC transport (async)
+# TLS; `ring` provider selected explicitly. SP2 Task 1 spike: the pure-Rust
+# `rustls-rustcrypto` provider (0.0.2-alpha) panics "no initial cipher suite found" when
+# quinn wraps it for QUIC packet protection — it does not yet expose a QUIC-usable AEAD
+# suite. `ring` is the working fallback documented in the SP2 plan's decision gate; see
+# crates/rayland-transport/src/tls.rs for the full note and .superpowers/sdd/task-1-report.md
+# for the spike evidence. `rustls-rustcrypto` was dropped as a dependency since it is unused;
+# revisit when the crate matures past alpha (rv64 portability was the original motivation).
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rcgen = "0.14"                                          # self-signed certificate generation
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] } # confined async runtime
