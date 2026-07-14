@@ -165,6 +165,18 @@ pub enum EngineError {
         ctx_id: u32,
     },
 
+    /// `create_resource`/`create_blob_resource` were asked to attach a resource to a `ctx_id`
+    /// this engine never created (or already destroyed). Only a context this engine created and
+    /// tracks in `self.contexts` is a safe `ctx_attach_resource` target — an untracked id might
+    /// name nothing, or might collide with something virglrenderer interprets differently. This
+    /// makes "`ctx_id` names a live context" (the invariant `wait_for_context_fence`'s doc comment
+    /// already assumes) an enforced check rather than caller discipline.
+    #[error("context id {ctx_id} is not tracked by this engine (no such Venus context)")]
+    UnknownContext {
+        /// The offending context id.
+        ctx_id: u32,
+    },
+
     /// An engine-assigned resource id does not fit in the C API's `int` (several resource calls
     /// take `res_handle` as `c_int`). `next_resource_id` is a `u32` counter starting at 1; this is
     /// unreachable in any real session (it would require ~2^31 resources in one process lifetime)
@@ -278,6 +290,25 @@ pub enum EngineError {
         height: u32,
         /// The reported row stride (0 here is the problem).
         stride: u32,
+    },
+
+    /// `create_resource`'s immediate post-creation `resource_get_info` succeeded, reported
+    /// nonzero width/height/stride, but the stride is narrower than a single tightly-packed row
+    /// (`width * bytes_per_pixel`) for a format `read_back`/`repack_tight` know how to unpad.
+    /// Refused here — while the resource can still be cleanly detached+unref'd — rather than
+    /// letting `read_back` discover it later via an out-of-bounds slice panic in `repack_tight`.
+    #[error(
+        "resource {resource_id} has an implausible stride (width={width} stride={stride} bytes_per_pixel={bytes_per_pixel}: stride is narrower than one packed row)"
+    )]
+    InvalidResourceStride {
+        /// The resource that was queried.
+        resource_id: u32,
+        /// The reported width.
+        width: u32,
+        /// The reported row stride (too small for `width` here is the problem).
+        stride: u32,
+        /// The format's bytes-per-pixel, from `bytes_per_pixel`.
+        bytes_per_pixel: u32,
     },
 
     /// `read_back` was asked to read a resource with no cached image layout — i.e. one created via
@@ -719,11 +750,24 @@ impl RenderEngine for VirglEngine {
     ///
     /// # Failure modes
     /// - `ResourceCtxIdOutOfRange`: `ctx_id` does not fit a C `int`.
+    /// - `UnknownContext`: `ctx_id` does not name a context this engine created.
     /// - `ResourceIdOverflow`: the engine's own id counter overflowed (practically unreachable).
     /// - `ResourceCreateFailed`: virglrenderer rejected the resource.
     /// - `ResourceInfoFailed`: the immediate post-creation `resource_get_info` failed.
     /// - `InvalidResourceInfo`: `resource_get_info` succeeded but reported a zero
     ///   width/height/stride.
+    /// - `InvalidResourceStride`: `resource_get_info` succeeded but reported a `stride` narrower
+    ///   than one tightly-packed row (`width * bytes_per_pixel`) for a format `read_back` knows how
+    ///   to unpad — reading it back would slice out of bounds.
+    ///
+    /// # No leaked resource on any error path
+    /// Once `virgl_renderer_resource_create` and `virgl_renderer_ctx_attach_resource` have both
+    /// succeeded, the resource genuinely exists inside virglrenderer. Every error branch that can
+    /// still occur after that point (`ResourceInfoFailed`, `InvalidResourceInfo`,
+    /// `InvalidResourceStride`) therefore detaches then unrefs the resource — mirroring
+    /// `unref_resource`/`Drop`'s teardown order — before returning `Err`, so a failed call never
+    /// leaves an orphaned GPU resource that nothing will ever unref (it was never inserted into
+    /// `self.resources`, so `unref_resource`/`Drop` would never otherwise see it).
     fn create_resource(
         &mut self,
         ctx_id: u32,
@@ -736,9 +780,21 @@ impl RenderEngine for VirglEngine {
         let ctx_id_c =
             c_int::try_from(ctx_id).map_err(|_| EngineError::ResourceCtxIdOutOfRange { ctx_id })?;
 
+        // Reject a `ctx_id` this engine never created (or already destroyed). Attaching a
+        // resource to an unknown context would either fail deep inside virglrenderer with an
+        // opaque code, or — worse — silently attach to whatever that context number happens to
+        // mean to virglrenderer. This makes `ctx_id` a checked invariant from here on, not
+        // caller discipline (see `wait_for_context_fence`'s doc comment, which relies on the same
+        // "ctx_id names a live context" property).
+        if !self.contexts.contains(&ctx_id) {
+            return Err(EngineError::UnknownContext { ctx_id });
+        }
+
         // Allocate the next engine-assigned id and pre-validate it fits `c_int` (required by
-        // `ctx_attach_resource`) *before* calling into C, so a failure here never leaves a
-        // half-created resource behind.
+        // `ctx_attach_resource`) *before* calling into C, so a failure *up to this point* never
+        // leaves a half-created resource behind. (A failure *after* `resource_create` +
+        // `ctx_attach_resource` succeed is a different case — see "No leaked resource on any
+        // error path" above; those branches explicitly detach+unref before returning.)
         let resource_id = self.next_resource_id;
         let resource_id_c = c_int::try_from(resource_id)
             .map_err(|_| EngineError::ResourceIdOverflow { resource_id })?;
@@ -788,6 +844,13 @@ impl RenderEngine for VirglEngine {
         // created and attached above.
         let rc = unsafe { ffi::virgl_renderer_resource_get_info(resource_id_c, &mut info) };
         if rc != 0 {
+            // The resource exists in virglrenderer (created + attached above) but will never be
+            // inserted into `self.resources`, so nothing will ever unref it unless we do so here.
+            // Detach then unref — the same order `unref_resource`/`Drop` use. SAFETY: both ids
+            // were validated to fit `c_int` above; `resource_id_c`/`resource_id` name the
+            // resource just created and attached above, not yet unref'd.
+            unsafe { ffi::virgl_renderer_ctx_detach_resource(ctx_id_c, resource_id_c) };
+            unsafe { ffi::virgl_renderer_resource_unref(resource_id) };
             return Err(EngineError::ResourceInfoFailed {
                 resource_id,
                 rc,
@@ -795,12 +858,40 @@ impl RenderEngine for VirglEngine {
             });
         }
         if info.width == 0 || info.height == 0 || info.stride == 0 {
+            // Same leak concern as the branch above: release the resource before reporting the
+            // error, rather than abandoning it un-tracked and un-releasable.
+            // SAFETY: as above.
+            unsafe { ffi::virgl_renderer_ctx_detach_resource(ctx_id_c, resource_id_c) };
+            unsafe { ffi::virgl_renderer_resource_unref(resource_id) };
             return Err(EngineError::InvalidResourceInfo {
                 resource_id,
                 width: info.width,
                 height: info.height,
                 stride: info.stride,
             });
+        }
+
+        // Guard against a stride narrower than a single tightly-packed row for a format
+        // `read_back`/`repack_tight` know how to unpad. Unknown formats have no `bytes_per_pixel`
+        // to compare against yet — `read_back`'s `UnsupportedReadbackFormat` check refuses those
+        // before ever reaching `repack_tight`, so they need no guard here. But for a *known*
+        // format, a too-small stride would make `repack_tight`'s `raw[start..start + row_bytes]`
+        // slice run past the row it actually has — an out-of-bounds panic, not a typed error.
+        // Converting that into `InvalidResourceStride` here (while the resource can still be
+        // cleanly released) closes that gap.
+        if let Some(bpp) = bytes_per_pixel(info.virgl_format) {
+            let min_stride = info.width.saturating_mul(bpp);
+            if info.stride < min_stride {
+                // SAFETY: as above.
+                unsafe { ffi::virgl_renderer_ctx_detach_resource(ctx_id_c, resource_id_c) };
+                unsafe { ffi::virgl_renderer_resource_unref(resource_id) };
+                return Err(EngineError::InvalidResourceStride {
+                    resource_id,
+                    width: info.width,
+                    stride: info.stride,
+                    bytes_per_pixel: bpp,
+                });
+            }
         }
 
         // Track ownership + the cached layout so `read_back` knows which context's fences to wait
@@ -844,6 +935,7 @@ impl RenderEngine for VirglEngine {
     ///
     /// # Failure modes
     /// - `ResourceCtxIdOutOfRange`: `ctx_id` does not fit a C `int`.
+    /// - `UnknownContext`: `ctx_id` does not name a context this engine created.
     /// - `ResourceIdOverflow`: the engine's own id counter overflowed (practically unreachable).
     /// - `BlobResourceCreateFailed`: virglrenderer rejected the resource (e.g. a guest-backed
     ///   `blob_mem` was requested, which this no-VM setup cannot satisfy — see above).
@@ -857,6 +949,11 @@ impl RenderEngine for VirglEngine {
     ) -> Result<u32, EngineError> {
         let ctx_id_c =
             c_int::try_from(ctx_id).map_err(|_| EngineError::ResourceCtxIdOutOfRange { ctx_id })?;
+        // Same check `create_resource` performs: refuse a `ctx_id` this engine did not itself
+        // create, rather than let `ctx_attach_resource` (below) target an unowned/unknown context.
+        if !self.contexts.contains(&ctx_id) {
+            return Err(EngineError::UnknownContext { ctx_id });
+        }
         let resource_id = self.next_resource_id;
         let resource_id_c = c_int::try_from(resource_id)
             .map_err(|_| EngineError::ResourceIdOverflow { resource_id })?;
@@ -1359,6 +1456,27 @@ mod tests {
                 assert_eq!(ctx_id, u32::MAX);
             }
             other => panic!("expected ResourceCtxIdOutOfRange, got {other:?}"),
+        }
+
+        // A ctx_id that fits a C `int` but was never created by this engine (context 99 was
+        // never passed to `create_venus_context`) is rejected too — this is the Fix 3 guard: a
+        // resource cannot be attached to a context the engine does not itself own. Checked for
+        // both `create_resource` and `create_blob_resource`, since both take this same guard.
+        match engine.create_resource(99, 4, 4, B8G8R8A8_UNORM) {
+            Err(EngineError::UnknownContext { ctx_id }) => {
+                assert_eq!(ctx_id, 99);
+            }
+            other => panic!("expected UnknownContext, got {other:?}"),
+        }
+        match engine.create_blob_resource(
+            99, 0x0002, /* HOST3D */
+            0x0001, /* MAPPABLE */
+            0, 64,
+        ) {
+            Err(EngineError::UnknownContext { ctx_id }) => {
+                assert_eq!(ctx_id, 99);
+            }
+            other => panic!("expected UnknownContext, got {other:?}"),
         }
 
         // (2) Create a real classic 2D resource: 4x4, BGRA8 (4 bytes/pixel), attached to ctx 1.
