@@ -33,6 +33,8 @@
 use ash::vk;
 // The vertex type as it arrives over the wire.
 use rayland_wire::Vertex;
+// The dmabuf export mechanics (Task 1) that `render_to_dmabuf` (Task 3) drives.
+use crate::dmabuf;
 
 /// Everything needed to render one frame.
 pub struct FrameRequest {
@@ -85,6 +87,35 @@ struct SizedTarget {
     framebuffer: vk::Framebuffer,
 }
 
+/// The persistent LINEAR export image + memory backing the most recent [`Renderer::render_to_dmabuf`]
+/// call's dmabuf.
+///
+/// `export_as_dmabuf` (Task 1's proven mechanics, in [`dmabuf`]) allocates a *fresh* image and
+/// memory block on every call — it has no notion of reuse — but the fd it hands to the
+/// compositor is only valid for as long as this backing memory exists. Something must therefore
+/// own that image/memory for longer than the `render_to_dmabuf` call that created it, and that
+/// owner is `self` (the [`Renderer`]), exactly as it already owns the size-dependent render
+/// target ([`SizedTarget`]). Bundled into one struct, rather than two loose `Option` fields, for
+/// the same reason `SizedTarget` is: the "destroy the old one" cleanup in `render_to_dmabuf`
+/// touches one field instead of two that could drift out of sync.
+///
+/// # Why this must be destroyed *before* a new one replaces it
+/// `export_as_dmabuf` does not reuse or free anything — every call allocates a brand-new image
+/// and a brand-new `vkAllocateMemory` block. If `render_to_dmabuf` is called a second time and
+/// simply overwrote `Renderer::export` with the new `ExportTarget`, the *previous* image and
+/// memory would become unreachable from Rust (no more references) while still being live,
+/// allocated Vulkan objects — a leak the driver has no way to reclaim on its own (Vulkan has no
+/// garbage collector; `vkDestroyImage`/`vkFreeMemory` must be called explicitly). SP3 only ever
+/// exports one frame per process, so this path is not exercised by SP3 itself, but a caller that
+/// renders more than one dmabuf frame over a `Renderer`'s lifetime must not leak, so
+/// `render_to_dmabuf` destroys any existing `ExportTarget` before installing the new one.
+struct ExportTarget {
+    /// The LINEAR `B8G8R8A8_UNORM` image [`dmabuf::export_as_dmabuf`] created and blitted into.
+    image: vk::Image,
+    /// The exportable device memory backing `image`; the dmabuf fd refers to this allocation.
+    memory: vk::DeviceMemory,
+}
+
 /// A persistent, reusable off-screen Vulkan renderer.
 ///
 /// Owns every Vulkan object whose lifetime must survive past a single [`render_to_frame`]
@@ -127,11 +158,13 @@ pub struct Renderer {
     /// last (after `device`) in [`Drop`].
     instance: ash::Instance,
     /// The physical GPU chosen at construction time. This is a handle owned by the driver, not
-    /// a resource we allocate — nothing to free — kept so future code (Task 3) can re-query its
-    /// properties (e.g. supported DRM format modifiers) without re-enumerating devices.
-    /// `#[allow(dead_code)]`: nothing in *this* task reads it back — `new_inner` uses a local
-    /// of the same value for device/queue creation — but the SP3 plan explicitly calls for
-    /// storing it now so Task 3 does not have to re-enumerate physical devices from scratch.
+    /// a resource we allocate — nothing to free. As it turned out, Task 3's `render_to_dmabuf`
+    /// did not need to re-query it (`export_as_dmabuf` only needs `mem_props`, already cached
+    /// below, plus the device/queue/pool also already held) — kept anyway for whatever later
+    /// SP3/SP4 code (e.g. window.rs's presentation-side capability checks) may still want to
+    /// re-query physical-device properties without re-enumerating from scratch.
+    /// `#[allow(dead_code)]`: nothing currently reads it back — `new_inner` uses a local of the
+    /// same value for device/queue creation.
     #[allow(dead_code)]
     physical_device: vk::PhysicalDevice,
     /// The logical device: every other Vulkan object in this struct is created through this
@@ -166,9 +199,21 @@ pub struct Renderer {
     /// Whether `physical_device` exposes every extension
     /// [`crate::dmabuf::required_device_extensions`] needs, and those extensions (plus their
     /// transitive dependency `VK_KHR_image_format_list`) were successfully enabled on `device`
-    /// in `new()`. `pub` so Task 3's `render_to_dmabuf` (and its caller, deciding between the
-    /// dmabuf and `wl_shm` presentation paths) can branch on it without re-probing the device.
+    /// in `new()`. `pub` so `render_to_dmabuf` (and its caller, deciding between the dmabuf and
+    /// `wl_shm` presentation paths) can branch on it without re-probing the device.
     pub supports_dmabuf: bool,
+    /// The device-level dispatch table for `VK_KHR_external_memory_fd` (`vkGetMemoryFdKHR`),
+    /// which [`dmabuf::export_as_dmabuf`] needs to actually export the fd. `Some` iff
+    /// `supports_dmabuf` is `true` — the extension was enabled on `device` in `new()`, and this
+    /// loader is only meaningful (and only safe to call through) for as long as `device` is
+    /// alive, so it is dropped explicitly in [`Drop`] before `device` is destroyed, even though
+    /// (being only a table of resolved function pointers, not a Vulkan object) it owns nothing
+    /// that itself needs a `vkDestroy*` call.
+    external_memory_fd: Option<ash::khr::external_memory_fd::Device>,
+    /// The most recent dmabuf export's LINEAR image + memory, or `None` if `render_to_dmabuf`
+    /// has never been called. See [`ExportTarget`] for why `self` must own this and why a new
+    /// export destroys the previous one first.
+    export: Option<ExportTarget>,
 }
 
 impl Renderer {
@@ -232,8 +277,7 @@ impl Renderer {
 
         // Probe dmabuf-export support BEFORE creating the device: which extensions we enable
         // below depends on the answer, and device extensions cannot be changed after creation.
-        let supports_dmabuf =
-            crate::dmabuf::device_supports_dmabuf_export(&instance, physical_device);
+        let supports_dmabuf = dmabuf::device_supports_dmabuf_export(&instance, physical_device);
 
         // Create a logical device with one graphics queue.
         let queue_priorities = [1.0f32]; // single queue, priority is irrelevant but required
@@ -251,7 +295,7 @@ impl Renderer {
         let mut ext_names: Vec<*const std::os::raw::c_char> = Vec::new();
         if supports_dmabuf {
             ext_names.extend(
-                crate::dmabuf::required_device_extensions()
+                dmabuf::required_device_extensions()
                     .iter()
                     .map(|c| c.as_ptr()),
             );
@@ -266,6 +310,15 @@ impl Renderer {
 
         // Query memory properties once; used to choose memory types for the image and buffers.
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+
+        // Build the VK_KHR_external_memory_fd dispatch table iff the extension was actually
+        // enabled above (`supports_dmabuf`). `Device::new` only *resolves function pointers* —
+        // it makes no Vulkan calls of its own — so it is cheap and infallible, but constructing
+        // it when the extension was never enabled would hand out a loader whose functions the
+        // driver has no obligation to have exposed; keeping it behind the same `supports_dmabuf`
+        // gate as the extension list above prevents that mismatch by construction.
+        let external_memory_fd =
+            supports_dmabuf.then(|| ash::khr::external_memory_fd::Device::new(&instance, &device));
 
         // --- Render pass: clear the colour attachment, store it, leave it as a transfer src ---
         let format = vk::Format::R8G8B8A8_UNORM; // 8 bits per channel, matches our RGBA8 output
@@ -452,6 +505,9 @@ impl Renderer {
             // No frame has been rendered yet, so there is no sized target to hold.
             sized: None,
             supports_dmabuf,
+            external_memory_fd,
+            // No dmabuf has been exported yet, so there is no export target to hold.
+            export: None,
         })
     }
 
@@ -554,30 +610,47 @@ impl Renderer {
         Ok((image, framebuffer))
     }
 
-    /// Render `request`'s triangle into this renderer's colour image and read the result back
-    /// to CPU memory.
+    /// Render `request`'s triangle into the persistent OPTIMAL colour image, blocking until the
+    /// GPU has completely finished, so the image is left in `TRANSFER_SRC_OPTIMAL` layout with
+    /// the triangle's pixels durably written and visible to any later Vulkan work.
     ///
     /// Builds (or reuses) the colour image/view/framebuffer for `request`'s size, uploads the
-    /// vertices, records and submits one draw, copies the image into a host-visible buffer
-    /// packed tightly, and returns the RGBA8 bytes. Unlike the persistent objects owned by
-    /// `self`, the vertex buffer, the readback buffer, the command buffer, and the fence used
-    /// for this call are all created and destroyed within this call — there is no benefit to
-    /// keeping per-frame objects alive between frames.
+    /// vertices to a throwaway host-visible buffer, and records+submits exactly the
+    /// bind-pipeline / set-viewport-and-scissor / bind-vertex-buffer / draw sequence — nothing
+    /// about what happens to the finished image. This is the render step shared by
+    /// [`Renderer::render_to_frame`] (which afterward copies the image into a CPU-readable
+    /// buffer) and [`Renderer::render_to_dmabuf`] (which afterward blits the image into a
+    /// LINEAR export image via [`dmabuf::export_as_dmabuf`]); factoring it out here means the
+    /// pipeline-binding/draw sequence exists in exactly one place (DRY) rather than being
+    /// duplicated between the two public methods, and a future change to the draw itself (e.g.
+    /// more geometry, push constants) only has to happen once.
+    ///
+    /// # Synchronization note — why this fence-waits before returning
+    /// Vulkan's queue submission order alone does **not** guarantee that one submission's
+    /// writes are visible to a *later, separate* submission's reads, even on the same queue —
+    /// the driver is free to reorder or overlap independently-submitted work unless an explicit
+    /// dependency (fence, semaphore, or pipeline barrier) says otherwise. `render_to_dmabuf`
+    /// needs exactly this guarantee: it calls this function, then hands the resulting image to
+    /// [`dmabuf::export_as_dmabuf`], which issues the export blit as a **second, independent
+    /// submission** on the same queue. Without a synchronization point between "render the
+    /// triangle" and "blit it into the export image", the blit could begin before the render's
+    /// colour-attachment writes have actually landed in memory, exporting a torn, partial, or
+    /// blank frame — and because this is a data race, not a deterministic bug, it could easily
+    /// pass in casual testing and fail intermittently (or fail on a different driver) in the
+    /// field. Blocking the host here, on this submission's fence, before returning is the
+    /// simplest correct fix: a signaled fence means the GPU has *completed* the submission and
+    /// (per the Vulkan spec's execution/memory-dependency guarantees for fence signal operations)
+    /// made its writes available and visible to any submission issued after the host observes
+    /// the signal — which is exactly what happens here, since `render_to_dmabuf` only calls
+    /// `export_as_dmabuf` after this function has returned. `render_to_frame` also benefits: it
+    /// needs the same guarantee for its own follow-up copy-to-buffer submission.
     ///
     /// # Errors
     /// Returns an error if building the sized target fails, or any per-frame Vulkan call fails.
-    pub fn render_to_frame(&mut self, request: &FrameRequest) -> anyhow::Result<RenderedFrame> {
-        // SAFETY: see `Renderer::new`'s comment — every ash call is FFI, made safe here by
-        // constructing each argument immediately before use.
-        unsafe { self.render_to_frame_inner(request) }
-    }
-
-    /// The `unsafe` body of [`Renderer::render_to_frame`], separated so the public method stays
-    /// safe to call and the safety reasoning lives in one place.
-    unsafe fn render_to_frame_inner(
+    unsafe fn render_triangle_to_optimal_image(
         &mut self,
         request: &FrameRequest,
-    ) -> anyhow::Result<RenderedFrame> {
+    ) -> anyhow::Result<vk::Image> {
         // Build or reuse the colour image/view/framebuffer sized for this request.
         let (image, framebuffer) =
             unsafe { self.ensure_sized_target(request.width, request.height) }?;
@@ -617,29 +690,7 @@ impl Renderer {
         };
         unsafe { self.device.unmap_memory(vbuf_mem) };
 
-        // --- Readback buffer (host-visible, holds the tightly-packed image after the copy) ---
-        // Compute the size in u64 arithmetic. width/height arrive from an untrusted client
-        // BeginFrame; multiplying them as u32 first could wrap (e.g. 46341*46341*4), silently
-        // sizing the buffer too small in release builds. Widening each factor before the
-        // multiply makes the arithmetic correct by construction regardless of the inputs.
-        let readback_size = request.width as u64 * request.height as u64 * 4;
-        let rbuf_info = vk::BufferCreateInfo::default()
-            .size(readback_size)
-            .usage(vk::BufferUsageFlags::TRANSFER_DST)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let readback_buffer = unsafe { self.device.create_buffer(&rbuf_info, None) }?;
-        let rbuf_req = unsafe { self.device.get_buffer_memory_requirements(readback_buffer) };
-        let rbuf_mem = unsafe {
-            allocate(
-                &self.device,
-                &self.mem_props,
-                rbuf_req,
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            )
-        }?;
-        unsafe { self.device.bind_buffer_memory(readback_buffer, rbuf_mem, 0) }?;
-
-        // --- Command buffer: draw, then copy image → readback buffer ---
+        // --- Command buffer: bind pipeline, set dynamic state, bind vertices, draw ---
         let cmd = unsafe {
             self.device.allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()
@@ -715,9 +766,109 @@ impl Renderer {
             self.device
                 .cmd_draw(cmd, request.vertices.len() as u32, 1, 0, 0)
         };
+        // Ending the render pass performs the layout transition declared by its
+        // `final_layout` (TRANSFER_SRC_OPTIMAL, see `new_inner`), so `image` is left ready for
+        // either caller's follow-up transfer command with no further barrier needed.
         unsafe { self.device.cmd_end_render_pass(cmd) };
+        unsafe { self.device.end_command_buffer(cmd) }?;
 
-        // Copy the rendered image (now TRANSFER_SRC_OPTIMAL) into the readback buffer,
+        // Submit and BLOCK until the GPU has finished — see the doc comment above for why this
+        // fence-wait (rather than just submitting and moving on) is the load-bearing
+        // synchronization step that makes it safe for a later, separate submission to read
+        // this image's contents.
+        let fence = unsafe {
+            self.device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+        }?;
+        let cmds = [cmd];
+        let submit = vk::SubmitInfo::default().command_buffers(&cmds);
+        unsafe { self.device.queue_submit(self.queue, &[submit], fence) }?;
+        // Wait up to ~10 seconds for the GPU to finish.
+        unsafe { self.device.wait_for_fences(&[fence], true, 10_000_000_000) }?;
+
+        // The command buffer, fence, and vertex buffer have served their purpose for this call
+        // — the draw that consumed the vertex data is now complete (guaranteed by the fence
+        // wait above) — so free/destroy all three. `image` (unlike these) is NOT destroyed
+        // here: it is the persistent `SizedTarget` image owned by `self.sized`, and is exactly
+        // what this function hands back to its caller.
+        unsafe {
+            self.device.destroy_fence(fence, None);
+            self.device.free_command_buffers(self.command_pool, &cmds);
+            self.device.destroy_buffer(vertex_buffer, None);
+            self.device.free_memory(vbuf_mem, None);
+        }
+
+        Ok(image)
+    }
+
+    /// Render `request`'s triangle into this renderer's colour image and read the result back
+    /// to CPU memory.
+    ///
+    /// Delegates the actual rendering to [`Renderer::render_triangle_to_optimal_image`] (shared
+    /// with [`Renderer::render_to_dmabuf`]), then copies the finished image into a host-visible
+    /// buffer packed tightly and returns the RGBA8 bytes. Unlike the persistent objects owned
+    /// by `self`, the readback buffer, the command buffer, and the fence used for this call are
+    /// all created and destroyed within this call — there is no benefit to keeping per-frame
+    /// objects alive between frames.
+    ///
+    /// # Errors
+    /// Returns an error if building the sized target fails, or any per-frame Vulkan call fails.
+    pub fn render_to_frame(&mut self, request: &FrameRequest) -> anyhow::Result<RenderedFrame> {
+        // SAFETY: see `Renderer::new`'s comment — every ash call is FFI, made safe here by
+        // constructing each argument immediately before use.
+        unsafe { self.render_to_frame_inner(request) }
+    }
+
+    /// The `unsafe` body of [`Renderer::render_to_frame`], separated so the public method stays
+    /// safe to call and the safety reasoning lives in one place.
+    unsafe fn render_to_frame_inner(
+        &mut self,
+        request: &FrameRequest,
+    ) -> anyhow::Result<RenderedFrame> {
+        // Render the triangle into the persistent OPTIMAL image; fence-waited to completion
+        // inside, so `image` is already fully written and in TRANSFER_SRC_OPTIMAL layout here.
+        let image = unsafe { self.render_triangle_to_optimal_image(request) }?;
+
+        // --- Readback buffer (host-visible, holds the tightly-packed image after the copy) ---
+        // Compute the size in u64 arithmetic. width/height arrive from an untrusted client
+        // BeginFrame; multiplying them as u32 first could wrap (e.g. 46341*46341*4), silently
+        // sizing the buffer too small in release builds. Widening each factor before the
+        // multiply makes the arithmetic correct by construction regardless of the inputs.
+        let readback_size = request.width as u64 * request.height as u64 * 4;
+        let rbuf_info = vk::BufferCreateInfo::default()
+            .size(readback_size)
+            .usage(vk::BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let readback_buffer = unsafe { self.device.create_buffer(&rbuf_info, None) }?;
+        let rbuf_req = unsafe { self.device.get_buffer_memory_requirements(readback_buffer) };
+        let rbuf_mem = unsafe {
+            allocate(
+                &self.device,
+                &self.mem_props,
+                rbuf_req,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )
+        }?;
+        unsafe { self.device.bind_buffer_memory(readback_buffer, rbuf_mem, 0) }?;
+
+        // --- Command buffer: copy image → readback buffer ---
+        let cmd = unsafe {
+            self.device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(self.command_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+        }?[0];
+        unsafe {
+            self.device.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+        }?;
+
+        // Copy the rendered image (already TRANSFER_SRC_OPTIMAL) into the readback buffer,
         // tightly packed: buffer_row_length = 0 means "use the image width", no padding.
         let copy = vk::BufferImageCopy::default()
             .buffer_offset(0)
@@ -783,8 +934,6 @@ impl Renderer {
             self.device.free_command_buffers(self.command_pool, &cmds);
             self.device.destroy_buffer(readback_buffer, None);
             self.device.free_memory(rbuf_mem, None);
-            self.device.destroy_buffer(vertex_buffer, None);
-            self.device.free_memory(vbuf_mem, None);
         }
 
         // Hand back the pixels.
@@ -794,20 +943,156 @@ impl Renderer {
             pixels,
         })
     }
+
+    /// Whether this renderer's GPU and enabled device extensions support the dmabuf zero-copy
+    /// export path ([`Renderer::render_to_dmabuf`]).
+    ///
+    /// Mirrors the public [`Renderer::supports_dmabuf`] field (kept as a method too, alongside
+    /// the field, so callers can use whichever reads more naturally — e.g. SP3's presentation
+    /// code, Task 4, deciding whether to try the dmabuf path or fall back to `wl_shm`). The
+    /// value never changes after `new()`: it reflects a fixed property of the chosen physical
+    /// device and the extensions enabled at device-creation time, neither of which can change
+    /// for the lifetime of this `Renderer`.
+    pub fn supports_dmabuf(&self) -> bool {
+        self.supports_dmabuf
+    }
+
+    /// Render one frame and export it as a dmabuf (SP3 zero-copy path).
+    ///
+    /// Renders the triangle into the OPTIMAL image (via the shared
+    /// [`Renderer::render_triangle_to_optimal_image`], the same pipeline `render_to_frame`
+    /// uses), then blits it into the persistent LINEAR export image and exports a dmabuf fd +
+    /// layout via [`dmabuf::export_as_dmabuf`] — reusing Task 1's proven export mechanics
+    /// rather than reimplementing them. The export image and its memory are owned by `self`
+    /// (see [`ExportTarget`]) and stay alive until either a later `render_to_dmabuf` call
+    /// replaces them or the `Renderer` itself is dropped — which the caller must ensure happens
+    /// only after the compositor has released the exported buffer, since the fd refers directly
+    /// to this memory.
+    ///
+    /// # Errors
+    /// Returns an error if the device does not support dmabuf export, or any Vulkan step fails.
+    pub fn render_to_dmabuf(
+        &mut self,
+        request: &FrameRequest,
+    ) -> anyhow::Result<dmabuf::DmabufFrame> {
+        // SAFETY: see `Renderer::new`'s comment — every ash call is FFI, made safe here by
+        // constructing each argument immediately before use.
+        unsafe { self.render_to_dmabuf_inner(request) }
+    }
+
+    /// The `unsafe` body of [`Renderer::render_to_dmabuf`], separated so the public method stays
+    /// safe to call and the safety reasoning lives in one place.
+    unsafe fn render_to_dmabuf_inner(
+        &mut self,
+        request: &FrameRequest,
+    ) -> anyhow::Result<dmabuf::DmabufFrame> {
+        // Refuse up front if the device can't export — the caller should have checked
+        // `supports_dmabuf()`, but this guards direct callers (and internal misuse) too. A
+        // clear error here is much easier to diagnose than the confusing failure that would
+        // follow from calling `export_as_dmabuf` with extensions the device never enabled.
+        anyhow::ensure!(
+            self.supports_dmabuf,
+            "device does not support dmabuf export"
+        );
+        // Render the triangle into the persistent OPTIMAL image FIRST (needs `&mut self`,
+        // before the immutable borrow of `external_memory_fd` below is taken — the two can't
+        // overlap under the borrow checker, and the ordering is correct anyway: the render
+        // must happen before the export can use its result). This fence-waits to completion
+        // internally (see that function's doc comment for the full synchronization reasoning)
+        // — which is exactly what makes it safe for the export blit below, a *second,
+        // independent* submission on the same queue, to read the image's contents.
+        let image = unsafe { self.render_triangle_to_optimal_image(request) }?;
+
+        // `supports_dmabuf` is true only when `new_inner` successfully built this loader (see
+        // its field doc), so reaching here with `external_memory_fd == None` would mean that
+        // invariant was somehow broken elsewhere in this module — surface that as a clear
+        // internal error rather than panicking.
+        let external_memory_fd = self.external_memory_fd.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "internal error: supports_dmabuf is true but no external_memory_fd loader exists"
+            )
+        })?;
+
+        // Hand the finished OPTIMAL image to Task 1's proven export mechanics: it creates the
+        // LINEAR export image, blits (component-semantic, not byte-copy — see `dmabuf.rs`'s
+        // module docs for why that matters) `image` into it, fence-waits that blit too, and
+        // exports a dmabuf fd. `queue`/`command_pool` are the same ones `self` uses for every
+        // other submission — safe to reuse here because the render submission above has
+        // already been fence-waited to completion, so the queue is idle with respect to it.
+        let extent = vk::Extent2D {
+            width: request.width,
+            height: request.height,
+        };
+        let (frame, export_image, export_memory) = unsafe {
+            dmabuf::export_as_dmabuf(
+                &self.device,
+                external_memory_fd,
+                &self.mem_props,
+                self.queue,
+                self.command_pool,
+                image,
+                extent,
+            )
+        }?;
+
+        // Destroy any PREVIOUS export image/memory before installing the new one: see
+        // `ExportTarget`'s doc comment for why simply overwriting `self.export` here would leak
+        // — `export_as_dmabuf` always allocates fresh Vulkan objects, it never reuses the old
+        // pair, so without this explicit destroy the old image/memory would become unreachable
+        // from Rust while still being live, allocated GPU resources.
+        if let Some(old) = self.export.take() {
+            unsafe {
+                self.device.destroy_image(old.image, None);
+                self.device.free_memory(old.memory, None);
+            }
+        }
+        // Store the new export target so it outlives this call — the returned `frame.fd` refers
+        // to `export_memory`, and that memory must stay allocated for as long as any holder of
+        // the fd (ultimately, the compositor) might still read it.
+        self.export = Some(ExportTarget {
+            image: export_image,
+            memory: export_memory,
+        });
+
+        Ok(frame)
+    }
 }
 
 impl Drop for Renderer {
     /// Destroy every Vulkan object this `Renderer` owns, in reverse creation order — child
-    /// objects before the parents they were created from, the device before the instance.
-    /// Mirrors exactly what the original one-shot `render_triangle_inner` did at the end of
-    /// every call; the only difference is that this now runs once, when the `Renderer` itself
-    /// is dropped, instead of after every single render.
+    /// objects before the parents they were created from, the device before the instance. The
+    /// dmabuf export image/memory (Task 3, if `render_to_dmabuf` was ever called) and the
+    /// `external_memory_fd` loader are destroyed/dropped first, ahead of the size-dependent
+    /// render target, the command pool, and everything else — all of it before `device` and
+    /// `instance`. Mirrors what the original one-shot `render_triangle_inner` did at the end of
+    /// every call; the difference is that this now runs once, when the `Renderer` itself is
+    /// dropped, instead of after every single render.
     fn drop(&mut self) {
         // SAFETY: `self` is being destroyed, so every Vulkan handle here is used for the last
         // time — nothing outside this function can touch them afterward through safe code. All
         // handles were created by `self.device`/`self.instance`, which are the last two things
         // destroyed below, so every child is torn down while its parent is still valid.
         unsafe {
+            // The dmabuf export image/memory exist only if `render_to_dmabuf` was ever called
+            // successfully (`None` otherwise). Destroyed FIRST among the size-/export-dependent
+            // objects for the reason called out in the SP3 Task 3 review: these back a fd that
+            // may have been handed to a compositor, so — same as `sized` below — they must be
+            // freed before `self.device` (their parent) is destroyed, or the destroy calls
+            // themselves become invalid. (This does not itself guarantee the compositor is done
+            // with the buffer — that ordering is the caller's responsibility, documented on
+            // `render_to_dmabuf` — it only guarantees these Vulkan objects are torn down in a
+            // valid order relative to the device that owns them.)
+            if let Some(export) = self.export.take() {
+                self.device.destroy_image(export.image, None);
+                self.device.free_memory(export.memory, None);
+            }
+            // The external_memory_fd loader is only a table of function pointers resolved
+            // against `instance`/`device` — it owns no Vulkan object and so has no
+            // `vkDestroy*` call of its own — but calling through it after `device` is destroyed
+            // below would be a use-after-free of the function pointers' backing driver state.
+            // Dropping it explicitly here, before `destroy_device`, removes any possibility of
+            // that regardless of what future code in this function might do.
+            self.external_memory_fd = None;
             // The size-dependent target exists only if at least one frame was rendered (`None`
             // if a `Renderer` was created and dropped without ever calling `render_to_frame`).
             if let Some(sized) = self.sized.take() {
@@ -900,4 +1185,274 @@ unsafe fn create_shader_module(
     // Build the module from the words.
     let info = vk::ShaderModuleCreateInfo::default().code(&words);
     Ok(unsafe { device.create_shader_module(&info, None) }?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // Needed to sanity-check the exported fd is a real, non-negative descriptor.
+    use std::os::fd::AsRawFd;
+
+    /// Fetch the B, G, R bytes at pixel `(x, y)` of a LINEAR-tiled `XRGB8888` buffer, honoring
+    /// the driver-reported `offset`/`stride` — **not** `width * 4`. A LINEAR image's row pitch
+    /// is whatever the driver chose for alignment and may exceed `width * 4`; indexing with
+    /// `width * 4` instead of the real `stride` is exactly the "sheared image" bug the `dmabuf`
+    /// module docs warn about, so this test deliberately exercises the real values.
+    ///
+    /// The 4th byte ("X") is not returned: for `XRGB8888` it is defined as padding/don't-care,
+    /// and (unlike Task 1's own synthetic clear-only test) this test's triangle fragment shader
+    /// always writes alpha = 1.0 (see `shaders/triangle.frag`), so asserting a specific X value
+    /// here would be asserting an implementation detail the DRM format does not promise.
+    fn xrgb_bgr_at(bytes: &[u8], offset: u32, stride: u32, x: u32, y: u32) -> [u8; 3] {
+        // Row y starts `offset + y * stride` bytes in; pixel x within that row is 4 bytes further.
+        let index = offset as usize + (y as usize) * (stride as usize) + (x as usize) * 4;
+        [bytes[index], bytes[index + 1], bytes[index + 2]]
+    }
+
+    /// GPU-gated correctness test for [`Renderer::render_to_dmabuf`].
+    ///
+    /// Renders the same "centred red triangle on a blue background" geometry as
+    /// `tests/render.rs`'s SP0 pixel test (64×64, so the same corner/centre pixels are
+    /// meaningful), exports it as a dmabuf, and reads the exported LINEAR image back through a
+    /// **separate, freshly allocated HOST_VISIBLE Vulkan buffer** — not by mapping the export
+    /// image's own memory, which `export_as_dmabuf` deliberately allocates `DEVICE_LOCAL` only
+    /// (see its doc comment) and so is not guaranteed host-mappable on every GPU (e.g. a
+    /// discrete card, unlike the integrated Intel ANV this was developed against). The copy's
+    /// destination row length is set to mirror the driver's *real* stride
+    /// (`frame.stride`, not `width * 4`), so indexing the readback buffer with
+    /// `offset + y * stride + x * 4` genuinely exercises those two `DmabufFrame` fields being
+    /// correct, rather than sidestepping them the way a tightly-packed (`buffer_row_length =
+    /// 0`) copy would.
+    ///
+    /// Skips cleanly (prints and returns — does **not** fail the test) when the device does not
+    /// support dmabuf export (e.g. lavapipe without export support). On a GPU that does support
+    /// it — a real GPU such as Intel ANV, or Mesa 26+ lavapipe — this must pass.
+    #[test]
+    fn render_to_dmabuf_round_trips_the_triangle() {
+        // Build a persistent Renderer exactly as any real caller would.
+        let mut renderer =
+            Renderer::new().expect("Renderer::new must succeed under any Vulkan ICD");
+        if !renderer.supports_dmabuf() {
+            // Not a bug in our code — the ICD genuinely cannot export a dmabuf (e.g. lavapipe
+            // built without VK_EXT_external_memory_dma_buf support). Skip, don't fail.
+            eprintln!("skipping: device does not support dmabuf export (e.g. lavapipe)");
+            return;
+        }
+
+        // Identical geometry to tests/render.rs's SP0 pixel test: a centred red triangle over a
+        // blue background, so "centre red / corners blue" is the correct assertion here too.
+        let request = FrameRequest {
+            width: 64,
+            height: 64,
+            clear_color: [0.0, 0.0, 1.0, 1.0],
+            vertices: vec![
+                Vertex {
+                    position: [0.0, -0.5],
+                    color: [1.0, 0.0, 0.0],
+                },
+                Vertex {
+                    position: [0.5, 0.5],
+                    color: [1.0, 0.0, 0.0],
+                },
+                Vertex {
+                    position: [-0.5, 0.5],
+                    color: [1.0, 0.0, 0.0],
+                },
+            ],
+        };
+
+        // The call under test.
+        let frame = renderer
+            .render_to_dmabuf(&request)
+            .expect("render_to_dmabuf must succeed on a device that reports dmabuf support");
+
+        // --- Assert the frame's metadata before touching any pixels ---
+        assert!(
+            frame.fd.as_raw_fd() >= 0,
+            "exported dmabuf fd must be a valid descriptor"
+        );
+        assert_eq!(
+            frame.drm_format,
+            dmabuf::DRM_FORMAT_XRGB8888,
+            "format must be XRGB8888"
+        );
+        assert_eq!(
+            frame.modifier,
+            dmabuf::DRM_FORMAT_MOD_LINEAR,
+            "modifier must be LINEAR"
+        );
+        assert!(
+            frame.stride >= frame.width * 4,
+            "stride {} must be at least width*4 = {}",
+            frame.stride,
+            frame.width * 4
+        );
+
+        // --- Read the export image back, honoring frame.offset/frame.stride ---
+        // Reach into the renderer's own (private, same-module) Vulkan state: this test lives
+        // inside `render`, the module that defines `Renderer`'s fields, so it may — exactly the
+        // access a same-crate integration test in `tests/` would NOT have, which is why this
+        // test lives here rather than there.
+        let export_image = renderer
+            .export
+            .as_ref()
+            .expect("render_to_dmabuf must have stored an export target in self.export")
+            .image;
+
+        // Size the readback buffer to cover every byte the copy below will touch: the plane
+        // starts `frame.offset` bytes in, and spans `frame.stride` bytes per row for
+        // `frame.height` rows.
+        let readback_bytes = frame.offset as u64 + frame.stride as u64 * frame.height as u64;
+        let rbuf = unsafe {
+            renderer.device.create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size(readback_bytes)
+                    .usage(vk::BufferUsageFlags::TRANSFER_DST)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                None,
+            )
+        }
+        .expect("create readback buffer");
+        let rreq = unsafe { renderer.device.get_buffer_memory_requirements(rbuf) };
+        let rmem = unsafe {
+            allocate(
+                &renderer.device,
+                &renderer.mem_props,
+                rreq,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )
+        }
+        .expect("alloc readback memory");
+        unsafe { renderer.device.bind_buffer_memory(rbuf, rmem, 0) }.expect("bind readback");
+
+        // `export_as_dmabuf` leaves the export image in TRANSFER_SRC_OPTIMAL (see its doc
+        // comment), so this copy needs no further layout barrier.
+        let cmd = unsafe {
+            renderer.device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(renderer.command_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+        }
+        .expect("alloc readback cmd")[0];
+        unsafe {
+            renderer
+                .device
+                .begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())
+        }
+        .expect("begin readback cmd");
+        // `buffer_row_length` is in TEXELS, not bytes: dividing the byte stride by the format's
+        // 4 bytes-per-pixel reproduces the driver's real row pitch in the destination buffer,
+        // which is the whole point — a tightly-packed copy (buffer_row_length = 0) would never
+        // exercise whether `frame.stride` is actually correct.
+        let region = vk::BufferImageCopy::default()
+            .buffer_offset(frame.offset as u64)
+            .buffer_row_length(frame.stride / 4)
+            .buffer_image_height(0)
+            .image_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .image_extent(vk::Extent3D {
+                width: frame.width,
+                height: frame.height,
+                depth: 1,
+            });
+        unsafe {
+            renderer.device.cmd_copy_image_to_buffer(
+                cmd,
+                export_image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                rbuf,
+                &[region],
+            )
+        };
+        unsafe { renderer.device.end_command_buffer(cmd) }.expect("end readback cmd");
+        let fence = unsafe {
+            renderer
+                .device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+        }
+        .expect("readback fence");
+        let cmds = [cmd];
+        unsafe {
+            renderer.device.queue_submit(
+                renderer.queue,
+                &[vk::SubmitInfo::default().command_buffers(&cmds)],
+                fence,
+            )
+        }
+        .expect("submit readback");
+        unsafe {
+            renderer
+                .device
+                .wait_for_fences(&[fence], true, 10_000_000_000)
+        }
+        .expect("wait readback");
+
+        let mapped = unsafe {
+            renderer
+                .device
+                .map_memory(rmem, 0, readback_bytes, vk::MemoryMapFlags::empty())
+        }
+        .expect("map readback");
+        // Copy into an owned Vec so the pixel assertions below don't need to juggle raw
+        // pointers or worry about the memory being unmapped underneath them.
+        let mut bytes = vec![0u8; readback_bytes as usize];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                mapped as *const u8,
+                bytes.as_mut_ptr(),
+                readback_bytes as usize,
+            )
+        };
+        unsafe { renderer.device.unmap_memory(rmem) };
+
+        // The centre pixel is inside the triangle → red → XRGB8888 bytes B,G,R = 0,0,255 (see
+        // the `dmabuf` module docs' "colour-order reasoning" for why red lands in byte 2, not
+        // byte 0, of a B8G8R8A8_UNORM-backed XRGB8888 buffer).
+        let center = xrgb_bgr_at(&bytes, frame.offset, frame.stride, 32, 32);
+        assert_eq!(
+            center,
+            [0, 0, 255],
+            "centre should be red (B,G,R = 0,0,255), was {center:?}"
+        );
+        // All four corners are outside the triangle → the blue clear colour → B,G,R = 255,0,0.
+        for (x, y) in [(0, 0), (63, 0), (0, 63), (63, 63)] {
+            let corner = xrgb_bgr_at(&bytes, frame.offset, frame.stride, x, y);
+            assert_eq!(
+                corner,
+                [255, 0, 0],
+                "corner ({x},{y}) should be blue (B,G,R = 255,0,0), was {corner:?}"
+            );
+        }
+
+        eprintln!(
+            "render_to_dmabuf OK: fd={} {}x{} stride={} offset={} centre={:?}",
+            frame.fd.as_raw_fd(),
+            frame.width,
+            frame.height,
+            frame.stride,
+            frame.offset,
+            center
+        );
+
+        // --- Tear down THIS TEST's own transient readback objects. The export image/memory
+        // are owned by `renderer` (in `self.export`) and are destroyed by its `Drop`, along
+        // with everything else, when `renderer` goes out of scope at the end of this function.
+        unsafe {
+            renderer.device.destroy_fence(fence, None);
+            renderer
+                .device
+                .free_command_buffers(renderer.command_pool, &cmds);
+            renderer.device.destroy_buffer(rbuf, None);
+            renderer.device.free_memory(rmem, None);
+        }
+        // `frame` (and its `OwnedFd`) drops here, closing the exported fd; `renderer` drops at
+        // the end of this function's scope, destroying the export image/memory (and every
+        // other Vulkan object it owns) via `Renderer`'s `Drop`.
+    }
 }
