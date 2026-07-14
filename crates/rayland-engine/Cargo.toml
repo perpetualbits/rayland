@@ -1,0 +1,25 @@
+# The Rayland render engine: the S-side ("server") replay engine. It FFI-embeds Mesa's
+# `libvirglrenderer` and brings up a *venus* capset context on the real GPU, behind a clean
+# Rust `RenderEngine` trait so the rest of Rayland never touches the C library directly.
+#
+# This is a LIBRARY crate (no `main`), so per the repository license policy it is
+# LGPL-3.0-or-later (binaries in the workspace are GPL-3.0-or-later).
+[package]
+name = "rayland-engine"                                                        # workspace / crates.io package name
+version = "0.0.1"                                                              # pre-release; C0 walking skeleton, not a stable API
+edition = "2024"                                                              # Rust 2024 edition, per repo convention
+rust-version = "1.85"                                                         # minimum toolchain that supports edition 2024
+description = "Rayland render engine: FFI-embedded libvirglrenderer driving a Venus context on S's GPU (C0)." # one-line purpose
+license = "LGPL-3.0-or-later"                                                 # library crate → LGPL per repo policy
+repository = "https://github.com/perpetualbits/rayland"                       # upstream source location
+
+[dependencies]
+thiserror = { workspace = true }   # precise, typed error enum (EngineError) mapping every C return code
+
+[build-dependencies]
+# `pkg-config` locates the installed `libvirglrenderer` (its `.so` and, for the record, its
+# include dir) and emits the correct `cargo:rustc-link-*` directives from build.rs. We
+# hand-write the small `extern "C"` surface (~12 functions + a couple of structs) rather than
+# run bindgen: the surface is small enough that hand-written bindings are clearer to review,
+# and they carry the per-function doc/safety comments this repository requires.
+pkg-config = "0.3"
