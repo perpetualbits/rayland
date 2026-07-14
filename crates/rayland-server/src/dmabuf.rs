@@ -105,6 +105,44 @@ pub fn device_supports_dmabuf_export(
         .all(|ext| have.contains(ext))
 }
 
+/// Return true iff `physical_device` exposes `VK_EXT_queue_family_foreign`.
+///
+/// This extension defines the special queue-family index `VK_QUEUE_FAMILY_FOREIGN_EXT`, used
+/// to release ownership of a shared image to a consumer that has **no Vulkan queue at all** —
+/// exactly the situation when a rendered dmabuf is handed to the Wayland compositor: from this
+/// process's Vulkan device's point of view, whatever eventually samples or scans out the
+/// memory (the compositor's own driver instance, or a fixed-function display path) is not a
+/// Vulkan queue this process can name. Per the Vulkan spec, a `VkImageMemoryBarrier` may only
+/// use `VK_QUEUE_FAMILY_FOREIGN_EXT` as `dstQueueFamilyIndex` when this extension is enabled
+/// on the device — see [`crate::render::Renderer::prepare_export_for_foreign_present`], which
+/// records that barrier, for the full ownership-transfer reasoning (SP3 Task 1 review finding
+/// #3).
+///
+/// Deliberately probed and enabled **separately** from [`required_device_extensions`]: a
+/// device can export dmabufs perfectly well without this extension (the export mechanics and
+/// this ownership-transfer courtesy are independent Vulkan features — the fd is valid memory
+/// either way), so its absence must not disable dmabuf export outright. The caller
+/// ([`crate::render::Renderer::new`]) enables it opportunistically when present and degrades
+/// gracefully (skips the barrier, logs a warning) when it is not — see that function and
+/// `prepare_export_for_foreign_present`'s doc comments.
+pub fn device_supports_foreign_release(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> bool {
+    // Enumerate the device's supported extensions (same pattern as
+    // `device_supports_dmabuf_export`; not shared as one helper because the two checks probe
+    // different, independent extension sets and reads best as two small, clearly-named
+    // functions rather than one parameterized over "which extensions").
+    let props = match unsafe { instance.enumerate_device_extension_properties(physical_device) } {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    props
+        .iter()
+        .filter_map(|e| e.extension_name_as_c_str().ok())
+        .any(|name| name == ash::ext::queue_family_foreign::NAME)
+}
+
 /// Create a LINEAR `B8G8R8A8_UNORM` export image of `extent`, blit `src_optimal_rgba` (an
 /// OPTIMAL `R8G8B8A8_UNORM` image already rendered) into it, wait for completion, and export a
 /// dmabuf.

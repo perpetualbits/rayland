@@ -41,6 +41,14 @@ const MAX_DIMENSION: u32 = 16384;
 /// SP0 does not police a strict message sequence. What it *does* reject is a stream that is
 /// internally inconsistent or incomplete (see Errors).
 ///
+/// This is a thin wrapper around [`read_frame_request`] (which does the actual parsing and
+/// validation) followed by [`render_triangle`] (a throwaway one-shot [`render::Renderer`]).
+/// Kept exactly as-is — rather than folded away — so SP0's original pixel test, the
+/// `--png` dump's original call site, and anything else that only wants "stream in, pixels
+/// out" with no persistent GPU state keep working unchanged. SP3's `main.rs`, which DOES need
+/// a persistent `Renderer` (so it can defer the render-to-frame-vs-render-to-dmabuf choice
+/// until after a live Wayland capability check), calls [`read_frame_request`] directly instead.
+///
 /// # Errors
 /// Returns an error on: a protocol-version mismatch (`Hello`); a `DrawTriangles` count that
 /// disagrees with the number of uploaded vertices; an `EndFrame` reached without a valid
@@ -48,6 +56,30 @@ const MAX_DIMENSION: u32 = 16384;
 /// before `EndFrame` (early end of stream, surfaced by [`read_message`]); or a failure in
 /// the GPU render itself.
 pub fn handle_connection<R: std::io::Read>(reader: &mut R) -> anyhow::Result<RenderedFrame> {
+    // Parse and validate the stream into a render-ready request...
+    let request = read_frame_request(reader)?;
+    // ...then render it with a throwaway one-shot Renderer, exactly as this function always
+    // has (see the doc comment above for why this wrapper still exists post-SP3).
+    render_triangle(&request)
+}
+
+/// Read a full SP0 command stream from `reader` and return the validated [`FrameRequest`],
+/// WITHOUT rendering it.
+///
+/// Contains the same message-accumulation/validation logic [`handle_connection`] has always
+/// used (see its doc comment) — extracted here (SP3 Task 4) so a caller that owns its own
+/// persistent [`render::Renderer`] can choose which render method to call (`render_to_frame`
+/// vs. `render_to_dmabuf`) using information ([`render::Renderer::supports_dmabuf`] plus a
+/// live Wayland compositor's advertised capabilities) that is only available *after* the
+/// stream has been read but *before* the actual GPU work happens. `handle_connection` remains
+/// the simpler entry point for callers that just want pixels back immediately.
+///
+/// # Errors
+/// Returns an error on: a protocol-version mismatch (`Hello`); a `DrawTriangles` count that
+/// disagrees with the number of uploaded vertices; an `EndFrame` reached without a valid
+/// `BeginFrame` (zero width or height) or without any uploaded vertices; or a stream that ends
+/// before `EndFrame` (early end of stream, surfaced by [`read_message`]).
+pub fn read_frame_request<R: std::io::Read>(reader: &mut R) -> anyhow::Result<FrameRequest> {
     // Frame parameters, filled in by BeginFrame.
     let mut width = 0u32;
     let mut height = 0u32;
@@ -107,14 +139,15 @@ pub fn handle_connection<R: std::io::Read>(reader: &mut R) -> anyhow::Result<Ren
                 // Likewise a zero-length vertex buffer is invalid (VkBufferCreateInfo::size
                 // must be > 0) and there would be nothing to draw regardless.
                 anyhow::ensure!(!vertices.is_empty(), "EndFrame with no uploaded vertices");
-                // Everything is gathered and validated; render and return.
-                let request = FrameRequest {
+                // Everything is gathered and validated; hand back the request WITHOUT
+                // rendering it — rendering is the caller's job (see this function's doc
+                // comment for why: the caller may still need to decide dmabuf-vs-wl_shm).
+                return Ok(FrameRequest {
                     width,
                     height,
                     clear_color,
                     vertices,
-                };
-                return render_triangle(&request);
+                });
             }
         }
     }

@@ -25,6 +25,7 @@ image = { workspace = true }                  # PNG encoding for the binary
 anyhow = { workspace = true }                 # top-level error handling
 smithay-client-toolkit = { workspace = true }   # the Wayland window + wl_shm + calloop event loop
 wayland-client = { workspace = true }            # enables the dlopen backend for the whole tree
+wayland-protocols = { workspace = true }         # zwp_linux_dmabuf_v1 (SP3 Task 4 dmabuf presenter)
 
 [dev-dependencies]
 # rayland-wire is already a normal dependency (above), so tests see it without re-listing.

@@ -173,6 +173,12 @@ pub struct Renderer {
     /// The single graphics-capable queue all work (per-frame draws, and later dmabuf export
     /// blits) is submitted to.
     queue: vk::Queue,
+    /// The queue family `queue` belongs to. `new_inner` only ever needed this as a local while
+    /// building `queue`/`command_pool`, but [`Renderer::prepare_export_for_foreign_present`]
+    /// (SP3 Task 4) needs it again later, as the `srcQueueFamilyIndex` of a queue-family
+    /// ownership-release barrier — persisted here rather than re-derived so that barrier does
+    /// not have to re-enumerate physical-device queue families just to recover one index.
+    queue_family_index: u32,
     /// The physical device's memory type table, queried once and reused by every allocation
     /// (the `allocate` helper) for the renderer's whole lifetime — the driver never changes
     /// this at runtime, so re-querying it per frame would be pure waste.
@@ -210,6 +216,13 @@ pub struct Renderer {
     /// (being only a table of resolved function pointers, not a Vulkan object) it owns nothing
     /// that itself needs a `vkDestroy*` call.
     external_memory_fd: Option<ash::khr::external_memory_fd::Device>,
+    /// Whether `VK_EXT_queue_family_foreign` was enabled on `device` — see
+    /// [`crate::dmabuf::device_supports_foreign_release`] for what this extension is for and
+    /// why it is probed/enabled independently of `supports_dmabuf`. Read by
+    /// [`Renderer::prepare_export_for_foreign_present`], which refuses to record a barrier
+    /// naming `VK_QUEUE_FAMILY_FOREIGN_EXT` when this is `false` (doing so without the
+    /// extension enabled would be a Vulkan validation error, not just a logical mistake).
+    supports_foreign_release: bool,
     /// The most recent dmabuf export's LINEAR image + memory, or `None` if `render_to_dmabuf`
     /// has never been called. See [`ExportTarget`] for why `self` must own this and why a new
     /// export destroys the previous one first.
@@ -278,6 +291,12 @@ impl Renderer {
         // Probe dmabuf-export support BEFORE creating the device: which extensions we enable
         // below depends on the answer, and device extensions cannot be changed after creation.
         let supports_dmabuf = dmabuf::device_supports_dmabuf_export(&instance, physical_device);
+        // Probe VK_EXT_queue_family_foreign the same way. Only meaningful when dmabuf export
+        // itself is supported (there is nothing to release ownership of otherwise); gated on
+        // `supports_dmabuf` so a device that lacks the export extensions but happens to expose
+        // this one does not get it enabled for no reason.
+        let supports_foreign_release =
+            supports_dmabuf && dmabuf::device_supports_foreign_release(&instance, physical_device);
 
         // Create a logical device with one graphics queue.
         let queue_priorities = [1.0f32]; // single queue, priority is irrelevant but required
@@ -300,6 +319,12 @@ impl Renderer {
                     .map(|c| c.as_ptr()),
             );
             ext_names.push(ash::khr::image_format_list::NAME.as_ptr());
+        }
+        // Enable VK_EXT_queue_family_foreign independently of the block above: see
+        // `device_supports_foreign_release`'s doc comment for why this is a separate,
+        // best-effort capability rather than a hard requirement for dmabuf export.
+        if supports_foreign_release {
+            ext_names.push(ash::ext::queue_family_foreign::NAME.as_ptr());
         }
         let device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_infos)
@@ -497,6 +522,7 @@ impl Renderer {
             physical_device,
             device,
             queue,
+            queue_family_index,
             mem_props,
             render_pass,
             pipeline_layout,
@@ -506,6 +532,7 @@ impl Renderer {
             sized: None,
             supports_dmabuf,
             external_memory_fd,
+            supports_foreign_release,
             // No dmabuf has been exported yet, so there is no export target to hold.
             export: None,
         })
@@ -1055,6 +1082,165 @@ impl Renderer {
         });
 
         Ok(frame)
+    }
+
+    /// Release Vulkan queue-family ownership of the most recent [`render_to_dmabuf`]'s export
+    /// image to `VK_QUEUE_FAMILY_FOREIGN_EXT`, and transition it to `GENERAL` layout, in
+    /// preparation for handing the dmabuf to the Wayland compositor.
+    ///
+    /// [`render_to_dmabuf`]: Renderer::render_to_dmabuf
+    ///
+    /// # Why this exists (SP3 Task 1 review finding #3)
+    /// [`dmabuf::export_as_dmabuf`] leaves the export image in `TRANSFER_SRC_OPTIMAL` layout,
+    /// still owned by *this process's* graphics queue family — exactly right for the GPU-gated
+    /// tests (`dmabuf.rs`'s and `render.rs`'s own `render_to_dmabuf` test), which read the
+    /// image back through **this same Vulkan device**, on the same queue family, via an
+    /// ordinary `vkCmdCopyImageToBuffer`. Handing the same fd to the **compositor**, however,
+    /// is a fundamentally different kind of consumer: per the Vulkan spec, an image with
+    /// `VK_SHARING_MODE_EXCLUSIVE` (the default, and what `export_as_dmabuf` creates) that will
+    /// be read by anything outside the queue family that last wrote it needs an explicit
+    /// **queue family ownership transfer** — a pipeline barrier whose `dstQueueFamilyIndex`
+    /// names the *other* side. When that other side is not a Vulkan queue we can name at all
+    /// (the compositor may composite with a completely different Vulkan instance, a GL
+    /// context, or a fixed-function scanout/display path — this process has no visibility into
+    /// which), the spec's answer is `VK_QUEUE_FAMILY_FOREIGN_EXT`: a sentinel meaning "some
+    /// consumer outside the Vulkan device graph." This function performs that **release** (our
+    /// side of the two-sided transfer); the compositor's own driver is responsible for the
+    /// matching **acquire** when (if) it imports the dmabuf into its own Vulkan context — we
+    /// have no way to perform that half from here, and most compositors importing a LINEAR
+    /// dmabuf under implicit fencing do not need to (see the caveat below).
+    ///
+    /// This also switches the image to `VK_IMAGE_LAYOUT_GENERAL`: once ownership leaves our
+    /// queue family, `TRANSFER_SRC_OPTIMAL` (an *optimal*, driver-chosen layout whose exact
+    /// bit-layout guarantees are only meaningful to Vulkan operations we no longer control) is
+    /// not a layout the foreign consumer has any reason to understand or preserve. `GENERAL` is
+    /// the one layout the spec guarantees is valid for every kind of access, making it the safe
+    /// choice for a resource that has just left this process's control.
+    ///
+    /// # Why this is a SEPARATE call, not folded into `render_to_dmabuf`
+    /// Folding this barrier into `render_to_dmabuf` itself would break the GPU-gated round-trip
+    /// tests: after a queue-family *release*, the releasing queue family has given up its
+    /// right to access the resource until a matching *acquire* brings it back — reading it
+    /// again from the same device (exactly what those tests do) without such an acquire is
+    /// itself a spec violation, not a safe fallback. Keeping this as a distinct, opt-in step
+    /// that only the real presentation path ([`window::present`](crate::window::present))
+    /// calls keeps both the tests (same-device readback, no foreign transfer) and the real
+    /// presenter (foreign transfer, no same-device readback afterward) individually correct.
+    /// The on-screen result of the presentation path is the human operator's own manual
+    /// verification (see the SP3 Task 4 report) — this function cannot be exercised by an
+    /// automated test that has no compositor to hand the buffer to.
+    ///
+    /// # Caveat: this is a courtesy, not a strict requirement, on many real setups
+    /// Several Mesa/ANV-class compositor combinations tolerate the *absence* of this barrier
+    /// for LINEAR-modifier dmabufs under **implicit synchronization** (where the kernel DRM/DMA
+    /// fence attached to the buffer, not an explicit Vulkan semaphore, is what actually
+    /// orders GPU access) — the hardware-level access is safe even without the Vulkan-level
+    /// bookkeeping being pedantically correct, because nothing about `TRANSFER_SRC_OPTIMAL`
+    /// vs. `GENERAL` changes the actual byte layout of a LINEAR image. This function exists to
+    /// do the textually-correct thing per spec anyway (skipping it is a real, if often
+    /// unobserved, spec violation), and callers treat its failure as non-fatal (see
+    /// `window::present`) precisely because of this real-world tolerance.
+    ///
+    /// # Errors
+    /// Returns an error if no `render_to_dmabuf` export exists yet, if
+    /// `VK_EXT_queue_family_foreign` was not enabled on this device (see
+    /// [`dmabuf::device_supports_foreign_release`]), or if the barrier submission fails.
+    pub fn prepare_export_for_foreign_present(&mut self) -> anyhow::Result<()> {
+        // SAFETY: see `Renderer::new`'s comment — every ash call is FFI, made safe here by
+        // constructing each argument immediately before use.
+        unsafe { self.prepare_export_for_foreign_present_inner() }
+    }
+
+    /// The `unsafe` body of [`Renderer::prepare_export_for_foreign_present`], separated so the
+    /// public method stays safe to call and the safety reasoning lives in one place.
+    unsafe fn prepare_export_for_foreign_present_inner(&mut self) -> anyhow::Result<()> {
+        // Refuse up front rather than recording a barrier the driver would reject: naming
+        // VK_QUEUE_FAMILY_FOREIGN_EXT without the extension enabled is a validation error, and
+        // a clear message here is easier to diagnose than that opaque failure.
+        anyhow::ensure!(
+            self.supports_foreign_release,
+            "device does not support VK_EXT_queue_family_foreign; cannot release dmabuf \
+             ownership for presentation"
+        );
+        // The export image from the most recent render_to_dmabuf call; nothing to release if
+        // that was never called.
+        let image = self
+            .export
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no dmabuf export exists; call render_to_dmabuf first"))?
+            .image;
+
+        // A throwaway command buffer, same pattern as every other per-call submission in this
+        // module: allocate, record one command, submit, fence-wait, free.
+        let cmd = unsafe {
+            self.device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(self.command_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+        }?[0];
+        unsafe {
+            self.device.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+        }?;
+
+        // The queue-family-ownership-release barrier: TRANSFER_SRC_OPTIMAL (where
+        // export_as_dmabuf left the image) -> GENERAL, our queue family -> FOREIGN. srcAccess
+        // names the blit's write (the last thing that touched this memory) so the barrier's
+        // availability operation has something concrete to make available; dstAccess is empty
+        // because the foreign consumer's own access pattern is opaque to us by definition —
+        // that is exactly what "foreign" means here.
+        let full_color = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        let release = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::empty())
+            .src_queue_family_index(self.queue_family_index)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+            .image(image)
+            .subresource_range(full_color);
+        unsafe {
+            // dstStageMask is BOTTOM_OF_PIPE: the consuming stage lives outside this device's
+            // pipeline entirely, so there is no meaningful Vulkan stage to name for it — this
+            // is the standard idiom for "hand off to an external consumer."
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[release],
+            )
+        };
+        unsafe { self.device.end_command_buffer(cmd) }?;
+
+        let fence = unsafe {
+            self.device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+        }?;
+        let cmds = [cmd];
+        let submit = vk::SubmitInfo::default().command_buffers(&cmds);
+        unsafe { self.device.queue_submit(self.queue, &[submit], fence) }?;
+        // Wait up to ~10 seconds, matching every other fence-wait in this module.
+        unsafe { self.device.wait_for_fences(&[fence], true, 10_000_000_000) }?;
+
+        unsafe {
+            self.device.destroy_fence(fence, None);
+            self.device.free_command_buffers(self.command_pool, &cmds);
+        }
+        Ok(())
     }
 }
 
