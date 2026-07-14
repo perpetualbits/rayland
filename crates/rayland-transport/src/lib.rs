@@ -2,12 +2,96 @@
 //!
 //! QUIC (via [`quinn`]) is asynchronous and needs a [`tokio`] runtime; the rest of Rayland is
 //! synchronous. This crate quarantines all of that: it owns the runtime and the QUIC/TLS
-//! stack and will expose blocking `Read`/`Write` adapters (Task 2) so the existing synchronous
-//! client/server code is reused unchanged. This file (Task 1) establishes the crate, the TLS
-//! configuration ([`tls`]), and proves a QUIC handshake + byte round-trip on localhost.
+//! stack and exposes blocking `Read`/`Write` adapters ([`sync_stream`]) so the existing
+//! synchronous client/server code (`send_triangle`/`wait_until_closed`/`handle_connection`)
+//! runs unchanged over QUIC. Task 1 established the crate and the TLS configuration ([`tls`])
+//! and proved a QUIC handshake + byte round-trip on localhost (see the `spike_tests` module
+//! below). Task 2 (this file's [`connect`]/[`listen`] plus [`sync_stream`]) adds the public
+//! synchronous API: [`connect`] for the client, [`listen`]/[`QuicListener::accept`] for the
+//! server, and the [`Liveness`] handle the server's window loop watches for client disconnect.
 
 // TLS configuration and the loud insecure verifier.
 pub mod tls;
+
+// The synchronous stream adapters.
+pub mod sync_stream;
+
+// Public re-exports so callers write `rayland_transport::QuicStream`, etc.
+pub use sync_stream::{Liveness, QuicListener, QuicRecv, QuicStream};
+
+// Standard networking types.
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::runtime::Runtime;
+
+/// Build the confined multi-thread tokio runtime that drives QUIC.
+///
+/// A multi-thread runtime is required (not `current_thread`): the synchronous adapters call
+/// `block_on` from the caller's own thread while expecting the runtime's *worker* threads to
+/// keep driving the QUIC connection's packet I/O concurrently. A `current_thread` runtime has
+/// no separate worker thread, so a `block_on` call from outside it would never see progress on
+/// tasks spawned onto it (e.g. the `Liveness` close-watcher).
+///
+/// # Errors
+/// Returns an error if the runtime cannot be created (e.g. thread spawning fails).
+fn build_runtime() -> anyhow::Result<Arc<Runtime>> {
+    // A multi-thread runtime so its workers drive QUIC while the caller blocks on `block_on`.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    Ok(Arc::new(rt))
+}
+
+/// Connect to a Rayland server over QUIC and return a synchronous bidirectional stream.
+///
+/// Binds an ephemeral local UDP port, connects to `server_addr` using the insecure client TLS
+/// config (see [`tls`]), and opens the single bidirectional command stream the rest of Rayland
+/// treats as its transport. The returned [`QuicStream`] owns a dedicated tokio runtime that
+/// keeps driving the connection for as long as the stream is alive.
+///
+/// # Errors
+/// Returns an error if the runtime, endpoint, TLS config, or connection fails.
+pub fn connect(server_addr: SocketAddr) -> anyhow::Result<QuicStream> {
+    // Own a runtime for this connection.
+    let rt = build_runtime()?;
+    // Everything QUIC happens inside the runtime.
+    let (send, recv) = rt.block_on(async {
+        // Bind an ephemeral local UDP port for the client endpoint.
+        let mut endpoint = quinn::Endpoint::client(SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            0,
+        ))?;
+        // Install our insecure client config.
+        endpoint.set_default_client_config(tls::client_quic_config()?);
+        // Connect; the server name is unchecked by our verifier but must be syntactically valid.
+        let conn = endpoint.connect(server_addr, "localhost")?.await?;
+        // Open the single bidirectional command stream.
+        let bi = conn.open_bi().await?;
+        anyhow::Ok(bi)
+    })?;
+    // Wrap the async streams in the sync adapter.
+    Ok(QuicStream::new(rt, send, recv))
+}
+
+/// Bind a QUIC server endpoint on `bind_addr`.
+///
+/// Use `bind_addr`'s port `0` to let the OS choose an ephemeral port, then read the actual
+/// bound address back with [`QuicListener::local_addr`].
+///
+/// # Errors
+/// Returns an error if the runtime, TLS config, or endpoint binding fails.
+pub fn listen(bind_addr: SocketAddr) -> anyhow::Result<QuicListener> {
+    // Own a runtime for the server.
+    let rt = build_runtime()?;
+    // Bind the server endpoint inside the runtime.
+    let endpoint = rt.block_on(async {
+        anyhow::Ok(quinn::Endpoint::server(
+            tls::server_quic_config()?,
+            bind_addr,
+        )?)
+    })?;
+    Ok(QuicListener::new(rt, endpoint))
+}
 
 #[cfg(test)]
 mod spike_tests {

@@ -19,3 +19,6 @@ rcgen = { workspace = true }              # ephemeral self-signed certificate
 tokio = { workspace = true }              # the confined async runtime that drives QUIC
 thiserror = { workspace = true }          # precise library error type
 anyhow = { workspace = true }             # contextual errors for setup paths returned to binaries
+# Non-blocking pipe for `Liveness`'s disconnect fd; pure-Rust syscall bindings, already in the
+# dependency tree (via SCTK) so this adds no new C dependency.
+rustix = { version = "1", features = ["pipe"] }
