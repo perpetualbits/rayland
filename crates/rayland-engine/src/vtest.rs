@@ -46,18 +46,22 @@
 //! semaphores), and `VCMD_SUBMIT_CMD2` (the Venus command buffers) — the last routed to
 //! [`RenderEngine::submit`].
 //!
-//! # Deliberate scope of this task (C0 Task 2)
-//! This is the parser + dispatcher skeleton. The handshake, `VCMD_CONTEXT_INIT` →
-//! `create_venus_context`, and `VCMD_SUBMIT_CMD2` → `submit` are wired for real. Resource and sync
-//! commands are handled with in-band bookkeeping stubs (they parse correctly and get an in-band
-//! reply), because two things they need are out of scope here and belong to later tasks:
+//! # Deliberate scope (C0 Tasks 2 and 3)
+//! This is the parser + dispatcher. The handshake, `VCMD_CONTEXT_INIT` → `create_venus_context`,
+//! `VCMD_SUBMIT_CMD2` → `submit` (Task 2), and `VCMD_RESOURCE_CREATE_BLOB` →
+//! `create_blob_resource` / `VCMD_RESOURCE_UNREF` → `unref_resource` (Task 3) are wired for real —
+//! every one of them reaches the actual `RenderEngine`, not vtest-local bookkeeping. The `VCMD_SYNC_*`
+//! family remains a bookkeeping stub (a local sync-id → value map; see `Session`), because what it
+//! needs is out of scope here and belongs to later tasks:
 //! - **fd passing.** `VCMD_RESOURCE_CREATE_BLOB` and `VCMD_SYNC_WAIT` reply with a *file
 //!   descriptor* over a `SCM_RIGHTS` control message. A generic `Read + Write` stream (the point
 //!   of the generic bound — SP2's QUIC transport has no fds) cannot carry one, so we write only
 //!   the in-band part of those replies and defer the fd side channel to Task 4's Unix-socket wiring
 //!   (and, ultimately, to Rayland's own sibling-protocol memory sharing, which replaces fd passing
 //!   for cross-machine operation).
-//! - **pixel readback.** Getting the rendered image back out of the resource is Task 3.
+//! - **real timeline semantics.** `VCMD_SYNC_*` still just stores/echoes values rather than
+//!   modeling actual GPU timeline completion; Task 3's fence-wait (`RenderEngine::read_back`) is a
+//!   separate, real mechanism that does not depend on this stub.
 //!
 //! Unimplemented opcodes are reported as a typed error — never silently dropped.
 
@@ -243,13 +247,20 @@ pub struct SubmitBatch {
 
 /// What a completed `serve_vtest` session reports back to its caller.
 ///
-/// Its reason for being is `rendered_resource_id`: the resource that Task 3 will read the rendered
-/// pixels out of. In the vtest/Venus data path the rendered image lives in a blob resource, so we
-/// report the most recently created blob as the best-effort readback candidate (Task 3 refines
-/// *which* blob once it understands the Venus object graph). The counters are for diagnostics.
+/// Its reason for being is `rendered_resource_id`: a resource id that genuinely exists in the
+/// engine (Task 3 routes `VCMD_RESOURCE_CREATE_BLOB` through `RenderEngine::create_blob_resource`,
+/// not a vtest-local counter). In the vtest/Venus data path the rendered image lives in a blob
+/// resource, so we report the most recently created blob as the best-effort readback candidate —
+/// *which* blob is actually the final rendered frame (Venus may create several: staging buffers,
+/// intermediate targets, the real swapchain image, ...) requires understanding a live client's
+/// object graph, which is Task 4's concern. `RenderEngine::read_back`'s doc comment also explains
+/// a further, empirically-discovered limitation: a *blob* resource (this field's kind) cannot
+/// currently be read back the same way a classic resource can — Task 4 must resolve that too. The
+/// counters are for diagnostics.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VtestOutcome {
-    /// The resource id Task 3 should read pixels from, if any resource was created.
+    /// The resource id Task 4's host may want to inspect, if any resource was created — see this
+    /// struct's doc comment for the current limitations on actually reading it back.
     pub rendered_resource_id: Option<u32>,
     /// The GPU context id this session created (if `VCMD_CONTEXT_INIT` was reached).
     pub context_id: Option<u32>,
@@ -633,20 +644,21 @@ fn write_capset_reply<W: Write>(w: &mut W, caps: &[u8]) -> Result<(), EngineErro
 // The server: read loop + per-command dispatch onto the engine.
 // ----------------------------------------------------------------------------------------------
 
-/// Mutable per-session state the dispatcher carries across messages (sync objects, resource ids,
-/// negotiated version, and the eventual outcome).
+/// Mutable per-session state the dispatcher carries across messages (sync objects, negotiated
+/// version, and the eventual outcome).
+///
+/// Resource ids are **not** tracked here (Task 2 had a local `next_res_id` counter and a
+/// `resources` set standing in for the engine's real resource path — Task 3 removes both: resource
+/// creation and release now route through [`RenderEngine::create_blob_resource`] and
+/// [`RenderEngine::unref_resource`], which are the single source of truth for which resources
+/// exist. Duplicating that bookkeeping locally would only invite the two copies to drift.
 struct Session {
     /// The protocol version negotiated in `VCMD_PROTOCOL_VERSION` (0 until then).
     protocol_version: u32,
-    /// Monotonic source of resource ids handed out for `VCMD_RESOURCE_CREATE_BLOB` (must be > 0,
-    /// since Mesa asserts `res_id > 0`).
-    next_res_id: u32,
     /// Monotonic source of sync ids handed out for `VCMD_SYNC_CREATE`.
     next_sync_id: u32,
     /// Stubbed sync-object timeline values, keyed by sync id (`SYNC_CREATE`/`WRITE`/`READ`).
     syncs: std::collections::HashMap<u32, u64>,
-    /// Live blob resource ids we handed out (so `RESOURCE_UNREF` can drop them).
-    resources: std::collections::HashSet<u32>,
     /// The outcome accumulated so far, returned when the session ends.
     outcome: VtestOutcome,
 }
@@ -656,11 +668,10 @@ impl Session {
     fn new() -> Self {
         Session {
             protocol_version: 0,
-            // Start ids at 1 so `0` stays a sentinel (Mesa treats res_id 0 / handle 0 specially).
-            next_res_id: 1,
+            // Start ids at 1 so `0` stays a sentinel (Mesa treats sync id 0 specially, matching the
+            // engine's own resource-id convention — see `VirglEngine::next_resource_id`).
             next_sync_id: 1,
             syncs: std::collections::HashMap::new(),
-            resources: std::collections::HashSet::new(),
             outcome: VtestOutcome::default(),
         }
     }
@@ -777,24 +788,34 @@ fn dispatch<S: Read + Write>(
             session.outcome.context_id = Some(VTEST_CONTEXT_ID);
             Ok(())
         }
-        VtestCommand::ResourceCreateBlob { size: _, .. } => {
-            // Stub: hand out a fresh resource id and record it as the current readback candidate
-            // (Task 3 will map Venus's real render-target blob). Reply is `[res_id]`.
+        VtestCommand::ResourceCreateBlob {
+            blob_type,
+            flags,
+            size,
+            blob_id,
+        } => {
+            // Task 3: route through the engine's *real* resource path (no more a vtest-local
+            // counter) — `virgl_renderer_resource_create_blob`, attached to this session's Venus
+            // context. The returned id genuinely exists in the engine, so `VtestOutcome`'s id is
+            // one Task 4's host can actually act on (e.g. hand to `read_back`, once a live
+            // client's object graph makes that meaningful — see `RenderEngine::read_back`'s doc
+            // comment on the current blob-resource limitation). Reply is `[res_id]`.
             //
             // DEFERRED: the full protocol also returns an mmap'able fd over SCM_RIGHTS right after
             // this header. A generic `Read + Write` stream cannot carry an fd, so the fd half is
             // Task 4's Unix-socket concern (and ultimately Rayland's own memory-sharing protocol).
             // A *live* Mesa client blocks on that fd; the in-band reply here is what the framing
             // unit tests exercise.
-            let res_id = session.next_res_id;
-            session.next_res_id = session.next_res_id.saturating_add(1);
-            session.resources.insert(res_id);
+            let res_id =
+                engine.create_blob_resource(VTEST_CONTEXT_ID, blob_type, flags, blob_id, size)?;
             session.outcome.rendered_resource_id = Some(res_id);
             write_reply(stream, VCMD_RESOURCE_CREATE_BLOB, &[res_id])
         }
         VtestCommand::ResourceUnref { res_handle } => {
-            // Drop the resource from our bookkeeping. No reply is defined.
-            session.resources.remove(&res_handle);
+            // Release the resource for real (Task 3): a no-op on the engine side if `res_handle`
+            // was never ours, matching `VCMD_RESOURCE_UNREF`'s fire-and-forget, no-reply wire
+            // semantics. No reply is defined for this command.
+            engine.unref_resource(res_handle);
             Ok(())
         }
         VtestCommand::SyncCreate { initial_value } => {
@@ -865,6 +886,9 @@ fn dwords_to_bytes(dwords: &[u32]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only `MockEngine::read_back`'s signature needs this (Task 3); no production code in this
+    // module constructs or names an `EngineFrame`.
+    use crate::EngineFrame;
     use std::io::Cursor;
 
     /// Build a raw vtest message (header + dword payload) as little-endian bytes, for feeding the
@@ -880,11 +904,18 @@ mod tests {
     }
 
     /// A `RenderEngine` test double that records the calls `serve_vtest` makes, so the full
-    /// read-loop + dispatch can be exercised with no GPU. Returns a canned Venus capset.
+    /// read-loop + dispatch can be exercised with no GPU. Returns a canned Venus capset and
+    /// maintains an in-memory resource id counter (Task 3), so `ResourceCreateBlob`/`ResourceUnref`
+    /// dispatch can be exercised end-to-end without a real virglrenderer.
     struct MockEngine {
         contexts: Vec<u32>,
         submits: Vec<(u32, Vec<u8>)>,
         capset: Vec<u8>,
+        /// `(resource_id, ctx_id)` pairs currently "live", in creation order — mirrors
+        /// `VirglEngine::resources` closely enough to prove the dispatch wiring without needing a
+        /// real GPU.
+        resources: Vec<(u32, u32)>,
+        next_resource_id: u32,
     }
 
     impl RenderEngine for MockEngine {
@@ -898,6 +929,42 @@ mod tests {
         }
         fn venus_capset(&mut self, _version: u32) -> Result<Vec<u8>, EngineError> {
             Ok(self.capset.clone())
+        }
+        fn create_resource(
+            &mut self,
+            ctx_id: u32,
+            _width: u32,
+            _height: u32,
+            _format: u32,
+        ) -> Result<u32, EngineError> {
+            let id = self.next_resource_id;
+            self.next_resource_id += 1;
+            self.resources.push((id, ctx_id));
+            Ok(id)
+        }
+        fn create_blob_resource(
+            &mut self,
+            ctx_id: u32,
+            _blob_mem: u32,
+            _blob_flags: u32,
+            _blob_id: u64,
+            _size: u64,
+        ) -> Result<u32, EngineError> {
+            let id = self.next_resource_id;
+            self.next_resource_id += 1;
+            self.resources.push((id, ctx_id));
+            Ok(id)
+        }
+        fn unref_resource(&mut self, resource_id: u32) {
+            self.resources.retain(|&(id, _)| id != resource_id);
+        }
+        fn read_back(&mut self, resource_id: u32) -> Result<EngineFrame, EngineError> {
+            // MockEngine has no real GPU / pixels; these no-GPU framing tests never call
+            // `read_back` (the real capability is proven on real hardware in `virgl.rs`'s own GPU
+            // tests), so an honest "not found" is the right stand-in rather than fabricating pixels.
+            Err(EngineError::VtestProtocol {
+                detail: format!("MockEngine has no pixels for resource {resource_id}"),
+            })
         }
     }
 
@@ -1136,6 +1203,8 @@ mod tests {
             contexts: Vec::new(),
             submits: Vec::new(),
             capset: capset.clone(),
+            resources: Vec::new(),
+            next_resource_id: 1,
         };
         let mut duplex = Duplex {
             input: Cursor::new(input),
@@ -1170,6 +1239,69 @@ mod tests {
         let caps = read_reply(&mut rcur);
         assert_eq!(caps.0, VCMD_GET_CAPSET);
         assert_eq!(caps.1, vec![1, 0, 0, 0, 0]);
+    }
+
+    /// Task 3, Step 2: `VCMD_RESOURCE_CREATE_BLOB` and `VCMD_RESOURCE_UNREF` must route through
+    /// the engine's real resource path — not vtest-local bookkeeping — and `VtestOutcome` must
+    /// carry the engine-assigned id back out. Proven here against `MockEngine` (no GPU needed):
+    /// the resource shows up in the engine's own tracking after creation and is gone from it after
+    /// unref, so the wiring is real, not merely an in-band reply with nothing behind it.
+    #[test]
+    fn resource_create_blob_and_unref_route_through_the_engine() {
+        // Payload per the pinned wire layout: `[type][flags][size_lo][size_hi][id_lo][id_hi]`.
+        // type=2 (VIRGL_RENDERER_BLOB_MEM_HOST3D), flags=1 (USE_MAPPABLE), size=64, blob_id=0.
+        let mut input = Vec::new();
+        input.extend_from_slice(&msg(VCMD_RESOURCE_CREATE_BLOB, &[2, 1, 64, 0, 0, 0]));
+        input.extend_from_slice(&msg(VCMD_RESOURCE_UNREF, &[1]));
+
+        struct Duplex {
+            input: Cursor<Vec<u8>>,
+            output: Vec<u8>,
+        }
+        impl Read for Duplex {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.input.read(buf)
+            }
+        }
+        impl Write for Duplex {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.output.write(buf)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.output.flush()
+            }
+        }
+
+        let mut engine = MockEngine {
+            contexts: Vec::new(),
+            submits: Vec::new(),
+            capset: Vec::new(),
+            resources: Vec::new(),
+            next_resource_id: 1,
+        };
+        let mut duplex = Duplex {
+            input: Cursor::new(input),
+            output: Vec::new(),
+        };
+        let outcome = serve_vtest(&mut duplex, &mut engine).expect("session completes cleanly");
+
+        // The engine-assigned id (not a vtest-local counter) flows into the outcome.
+        assert_eq!(
+            outcome.rendered_resource_id,
+            Some(1),
+            "VtestOutcome must carry the id the engine itself assigned"
+        );
+        // The in-band reply is `[res_id]` under VCMD_RESOURCE_CREATE_BLOB (the fd half is
+        // deferred — see the module docs).
+        let mut rcur = Cursor::new(duplex.output);
+        let reply = read_reply(&mut rcur);
+        assert_eq!(reply, (VCMD_RESOURCE_CREATE_BLOB, vec![1]));
+        // The engine actually released it: proves RESOURCE_UNREF reached the engine, not just a
+        // vtest-side stub that would leave the engine's own tracking untouched.
+        assert!(
+            engine.resources.is_empty(),
+            "unref must reach the engine's real resource tracking"
+        );
     }
 
     /// Read one reply (header + dword payload) back out of a buffer, for asserting on server output.
