@@ -199,9 +199,9 @@ pub struct Renderer {
     /// Whether `physical_device` exposes every extension
     /// [`crate::dmabuf::required_device_extensions`] needs, and those extensions (plus their
     /// transitive dependency `VK_KHR_image_format_list`) were successfully enabled on `device`
-    /// in `new()`. `pub` so `render_to_dmabuf` (and its caller, deciding between the dmabuf and
-    /// `wl_shm` presentation paths) can branch on it without re-probing the device.
-    pub supports_dmabuf: bool,
+    /// in `new()`. Private: callers read it through the [`Renderer::supports_dmabuf`] getter so
+    /// there is a single public way to ask "can this renderer export a dmabuf?".
+    supports_dmabuf: bool,
     /// The device-level dispatch table for `VK_KHR_external_memory_fd` (`vkGetMemoryFdKHR`),
     /// which [`dmabuf::export_as_dmabuf`] needs to actually export the fd. `Some` iff
     /// `supports_dmabuf` is `true` — the extension was enabled on `device` in `new()`, and this
