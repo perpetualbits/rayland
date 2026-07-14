@@ -13,6 +13,10 @@ pub mod render;
 // show it in a live Wayland window (SP1).
 pub mod window;
 
+// The GPU dmabuf export path (SP3): render on the GPU, hand the compositor the image by
+// dmabuf handle instead of copying it through CPU memory.
+pub mod dmabuf;
+
 // The wire messages and framed reader.
 use rayland_wire::{Message, PROTOCOL_VERSION, read_message};
 // The renderer and its request/result types.
