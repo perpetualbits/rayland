@@ -71,7 +71,7 @@ use smithay_client_toolkit::reexports::calloop::{
     LoopHandle, // the event loop and a handle to register sources on it
     Mode,
     PostAction,       // how a file-descriptor source is polled and what to do after
-    generic::Generic, // wraps an arbitrary fd (our TCP socket) as a calloop source
+    generic::Generic, // wraps an arbitrary fd (the disconnect source) as a calloop source
 };
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource; // Wayland fd -> calloop
 // wl_output is imported as a module (not just its WlOutput type) because
