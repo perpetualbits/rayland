@@ -14,8 +14,16 @@ Terminal B — the client:
 
     cargo run -p rayland-client            # connects to 127.0.0.1:9000 over QUIC
 
-A window shows a red triangle on blue. Close it → the client exits; Ctrl-C the client → the
-window closes (SP1 teardown, now over QUIC).
+A window shows a red triangle on blue.
+
+- Close the window → the client exits **immediately**: the server's window-close handler
+  explicitly closes the QUIC connection, and the client's blocking read observes that close
+  right away (SP1 teardown, now over QUIC).
+- Ctrl-C the client → the window closes **within a few seconds**, not instantly. UDP has no
+  connection-oriented "the peer hung up" signal, so the server can only notice a vanished
+  client via QUIC's idle timeout, which this transport sets to ~5s (see
+  `rayland-transport`'s `tls::transport_config`). A live-but-idle connection is kept alive by
+  a keep-alive ping well inside that window, so only a genuinely dead client trips it.
 
 Headless / PNG fallback:
 
@@ -68,3 +76,6 @@ skip-verify); real authentication is SP4. See the
 - One bidirectional stream; the multi-stream sibling protocol is SP3.
 - Encrypted but unauthenticated (skip-verify); SSH-bootstrap + real trust is SP4.
 - CPU round-trip through `wl_shm`; zero-copy dmabuf is SP3.
+- Client-kill teardown is idle-timeout-bounded (~5s), not instantaneous: UDP has no FIN, so
+  the server can only detect a vanished client by the QUIC idle timeout expiring, unlike a
+  window close, which is an explicit, immediate connection close.

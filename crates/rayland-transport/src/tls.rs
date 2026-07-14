@@ -18,6 +18,36 @@
 // The ALPN protocol identifier both ends must agree on; a mismatch fails the handshake.
 const ALPN: &[u8] = b"rayland-sp2";
 
+/// Build the shared QUIC transport parameters: a short idle timeout so a peer that vanishes
+/// (e.g. the client is Ctrl-C'd — UDP has no connection-close signal) is detected within a
+/// few seconds, plus a keep-alive interval so a live-but-idle connection is NOT dropped by
+/// that timeout. This keeps SP1's "close on either side" teardown prompt over QUIC.
+///
+/// Without this, quinn's default 30s idle timeout means a killed client's window lingers on
+/// the server for up to 30 seconds (a window-close, by contrast, is already prompt: it drives
+/// an explicit `conn.close()` in [`super::sync_stream::Liveness::drop`], which the peer sees
+/// immediately as `ConnectionLost`, not via the idle timer). Applied to BOTH
+/// [`server_quic_config`] and [`client_quic_config`] — quinn negotiates the *lower* of the two
+/// peers' advertised idle timeouts, so both ends must set it for the short value to take
+/// effect regardless of which side goes quiet.
+fn transport_config() -> std::sync::Arc<quinn::TransportConfig> {
+    // A fresh transport config with quinn's defaults, then our two overrides.
+    let mut tc = quinn::TransportConfig::default();
+    // Detect a silently-gone peer within ~5s (default is 30s). `IdleTimeout` wraps a QUIC
+    // varint of milliseconds; converting from a hardcoded 5s `Duration` cannot fail in
+    // practice (it is far below the varint's range limit), so `.expect` documents that as an
+    // assert on our own constant rather than a runtime possibility.
+    tc.max_idle_timeout(Some(
+        std::time::Duration::from_secs(5)
+            .try_into()
+            .expect("5s is a valid idle timeout"),
+    ));
+    // Send keep-alive pings well inside the idle timeout so an idle-but-alive link (e.g. the
+    // window is open but nothing is being drawn) survives instead of being timed out.
+    tc.keep_alive_interval(Some(std::time::Duration::from_millis(1500)));
+    std::sync::Arc::new(tc)
+}
+
 /// Build the QUIC server configuration: a fresh self-signed certificate and a rustls server
 /// config wrapped for QUIC.
 ///
@@ -51,7 +81,11 @@ pub fn server_quic_config() -> anyhow::Result<quinn::ServerConfig> {
     // Wrap the rustls config for QUIC; this fails if the provider lacks a QUIC cipher suite.
     let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?;
     // The final quinn server configuration.
-    Ok(quinn::ServerConfig::with_crypto(Arc::new(quic_crypto)))
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
+    // Short idle timeout + keep-alive so a Ctrl-C'd client is noticed within seconds, not
+    // quinn's default 30s (see `transport_config`'s doc comment).
+    server_config.transport_config(transport_config());
+    Ok(server_config)
 }
 
 /// Build the QUIC client configuration: the insecure verifier plus our ALPN.
@@ -77,7 +111,11 @@ pub fn client_quic_config() -> anyhow::Result<quinn::ClientConfig> {
     // Wrap for QUIC (same QUIC-suite requirement as the server side).
     let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)?;
     // The final quinn client configuration.
-    Ok(quinn::ClientConfig::new(Arc::new(quic_crypto)))
+    let mut client_config = quinn::ClientConfig::new(Arc::new(quic_crypto));
+    // Same short idle timeout + keep-alive as the server; quinn negotiates the lower of the
+    // two peers' values, so both sides must set it (see `transport_config`'s doc comment).
+    client_config.transport_config(transport_config());
+    Ok(client_config)
 }
 
 /// The deliberately-insecure certificate verifier. **DO NOT SHIP.**

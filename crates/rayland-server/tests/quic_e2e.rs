@@ -10,6 +10,16 @@ use rayland_transport::{connect, listen};
 // Networking types.
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+/// Drive a full client -> QUIC -> server render and assert the returned pixels are correct.
+///
+/// A background thread plays the server: it binds an ephemeral localhost QUIC/UDP port,
+/// `accept()`s the client's connection and its single bidirectional command stream, and
+/// renders the frame the client sends via `handle_connection`. The test thread plays the
+/// client: it `connect()`s over QUIC to the discovered address and sends the triangle command
+/// stream. Finally we join the server thread to recover the rendered frame and check two
+/// pixels (triangle centre, background corner) prove the triangle actually landed after
+/// crossing the real QUIC transport — not just an in-memory buffer or a plain TCP socket
+/// (that is `tests/e2e.rs`'s job).
 #[test]
 fn client_to_server_over_quic_renders_the_triangle() {
     // Bind the server on an ephemeral localhost UDP port.
