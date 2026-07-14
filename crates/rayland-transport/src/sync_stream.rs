@@ -57,7 +57,12 @@ impl Read for QuicStream {
             Ok(Some(n)) => Ok(n),
             // The stream finished cleanly: report EOF so sync readers terminate.
             Ok(None) => Ok(0),
-            // A read error (reset, connection lost) becomes an io::Error.
+            // A closed connection is end-of-stream for our synchronous consumers: the client's
+            // liveness read treats "server closed the connection" as a clean finish, and the
+            // server's command read treats "client vanished" as EOF. Other read errors remain
+            // hard errors.
+            Err(quinn::ReadError::ConnectionLost(_)) => Ok(0),
+            // A read error (reset, other connection errors) becomes an io::Error.
             Err(e) => Err(std::io::Error::other(e)),
         }
     }
@@ -98,6 +103,11 @@ impl Read for QuicRecv {
         match self.rt.block_on(self.recv.read(buf)) {
             Ok(Some(n)) => Ok(n),
             Ok(None) => Ok(0),
+            // A closed connection is end-of-stream for our synchronous consumers: the client's
+            // liveness read treats "server closed the connection" as a clean finish, and the
+            // server's command read treats "client vanished" as EOF. Other read errors remain
+            // hard errors.
+            Err(quinn::ReadError::ConnectionLost(_)) => Ok(0),
             Err(e) => Err(std::io::Error::other(e)),
         }
     }
@@ -105,12 +115,16 @@ impl Read for QuicRecv {
 
 /// A liveness handle for the server's window loop.
 ///
-/// It bundles two things the SP1 window loop needs, now transport-agnostic:
+/// It bundles three things the SP1 window loop needs, now transport-agnostic:
 /// - an fd ([`AsFd`]) that reaches **end-of-file when the client disconnects**, so the calloop
 ///   loop can watch it exactly as SP1 watched the TCP socket fd (a background task closes the
 ///   pipe's write end when the QUIC connection closes);
+/// - the server's send half of the client's bi-stream, **held open and never written**, so the
+///   client's receive half does not reach EOF the moment the stream is accepted — quinn's
+///   `SendStream::Drop` sends a clean FIN, so dropping it early would end the client's liveness
+///   read prematurely;
 /// - a `Drop` that **closes the QUIC connection**, so when the window is closed and the loop
-///   drops this handle, the client's stream reaches EOF and the client exits.
+///   drops this handle, the client's stream observes the close and the client exits.
 ///
 /// This preserves SP1's "close on either" teardown over QUIC.
 pub struct Liveness {
@@ -118,16 +132,24 @@ pub struct Liveness {
     _rt: Arc<Runtime>,
     // The QUIC connection; closed on drop (window-close → client sees EOF).
     conn: quinn::Connection,
+    // The server->client send half, held open (never written) so the client's receive half
+    // stays open until we deliberately close the connection. Dropping it early would send a
+    // FIN and make the client see EOF immediately.
+    _send: quinn::SendStream,
     // The read end of a pipe; reaches EOF when the watcher closes the write end on disconnect.
     disconnect: File,
 }
 
 impl Liveness {
     /// Build a liveness handle: spawn a task that closes `pipe_write` when `conn` closes, and
-    /// keep the pipe read end for the caller to watch. `disconnect` must be non-blocking.
+    /// keep the pipe read end for the caller to watch. `send` is the server's half of the
+    /// client's bi-stream; it is held open (never written) for the lifetime of this handle so
+    /// the client's receive half does not reach EOF until we deliberately close the connection
+    /// on drop. `disconnect` must be non-blocking.
     pub(crate) fn new(
         rt: Arc<Runtime>,
         conn: quinn::Connection,
+        send: quinn::SendStream,
         disconnect: File,
         pipe_write: File,
     ) -> Self {
@@ -142,6 +164,7 @@ impl Liveness {
         Self {
             _rt: rt,
             conn,
+            _send: send,
             disconnect,
         }
     }
@@ -164,9 +187,12 @@ impl Read for &Liveness {
 }
 
 impl Drop for Liveness {
-    /// Close the QUIC connection when the window loop drops us (window closed → client EOF).
+    /// Close the QUIC connection when the window loop drops us (window closed → client's read
+    /// unblocks). The peer observes this as a `ConnectionLost` error, which the read adapters
+    /// in this module translate to end-of-file (`Ok(0)`) — see `QuicStream::read`.
     fn drop(&mut self) {
-        // Application close code 0 with a short reason; the client observes this as EOF.
+        // Application close code 0 with a short reason; the client's read then fails with
+        // `ReadError::ConnectionLost`, which `QuicStream::read` maps to EOF.
         self.conn.close(0u32.into(), b"window closed");
     }
 }
@@ -202,16 +228,19 @@ impl QuicListener {
     /// pipe cannot be created.
     pub fn accept(&self) -> anyhow::Result<(QuicRecv, Liveness)> {
         // Accept the connection and its first bi-stream on the runtime.
-        let (conn, recv) = self.rt.block_on(async {
+        let (conn, send, recv) = self.rt.block_on(async {
             // Wait for an incoming connection and finish its handshake.
             let incoming =
                 self.endpoint.accept().await.ok_or_else(|| {
                     anyhow::anyhow!("endpoint closed before a connection arrived")
                 })?;
             let conn = incoming.await?;
-            // Accept the client's single command bi-stream; we only read from it.
-            let (_send, recv) = conn.accept_bi().await?;
-            anyhow::Ok((conn, recv))
+            // Accept the client's single command bi-stream. We only read from `recv`; `send` is
+            // not written to but must be kept alive (not dropped) by the caller — see
+            // `Liveness`'s doc comment for why dropping it here would end the client's liveness
+            // read prematurely with an unintended FIN.
+            let (send, recv) = conn.accept_bi().await?;
+            anyhow::Ok((conn, send, recv))
         })?;
 
         // Create a non-blocking pipe: the read end is watched by the window loop; the write end
@@ -223,7 +252,7 @@ impl QuicListener {
 
         // Build the reader and liveness handle sharing this listener's runtime.
         let quic_recv = QuicRecv::new(self.rt.clone(), recv);
-        let liveness = Liveness::new(self.rt.clone(), conn, disconnect, pipe_write);
+        let liveness = Liveness::new(self.rt.clone(), conn, send, disconnect, pipe_write);
         Ok((quic_recv, liveness))
     }
 }
@@ -234,9 +263,21 @@ mod sync_tests {
     use std::io::{Read, Write};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    // Prove the public sync API end-to-end: bytes written by the client's `Write` arrive at the
-    // server's `Read`, and dropping the server's `Liveness` (the window-close analogue) makes
-    // the client's `Read` observe EOF — the same teardown SP1 relied on over TCP.
+    // Prove the public sync API end-to-end in two parts:
+    //
+    // (a) the data path: bytes written by the client's `Write` arrive at the server's `Read`.
+    //     The client finishes its OWN send half to signal end-of-command-stream — a legitimate
+    //     client->server FIN, unrelated to liveness teardown.
+    //
+    // (b) the liveness path: the server holds `Liveness` open (does NOT drop it, does NOT
+    //     finish its send half except through `Liveness`'s `Drop`) while the client's liveness
+    //     read (`read_to_end`, mirroring the window loop's disconnect-watch idiom) is proven to
+    //     still be pending. Only once the test explicitly drops `liveness` on the server side
+    //     does the client's read unblock and observe EOF. This is the genuine regression test
+    //     for holding the server's send half open (sync_stream.rs `Liveness::_send`): if that
+    //     field were removed and `accept()` went back to dropping the send half immediately,
+    //     the client's read would complete long before `liveness` is dropped, and the
+    //     `still_pending` assertion below would fail.
     #[test]
     fn sync_api_round_trips_and_signals_disconnect() {
         // Bind the server on an ephemeral localhost port.
@@ -244,33 +285,93 @@ mod sync_tests {
         // Discover the bound address for the client (port 0 was resolved by the OS).
         let addr = listener.local_addr().expect("listener local addr");
 
-        // Server thread: accept, read the client's bytes to EOF, then drop liveness (closing conn).
+        // The server uses this to tell the main thread "I've read the payload and am now
+        // holding `liveness` open, doing nothing else to the connection."
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel::<()>();
+        // The main thread uses this to tell the server "drop `liveness` now" — the ONLY
+        // event in this test that is allowed to close the client's receive half.
+        let (drop_tx, drop_rx) = std::sync::mpsc::channel::<()>();
+
+        // Server thread: accept, read the client's bytes to EOF (client-initiated FIN), signal
+        // the main thread, then block until told to drop `liveness` (closing the connection).
         let server = std::thread::spawn(move || {
             let (mut recv, liveness) = listener.accept().expect("accept");
-            // Read everything the client sends until it half-closes its send side.
+            // Read everything the client sends until it half-closes its own send side.
             let mut got = Vec::new();
             recv.read_to_end(&mut got).expect("read to end");
-            // Dropping `liveness` here closes the connection (window-close analogue).
+            // Tell the main thread the payload is in and `liveness` is now being held open
+            // untouched, so it can safely start (and time-bound) the client's liveness read.
+            accepted_tx.send(()).expect("signal accepted");
+            // Do not drop `liveness` until explicitly told to; this is what keeps the
+            // server->client send half open per Change 1, and is exactly what the test below
+            // exercises.
+            drop_rx.recv().expect("wait for drop signal");
             drop(liveness);
+            // `Liveness::drop` only QUEUES the CONNECTION_CLOSE frame and wakes the
+            // connection's background driver task (see `sync_stream.rs`'s `Liveness::_send`
+            // doc comment); the frame is actually put on the wire whenever the runtime's
+            // worker threads next get to poll that task. `listener` and `recv` are the only
+            // remaining owners of this test's `Arc<Runtime>` clones, and both are about to be
+            // dropped when this closure returns — which would tear down every worker thread
+            // immediately. Without this pause, that teardown races the driver task: on an
+            // unlucky scheduling, the runtime (and its worker threads) can be gone before the
+            // close frame is ever transmitted, so the client would never see it and would fall
+            // all the way back to QUIC's 30s idle timeout instead of observing the close
+            // promptly. Sleeping here gives the driver task a guaranteed window to run while
+            // the runtime is still alive.
+            std::thread::sleep(std::time::Duration::from_millis(100));
             got
         });
 
         // Client: connect, send bytes, finish the send side so the server sees EOF.
         let mut stream = connect(addr).expect("connect");
         stream.write_all(b"hello quic").expect("write");
-        // Signal end of the client's send stream so the server's read_to_end returns.
+        // Signal end of the client's send stream so the server's read_to_end returns. This is
+        // the client's own FIN and is unrelated to liveness teardown.
         stream.finish().expect("finish");
+
+        // Wait for the server to have consumed the payload and be holding `liveness` open.
+        accepted_rx
+            .recv()
+            .expect("server accepted and is holding liveness");
+
+        // Perform the client's liveness read (the window-loop's disconnect-watch idiom) on its
+        // own thread so the main thread can observe whether it is still pending.
+        let (tail_tx, tail_rx) = std::sync::mpsc::channel();
+        let read_thread = std::thread::spawn(move || {
+            let mut tail = Vec::new();
+            stream
+                .read_to_end(&mut tail)
+                .expect("client reads to EOF after server drops liveness");
+            tail_tx.send(tail).expect("send tail");
+        });
+
+        // The read must still be pending: nothing has closed the connection yet. If the
+        // server's send half were dropped at accept time (Change 1 reverted), this read would
+        // already have completed and `recv_timeout` would return `Ok` instead of timing out.
+        let still_pending = tail_rx.recv_timeout(std::time::Duration::from_millis(200));
+        assert!(
+            still_pending.is_err(),
+            "client's liveness read returned before the server dropped `liveness` -- \
+             the server's send half was not held open (Change 1 regressed)"
+        );
+
+        // Now let the server drop `liveness`, closing the connection — the sole trigger for
+        // the client's read to unblock.
+        drop_tx.send(()).expect("signal drop");
 
         // The server received exactly what we sent.
         let got = server.join().expect("server thread");
         assert_eq!(got, b"hello quic");
 
-        // After the server dropped liveness, the client's read reaches EOF.
-        let mut tail = Vec::new();
-        stream
-            .read_to_end(&mut tail)
-            .expect("client reads to EOF after server close");
+        // After the server dropped `liveness`, the client's read reaches EOF (`ConnectionLost`
+        // mapped to `Ok(0)` by `QuicStream::read`, Change 4).
+        let tail = tail_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("client's liveness read unblocked after liveness was dropped");
         // No trailing bytes were sent after the payload; EOF should be immediate.
         assert!(tail.is_empty());
+
+        read_thread.join().expect("read thread");
     }
 }
