@@ -19,6 +19,7 @@ path = "src/main.rs"           # binary entry point
 
 [dependencies]
 rayland-wire = { path = "../rayland-wire" }   # the shared command/protocol types
+rayland-transport = { path = "../rayland-transport" } # QUIC listen()/accept() (SP2)
 ash = { workspace = true }                    # Vulkan bindings for the off-screen renderer
 image = { workspace = true }                  # PNG encoding for the binary
 anyhow = { workspace = true }                 # top-level error handling

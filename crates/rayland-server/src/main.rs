@@ -1,27 +1,24 @@
-//! Rayland server binary: accept one TCP connection, render it on the GPU, and either show
+//! Rayland server binary: accept one QUIC connection, render it on the GPU, and either show
 //! the result in a live Wayland window (default) or write it to a PNG (`--png <path>`).
 
 // The connection handler and the window presenter from the library.
 use rayland_server::handle_connection;
 use rayland_server::window::run_window;
-// TcpListener accepts the incoming connection.
-use std::net::TcpListener;
+// The QUIC transport listener.
+use rayland_transport::listen;
 
-/// Run the server: bind, accept one connection, render the streamed frame, then present it.
+/// Run the server: bind a QUIC endpoint, accept one connection, render the streamed frame,
+/// then present it (window by default, or `--png <path>` to write a PNG and exit).
 ///
-/// Arguments (all optional, order-independent for the flag):
-/// - the first positional argument is the listen address (default `127.0.0.1:9000`);
-/// - `--png <path>` writes the frame to `<path>` and exits instead of opening a window
-///   (the SP0 behaviour, kept for headless machines and for reproducing the PNG).
+/// The first positional argument is the listen address (default `127.0.0.1:9000`).
 ///
 /// # Errors
-/// Returns an error if binding, accepting, rendering, PNG writing, or window presentation
-/// fails.
+/// Returns an error if the address is invalid, or binding, accepting, rendering, PNG writing,
+/// or window presentation fails.
 fn main() -> anyhow::Result<()> {
-    // Collect args once so we can scan for the flag and the positional address.
+    // Collect args, scanning for `--png <path>` and the positional address (same as SP1).
     let args: Vec<String> = std::env::args().skip(1).collect();
-
-    // Look for `--png <path>`; if present, remember the path and treat it as the mode.
+    // Set once `--png <path>` is seen; presence switches the present-frame mode below.
     let mut png_path: Option<String> = None;
     // The listen address is the first argument that is not the flag or its value.
     let mut address: Option<String> = None;
@@ -35,10 +32,10 @@ fn main() -> anyhow::Result<()> {
                     .get(i + 1)
                     .ok_or_else(|| anyhow::anyhow!("--png requires a path argument"))?;
                 png_path = Some(path.clone());
-                // Skip the flag and its value.
+                // Skip past both the flag and its value.
                 i += 2;
             }
-            // The first non-flag argument is the listen address.
+            // The first non-flag argument is the listen address; later ones are ignored.
             other => {
                 if address.is_none() {
                     address = Some(other.to_string());
@@ -49,22 +46,27 @@ fn main() -> anyhow::Result<()> {
     }
     // Fall back to the localhost default if no address was given.
     let address = address.unwrap_or_else(|| "127.0.0.1:9000".to_string());
+    // Parse the UDP socket address QUIC binds to.
+    let bind_addr: std::net::SocketAddr = address
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid bind address {address:?}: {e}"))?;
 
-    // Bind and announce readiness.
-    let listener = TcpListener::bind(&address)?;
-    println!("rayland-server listening on {address}");
+    // Bind the QUIC endpoint and announce readiness.
+    let listener = listen(bind_addr)?;
+    println!("rayland-server listening on {address} (QUIC)");
 
-    // Accept exactly one connection (SP1 still handles a single client).
-    let (mut stream, peer) = listener.accept()?;
-    println!("connection from {peer}");
+    // Accept exactly one connection; get the sync command reader and the liveness handle.
+    let (mut recv, liveness) = listener.accept()?;
+    println!("connection accepted");
 
     // Replay the stream on the GPU into a CPU-side frame.
-    let frame = handle_connection(&mut stream)?;
+    let frame = handle_connection(&mut recv)?;
 
-    // Present the frame: PNG if requested, otherwise a live window.
+    // Present: PNG fallback, or a live window watching `liveness` for client disconnect.
     match png_path {
-        // Headless/fallback path: encode the tightly-packed RGBA8 pixels as a PNG.
         Some(path) => {
+            // Headless path: encode the RGBA8 pixels as a PNG. Dropping `liveness` closes the
+            // connection so the client exits.
             image::save_buffer(
                 &path,
                 &frame.pixels,
@@ -73,20 +75,16 @@ fn main() -> anyhow::Result<()> {
                 image::ColorType::Rgba8,
             )?;
             println!("wrote {path} ({}x{})", frame.width, frame.height);
+            drop(liveness);
         }
-        // Default path: show the frame in a window until it or the client closes.
         None => {
+            // Default path: show the frame until the window or the client closes. `liveness`
+            // is moved in BY VALUE; when the window loop ends, run_window drops it, which
+            // closes the QUIC connection so the client also exits.
             println!("presenting in a window; close it (or stop the client) to exit");
-            // `run_window` requires its disconnect source to already be non-blocking (it is
-            // no longer TCP-specific, so it cannot call `set_nonblocking` itself); set it
-            // here before handing the socket over so the liveness callback never stalls.
-            stream.set_nonblocking(true)?;
-            // Hand the socket to the window so it can watch for client disconnect.
-            run_window(frame, stream)?;
+            run_window(frame, liveness)?;
             println!("window closed; exiting");
         }
     }
-
-    // Success.
     Ok(())
 }
