@@ -25,6 +25,12 @@ image = "0.25"                       # PNG encoding (used by the server)
 # pkg-config at build time — we do no keyboard/seat handling, so we need only `calloop`.
 smithay-client-toolkit = { version = "0.20", default-features = false, features = ["calloop"] }
 wayland-client = { version = "0.31", features = ["dlopen"] }  # dlopen: load libwayland at runtime so CI needs no libwayland package
+# Generated Rust bindings for the official Wayland protocol extensions. SCTK already pulls
+# this in transitively for xdg-shell; declared directly here (SP3 Task 4) so `window.rs` can
+# name `zwp_linux_dmabuf_v1` types itself, which SCTK 0.20 has no first-class helper for.
+# `staging`/`unstable` are enabled for completeness even though `linux-dmabuf-v1` itself lives
+# under the crate's "stable" category and needs neither feature to compile.
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
 quinn = "0.11"                                          # QUIC transport (async)
 # TLS; `ring` provider selected explicitly. SP2 Task 1 spike: the pure-Rust
 # `rustls-rustcrypto` provider (0.0.2-alpha) panics "no initial cipher suite found" when
