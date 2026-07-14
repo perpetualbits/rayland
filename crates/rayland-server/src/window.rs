@@ -357,8 +357,8 @@ where
     let surface = compositor.create_surface(&qh);
     let window = xdg_shell.create_window(surface, WindowDecorations::RequestServer, &qh);
     // A human-readable title and a stable app id (provisional).
-    window.set_title("Rayland — SP1");
-    window.set_app_id("nl.rayland.Sp1");
+    window.set_title("Rayland — SP2");
+    window.set_app_id("nl.rayland.Sp2");
     // Request a fixed size by pinning min == max to the frame's dimensions; compositors
     // commonly honour this by floating the window at exactly that size.
     window.set_min_size(Some((frame.width, frame.height)));

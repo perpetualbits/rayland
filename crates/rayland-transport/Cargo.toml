@@ -17,8 +17,7 @@ quinn = { workspace = true }              # QUIC endpoints, connections, streams
 rustls = { workspace = true }             # TLS configuration underlying QUIC (provider: ring)
 rcgen = { workspace = true }              # ephemeral self-signed certificate
 tokio = { workspace = true }              # the confined async runtime that drives QUIC
-thiserror = { workspace = true }          # precise library error type
-anyhow = { workspace = true }             # contextual errors for setup paths returned to binaries
+anyhow = { workspace = true }             # contextual errors for setup paths returned to binaries (the transport wraps heterogeneous quinn/rustls/tokio errors; the hot Read/Write paths return std::io::Error directly, so no typed thiserror enum is needed yet)
 # Non-blocking pipe for `Liveness`'s disconnect fd; pure-Rust syscall bindings, already in the
 # dependency tree (via SCTK) so this adds no new C dependency.
 rustix = { version = "1", features = ["pipe"] }

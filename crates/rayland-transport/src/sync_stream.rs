@@ -194,6 +194,13 @@ impl Drop for Liveness {
         // Application close code 0 with a short reason; the client's read then fails with
         // `ReadError::ConnectionLost`, which `QuicStream::read` maps to EOF.
         self.conn.close(0u32.into(), b"window closed");
+        // `close` only *queues* the CONNECTION_CLOSE frame; the runtime's worker still has to
+        // transmit it. If we returned now, the process could drop the runtime before that
+        // happens, and the client would fall back to the ~5s idle timeout instead of exiting
+        // promptly. Block (on this non-runtime thread; the runtime is still alive via `_rt`)
+        // until the connection has finished closing, so the close frame is on the wire before
+        // we proceed. This resolves quickly for a locally-initiated close.
+        let _ = self._rt.block_on(self.conn.closed());
     }
 }
 
