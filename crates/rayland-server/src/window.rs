@@ -331,7 +331,7 @@ pub fn run_window(frame: RenderedFrame, stream: TcpStream) -> anyhow::Result<()>
     let shm = Shm::bind(&globals, &qh).map_err(|e| anyhow::anyhow!("wl_shm unavailable: {e}"))?;
 
     // Allocate a shm pool large enough for one frame-sized buffer.
-    let pool_size = (frame.width * frame.height * 4) as usize;
+    let pool_size = frame.width as usize * frame.height as usize * 4;
     let pool = SlotPool::new(pool_size, &shm)
         .map_err(|e| anyhow::anyhow!("failed to create shm pool: {e}"))?;
 
@@ -359,13 +359,9 @@ pub fn run_window(frame: RenderedFrame, stream: TcpStream) -> anyhow::Result<()>
             Generic::new(stream, Interest::READ, Mode::Level),
             |_readiness, socket, state: &mut RaylandWindow| {
                 // Drain whatever is readable; we only care whether the stream has ended.
-                // calloop wraps the registered IO object in `NoIoDrop` (it only exposes it
-                // through `&`, to stop a callback from dropping — and thereby invalidating —
-                // the fd calloop still has registered with the poller). `get_mut` is unsafe
-                // only in the sense that the caller must not drop the returned reference's
-                // target; we merely read from it and let it stay owned by the source, so
-                // this is sound.
-                let socket = unsafe { socket.get_mut() };
+                // NoIoDrop derefs to the wrapped TcpStream; std's `impl Read for &TcpStream` lets us
+                // read through a shared reference, so no unsafe access to the fd is needed here.
+                let mut socket: &std::net::TcpStream = socket;
                 let mut sink = [0u8; 256];
                 loop {
                     match socket.read(&mut sink) {
