@@ -398,8 +398,9 @@ pub fn run_window(frame: RenderedFrame, stream: TcpStream) -> anyhow::Result<()>
         exit: false,
         first_configure: true,
     };
-    // Dispatch events with a modest timeout; break out as soon as `exit` is set. A None
-    // timeout blocks until an event, which is fine since both triggers produce events.
+    // Dispatch events, blocking until one arrives (`None` = no timeout); break out as soon
+    // as `exit` is set. Blocking is fine because both teardown triggers — a window-close
+    // event and socket readability on client disconnect — wake the loop.
     while !state.exit {
         event_loop
             .dispatch(None, &mut state)
