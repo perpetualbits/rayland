@@ -9,6 +9,10 @@
 // The off-screen Vulkan renderer (Task 4).
 pub mod render;
 
+// The S-side presentation path: convert a rendered frame to a wl_shm buffer and
+// show it in a live Wayland window (SP1).
+pub mod window;
+
 // The wire messages and framed reader.
 use rayland_wire::{Message, PROTOCOL_VERSION, read_message};
 // The renderer and its request/result types.
