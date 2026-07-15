@@ -21,6 +21,12 @@ thiserror = { workspace = true }   # precise, typed error enum (EngineError) map
 # for why libc rather than nix/sendfd.
 libc = { workspace = true }
 
+[dev-dependencies]
+# `refapp_venus_e2e.rs` decodes the two PNGs the reference app writes (native and Venus-rendered)
+# and compares them pixel by pixel. A dev-dependency only: nothing in the engine itself touches
+# images — the engine moves command streams, not pictures.
+image = { workspace = true }
+
 [build-dependencies]
 # `pkg-config` locates the installed `libvirglrenderer` (its `.so` and, for the record, its
 # include dir) and emits the correct `cargo:rustc-link-*` directives from build.rs. We

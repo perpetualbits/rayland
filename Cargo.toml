@@ -11,6 +11,7 @@ members = [
     "crates/rayland-client",         # client: builds and sends the triangle stream (this task)
     "crates/rayland-transport",      # QUIC transport foundation + loopback spike (SP2 Task 1)
     "crates/rayland-engine",         # S-side render engine: FFI-embedded libvirglrenderer + Venus context (C0 Task 1)
+    "crates/rayland-refapp",         # C0's unmodified reference app: a plain offscreen Vulkan triangle (C0 Task 4b)
 ]
 
 # Dependency versions shared across member crates, so every crate agrees on one version.
