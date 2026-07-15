@@ -15,6 +15,11 @@ repository = "https://github.com/perpetualbits/rayland"                       # 
 
 [dependencies]
 thiserror = { workspace = true }   # precise, typed error enum (EngineError) mapping every C return code
+# The POSIX syscalls the vtest protocol needs but `std` does not expose: `sendmsg` (SCM_RIGHTS fd
+# passing to a live Mesa Venus client), `memfd_create`/`mmap`/`munmap` (server-allocated blob
+# shared memory), and `eventfd` (the pollable VCMD_SYNC_WAIT reply fd). See the workspace manifest
+# for why libc rather than nix/sendfd.
+libc = { workspace = true }
 
 [build-dependencies]
 # `pkg-config` locates the installed `libvirglrenderer` (its `.so` and, for the record, its

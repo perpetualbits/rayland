@@ -46,31 +46,46 @@
 //! semaphores), and `VCMD_SUBMIT_CMD2` (the Venus command buffers) — the last routed to
 //! [`RenderEngine::submit`].
 //!
-//! # Deliberate scope (C0 Tasks 2 and 3)
+//! # fd passing is mandatory, and that has consequences (the Task 4a correction)
+//! Tasks 2/3 served this protocol over a generic `S: Read + Write` and deferred the fd side
+//! channel, on the stated assumption that SP2's QUIC transport could then swap in unchanged. **A
+//! live Mesa client proved that assumption false**: `VCMD_RESOURCE_CREATE_BLOB` and
+//! `VCMD_SYNC_WAIT` must reply with a real file descriptor over an `SCM_RIGHTS` control message,
+//! and the client blocks in `recvmsg` forever without it — so the old bound could never have served
+//! a real client at all. `serve_vtest` is now generic over [`VtestTransport`] (a byte stream **plus**
+//! `send_fd`), and C0 serves it over a `UnixStream`.
+//!
+//! The honest consequence for SP2/(c)1, recorded here because it is a *finding*, not a to-do: a
+//! blob resource is **shared memory**, and the client writes its Venus command ring directly into
+//! the pages the descriptor names. QUIC has neither fd passing nor shared memory, so (c)1 cannot
+//! "just swap the socket" — those ring writes have to become explicit, shipped bytes, which is a
+//! protocol design question rather than a transport substitution. [`VtestTransport::send_fd`] being
+//! a *required* method is what forces that question to be confronted at compile time.
+//!
+//! # Deliberate scope (C0 Tasks 2, 3 and 4a)
 //! This is the parser + dispatcher. The handshake, `VCMD_CONTEXT_INIT` → `create_venus_context`,
-//! `VCMD_SUBMIT_CMD2` → `submit` (Task 2), and `VCMD_RESOURCE_CREATE_BLOB` →
-//! `create_blob_resource` / `VCMD_RESOURCE_UNREF` → `unref_resource` (Task 3) are wired for real —
-//! every one of them reaches the actual `RenderEngine`, not vtest-local bookkeeping. The `VCMD_SYNC_*`
-//! family remains a bookkeeping stub (a local sync-id → value map; see `Session`), because what it
-//! needs is out of scope here and belongs to later tasks:
-//! - **fd passing.** `VCMD_RESOURCE_CREATE_BLOB` and `VCMD_SYNC_WAIT` reply with a *file
-//!   descriptor* over a `SCM_RIGHTS` control message. A generic `Read + Write` stream (the point
-//!   of the generic bound — SP2's QUIC transport has no fds) cannot carry one, so we write only
-//!   the in-band part of those replies and defer the fd side channel to Task 4's Unix-socket wiring
-//!   (and, ultimately, to Rayland's own sibling-protocol memory sharing, which replaces fd passing
-//!   for cross-machine operation).
-//! - **real timeline semantics.** `VCMD_SYNC_*` still just stores/echoes values rather than
-//!   modeling actual GPU timeline completion; Task 3's fence-wait (`RenderEngine::read_back`) is a
-//!   separate, real mechanism that does not depend on this stub.
+//! `VCMD_SUBMIT_CMD2` → `submit` (Task 2), `VCMD_RESOURCE_CREATE_BLOB` → `create_blob_resource` /
+//! `VCMD_RESOURCE_UNREF` → `unref_resource` (Task 3), and both fd replies (Task 4a) are wired for
+//! real — every one of them reaches the actual `RenderEngine` or the actual kernel, not vtest-local
+//! bookkeeping. What remains deliberately stubbed, and honestly so:
+//! - **real timeline semantics.** The `VCMD_SYNC_*` family is still a local sync-id → value map
+//!   (see `Session`) rather than a model of actual GPU timeline completion. Its `VCMD_SYNC_WAIT`
+//!   reply now sends a **real, pollable eventfd** — not a fabricated descriptor — but, because
+//!   every sync in the stub is by construction already at its target, that eventfd is always
+//!   pre-signaled. That is precisely virglrenderer's own `is_ready` branch, taken unconditionally;
+//!   a wait that should genuinely block does not. Task 3's fence-wait
+//!   (`RenderEngine::read_back`) is a separate, real mechanism that does not depend on this stub.
 //!
 //! Unimplemented opcodes are reported as a typed error — never silently dropped.
 
-// Streaming I/O over whatever byte transport carries the vtest protocol (Unix socket now, QUIC
-// stream later — the whole reason `serve_vtest` is generic).
+// Reading requests and writing in-band replies. The transport also carries file descriptors, which
+// is why `serve_vtest` is generic over `VtestTransport` rather than these two traits alone.
 use std::io::{Read, Write};
+// Borrowing an owned descriptor to hand to `send_fd`, which duplicates rather than consumes it.
+use std::os::fd::AsFd;
 
-// The trait we drive and the crate error type every failure maps into.
-use crate::{EngineError, RenderEngine};
+// The traits we drive and the crate error type every failure maps into.
+use crate::{EngineError, RenderEngine, VtestTransport};
 
 // ----------------------------------------------------------------------------------------------
 // Pinned protocol constants (transcribed from virglrenderer's `vtest/vtest_protocol.h`).
@@ -112,6 +127,14 @@ const VCMD_SUBMIT_CMD2: u32 = 24;
 /// `VCMD_PARAM_MAX_TIMELINE_COUNT` — the one `VCMD_GET_PARAM` parameter Mesa's Venus backend asks
 /// for (and requires non-zero).
 const VCMD_PARAM_MAX_TIMELINE_COUNT: u32 = 1;
+
+/// `VCMD_SUBMIT_CMD2_FLAG_RING_IDX` (bit 0) — "this batch's `ring_idx` field is meaningful".
+///
+/// The **only** `SUBMIT_CMD2` batch flag this server implements, and the only one Mesa's Venus vtest
+/// backend sets (confirmed by a live capture: `flags = 0x1`). The other two defined flags,
+/// `..._IN_FENCE_FD` (1<<1) and `..._OUT_FENCE_FD` (1<<2), make the C server receive or send a file
+/// descriptor out of band; `decode_submit_cmd2` rejects them rather than mis-frame the stream.
+const VCMD_SUBMIT_CMD2_FLAG_RING_IDX: u32 = 1 << 0;
 
 /// The Venus capset id on the wire (`VIRTGPU_DRM_CAPSET_VENUS`), which Mesa sends in
 /// `VCMD_GET_CAPSET` / `VCMD_CONTEXT_INIT`. Same value as the engine's Venus capset (4).
@@ -174,8 +197,9 @@ pub enum VtestCommand {
         /// The capset id to initialize the context with (4 = Venus).
         capset_id: u32,
     },
-    /// `VCMD_RESOURCE_CREATE_BLOB`: allocate a host/guest-shared memory blob (device memory, the
-    /// command ring, staging buffers). Its reply carries a res_id **and an fd** (fd deferred here).
+    /// `VCMD_RESOURCE_CREATE_BLOB`: allocate a host/guest-shared memory blob (the Venus command
+    /// ring, staging buffers, device memory). Its reply carries a res_id **and an fd** — both are
+    /// sent (Task 4a); the client `mmap`s the fd and writes commands straight into those pages.
     ResourceCreateBlob {
         /// Blob type (`VCMD_BLOB_TYPE_*`).
         blob_type: u32,
@@ -214,7 +238,8 @@ pub enum VtestCommand {
         value: u64,
     },
     /// `VCMD_SYNC_WAIT`: wait for one or more syncs to reach given values. Its reply is a *pollable
-    /// fd* over `SCM_RIGHTS` (deferred here — see the module scope note).
+    /// fd* over `SCM_RIGHTS`, which is sent for real (Task 4a) — though always pre-signaled, since
+    /// this server's sync objects are a stub. See the module scope note.
     SyncWait {
         /// Wait flags (`VCMD_SYNC_WAIT_FLAG_ANY`).
         flags: u32,
@@ -250,17 +275,23 @@ pub struct SubmitBatch {
 /// Its reason for being is `rendered_resource_id`: a resource id that genuinely exists in the
 /// engine (Task 3 routes `VCMD_RESOURCE_CREATE_BLOB` through `RenderEngine::create_blob_resource`,
 /// not a vtest-local counter). In the vtest/Venus data path the rendered image lives in a blob
-/// resource, so we report the most recently created blob as the best-effort readback candidate —
-/// *which* blob is actually the final rendered frame (Venus may create several: staging buffers,
-/// intermediate targets, the real swapchain image, ...) requires understanding a live client's
-/// object graph, which is Task 4's concern. `RenderEngine::read_back`'s doc comment also explains
-/// a further, empirically-discovered limitation: a *blob* resource (this field's kind) cannot
-/// currently be read back the same way a classic resource can — Task 4 must resolve that too. The
-/// counters are for diagnostics.
+/// resource, so we report the most recently created blob as a best-effort readback candidate.
+///
+/// # What a live client showed about this field (Task 4a) — read before relying on it
+/// Observing a real Mesa Venus client makes the "best-effort" above concrete, and mostly negative:
+/// the blobs it creates are its **command ring and staging shmem**, not rendered images (a trivial
+/// init-only client requested exactly two, both `HOST3D`/`MAPPABLE` with `blob_id = 0`, of ~128 KiB
+/// and 1 MiB). So "the most recently created blob" is not the rendered frame in any run observed so
+/// far, and there is no reason to think it would be in general — identifying the frame requires
+/// understanding the client's object graph, which is Task 4b's concern. `RenderEngine::read_back`'s
+/// doc comment explains the second half of the problem: a *blob* resource cannot be read back the
+/// way a classic resource can. Both must be resolved before this field means what its name suggests.
+/// The counters are for diagnostics.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VtestOutcome {
-    /// The resource id Task 4's host may want to inspect, if any resource was created — see this
-    /// struct's doc comment for the current limitations on actually reading it back.
+    /// The most recently created blob resource id, if any — **not**, as things stand, the rendered
+    /// frame. See this struct's doc comment for what a live client actually put here and why
+    /// reading it back is still an open problem.
     pub rendered_resource_id: Option<u32>,
     /// The GPU context id this session created (if `VCMD_CONTEXT_INIT` was reached).
     pub context_id: Option<u32>,
@@ -529,6 +560,11 @@ fn decode_sync_wait(p: &[u32]) -> Result<VtestCommand, EngineError> {
 /// — followed by the command streams and sync arrays the offsets point into. Offsets are dword
 /// indices *from the start of the whole payload* (matching the C server's `submit_cmd2_buf[...]`).
 fn decode_submit_cmd2(p: &[u32]) -> Result<VtestCommand, EngineError> {
+    // Before interpreting anything, optionally dump the raw payload (see `dump_submit_cmd2`). This
+    // is what byte-verified the layout below against a live Mesa Venus client rather than against
+    // the C source alone.
+    dump_submit_cmd2(p);
+
     // The first dword is the batch count (`VCMD_SUBMIT_CMD2_BATCH_COUNT == 0`).
     if p.is_empty() {
         return Err(protocol_err("SUBMIT_CMD2: empty payload (no batch count)"));
@@ -557,8 +593,34 @@ fn decode_submit_cmd2(p: &[u32]) -> Result<VtestCommand, EngineError> {
         let sync_offset = p[base + 3] as usize;
         let sync_count = p[base + 4] as usize;
         let ring_idx = p[base + 5];
-        // (num_in_syncobj / num_out_syncobj at +6/+7 are protocol-v4 syncobj passing — out of
-        // scope here; we do not read them, but they are part of the 8-dword header we bounded.)
+        let num_in_syncobj = p[base + 6];
+        let num_out_syncobj = p[base + 7];
+
+        // Refuse the batch features this server does not implement, rather than ignore them.
+        //
+        // This is not defensive boilerplate — ignoring these **silently corrupts the connection**.
+        // Reading virglrenderer's `vtest_submit_cmd2_batch` shows why: a nonzero `num_in_syncobj` /
+        // `num_out_syncobj` makes the server read *additional bytes off the socket* beyond this
+        // message's declared `length` (an array of `drm_virtgpu_execbuffer_syncobj` per batch), and
+        // `VCMD_SUBMIT_CMD2_FLAG_IN_FENCE_FD` / `..._OUT_FENCE_FD` make it receive / send a file
+        // descriptor. A decoder that skipped any of them would leave those bytes in the stream and
+        // mis-frame every subsequent message, or leave the client waiting on a fence fd forever —
+        // failures that would surface far from their cause.
+        //
+        // Mesa's Venus vtest backend sets `flags = VCMD_SUBMIT_CMD2_FLAG_RING_IDX` and leaves both
+        // syncobj counts at 0, which a live capture confirms (flags=0x1, num_in=0, num_out=0), so
+        // this rejects nothing a real Venus client sends today. It is what makes a *future* client
+        // that does use them fail loudly here instead of subtly downstream.
+        if num_in_syncobj != 0 || num_out_syncobj != 0 {
+            return Err(protocol_err(format!(
+                "SUBMIT_CMD2 batch {i}: syncobj passing is not supported (num_in_syncobj={num_in_syncobj}, num_out_syncobj={num_out_syncobj}); it carries out-of-band bytes this server would mis-frame"
+            )));
+        }
+        if flags & !VCMD_SUBMIT_CMD2_FLAG_RING_IDX != 0 {
+            return Err(protocol_err(format!(
+                "SUBMIT_CMD2 batch {i}: unsupported flags {flags:#x} (only VCMD_SUBMIT_CMD2_FLAG_RING_IDX is implemented; the fence-fd flags carry an out-of-band descriptor)"
+            )));
+        }
 
         // The command slice `[cmd_offset, cmd_offset+cmd_size)` must lie inside the payload.
         let cmd_end = cmd_offset
@@ -601,6 +663,95 @@ fn decode_submit_cmd2(p: &[u32]) -> Result<VtestCommand, EngineError> {
         });
     }
     Ok(VtestCommand::SubmitCmd2 { batches })
+}
+
+/// The environment variable that enables [`dump_submit_cmd2`]. Set it to any non-empty value.
+const DUMP_ENV_VAR: &str = "RAYLAND_VTEST_DUMP";
+
+/// Dumps a raw `VCMD_SUBMIT_CMD2` payload as hex, plus this decoder's field-by-field
+/// interpretation of it, to stderr — **only** when [`DUMP_ENV_VAR`] is set.
+///
+/// # Why this exists (Task 4a's headline deliverable)
+/// Task 2 derived the `SUBMIT_CMD2` body layout from virglrenderer's C source but **never saw a
+/// real one**: the client blocks on the blob fd long before it ever sends a submit, so every
+/// downstream assumption rested on a reading of C macros. Task 2's own review flagged it as a
+/// carry-forward: *do not trust `engine.submit` until real bytes confirm it.* This function is the
+/// instrument that confirmed it. It prints what actually arrived, so the decode can be checked
+/// against reality rather than against the same source it was derived from.
+///
+/// It is deliberately behind an environment variable rather than a feature flag or a log level:
+/// a live Venus client sends thousands of these, so this is a diagnostic you reach for once, not
+/// something that should ever be on by default. Off, it costs one `var_os` lookup per submit.
+///
+/// # Inputs / outputs
+/// - `p`: the message's raw payload dwords, exactly as they came off the wire and before any
+///   validation — so a *malformed* submit is dumped too, which is precisely when a dump is most
+///   useful. Nothing is returned; this is a pure diagnostic with no effect on decoding.
+fn dump_submit_cmd2(p: &[u32]) {
+    // Off unless explicitly asked for. `var_os` (not `var`) so a non-UTF-8 value still enables it.
+    if std::env::var_os(DUMP_ENV_VAR).is_none() {
+        return;
+    }
+
+    eprintln!("--- SUBMIT_CMD2 raw payload: {} dwords ---", p.len());
+    // Raw hex, 8 dwords per line with the dword index of each line. This is the ground truth: it
+    // is printed before any interpretation, so it stays correct even if the decode below is wrong.
+    for (line, chunk) in p.chunks(8).enumerate() {
+        let hex: Vec<String> = chunk.iter().map(|d| format!("{d:08x}")).collect();
+        eprintln!("  [{:4}] {}", line * 8, hex.join(" "));
+    }
+
+    // The decoder's reading of those bytes, so the two can be compared by eye. Deliberately
+    // re-derived here from `p` rather than taken from the decode below — a dump that shared the
+    // decode's own bounds checks could not reveal a decode that is wrong.
+    let Some(&batch_count) = p.first() else {
+        eprintln!("  (empty payload: no batch count)");
+        return;
+    };
+    eprintln!("  batch_count = {batch_count}");
+    for i in 0..batch_count as usize {
+        // Per the pinned layout each batch header is 8 dwords at `1 + 8*i`. Bounds-check by hand:
+        // this runs before validation, so a lying `batch_count` must not panic the dump.
+        let base = 1 + i * 8;
+        let Some(h) = p.get(base..base + 8) else {
+            eprintln!("  batch {i}: header at dword {base} runs past the payload — TRUNCATED");
+            return;
+        };
+        eprintln!(
+            "  batch {i}: flags={:#x} cmd_offset={} cmd_size={} sync_offset={} sync_count={} ring_idx={} num_in_syncobj={} num_out_syncobj={}",
+            h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]
+        );
+    }
+}
+
+/// Dumps a `VCMD_RESOURCE_CREATE_BLOB` request to stderr — **only** when [`DUMP_ENV_VAR`] is set.
+///
+/// # Why this is worth its own dump (the (c)1 input)
+/// Which `blob_mem` kinds a live client actually asks for, and how large they are, is not a
+/// curiosity: it is the input to Rayland's transport design. A blob is **shared memory**, and the
+/// client writes its Venus command ring straight into it. Whatever appears here is precisely what a
+/// future QUIC transport — which has no shared memory and no fd passing — will have to replace with
+/// explicitly shipped bytes. Observing it from a real client, rather than reasoning about what a
+/// client "should" request, is the point.
+///
+/// # Inputs / outputs
+/// - `blob_type`, `flags`, `size`, `blob_id`: the request's decoded fields, exactly as they came off
+///   the wire. Nothing is returned; this is a pure diagnostic.
+fn dump_blob_request(blob_type: u32, flags: u32, size: u64, blob_id: u64) {
+    // Off unless explicitly asked for; see `dump_submit_cmd2` for why this is an env var.
+    if std::env::var_os(DUMP_ENV_VAR).is_none() {
+        return;
+    }
+    // Name the two fields whose *meaning* is the finding, rather than making a reader decode them.
+    let kind = match blob_type {
+        1 => "GUEST (server-allocated memfd + iovec)",
+        2 => "HOST3D (driver-allocated, exported)",
+        3 => "HOST3D_GUEST (server-allocated memfd + iovec)",
+        other => return eprintln!("--- RESOURCE_CREATE_BLOB: unsupported blob_mem {other} ---"),
+    };
+    eprintln!(
+        "--- RESOURCE_CREATE_BLOB: blob_mem={blob_type} [{kind}] flags={flags:#x} size={size} blob_id={blob_id} ---"
+    );
 }
 
 /// Write one vtest reply: the 2-dword header `[len][cmd_id]` followed by `payload` dwords, all
@@ -685,20 +836,25 @@ impl Session {
 /// - `VCMD_SUBMIT_CMD2` → [`RenderEngine::submit`] (once per batch),
 /// - `VCMD_GET_CAPSET` → [`RenderEngine::venus_capset`].
 ///
-/// It answers the handshake / resource / sync commands in-band (with the fd side channels and
-/// pixel readback deferred to later tasks — see the module scope note).
+/// It answers the handshake / resource / sync commands in-band, and passes the two protocol-
+/// mandated file descriptors (`VCMD_RESOURCE_CREATE_BLOB`, `VCMD_SYNC_WAIT`) over the transport's
+/// `send_fd` — the Task 4a change that makes a live client possible at all.
 ///
-/// # Generic over the transport
-/// `S: Read + Write` is deliberate: C0 passes a Unix socket; SP2 passes a QUIC stream unchanged.
+/// # Generic over the transport, but not over "does it have fds"
+/// `T: VtestTransport` replaces Task 2's `S: Read + Write`. That bound was not merely narrower than
+/// needed; it was *wrong* — see the module docs. A transport for this protocol must be able to pass
+/// a descriptor, and the trait says so.
 ///
 /// # Inputs / outputs
-/// - `stream`: the byte transport carrying the vtest protocol.
+/// - `stream`: the transport carrying the vtest protocol (bytes **and** descriptors). Taken by
+///   `&mut` so the caller retains the socket after the session (e.g. to close it explicitly, or to
+///   inspect it in a test).
 /// - `engine`: the render engine every Venus command is routed to.
-/// - Returns a [`VtestOutcome`] (notably the resource id for Task 3's readback) on a clean end of
-///   session, or an [`EngineError`] on I/O failure, a malformed/unsupported message, or an engine
-///   error.
-pub fn serve_vtest<S: Read + Write>(
-    mut stream: S,
+/// - Returns a [`VtestOutcome`] (notably the resource id for readback) on a clean end of session,
+///   or an [`EngineError`] on I/O failure, a malformed/unsupported message, an fd-passing failure,
+///   or an engine error.
+pub fn serve_vtest<T: VtestTransport>(
+    stream: &mut T,
     engine: &mut dyn RenderEngine,
 ) -> Result<VtestOutcome, EngineError> {
     // Per-connection state accumulated across messages.
@@ -706,9 +862,9 @@ pub fn serve_vtest<S: Read + Write>(
 
     // Read and dispatch messages until the peer closes at a message boundary (clean end).
     loop {
-        match read_command(&mut stream)? {
-            // A decoded command: handle it (may write a reply and/or call the engine).
-            Some(cmd) => dispatch(cmd, &mut stream, engine, &mut session)?,
+        match read_command(stream)? {
+            // A decoded command: handle it (may write a reply, send an fd, and/or call the engine).
+            Some(cmd) => dispatch(cmd, stream, engine, &mut session)?,
             // Clean EOF: the session is over; hand back what we accumulated.
             None => return Ok(session.outcome),
         }
@@ -718,11 +874,13 @@ pub fn serve_vtest<S: Read + Write>(
 /// Handle one decoded command: write any protocol-mandated reply and route Venus work to `engine`.
 ///
 /// Every command is either answered per the protocol or routed to the engine; none is silently
-/// ignored. Commands whose full behavior is deferred (fd replies, pixel readback) still get their
-/// in-band reply and a clear boundary, documented at each arm.
-fn dispatch<S: Read + Write>(
+/// ignored. The two commands whose replies carry a file descriptor (`VCMD_RESOURCE_CREATE_BLOB`,
+/// `VCMD_SYNC_WAIT`) send it here for real — in-band reply first, then the fd, the order the client
+/// reads in. Where behaviour is still a stub (sync-object timelines) the arm says so explicitly
+/// rather than looking complete.
+fn dispatch<T: VtestTransport>(
     cmd: VtestCommand,
-    stream: &mut S,
+    stream: &mut T,
     engine: &mut dyn RenderEngine,
     session: &mut Session,
 ) -> Result<(), EngineError> {
@@ -794,22 +952,39 @@ fn dispatch<S: Read + Write>(
             size,
             blob_id,
         } => {
-            // Task 3: route through the engine's *real* resource path (no more a vtest-local
-            // counter) — `virgl_renderer_resource_create_blob`, attached to this session's Venus
-            // context. The returned id genuinely exists in the engine, so `VtestOutcome`'s id is
-            // one Task 4's host can actually act on (e.g. hand to `read_back`, once a live
-            // client's object graph makes that meaningful — see `RenderEngine::read_back`'s doc
-            // comment on the current blob-resource limitation). Reply is `[res_id]`.
+            // Record what the client asked for before acting on it — see `dump_blob_request`.
+            dump_blob_request(blob_type, flags, size, blob_id);
+
+            // Route through the engine's *real* resource path (Task 3):
+            // `virgl_renderer_resource_create_blob`, attached to this session's Venus context.
             //
-            // DEFERRED: the full protocol also returns an mmap'able fd over SCM_RIGHTS right after
-            // this header. A generic `Read + Write` stream cannot carry an fd, so the fd half is
-            // Task 4's Unix-socket concern (and ultimately Rayland's own memory-sharing protocol).
-            // A *live* Mesa client blocks on that fd; the in-band reply here is what the framing
-            // unit tests exercise.
-            let res_id =
+            // Task 4a completes the reply. The client is not merely being told an id — it is being
+            // handed **shared memory**, and it blocks in `recvmsg` until the descriptor for that
+            // memory arrives. The order below is virglrenderer's own and the client depends on it:
+            // in-band `[res_id]` first, then the fd on its own carrier message, then close our copy
+            // ("closing the file descriptor does not unmap the region").
+            let blob =
                 engine.create_blob_resource(VTEST_CONTEXT_ID, blob_type, flags, blob_id, size)?;
-            session.outcome.rendered_resource_id = Some(res_id);
-            write_reply(stream, VCMD_RESOURCE_CREATE_BLOB, &[res_id])
+            session.outcome.rendered_resource_id = Some(blob.resource_id);
+
+            // The engine must have produced a descriptor; without one the client would hang
+            // forever, so refuse loudly rather than write a reply we cannot complete.
+            // `VirglEngine` always supplies one — this guards a *different* engine impl's mistake
+            // (see `EngineError::BlobFdMissing`).
+            let Some(fd) = blob.fd else {
+                return Err(EngineError::BlobFdMissing {
+                    resource_id: blob.resource_id,
+                });
+            };
+
+            // (4) the in-band reply.
+            write_reply(stream, VCMD_RESOURCE_CREATE_BLOB, &[blob.resource_id])?;
+            // (5) the descriptor. Borrowed: the kernel duplicates it into the client.
+            stream.send_fd(fd.as_fd())?;
+            // (6) drop our copy. The resource — and, for a GUEST blob, the engine's mapping of the
+            // same pages — lives on until `VCMD_RESOURCE_UNREF`; only this descriptor goes away.
+            drop(fd);
+            Ok(())
         }
         VtestCommand::ResourceUnref { res_handle } => {
             // Release the resource for real (Task 3): a no-op on the engine side if `res_handle`
@@ -841,20 +1016,39 @@ fn dispatch<S: Read + Write>(
             Ok(())
         }
         VtestCommand::SyncWait { waits, .. } => {
-            // Signal semantics are stubbed: we treat every waited-on sync as already at its target
-            // (we advance our stored value to the requested one) and reply with the empty header.
-            //
-            // DEFERRED: the real reply is a *pollable fd* over SCM_RIGHTS that becomes readable when
-            // the syncs signal — same generic-stream limitation as blob creation, deferred to Task
-            // 4 / real fence handling. We emit only the in-band header here.
+            // Signal semantics remain stubbed: we treat every waited-on sync as already at its
+            // target (advancing our stored value to the requested one).
             for (sync_id, value) in waits {
                 session.syncs.insert(sync_id, value);
             }
-            write_reply(stream, VCMD_SYNC_WAIT, &[])
+
+            // The reply is a *pollable* fd: the client polls it, and its becoming readable is the
+            // "your wait is satisfied" signal. virglrenderer sends an `eventfd`, pre-signaled via
+            // `write_ready` when every waited-on sync is already at its target (its `is_ready`
+            // branch) and signaled later from its event loop otherwise.
+            //
+            // We send a real, pre-signaled eventfd — not a fabricated descriptor. Because the sync
+            // objects above are a bookkeeping stub, every wait *is* by construction already
+            // satisfied, so `is_ready` is unconditionally true here and taking that branch is the
+            // faithful thing to do. The honest limitation, recorded rather than hidden: a wait that
+            // should genuinely block does not, because this server has no real timeline to block
+            // on. Modelling real timelines (and signaling the eventfd from GPU fence retirement
+            // instead) is future work — see the module docs.
+            let fd = crate::transport::create_eventfd(true)?;
+            // In-band header first (payload is empty: `resp_buf[VTEST_CMD_LEN] = 0`), then the fd —
+            // the same order as the blob reply, and the order the client reads in.
+            write_reply(stream, VCMD_SYNC_WAIT, &[])?;
+            stream.send_fd(fd.as_fd())?;
+            // The client now holds its own duplicate; ours has no further use (the C server closes
+            // it here too, via `vtest_free_sync_wait` on the already-ready path).
+            drop(fd);
+            Ok(())
         }
         VtestCommand::SubmitCmd2 { batches } => {
-            // The load-bearing path: replay each batch's Venus command dwords on the GPU. No reply
-            // is defined for a plain submit (fence-fd replies are the deferred fd path).
+            // The load-bearing path: replay each batch's Venus command dwords on the GPU. A submit
+            // has no reply at all — not an empty one — which a live capture confirms. (The C server
+            // does send a descriptor for a batch that sets `VCMD_SUBMIT_CMD2_FLAG_OUT_FENCE_FD`,
+            // but `decode_submit_cmd2` refuses such a batch outright rather than half-answer it.)
             for batch in batches {
                 // Reinterpret the command dwords as the byte buffer `submit` expects. The length is
                 // a whole number of dwords by construction, so it satisfies `submit`'s alignment
@@ -886,10 +1080,81 @@ fn dwords_to_bytes(dwords: &[u32]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Only `MockEngine::read_back`'s signature needs this (Task 3); no production code in this
-    // module constructs or names an `EngineFrame`.
-    use crate::EngineFrame;
+    // `MockEngine`'s signatures need these (Tasks 3 and 4a); no production code in this module
+    // constructs or names either type.
+    use crate::{BlobResource, EngineFrame};
     use std::io::Cursor;
+    // The test transport records the descriptors `serve_vtest` sends, and `MockEngine` hands out
+    // real memfds so those recordings are of real, checkable descriptors.
+    use crate::transport::create_memfd;
+    use std::os::fd::{AsRawFd, OwnedFd};
+
+    /// A [`VtestTransport`] test double: canned request bytes in, replies and **sent descriptors**
+    /// recorded out, with no socket, no client and no GPU.
+    ///
+    /// # Why it records fds rather than ignoring them
+    /// The Task 4a bug was precisely "the server wrote a reply and then did not send a descriptor",
+    /// which no in-band assertion can detect — the reply bytes are identical either way. A test
+    /// double that silently accepted `send_fd` would keep every test here green while a live client
+    /// hung. So `send_fd` duplicates what it is given into `sent_fds`, and the tests assert on
+    /// **how many** descriptors were sent, **when** relative to the reply bytes, and — via
+    /// `MockEngine`'s real memfds — that they name what they should.
+    struct RecordingTransport {
+        /// The request bytes `serve_vtest` reads.
+        input: Cursor<Vec<u8>>,
+        /// Every in-band byte `serve_vtest` wrote, in order.
+        output: Vec<u8>,
+        /// Every descriptor `send_fd` was called with, in order. Duplicated (not borrowed), so
+        /// they stay valid and inspectable after the session ends and the originals are dropped —
+        /// exactly as the kernel duplicates them into a real client.
+        sent_fds: Vec<OwnedFd>,
+        /// `output.len()` at the moment of each `send_fd`, so a test can prove the in-band reply
+        /// was written **before** the descriptor. Order is part of the wire contract: a client that
+        /// receives them the other way round mis-frames the protocol.
+        fd_send_offsets: Vec<usize>,
+    }
+
+    impl RecordingTransport {
+        /// A transport that will feed `input` to the server and record everything it sends back.
+        fn new(input: Vec<u8>) -> Self {
+            RecordingTransport {
+                input: Cursor::new(input),
+                output: Vec::new(),
+                sent_fds: Vec::new(),
+                fd_send_offsets: Vec::new(),
+            }
+        }
+    }
+
+    impl Read for RecordingTransport {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.input.read(buf)
+        }
+    }
+
+    impl Write for RecordingTransport {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.output.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.output.flush()
+        }
+    }
+
+    impl VtestTransport for RecordingTransport {
+        /// Record the descriptor (duplicated, so it outlives the caller's copy) and where in the
+        /// output stream it was sent. `try_clone` is `dup(2)`: the same thing a real `SCM_RIGHTS`
+        /// send does to the receiving process, which makes this double faithful rather than merely
+        /// convenient.
+        fn send_fd(&mut self, fd: std::os::fd::BorrowedFd<'_>) -> Result<(), EngineError> {
+            self.fd_send_offsets.push(self.output.len());
+            self.sent_fds.push(
+                fd.try_clone_to_owned()
+                    .map_err(|source| EngineError::FdSendFailed { source })?,
+            );
+            Ok(())
+        }
+    }
 
     /// Build a raw vtest message (header + dword payload) as little-endian bytes, for feeding the
     /// parser synthetic ground-truth exactly as the wire carries it.
@@ -916,6 +1181,24 @@ mod tests {
         /// real GPU.
         resources: Vec<(u32, u32)>,
         next_resource_id: u32,
+        /// The `blob_mem` value of each `create_blob_resource` call, in order — so a test can prove
+        /// the client's requested memory *kind* reaches the engine unchanged rather than being
+        /// silently normalized somewhere in dispatch.
+        blob_mems: Vec<u32>,
+    }
+
+    impl MockEngine {
+        /// A fresh mock with the given canned capset and nothing recorded yet.
+        fn new(capset: Vec<u8>) -> Self {
+            MockEngine {
+                contexts: Vec::new(),
+                submits: Vec::new(),
+                capset,
+                resources: Vec::new(),
+                next_resource_id: 1,
+                blob_mems: Vec::new(),
+            }
+        }
     }
 
     impl RenderEngine for MockEngine {
@@ -942,18 +1225,31 @@ mod tests {
             self.resources.push((id, ctx_id));
             Ok(id)
         }
+        /// Hands back a **real** memfd, not a placeholder. `VirglEngine`'s two blob paths both
+        /// produce a genuine, mappable descriptor, and the whole point of the dispatch tests is
+        /// that such a descriptor reaches the client — so a mock that returned `None`, or a
+        /// borrowed stand-in like `/dev/null`, would test a code path that cannot exist in
+        /// production. The memfd is sized and content-tagged with the resource id so a test can
+        /// prove the descriptor the transport recorded is the one this call created.
         fn create_blob_resource(
             &mut self,
             ctx_id: u32,
-            _blob_mem: u32,
+            blob_mem: u32,
             _blob_flags: u32,
             _blob_id: u64,
-            _size: u64,
-        ) -> Result<u32, EngineError> {
+            size: u64,
+        ) -> Result<BlobResource, EngineError> {
             let id = self.next_resource_id;
             self.next_resource_id += 1;
             self.resources.push((id, ctx_id));
-            Ok(id)
+            self.blob_mems.push(blob_mem);
+            // A real anonymous shared-memory object of the requested size, standing in for what
+            // virglrenderer would allocate or export.
+            let fd = create_memfd(size)?;
+            Ok(BlobResource {
+                resource_id: id,
+                fd: Some(fd),
+            })
         }
         fn unref_resource(&mut self, resource_id: u32) {
             self.resources.retain(|&(id, _)| id != resource_id);
@@ -1092,6 +1388,94 @@ mod tests {
         assert_eq!(batches[0].syncs, vec![(7, 0x5_0000_0001)]);
     }
 
+    /// The real bytes a live Mesa Venus client sends, replayed through the decoder verbatim.
+    ///
+    /// # Why this test exists in this exact form
+    /// Task 2 derived the `SUBMIT_CMD2` layout from virglrenderer's C macros and never saw a real
+    /// message — its own review flagged that as "do not trust `engine.submit` until real bytes
+    /// confirm it", because the client blocks on the blob fd long before it ever submits. Task 4a
+    /// unblocked it and captured this payload from a live client (Mesa 26.0.3, Venus over vtest,
+    /// `RAYLAND_VTEST_DUMP=1`). Every dword below is transcribed from that capture, not constructed
+    /// from the layout the decoder assumes — so agreement here is evidence about reality, not a
+    /// tautology. It confirms the source-derived layout was **correct**, including the 8-dword
+    /// per-batch stride.
+    #[test]
+    fn submit_cmd2_decodes_bytes_captured_from_a_live_venus_client() {
+        // Verbatim from the capture: a 44-dword payload, one batch, 35 command dwords at offset 9.
+        //   [   0] 00000001 00000001 00000009 00000023 0000002c 00000000 00000000 00000000
+        //   [   8] 00000000 000000bc 00000000 41faf130 00005793 00000001 00000000 3ba0a600
+        //   [  16] 00000001 00000000 3ba0a606 00000000 00000000 002dc6c0 00000000 00000001
+        //   [  24] 00000000 00000000 000200c4 00000000 000f4240 00000000 00000000 00000000
+        //   [  32] 00000040 00000000 00000080 00000000 000000c0 00000000 00020000 00000000
+        //   [  40] 000200c0 00000000 00000004 00000000
+        let captured: [u32; 44] = [
+            0x00000001, 0x00000001, 0x00000009, 0x00000023, 0x0000002c, 0x00000000, 0x00000000,
+            0x00000000, 0x00000000, 0x000000bc, 0x00000000, 0x41faf130, 0x00005793, 0x00000001,
+            0x00000000, 0x3ba0a600, 0x00000001, 0x00000000, 0x3ba0a606, 0x00000000, 0x00000000,
+            0x002dc6c0, 0x00000000, 0x00000001, 0x00000000, 0x00000000, 0x000200c4, 0x00000000,
+            0x000f4240, 0x00000000, 0x00000000, 0x00000000, 0x00000040, 0x00000000, 0x00000080,
+            0x00000000, 0x000000c0, 0x00000000, 0x00020000, 0x00000000, 0x000200c0, 0x00000000,
+            0x00000004, 0x00000000,
+        ];
+
+        let cmd = read_command(&mut Cursor::new(msg(VCMD_SUBMIT_CMD2, &captured)))
+            .expect("real client bytes must decode")
+            .expect("a command");
+        let VtestCommand::SubmitCmd2 { batches } = cmd else {
+            panic!("expected SubmitCmd2, got {cmd:?}");
+        };
+
+        // One batch, exactly as `[0] = 0x00000001` says.
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        // flags = 0x1 = RING_IDX only: the client sets no fence-fd flags (see `decode_submit_cmd2`).
+        assert_eq!(batch.flags, VCMD_SUBMIT_CMD2_FLAG_RING_IDX);
+        // ring_idx = 0. This is the finding the fence path depends on: `read_back` hardcodes ring 0,
+        // and a live client using a nonzero ring would make that silently wrong. It does not.
+        assert_eq!(batch.ring_idx, 0);
+        // sync_count = 0: this batch signals no timeline syncs.
+        assert!(batch.syncs.is_empty());
+        // cmd_offset = 9 and cmd_size = 0x23 = 35. Offset 9 is `1 + 8*1` — the 8-dword-per-batch
+        // stride, confirmed against real bytes rather than assumed from the C macros.
+        assert_eq!(batch.cmd.len(), 35);
+        // 9 + 35 = 44 = the whole payload: the command stream runs to the end, so a stride of
+        // anything other than 8 would have produced a different (and out-of-range) slice.
+        assert_eq!(batch.cmd, captured[9..44]);
+        // The first command dword the GPU actually replayed, spot-checked against the hex dump.
+        assert_eq!(batch.cmd[0], 0x000000bc);
+    }
+
+    /// A batch asking for syncobj passing must be **rejected**, not ignored. virglrenderer's server
+    /// reads extra bytes off the socket for a nonzero syncobj count, so a decoder that skipped the
+    /// field would leave those bytes in the stream and mis-frame every message after it — a
+    /// corruption that surfaces nowhere near its cause. (No Venus client sends this today; the test
+    /// pins the behaviour for the one that eventually does.)
+    #[test]
+    fn submit_cmd2_rejects_syncobj_passing_it_cannot_frame() {
+        // A well-formed batch except for num_in_syncobj = 1 (dword +6 of the batch header).
+        let payload = [1u32, 0x1, 9, 1, 10, 0, 0, 1, 0, 0xAAAA];
+        let err = read_command(&mut Cursor::new(msg(VCMD_SUBMIT_CMD2, &payload))).unwrap_err();
+        assert!(
+            matches!(err, EngineError::VtestProtocol { .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// A batch setting a fence-fd flag must likewise be rejected: those flags make the C server
+    /// receive or send a descriptor out of band, which this server does not do — and a client left
+    /// waiting on an out-fence descriptor that never arrives is exactly the hang Task 4a exists to
+    /// eliminate, not one to reintroduce.
+    #[test]
+    fn submit_cmd2_rejects_fence_fd_flags_it_does_not_implement() {
+        // flags = 0x4 = VCMD_SUBMIT_CMD2_FLAG_OUT_FENCE_FD, which we do not implement.
+        let payload = [1u32, 0x4, 9, 1, 10, 0, 0, 0, 0, 0xAAAA];
+        let err = read_command(&mut Cursor::new(msg(VCMD_SUBMIT_CMD2, &payload))).unwrap_err();
+        assert!(
+            matches!(err, EngineError::VtestProtocol { .. }),
+            "got {err:?}"
+        );
+    }
+
     #[test]
     fn submit_cmd2_rejects_out_of_range_cmd_offset() {
         // cmd_offset+cmd_size (9+100) runs off the end of the payload → must be a protocol error,
@@ -1179,37 +1563,8 @@ mod tests {
             &[1, 0x1, 9, 2, 0, 0, 0, 0, 0, 0xCAFE, 0xF00D],
         ));
 
-        // `Cursor` is Read; a `Vec` is Write; a duplex pair lets serve_vtest read requests and
-        // write replies. We combine them into one Read+Write object.
-        struct Duplex {
-            input: Cursor<Vec<u8>>,
-            output: Vec<u8>,
-        }
-        impl Read for Duplex {
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                self.input.read(buf)
-            }
-        }
-        impl Write for Duplex {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.output.write(buf)
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                self.output.flush()
-            }
-        }
-
-        let mut engine = MockEngine {
-            contexts: Vec::new(),
-            submits: Vec::new(),
-            capset: capset.clone(),
-            resources: Vec::new(),
-            next_resource_id: 1,
-        };
-        let mut duplex = Duplex {
-            input: Cursor::new(input),
-            output: Vec::new(),
-        };
+        let mut engine = MockEngine::new(capset.clone());
+        let mut duplex = RecordingTransport::new(input);
         let outcome = serve_vtest(&mut duplex, &mut engine).expect("session completes cleanly");
 
         // The engine saw exactly the routed Venus work.
@@ -1223,6 +1578,14 @@ mod tests {
         );
         assert_eq!(outcome.context_id, Some(VTEST_CONTEXT_ID));
         assert_eq!(outcome.submitted_batches, 1);
+
+        // This session creates no blob and performs no sync-wait, so no descriptor should have been
+        // sent. Asserted because `send_fd` on the wrong command would inject a stray carrier byte
+        // into the client's byte stream and mis-frame everything after it.
+        assert!(
+            duplex.sent_fds.is_empty(),
+            "a handshake+submit session must send no file descriptors"
+        );
 
         // The replies begin with ping-echo, busy-wait, protocol-version, get-param, get-capset.
         // Decode them back to confirm the handshake responses are well-formed.
@@ -1241,48 +1604,26 @@ mod tests {
         assert_eq!(caps.1, vec![1, 0, 0, 0, 0]);
     }
 
-    /// Task 3, Step 2: `VCMD_RESOURCE_CREATE_BLOB` and `VCMD_RESOURCE_UNREF` must route through
-    /// the engine's real resource path — not vtest-local bookkeeping — and `VtestOutcome` must
-    /// carry the engine-assigned id back out. Proven here against `MockEngine` (no GPU needed):
-    /// the resource shows up in the engine's own tracking after creation and is gone from it after
-    /// unref, so the wiring is real, not merely an in-band reply with nothing behind it.
+    /// `VCMD_RESOURCE_CREATE_BLOB` and `VCMD_RESOURCE_UNREF` must route through the engine's real
+    /// resource path — not vtest-local bookkeeping — `VtestOutcome` must carry the engine-assigned
+    /// id back out (Task 3), **and the reply must deliver the client's descriptor** (Task 4a).
+    ///
+    /// The last part is the one that matters most: everything up to it was already green while a
+    /// live client hung forever, because an in-band reply looks identical whether or not a
+    /// descriptor follows it. So this asserts the descriptor was sent, that it was sent *after* the
+    /// in-band reply, and that it is a real, `stat`able object of the size the client asked for.
     #[test]
-    fn resource_create_blob_and_unref_route_through_the_engine() {
+    fn resource_create_blob_replies_with_the_id_and_the_client_fd() {
         // Payload per the pinned wire layout: `[type][flags][size_lo][size_hi][id_lo][id_hi]`.
-        // type=2 (VIRGL_RENDERER_BLOB_MEM_HOST3D), flags=1 (USE_MAPPABLE), size=64, blob_id=0.
+        // type=2 (VIRGL_RENDERER_BLOB_MEM_HOST3D — what a live Mesa Venus client actually asks
+        // for), flags=1 (USE_MAPPABLE), size=4096, blob_id=0 (Venus's shmem blob id).
+        const BLOB_SIZE: u32 = 4096;
         let mut input = Vec::new();
-        input.extend_from_slice(&msg(VCMD_RESOURCE_CREATE_BLOB, &[2, 1, 64, 0, 0, 0]));
+        input.extend_from_slice(&msg(VCMD_RESOURCE_CREATE_BLOB, &[2, 1, BLOB_SIZE, 0, 0, 0]));
         input.extend_from_slice(&msg(VCMD_RESOURCE_UNREF, &[1]));
 
-        struct Duplex {
-            input: Cursor<Vec<u8>>,
-            output: Vec<u8>,
-        }
-        impl Read for Duplex {
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                self.input.read(buf)
-            }
-        }
-        impl Write for Duplex {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.output.write(buf)
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                self.output.flush()
-            }
-        }
-
-        let mut engine = MockEngine {
-            contexts: Vec::new(),
-            submits: Vec::new(),
-            capset: Vec::new(),
-            resources: Vec::new(),
-            next_resource_id: 1,
-        };
-        let mut duplex = Duplex {
-            input: Cursor::new(input),
-            output: Vec::new(),
-        };
+        let mut engine = MockEngine::new(Vec::new());
+        let mut duplex = RecordingTransport::new(input);
         let outcome = serve_vtest(&mut duplex, &mut engine).expect("session completes cleanly");
 
         // The engine-assigned id (not a vtest-local counter) flows into the outcome.
@@ -1291,16 +1632,106 @@ mod tests {
             Some(1),
             "VtestOutcome must carry the id the engine itself assigned"
         );
-        // The in-band reply is `[res_id]` under VCMD_RESOURCE_CREATE_BLOB (the fd half is
-        // deferred — see the module docs).
-        let mut rcur = Cursor::new(duplex.output);
+        // The client's requested memory *kind* reached the engine unchanged — the engine dispatches
+        // on it to decide where the shared pages come from, so a normalized value would silently
+        // pick the wrong allocation strategy.
+        assert_eq!(
+            engine.blob_mems,
+            vec![2],
+            "the client's blob_mem must reach the engine verbatim"
+        );
+
+        // The in-band reply is `[res_id]` under VCMD_RESOURCE_CREATE_BLOB.
+        let mut rcur = Cursor::new(duplex.output.clone());
         let reply = read_reply(&mut rcur);
         assert_eq!(reply, (VCMD_RESOURCE_CREATE_BLOB, vec![1]));
-        // The engine actually released it: proves RESOURCE_UNREF reached the engine, not just a
-        // vtest-side stub that would leave the engine's own tracking untouched.
+
+        // Exactly one descriptor was sent: the blob's. (Not zero — the bug this task fixes; and not
+        // two — a stray extra carrier byte would mis-frame the client's stream.)
+        assert_eq!(
+            duplex.sent_fds.len(),
+            1,
+            "the blob reply must deliver exactly one file descriptor"
+        );
+        // It was sent *after* all 12 bytes of the in-band reply (8-byte header + 1 dword), which is
+        // the order virglrenderer uses and Mesa's client reads in.
+        assert_eq!(
+            duplex.fd_send_offsets,
+            vec![12],
+            "the descriptor must follow the complete in-band reply, never precede or interleave it"
+        );
+
+        // And it is a real object of the size the client asked for — not a placeholder that
+        // happened to satisfy the type checker. A live client `mmap`s exactly this many bytes.
+        let sent = std::fs::File::from(duplex.sent_fds.pop().expect("the blob fd"));
+        assert_eq!(
+            sent.metadata().expect("stat the sent fd").len(),
+            BLOB_SIZE as u64,
+            "the descriptor sent to the client must name the memory it asked for"
+        );
+
+        // The engine actually released the resource: proves RESOURCE_UNREF reached the engine, not
+        // just a vtest-side stub that would leave the engine's own tracking untouched.
         assert!(
             engine.resources.is_empty(),
             "unref must reach the engine's real resource tracking"
+        );
+    }
+
+    /// `VCMD_SYNC_WAIT`'s reply must be an empty in-band header **followed by a pollable
+    /// descriptor** — the client polls that descriptor and treats its readability as "your wait is
+    /// satisfied". Task 3 sent only the header, which leaves a live client waiting on a descriptor
+    /// that never arrives.
+    ///
+    /// This also pins the honest limitation stated in the module docs: because this server's sync
+    /// objects are a bookkeeping stub, every wait is already satisfied, so the eventfd is sent
+    /// pre-signaled (virglrenderer's own `is_ready` branch). The test asserts that pre-signaling,
+    /// so the day real timeline semantics arrive, this test is what notices.
+    #[test]
+    fn sync_wait_replies_with_a_header_and_a_ready_pollable_fd() {
+        // `[flags][timeout]` then one `(sync_id, value_lo, value_hi)` triple: wait for sync 1 to
+        // reach 5, with an infinite timeout.
+        let input = msg(VCMD_SYNC_WAIT, &[0, u32::MAX, 1, 5, 0]);
+
+        let mut engine = MockEngine::new(Vec::new());
+        let mut duplex = RecordingTransport::new(input);
+        serve_vtest(&mut duplex, &mut engine).expect("session completes cleanly");
+
+        // The in-band half: an empty payload under VCMD_SYNC_WAIT (`resp_buf[VTEST_CMD_LEN] = 0`).
+        let mut rcur = Cursor::new(duplex.output.clone());
+        assert_eq!(read_reply(&mut rcur), (VCMD_SYNC_WAIT, vec![]));
+
+        // The fd half, sent after the complete 8-byte header.
+        assert_eq!(
+            duplex.sent_fds.len(),
+            1,
+            "the sync-wait reply must deliver exactly one file descriptor"
+        );
+        assert_eq!(
+            duplex.fd_send_offsets,
+            vec![8],
+            "the descriptor must follow the complete in-band header"
+        );
+
+        // The descriptor must be *readable right now*: that readability is the entire signal. A
+        // descriptor that was created but never signaled would leave a live client blocked, which
+        // is indistinguishable from the bug this task fixes.
+        let fd = &duplex.sent_fds[0];
+        let mut buf = [0u8; 8];
+        // SAFETY: `fd` is the live eventfd the dispatcher sent; `buf` is the 8 bytes an eventfd
+        // read requires. It is EFD_NONBLOCK, so an unsignaled fd would return EAGAIN, not hang.
+        let n = unsafe {
+            libc::read(
+                fd.as_raw_fd(),
+                buf.as_mut_ptr() as *mut std::ffi::c_void,
+                buf.len(),
+            )
+        };
+        assert_eq!(
+            n,
+            8,
+            "the sync-wait eventfd must be pre-signaled (the stub treats every wait as satisfied): {}",
+            std::io::Error::last_os_error()
         );
     }
 

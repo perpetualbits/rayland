@@ -25,6 +25,10 @@
 
 // The raw FFI surface (constants, structs, C functions, callbacks).
 use crate::ffi;
+// The typed error every C return code maps into, and the errno→name helper its messages use.
+use crate::error::{EngineError, errno_name};
+// The POSIX primitives a blob resource's shared memory needs (`std` exposes none of them).
+use crate::transport::{ShmMapping, create_memfd};
 // The trait this engine implements.
 use crate::RenderEngine;
 // Raw C string / char for the context debug label.
@@ -39,315 +43,50 @@ use std::time::{Duration, Instant};
 
 // Path handling for the render node.
 use std::path::Path;
+// Owned descriptors: a blob resource's client-facing fd is owned by whoever holds the
+// `BlobResource`, and the type says so (Task 4a).
+use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 
 /// Process-global "an engine is initialized" flag. virglrenderer is a global singleton, so this
 /// serializes the whole init→use→cleanup lifecycle to one engine at a time. `false` = no engine.
 static ENGINE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// Errors from the render engine. Every fallible C call maps into exactly one variant here — a C
-/// error can never silently become success. Variants that wrap a C return code carry both the raw
-/// code and a human-readable errno name (see [`errno_name`]).
-#[derive(Debug, thiserror::Error)]
-pub enum EngineError {
-    /// Another `VirglEngine` is already initialized in this process. virglrenderer is a global
-    /// singleton; only one engine may be live at a time.
-    #[error("a virglrenderer engine is already active in this process (it is a global singleton)")]
-    AlreadyActive,
-
-    /// The DRM render node could not be opened (absent, or permission denied). This is the
-    /// expected "no usable GPU" condition on a CI runner and the reason tests skip rather than fail.
-    #[error("render node {path} could not be opened: {source}")]
-    RenderNodeUnavailable {
-        /// The render-node path we tried to open.
-        path: String,
-        /// The underlying OS error.
-        source: std::io::Error,
-    },
-
-    /// `virgl_renderer_init` returned a non-zero code. The renderer's EGL/Venus winsys failed to
-    /// come up (e.g. the render node does not support the required EGL/Vulkan features).
-    #[error("virgl_renderer_init failed for {path} (rc={rc}: {reason})")]
-    InitFailed {
-        /// The render-node path passed to the engine.
-        path: String,
-        /// The raw return code from `virgl_renderer_init`.
-        rc: c_int,
-        /// Human-readable errno name for `rc`.
-        reason: String,
-    },
-
-    /// `virgl_renderer_context_create_with_flags` returned a non-zero code for a Venus context.
-    /// The most common cause (`EINVAL`) is Venus being unavailable or the render server not
-    /// running — but with `RAYLAND_INIT_FLAGS` the render server is enabled, so a failure here is
-    /// a genuine capability problem, not the missing-flag artifact the spike diagnosed.
-    #[error(
-        "virgl_renderer_context_create_with_flags(ctx_id={ctx_id}, capset=venus) failed (rc={rc}: {reason})"
-    )]
-    ContextCreateFailed {
-        /// The context id we tried to create.
-        ctx_id: u32,
-        /// The raw return code.
-        rc: c_int,
-        /// Human-readable errno name for `rc`.
-        reason: String,
-    },
-
-    /// A command buffer's length is not a whole number of 4-byte words. virglrenderer measures
-    /// command buffers in `ndw` (number of dwords), so any byte length must be a multiple of 4.
-    #[error("command buffer length {len} bytes is not a multiple of 4")]
-    UnalignedCommand {
-        /// The offending byte length.
-        len: usize,
-    },
-
-    /// A command buffer is too long to express as `ndw` in the C API's `int` word count.
-    #[error("command buffer of {len} bytes is too large to submit")]
-    CommandTooLarge {
-        /// The offending byte length.
-        len: usize,
-    },
-
-    /// `virgl_renderer_submit_cmd` returned a non-zero code. The command stream was rejected
-    /// (e.g. malformed, or the context is gone).
-    #[error("virgl_renderer_submit_cmd(ctx_id={ctx_id}) failed (rc={rc}: {reason})")]
-    SubmitFailed {
-        /// The context id the command targeted.
-        ctx_id: u32,
-        /// The raw return code.
-        rc: c_int,
-        /// Human-readable errno name for `rc`.
-        reason: String,
-    },
-
-    /// A context id does not fit in the C API's `int`. `virgl_renderer_submit_cmd` takes `ctx_id`
-    /// as an `int`; ids come from the (untrusted) vtest client, so an id above `INT_MAX` would
-    /// wrap to a negative context under a bare `as c_int` cast. We reject it up front instead.
-    #[error("context id {ctx_id} does not fit in a C int and cannot be submitted to")]
-    SubmitCtxIdOutOfRange {
-        /// The offending context id.
-        ctx_id: u32,
-    },
-
-    /// The renderer reports no Venus capset, so the vtest handshake cannot answer `VCMD_GET_CAPSET`
-    /// with real capability data (typically: no GPU, or this build/host lacks Venus support).
-    #[error("no Venus capset available to answer the vtest handshake (Venus unsupported here)")]
-    NoVenusCapset,
-
-    /// The stream carrying the vtest protocol failed (peer closed mid-message, socket error, ...).
-    #[error("vtest stream I/O failed")]
-    VtestIo(#[from] std::io::Error),
-
-    /// A vtest length prefix exceeded [`crate::vtest::MAX_VTEST_PAYLOAD_BYTES`]; the message is
-    /// refused before any buffer is allocated (an untrusted peer must not force a huge allocation).
-    #[error("vtest message payload of {len} bytes exceeds the maximum allowed")]
-    VtestFrameTooLarge {
-        /// The offending declared payload length in bytes.
-        len: u64,
-    },
-
-    /// A vtest message was malformed or an opcode arrived that this server does not implement.
-    /// Carries a human-readable description; the server never silently drops an unhandled message.
-    #[error("vtest protocol error: {detail}")]
-    VtestProtocol {
-        /// What was wrong (bad length, unknown/unsupported opcode, out-of-range offset, ...).
-        detail: String,
-    },
-
-    // ---------------------------------------------------------------------------------------
-    // Task 3: resource creation + fence-waited readback.
-    // ---------------------------------------------------------------------------------------
-    /// A context id supplied to a resource-creation call does not fit in the C API's `int`
-    /// (`ctx_attach_resource` takes `ctx_id` as `c_int`). Ids ultimately come from the untrusted
-    /// vtest client, so — exactly like `SubmitCtxIdOutOfRange` — we reject rather than wrap.
-    #[error("context id {ctx_id} does not fit in a C int and cannot own a resource")]
-    ResourceCtxIdOutOfRange {
-        /// The offending context id.
-        ctx_id: u32,
-    },
-
-    /// `create_resource`/`create_blob_resource` were asked to attach a resource to a `ctx_id`
-    /// this engine never created (or already destroyed). Only a context this engine created and
-    /// tracks in `self.contexts` is a safe `ctx_attach_resource` target — an untracked id might
-    /// name nothing, or might collide with something virglrenderer interprets differently. This
-    /// makes "`ctx_id` names a live context" (the invariant `wait_for_context_fence`'s doc comment
-    /// already assumes) an enforced check rather than caller discipline.
-    #[error("context id {ctx_id} is not tracked by this engine (no such Venus context)")]
-    UnknownContext {
-        /// The offending context id.
-        ctx_id: u32,
-    },
-
-    /// An engine-assigned resource id does not fit in the C API's `int` (several resource calls
-    /// take `res_handle` as `c_int`). `next_resource_id` is a `u32` counter starting at 1; this is
-    /// unreachable in any real session (it would require ~2^31 resources in one process lifetime)
-    /// but is guarded rather than assumed, per this crate's no-silent-wrap discipline.
-    #[error("resource id {resource_id} does not fit in a C int")]
-    ResourceIdOverflow {
-        /// The offending resource id.
-        resource_id: u32,
-    },
-
-    /// `virgl_renderer_resource_create` returned a non-zero code for a classic 2D resource.
-    #[error(
-        "virgl_renderer_resource_create(ctx_id={ctx_id}, resource_id={resource_id}) failed (rc={rc}: {reason})"
-    )]
-    ResourceCreateFailed {
-        /// The context the resource was being created for.
-        ctx_id: u32,
-        /// The engine-assigned id that was about to be attached to it.
-        resource_id: u32,
-        /// The raw return code.
-        rc: c_int,
-        /// Human-readable errno name for `rc`.
-        reason: String,
-    },
-
-    /// `virgl_renderer_resource_create_blob` returned a non-zero code for a blob resource (the
-    /// resource type Venus's real wire protocol, `VCMD_RESOURCE_CREATE_BLOB`, allocates).
-    #[error(
-        "virgl_renderer_resource_create_blob(ctx_id={ctx_id}, resource_id={resource_id}) failed (rc={rc}: {reason})"
-    )]
-    BlobResourceCreateFailed {
-        /// The context the blob resource was being created for.
-        ctx_id: u32,
-        /// The engine-assigned id that was about to be attached to it.
-        resource_id: u32,
-        /// The raw return code.
-        rc: c_int,
-        /// Human-readable errno name for `rc`.
-        reason: String,
-    },
-
-    /// `virgl_renderer_context_create_fence` returned a non-zero code — the fence-wait
-    /// `read_back` performs before every readback could not even be created.
-    #[error(
-        "virgl_renderer_context_create_fence(ctx_id={ctx_id}, ring_idx={ring_idx}) failed (rc={rc}: {reason})"
-    )]
-    FenceCreateFailed {
-        /// The context the fence targeted.
-        ctx_id: u32,
-        /// The ring index the fence targeted.
-        ring_idx: u32,
-        /// The raw return code.
-        rc: c_int,
-        /// Human-readable errno name for `rc`.
-        reason: String,
-    },
-
-    /// A fence created by `read_back`'s wait loop never retired within `FENCE_WAIT_TIMEOUT`.
-    /// Either the render server wedged, or
-    /// (more likely in Task 3/4's early integration) the context never actually had the submitted
-    /// work retire because nothing was ever submitted to it. Distinguishing those is future work;
-    /// today this is a clear, typed "readback did not complete in time" rather than a silent hang.
-    #[error(
-        "fence wait timed out: ctx_id={ctx_id} ring_idx={ring_idx} fence_id={fence_id} never retired"
-    )]
-    FenceTimeout {
-        /// The context the fence targeted.
-        ctx_id: u32,
-        /// The ring index the fence targeted.
-        ring_idx: u32,
-        /// The fence id that never retired.
-        fence_id: u64,
-    },
-
-    /// `read_back` (or `unref_resource`) was asked about a resource id this engine never created
-    /// (or already unref'd). The engine only knows how to fence-wait/read back resources it
-    /// created itself, since only it knows which context they were attached to.
-    #[error("resource id {resource_id} is not tracked by this engine")]
-    UnknownResource {
-        /// The offending resource id.
-        resource_id: u32,
-    },
-
-    /// `virgl_renderer_resource_get_info` returned a non-zero code when `create_resource` queried
-    /// it immediately after creation (the *only* time this engine ever calls it — see
-    /// `TrackedResource`'s doc comment for why calling it again later, e.g. from `read_back`, is
-    /// actively dangerous, not just redundant).
-    #[error(
-        "virgl_renderer_resource_get_info(resource_id={resource_id}) failed (rc={rc}: {reason})"
-    )]
-    ResourceInfoFailed {
-        /// The resource that was queried.
-        resource_id: u32,
-        /// The raw return code.
-        rc: c_int,
-        /// Human-readable errno name for `rc`.
-        reason: String,
-    },
-
-    /// `create_resource`'s immediate post-creation `resource_get_info` succeeded but reported a
-    /// zero width, height, or stride — not a valid 2D image to ever read back.
-    #[error(
-        "resource {resource_id} has no valid image info (width={width} height={height} stride={stride})"
-    )]
-    InvalidResourceInfo {
-        /// The resource that was queried.
-        resource_id: u32,
-        /// The reported width (0 here is the problem).
-        width: u32,
-        /// The reported height (0 here is the problem).
-        height: u32,
-        /// The reported row stride (0 here is the problem).
-        stride: u32,
-    },
-
-    /// `create_resource`'s immediate post-creation `resource_get_info` succeeded, reported
-    /// nonzero width/height/stride, but the stride is narrower than a single tightly-packed row
-    /// (`width * bytes_per_pixel`) for a format `read_back`/`repack_tight` know how to unpad.
-    /// Refused here — while the resource can still be cleanly detached+unref'd — rather than
-    /// letting `read_back` discover it later via an out-of-bounds slice panic in `repack_tight`.
-    #[error(
-        "resource {resource_id} has an implausible stride (width={width} stride={stride} bytes_per_pixel={bytes_per_pixel}: stride is narrower than one packed row)"
-    )]
-    InvalidResourceStride {
-        /// The resource that was queried.
-        resource_id: u32,
-        /// The reported width.
-        width: u32,
-        /// The reported row stride (too small for `width` here is the problem).
-        stride: u32,
-        /// The format's bytes-per-pixel, from `bytes_per_pixel`.
-        bytes_per_pixel: u32,
-    },
-
-    /// `read_back` was asked to read a resource with no cached image layout — i.e. one created via
-    /// `create_blob_resource`, not `create_resource`. Blob resources have no format/dimension
-    /// concept (`virgl_renderer_resource_get_info` fails on one, confirmed empirically), so there
-    /// is nothing cached to read back with; see `RenderEngine::read_back`'s doc comment for what a
-    /// real blob readback would need (Task 4's concern).
-    #[error(
-        "resource {resource_id} has no cached image layout (it is a blob resource, not a classic one — read_back only supports resources created via create_resource)"
-    )]
-    ResourceNotReadable {
-        /// The resource that was asked for.
-        resource_id: u32,
-    },
-
-    /// The resource's `virgl_format` is not one of the small set of 32-bit-per-pixel formats
-    /// `read_back` knows how to repack into a tightly-packed `EngineFrame` (see
-    /// `bytes_per_pixel`). Refused rather than guessed — inventing a byte width for an unknown
-    /// format would silently corrupt every pixel.
-    #[error("resource {resource_id} has unsupported virgl_format {format} for readback")]
-    UnsupportedReadbackFormat {
-        /// The resource that was queried.
-        resource_id: u32,
-        /// The unrecognized `VIRGL_FORMAT_*` code.
-        format: u32,
-    },
-
-    /// `virgl_renderer_transfer_read_iov` returned a non-zero code.
-    #[error(
-        "virgl_renderer_transfer_read_iov(resource_id={resource_id}) failed (rc={rc}: {reason})"
-    )]
-    TransferReadFailed {
-        /// The resource that was being read.
-        resource_id: u32,
-        /// The raw return code.
-        rc: c_int,
-        /// Human-readable errno name for `rc`.
-        reason: String,
-    },
+/// A blob resource that was just created, and the file descriptor the vtest client must receive
+/// for it — the result of [`RenderEngine::create_blob_resource`].
+///
+/// # Why the fd is part of the result (Task 4a)
+/// Tasks 2/3 returned a bare `u32` resource id, which was not merely incomplete but *unusable*: a
+/// blob is shared memory, and the client cannot use memory it has no descriptor for. It blocks in
+/// `recvmsg` until the descriptor arrives. This type is what lets the engine express "here is the
+/// resource, and here is the descriptor that makes it real to the client".
+///
+/// # Ownership contract (read this before touching the fd)
+/// The `fd` is **owned by the receiver of this struct** and is closed when it drops. The intended
+/// lifecycle, which mirrors virglrenderer's own vtest server exactly, is:
+/// 1. write the in-band `[len=1][VCMD_RESOURCE_CREATE_BLOB][res_id]` reply,
+/// 2. `send_fd(fd.as_fd())` — the kernel *duplicates* the descriptor into the client, so this
+///    borrows rather than consumes it,
+/// 3. drop it (the C server's `close(fd)` at the same point).
+///
+/// Dropping the fd does **not** release the resource, and does not unmap anything: for a
+/// `GUEST`-family blob the pages stay alive because the *engine* holds a mapping of them for the
+/// resource's lifetime (see `VirglEngine::create_blob_resource`), and for a `HOST3D` blob the
+/// memory belongs to the 3D driver. The resource itself is released only by
+/// [`RenderEngine::unref_resource`] (or `Drop` of the engine). "Closing the file descriptor does
+/// not unmap the region", as virglrenderer's own comment at this exact step puts it.
+#[derive(Debug)]
+pub struct BlobResource {
+    /// The engine-assigned resource id, which the in-band reply reports to the client.
+    pub resource_id: u32,
+    /// The descriptor the client must receive over `SCM_RIGHTS` in order to `mmap` this blob's
+    /// memory.
+    ///
+    /// `None` means "this blob has no client-visible descriptor". [`VirglEngine`] never produces
+    /// that — both blob paths it serves always yield one — but the type admits it so that an engine
+    /// implementation which genuinely cannot supply an fd is *forced* to say so, and the vtest
+    /// layer can turn it into a typed [`EngineError::BlobFdMissing`] instead of leaving a live
+    /// client hanging on a descriptor that is never coming.
+    pub fd: Option<OwnedFd>,
 }
 
 /// A CPU-side copy of a rendered resource's pixels, produced by [`RenderEngine::read_back`].
@@ -372,31 +111,15 @@ pub struct EngineFrame {
     pub format: u32,
 }
 
-/// Maps a C return code (an errno, possibly returned as a positive value) to a short readable
-/// name, so `EngineError` messages say `EINVAL` rather than a bare `22`. Falls back to the numeric
-/// code for anything `std` does not recognize.
-///
-/// # Inputs / outputs
-/// - `rc`: the raw return code from a `virgl_renderer_*` call (treated by absolute value, since
-///   these functions variously return positive or negative errnos).
-/// - Returns an owned `String` like `"EINVAL"` or `"os error 22"`.
-fn errno_name(rc: c_int) -> String {
-    // Normalize sign: virglrenderer returns errnos both as +22 (context create) and, elsewhere,
-    // as negatives; `std::io::Error` wants the positive errno.
-    let errno = rc.unsigned_abs() as i32;
-    // `from_raw_os_error(0)` is not a real error, so guard it to avoid a misleading "success".
-    if errno == 0 {
-        return "unknown error (rc=0)".to_string();
-    }
-    // Let std translate the errno to its platform description (e.g. "Invalid argument (os error 22)").
-    std::io::Error::from_raw_os_error(errno).to_string()
-}
-
 /// How long [`VirglEngine`]'s fence-wait poll loop (used by `read_back`) waits for a fence to
 /// retire before giving up. Generous for varied/loaded hardware while still bounding a hang if
-/// the render server wedges. Chosen conservatively, not measured against real Venus render
-/// workloads — no live Venus client exists yet (that is Task 4); revisit if Task 4 finds it too
-/// tight for real GPU work.
+/// the render server wedges.
+///
+/// Chosen conservatively rather than measured. Task 4a drove a live Venus client through this
+/// engine for the first time, but that client only initializes Vulkan — it never renders, so it
+/// never exercised a fence wait against real GPU work and this value remains unvalidated for a
+/// real render. Task 4b, which reads back an actual rendered frame, is the first task in a
+/// position to find out whether 5s is too tight.
 const FENCE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long the fence-wait poll loop sleeps between calls to `virgl_renderer_context_poll`.
@@ -454,6 +177,24 @@ struct TrackedResource {
     /// empirically, `resource_get_info` fails on one — so its entry is `None`; `read_back` refuses
     /// such a resource with `EngineError::ResourceNotReadable` rather than trying.
     image: Option<CachedImageInfo>,
+    /// For a `GUEST`-family blob resource: the engine's own `mmap` of the shared memory it handed
+    /// virglrenderer as an iovec (`None` for every other resource kind — a classic resource is
+    /// backed by GPU-side storage, and a `HOST3D` blob's memory belongs to the 3D driver).
+    ///
+    /// **This field is a lifetime, not data** (Task 4a). virglrenderer holds a raw iovec pointing
+    /// into this mapping for as long as the resource exists, so the mapping must outlive the
+    /// resource — otherwise an untrusted client's command stream drives virglrenderer into reading
+    /// freed address space. Storing it here, and unrefing the resource *before* this
+    /// `TrackedResource` drops (see `unref_resource` and `Drop`), makes that ordering structural:
+    /// there is no way to drop the mapping early without also removing the resource from tracking.
+    /// The *fd* has no such constraint and is long gone by this point — it was sent to the client
+    /// and closed at creation time.
+    ///
+    /// Never read, and that is correct: the field exists to be *dropped* at the right moment, not
+    /// to be consulted. `dead_code` would otherwise fire on exactly the property that makes it
+    /// load-bearing.
+    #[allow(dead_code)]
+    mapping: Option<ShmMapping>,
 }
 
 /// The Venus render engine: an initialized `libvirglrenderer` bound to one DRM render node.
@@ -731,8 +472,10 @@ impl RenderEngine for VirglEngine {
     /// This is the resource kind `read_back` can actually read pixels out of (see that method's
     /// doc comment for why blob resources, `create_blob_resource`'s kind, cannot be read back the
     /// same way). `bind` is fixed to render-target + sampler-view, which covers both "the GPU
-    /// draws into this" and "a shader samples from this" — the two ways Task 4's live drive might
-    /// plausibly use a readback target.
+    /// draws into this" and "a shader samples from this" — the two plausible ways a readback target
+    /// gets used. Note that a live Venus client never asks for a resource of this kind (Task 4a
+    /// observed it creating only *blob* resources); this path exists for a readback target Rayland
+    /// itself creates, which is Task 4b's design problem.
     ///
     /// # Why this queries `resource_get_info` immediately (not later, in `read_back`)
     /// See [`TrackedResource`]'s doc comment for the full story: calling
@@ -801,7 +544,7 @@ impl RenderEngine for VirglEngine {
         self.next_resource_id = self.next_resource_id.saturating_add(1);
 
         // `VIRGL_RES_BIND_RENDER_TARGET (1<<1) | VIRGL_RES_BIND_SAMPLER_VIEW (1<<3)`: this
-        // resource can be drawn into and sampled from, covering both plausible Task 4 uses.
+        // resource can be drawn into and sampled from, covering both plausible readback uses.
         const PIPE_TEXTURE_2D: u32 = 2; // gallium's `pipe_texture_target` enum, stable ABI value.
         const VIRGL_RES_BIND_RENDER_TARGET: u32 = 1 << 1;
         const VIRGL_RES_BIND_SAMPLER_VIEW: u32 = 1 << 3;
@@ -906,39 +649,80 @@ impl RenderEngine for VirglEngine {
                     stride: info.stride,
                     format: info.virgl_format,
                 }),
+                // A classic resource is backed by the GPU's own texture storage, not by host
+                // pages we supplied — there is no mapping to keep alive (see
+                // `TrackedResource::mapping`).
+                mapping: None,
             },
         );
         Ok(resource_id)
     }
 
-    /// Creates a *blob* resource — opaque host/guest-shareable memory, the resource type Venus's
-    /// real wire protocol (`VCMD_RESOURCE_CREATE_BLOB`) allocates for device memory — attaches it
-    /// to `ctx_id`, and tracks it.
+    /// Creates a *blob* resource — the shared memory Venus's real wire protocol
+    /// (`VCMD_RESOURCE_CREATE_BLOB`) allocates for both its command ring and its device memory —
+    /// attaches it to `ctx_id`, tracks it, and produces the file descriptor the client must receive.
     ///
-    /// # Empirical limitation (see `read_back`'s doc comment for the full story)
-    /// A blob resource has no format/dimension concept of its own; `virgl_renderer_resource_get_info`
-    /// fails on one (confirmed on real hardware in this task). `read_back` therefore cannot read
-    /// pixels out of a resource created here — only out of one created via `create_resource`. This
-    /// method exists so `VCMD_RESOURCE_CREATE_BLOB` routes through a *real* engine resource path
-    /// (Task 3's Step 2 requirement) rather than a vtest-local counter; turning its output into
-    /// readable pixels is Task 4's concern once a live Venus client's actual object graph is known.
+    /// # The two paths, and why they are completely different (Task 4a)
+    /// `blob_mem` is not a flavour; it decides **who allocates the memory**, and the two answers
+    /// share no mechanism at all:
+    ///
+    /// - **`GUEST` (1) / `HOST3D_GUEST` (3) — *we* allocate.** There is no virtual machine here, so
+    ///   "guest memory" has to come from somewhere: we create a `memfd`, `mmap` it, hand
+    ///   virglrenderer that mapping as an `iovec`, and hand the *client* the memfd. Client and host
+    ///   then hold two mappings of one object — literally the same physical pages. This is the path
+    ///   that makes the Venus command ring work in a VM-less setup.
+    /// - **`HOST3D` (2) — the *3D driver* allocates.** We pass no pages; virglrenderer/Venus
+    ///   allocates real Vulkan device memory, and we ask it to export a descriptor for that memory
+    ///   (`virgl_renderer_resource_export_blob`) to give the client. The exported `fd_type` is
+    ///   validated: only `DMABUF` and `SHM` are `mmap`able by the client, and an `OPAQUE` handle
+    ///   would be accepted here only to fail in the client's `mmap`, far from the cause.
+    ///
+    /// Anything else (notably `GUEST_VRAM`) is refused with `UnsupportedBlobMem` — exactly as
+    /// virglrenderer's own vtest server answers `-EINVAL`.
+    ///
+    /// # Call order is load-bearing
+    /// create → (HOST3D only) export → attach. This mirrors `vtest_resource_create_blob` in
+    /// virglrenderer's server, and the client's read order depends on the reply that follows it; do
+    /// not reorder. The remaining two steps of the protocol's sequence (write the in-band reply,
+    /// then send the fd) belong to the caller — see [`BlobResource`]'s doc comment.
+    ///
+    /// # Memory lifetime (the leak/use-after-free surface)
+    /// For a `GUEST`-family blob, virglrenderer keeps a raw iovec into our mapping for the
+    /// resource's whole life. The **fd** may be closed as soon as it is sent, but the **mapping**
+    /// must not be unmapped until the resource is unref'd — so the mapping is stored in the
+    /// resource's `TrackedResource` (see `TrackedResource::mapping`) rather than kept locally, and
+    /// `unref_resource`/`Drop` release the resource *before* dropping it. Every error path below
+    /// likewise releases whatever it had already acquired: an fd, a mapping, and/or a resource that
+    /// exists inside virglrenderer but will never be inserted into `self.resources` (Task 3's review
+    /// caught exactly this class of leak on the classic-resource paths).
+    ///
+    /// # Empirical limitation, unchanged from Task 3 (see `read_back`'s doc comment)
+    /// A blob resource has no format/dimension concept; `virgl_renderer_resource_get_info` fails on
+    /// one. `read_back` therefore still cannot read pixels out of a resource created here — turning
+    /// a blob's bytes into a frame is Task 4b's problem, and deliberately not attempted here.
     ///
     /// # Inputs / outputs
     /// - `ctx_id`: the context this resource is created for (must already exist).
-    /// - `blob_mem`: `VIRGL_RENDERER_BLOB_MEM_*` (Venus typically uses `HOST3D` for device memory
-    ///   in this no-VM vtest setup, since there is no real guest to back `GUEST`/`HOST3D_GUEST`
-    ///   memory with pages).
-    /// - `blob_flags`: `VIRGL_RENDERER_BLOB_FLAG_*` (e.g. `USE_MAPPABLE`).
-    /// - `blob_id`: the client-chosen blob id from the wire message (0 is valid for Venus).
+    /// - `blob_mem`: `VIRGL_RENDERER_BLOB_MEM_*` — dispatched on, per the two paths above. **A live
+    ///   Mesa Venus client asks for `HOST3D` (2)** for both its shmem and its device memory
+    ///   (`vn_renderer_vtest.c` hardcodes `shmem_blob_mem = VCMD_BLOB_TYPE_HOST3D`), so the export
+    ///   path is the one real traffic exercises; the GUEST path is implemented because the protocol
+    ///   defines it and another client may use it.
+    /// - `blob_flags`: `VIRGL_RENDERER_BLOB_FLAG_*` (e.g. `USE_MAPPABLE`), passed through unchanged.
+    /// - `blob_id`: the client-chosen blob id from the wire message (0 is valid for Venus, and is
+    ///   what its shmem allocations use).
     /// - `size`: requested size in bytes.
-    /// - Returns the engine-assigned resource id on success.
+    /// - Returns a [`BlobResource`] whose `fd` is always `Some` on this engine.
     ///
     /// # Failure modes
     /// - `ResourceCtxIdOutOfRange`: `ctx_id` does not fit a C `int`.
     /// - `UnknownContext`: `ctx_id` does not name a context this engine created.
     /// - `ResourceIdOverflow`: the engine's own id counter overflowed (practically unreachable).
-    /// - `BlobResourceCreateFailed`: virglrenderer rejected the resource (e.g. a guest-backed
-    ///   `blob_mem` was requested, which this no-VM setup cannot satisfy — see above).
+    /// - `UnsupportedBlobMem`: a `blob_mem` outside `{GUEST, HOST3D, HOST3D_GUEST}`.
+    /// - `ShmCreateFailed` / `ShmMapFailed`: the GUEST path could not allocate or map its memfd.
+    /// - `BlobResourceCreateFailed`: virglrenderer rejected the resource.
+    /// - `BlobExportFailed` / `BlobExportUnusableFdType`: the HOST3D path produced no usable
+    ///   descriptor for the client.
     fn create_blob_resource(
         &mut self,
         ctx_id: u32,
@@ -946,7 +730,7 @@ impl RenderEngine for VirglEngine {
         blob_flags: u32,
         blob_id: u64,
         size: u64,
-    ) -> Result<u32, EngineError> {
+    ) -> Result<BlobResource, EngineError> {
         let ctx_id_c =
             c_int::try_from(ctx_id).map_err(|_| EngineError::ResourceCtxIdOutOfRange { ctx_id })?;
         // Same check `create_resource` performs: refuse a `ctx_id` this engine did not itself
@@ -954,10 +738,40 @@ impl RenderEngine for VirglEngine {
         if !self.contexts.contains(&ctx_id) {
             return Err(EngineError::UnknownContext { ctx_id });
         }
+
+        // Reject an unsupported `blob_mem` *before* allocating an id or any memory, so the
+        // unsupported case has nothing to clean up. Mirrors the C server's `default: return
+        // -EINVAL`.
+        let guest_backed = match blob_mem {
+            ffi::VIRGL_RENDERER_BLOB_MEM_GUEST | ffi::VIRGL_RENDERER_BLOB_MEM_HOST3D_GUEST => true,
+            ffi::VIRGL_RENDERER_BLOB_MEM_HOST3D => false,
+            other => return Err(EngineError::UnsupportedBlobMem { blob_mem: other }),
+        };
+
         let resource_id = self.next_resource_id;
         let resource_id_c = c_int::try_from(resource_id)
             .map_err(|_| EngineError::ResourceIdOverflow { resource_id })?;
         self.next_resource_id = self.next_resource_id.saturating_add(1);
+
+        // The GUEST path's shared memory, allocated *before* the resource so its iovec can be part
+        // of the creation arguments. Both are dropped automatically if we bail out below: the fd is
+        // closed and the mapping unmapped, with no resource yet existing to orphan.
+        let guest_shm = if guest_backed {
+            let fd = create_memfd(size)?;
+            let mapping = ShmMapping::map(fd.as_fd(), size)?;
+            Some((fd, mapping))
+        } else {
+            None
+        };
+
+        // The iovec describing the guest pages, if any. It must stay alive for the duration of the
+        // `create_blob` call only — virglrenderer copies the descriptor's contents, though it keeps
+        // pointing at the memory the descriptor names (which is why the *mapping*, not this local,
+        // is what must outlive the resource).
+        let iov = guest_shm.as_ref().map(|(_, mapping)| ffi::IoVec {
+            iov_base: mapping.as_ptr(),
+            iov_len: mapping.len(),
+        });
 
         let args = ffi::VirglRendererResourceCreateBlobArgs {
             res_handle: resource_id,
@@ -966,14 +780,20 @@ impl RenderEngine for VirglEngine {
             blob_flags,
             blob_id,
             size,
-            // No guest pages to describe: this no-VM vtest server has no real guest memory, so
-            // only host-resident blob types (HOST3D) are actually satisfiable here.
-            iovecs: std::ptr::null(),
-            num_iovs: 0,
+            // GUEST-family: point virglrenderer at our mapping of the memfd the client will also
+            // map. HOST3D: no pages from us — the 3D driver allocates, and we export what it made.
+            iovecs: iov
+                .as_ref()
+                .map_or(std::ptr::null(), |iov| iov as *const ffi::IoVec),
+            num_iovs: if iov.is_some() { 1 } else { 0 },
         };
-        // SAFETY: `args` is fully initialized and valid for the call's duration.
+        // SAFETY: `args` is fully initialized and valid for the call's duration, as is the `iov` it
+        // may point at (a live local outliving this call) and the mapping that iovec names (owned
+        // by `guest_shm`, moved into `self.resources` on success).
         let rc = unsafe { ffi::virgl_renderer_resource_create_blob(&args) };
         if rc != 0 {
+            // Nothing to release but `guest_shm`, which drops here (closing the memfd and unmapping)
+            // — the resource does not exist, so there is nothing for virglrenderer to still hold.
             return Err(EngineError::BlobResourceCreateFailed {
                 ctx_id,
                 resource_id,
@@ -981,22 +801,49 @@ impl RenderEngine for VirglEngine {
                 reason: errno_name(rc),
             });
         }
+        // From here on the resource genuinely exists inside virglrenderer, so every error path must
+        // release it explicitly: it is not yet in `self.resources`, so nothing else ever would.
 
-        // SAFETY: both ids were just validated to fit `c_int`; `ctx_id` names a live context and
-        // `resource_id` names the resource just created above.
+        // Split the shm pair: the fd goes to the client, the mapping stays with the resource.
+        let (client_fd, mapping) = match guest_shm {
+            // GUEST path: the client's descriptor *is* our memfd.
+            Some((fd, mapping)) => (fd, Some(mapping)),
+            // HOST3D path: ask the 3D driver for a descriptor to the memory it allocated.
+            None => match self.export_blob_fd(resource_id) {
+                Ok(fd) => (fd, None),
+                Err(err) => {
+                    // Release the resource we just created before reporting; see this method's
+                    // "Memory lifetime" note. No detach: `ctx_attach_resource` has not run yet.
+                    // SAFETY: `resource_id` names the blob resource created immediately above and
+                    // not yet unref'd.
+                    unsafe { ffi::virgl_renderer_resource_unref(resource_id) };
+                    return Err(err);
+                }
+            },
+        };
+
+        // Make the resource visible to the context — step 3 of the C server's order, after the
+        // export. SAFETY: both ids were validated to fit `c_int`; `ctx_id` names a live context and
+        // `resource_id` names the resource created above.
         unsafe { ffi::virgl_renderer_ctx_attach_resource(ctx_id_c, resource_id_c) };
 
         // No `resource_get_info` call here — deliberately: it is known to fail for a blob resource
         // (confirmed empirically), so there is nothing to cache. `image: None` is what makes
         // `read_back` refuse this resource with a clear `ResourceNotReadable` instead of guessing.
+        // `mapping` is moved in here because virglrenderer's iovec must not outlive it.
         self.resources.insert(
             resource_id,
             TrackedResource {
                 ctx_id,
                 image: None,
+                mapping,
             },
         );
-        Ok(resource_id)
+        Ok(BlobResource {
+            resource_id,
+            // Always `Some` for this engine: both paths above produce a descriptor or return `Err`.
+            fd: Some(client_fd),
+        })
     }
 
     /// Releases a resource created by `create_resource` or `create_blob_resource`.
@@ -1029,6 +876,12 @@ impl RenderEngine for VirglEngine {
         // removed it from `self.resources`, so a second call is a no-op — the tracking prevents
         // a double-unref).
         unsafe { ffi::virgl_renderer_resource_unref(resource_id) };
+
+        // Only now may a GUEST blob's shared memory be unmapped: until the unref above,
+        // virglrenderer still held an iovec pointing into it (see `TrackedResource::mapping`).
+        // `tracked` would drop here anyway; dropping it explicitly is what makes the ordering
+        // visible to a reader instead of an accident of where the binding happens to end.
+        drop(tracked);
     }
 
     /// Fence-waits for every command submitted to a resource's context to retire, then reads the
@@ -1079,8 +932,10 @@ impl RenderEngine for VirglEngine {
     /// with `ResourceNotReadable`. Turning a real Venus-rendered blob's bytes into an `EngineFrame`
     /// needs either `virgl_renderer_resource_map` plus externally-known image layout (Venus does
     /// not expose `VkSubresourceLayout` over the vtest wire), or a companion classic "swapchain"
-    /// resource a live client's WSI copies into — both are Task 4 (live drive) design decisions,
-    /// deliberately out of this task's scope (see the module/task docs).
+    /// resource a live client's WSI copies into — both are Task 4b design decisions, deliberately
+    /// out of scope here. Task 4a added one relevant data point: the blobs a live client creates are
+    /// its command ring and staging shmem, exported as `VIRGL_RENDERER_BLOB_FD_TYPE_SHM`, and are
+    /// not rendered images at all — so "read back the last blob" is not a shortcut to a frame.
     ///
     /// # Stride-honoring discipline (the SP0/SP3 precedent this task follows)
     /// The cached `stride` is frequently **larger** than `width * bytes_per_pixel` (GPU drivers
@@ -1181,6 +1036,69 @@ impl RenderEngine for VirglEngine {
 }
 
 impl VirglEngine {
+    /// Exports a **host-allocated** (`HOST3D`) blob resource as a descriptor the client can `mmap`,
+    /// validating that the descriptor is actually of a mappable kind.
+    ///
+    /// This is the path a live Mesa Venus client actually takes: its command ring and its device
+    /// memory are both `HOST3D` blobs, and it blocks in `recvmsg` until this descriptor arrives.
+    ///
+    /// # Why the `fd_type` check is not optional
+    /// `virgl_renderer_resource_export_blob` may hand back a `DMABUF`, an `SHM` object, or an
+    /// `OPAQUE` driver-private handle. The client's only use for it is `mmap`, which an opaque
+    /// handle does not support — so accepting one would report success here and fail inside the
+    /// client, with nothing connecting the two. virglrenderer's own vtest server rejects the same
+    /// two-of-three set, and we mirror it exactly.
+    ///
+    /// # Inputs / outputs
+    /// - `resource_id`: a blob resource created with `blob_mem = HOST3D`, not yet attached.
+    /// - Returns the exported descriptor, owned by the caller.
+    ///
+    /// # Failure modes
+    /// - `BlobExportFailed`: virglrenderer could not export the resource at all.
+    /// - `BlobExportUnusableFdType`: it exported something the client cannot map. The descriptor is
+    ///   closed (by `OwnedFd`'s drop) before returning, so this path leaks nothing — virglrenderer
+    ///   hands us ownership of the fd on success, and "success then rejected" is still success as
+    ///   far as that transfer is concerned.
+    fn export_blob_fd(&mut self, resource_id: u32) -> Result<OwnedFd, EngineError> {
+        // Out-params. `raw_fd` starts invalid so a buggy "success without writing it" from the C
+        // side could not be mistaken for a real descriptor (we only read it when `rc == 0`, but
+        // -1 makes that assumption self-evidently safe rather than merely documented).
+        let mut fd_type: u32 = 0;
+        let mut raw_fd: c_int = -1;
+        // SAFETY: both out-params are valid, writable locals; `resource_id` names a blob resource
+        // this engine just created.
+        let rc = unsafe {
+            ffi::virgl_renderer_resource_export_blob(resource_id, &mut fd_type, &mut raw_fd)
+        };
+        if rc != 0 {
+            // On failure virglrenderer leaves `raw_fd` alone — there is no descriptor to close.
+            return Err(EngineError::BlobExportFailed {
+                resource_id,
+                rc,
+                reason: errno_name(rc),
+            });
+        }
+
+        // Take ownership of the descriptor *immediately*, before the validation below, so that the
+        // rejection path closes it via `Drop` rather than needing a manual `close` that a future
+        // edit could forget. virglrenderer transfers ownership to us on success (see the FFI
+        // declaration's doc comment) and will never close it itself.
+        // SAFETY: `rc == 0` means virglrenderer wrote a real, owned descriptor into `raw_fd`.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+
+        // Only DMABUF and SHM can be mapped by the client; anything else is unusable to it.
+        if fd_type != ffi::VIRGL_RENDERER_BLOB_FD_TYPE_DMABUF
+            && fd_type != ffi::VIRGL_RENDERER_BLOB_FD_TYPE_SHM
+        {
+            // `fd` drops here, closing the unusable descriptor.
+            return Err(EngineError::BlobExportUnusableFdType {
+                resource_id,
+                fd_type,
+            });
+        }
+        Ok(fd)
+    }
+
     /// Blocks until every command submitted to `(ctx_id, ring_idx)` so far has retired on the GPU,
     /// or [`FENCE_WAIT_TIMEOUT`] elapses.
     ///
@@ -1313,19 +1231,28 @@ fn repack_tight(raw: &[u8], width: u32, height: u32, stride: u32, bpp: u32) -> V
 impl Drop for VirglEngine {
     /// Tears the engine down in the correct order and releases the single-instance lock.
     ///
-    /// Order matters: release every resource we created, then destroy every context we created,
-    /// then `virgl_renderer_cleanup` (which releases the EGL winsys and reaps the render-server
-    /// subprocess), and only then release the global lock so a subsequent `VirglEngine::new` can
-    /// safely re-initialize. Resources before contexts because a resource can reference its
-    /// context (releasing the context first would leave a dangling reference); the boxed cookie is
-    /// a field, so it is dropped *after* this method returns — i.e. it stays valid through
-    /// `virgl_renderer_cleanup`, which is the last C call that could touch it.
+    /// Order matters: release every resource we created (and only then unmap any shared memory
+    /// backing it), then destroy every context we created, then `virgl_renderer_cleanup` (which
+    /// releases the EGL winsys and reaps the render-server subprocess), and only then release the
+    /// global lock so a subsequent `VirglEngine::new` can safely re-initialize. Resources before
+    /// contexts because a resource can reference its context (releasing the context first would
+    /// leave a dangling reference); the boxed cookie is a field, so it is dropped *after* this
+    /// method returns — i.e. it stays valid through `virgl_renderer_cleanup`, which is the last C
+    /// call that could touch it.
     fn drop(&mut self) {
+        // Take the map rather than iterate it by reference, so each `TrackedResource` — and hence
+        // any `ShmMapping` it owns — drops inside this loop, immediately *after* its resource has
+        // been unref'd. Iterating by reference would instead leave every mapping alive until the
+        // `resources` field itself drops, which happens after `virgl_renderer_cleanup` below: still
+        // sound, but it would make the "unref before munmap" ordering that
+        // `TrackedResource::mapping` depends on an accident of field-drop order rather than
+        // something this function actually does.
+        let resources = std::mem::take(&mut self.resources);
         // Release every resource we created. SAFETY: these (ctx_id, resource_id) pairs were
         // recorded by successful `create_resource`/`create_blob_resource` calls on the
         // still-initialized renderer; detach/unref are safe to call once per resource, which this
         // loop does (each id appears once in the map).
-        for (&resource_id, tracked) in &self.resources {
+        for (resource_id, tracked) in resources {
             if let (Ok(ctx_id_c), Ok(resource_id_c)) = (
                 c_int::try_from(tracked.ctx_id),
                 c_int::try_from(resource_id),
@@ -1333,6 +1260,8 @@ impl Drop for VirglEngine {
                 unsafe { ffi::virgl_renderer_ctx_detach_resource(ctx_id_c, resource_id_c) };
             }
             unsafe { ffi::virgl_renderer_resource_unref(resource_id) };
+            // `tracked` drops at the end of this iteration, unmapping a GUEST blob's shared memory
+            // now that virglrenderer's iovec into it is gone.
         }
 
         // Destroy each live context. SAFETY: these ids were returned by successful context
@@ -1417,12 +1346,14 @@ mod tests {
     /// swapchain pixel format, and the one this task's round-trip test creates resources with.
     const B8G8R8A8_UNORM: u32 = 1;
 
-    /// The real end-to-end capability this task builds, proven against the real GPU: create a
-    /// classic resource, seed it with known pixel content (standing in for a live Venus client's
-    /// rendering — Task 4), fence-wait, and read it back — asserting the bytes round-trip exactly.
+    /// Task 3's end-to-end capability, proven against the real GPU: create a classic resource, seed
+    /// it with known pixel content (standing in for a real render), fence-wait, and read it back —
+    /// asserting the bytes round-trip exactly.
     ///
-    /// This is the strongest test this task can run without a live Venus client (see the module
-    /// docs on `read_back` for exactly why a live client is Task 4's concern): it exercises the
+    /// The seeding is still synthetic, and deliberately so even now that a live Venus client exists
+    /// (Task 4a): that client's rendered output lives in a *blob* resource, which `read_back` cannot
+    /// read (see its doc comment) — closing that gap is Task 4b's task, not this test's. What this
+    /// test proves remains exactly as valuable meanwhile: it exercises the
     /// real `virgl_renderer_resource_create`, `ctx_attach_resource`, the *one-shot*
     /// `virgl_renderer_resource_get_info` (see `TrackedResource`'s doc comment for why it must be
     /// one-shot), `virgl_renderer_context_create_fence` + `write_context_fence` + `context_poll`,
@@ -1552,17 +1483,17 @@ mod tests {
 
         // (5) A blob resource (the kind Venus's real wire protocol allocates) has no cached image
         // layout, so `read_back` refuses it clearly instead of guessing — the documented
-        // limitation this task hands to Task 4 (see `read_back`'s doc comment).
-        let blob_id = engine
+        // limitation this task hands to Task 4b (see `read_back`'s doc comment).
+        let blob = engine
             .create_blob_resource(
                 1, 0x0002, /* HOST3D */
                 0x0001, /* MAPPABLE */
                 0, 64,
             )
             .expect("create_blob_resource should succeed on a GPU host");
-        match engine.read_back(blob_id) {
+        match engine.read_back(blob.resource_id) {
             Err(EngineError::ResourceNotReadable { resource_id }) => {
-                assert_eq!(resource_id, blob_id);
+                assert_eq!(resource_id, blob.resource_id);
             }
             other => panic!("expected ResourceNotReadable, got {other:?}"),
         }

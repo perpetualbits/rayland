@@ -19,6 +19,19 @@ use std::path::Path;
 // Serialize the GPU tests against each other (see `GPU_TEST_LOCK`).
 use std::sync::Mutex;
 
+/// `VirglEngine` must stay `Send`: it must be possible to build the engine on one thread and hand
+/// it to another (e.g. a connection-handling thread), which the eventual host binary will want.
+///
+/// This is a compile-time assertion with a runtime test's name, and it exists because the property
+/// is easy to lose *by accident*: any `!Send` field — a raw pointer, an `Rc` — silently makes the
+/// whole engine `!Send`, and nothing else in this crate would notice. Task 4a came close to doing
+/// exactly that by storing an `mmap`ed region (a raw pointer) in every blob resource. No GPU is
+/// needed; if this file compiles, the property holds.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    let _ = assert_send::<VirglEngine>;
+};
+
 /// Serializes the GPU-touching tests. `libvirglrenderer` is a process-global singleton, and so is
 /// the engine's single-instance guard, so two engine-constructing tests running on separate
 /// threads (cargo's default) would contend — one would see `AlreadyActive`. This lock makes the

@@ -6,8 +6,16 @@
 //! must carry the domain/safety documentation this repository requires on FFI. Hand-writing the
 //! bindings keeps that documentation attached to each symbol and keeps the exact, reviewed shape
 //! of the C ABI visible in one file. The signatures and struct layouts below are transcribed
-//! directly from `/usr/include/virgl/virglrenderer.h` (libvirglrenderer 1.10.0) and are the
-//! single source of truth for later C0 tasks.
+//! directly from `/usr/include/virgl/virglrenderer.h` and are the single source of truth for later
+//! C0 tasks.
+//!
+//! **Pinned against libvirglrenderer 1.2.0** (`pkg-config --modversion virglrenderer` on the C0
+//! development host; Ubuntu's `libvirglrenderer-dev 1.2.0-2ubuntu2`). An earlier revision of this
+//! comment claimed 1.10.0, which is not a version that exists — corrected in Task 4a after checking
+//! the installed package rather than trusting the note. The version matters: this file's contract
+//! with the library is exactly the header of the `.so` that is actually linked, and several of the
+//! non-obvious behaviours documented below (notably the `resource_get_info` content-reset pitfall)
+//! were observed against this specific build.
 //!
 //! # The one hard constraint: virglrenderer is a process-global singleton
 //! None of these functions take a handle. They all operate on one hidden global renderer, so at
@@ -72,6 +80,50 @@ pub const VIRGL_RENDERER_CAPSET_VENUS: u32 = 4;
 /// `VIRGL_RENDERER_CALLBACKS_VERSION` — the ABI version of the callbacks struct below. Must be 4
 /// to match the v4 struct layout virglrenderer 1.x expects.
 pub const VIRGL_RENDERER_CALLBACKS_VERSION: c_int = 4;
+
+// ----- Blob memory kinds (`VIRGL_RENDERER_BLOB_MEM_*`, virglrenderer.h:399-402). -----
+//
+// These name *where the shared pages live*, which decides the entire mechanism by which a blob's
+// memory reaches the client. `VirglEngine::create_blob_resource` dispatches on this value; read its
+// doc comment before touching any of them. The wire protocol's `VCMD_BLOB_TYPE_*`
+// (vtest_protocol.h) use the identical numeric values, so the vtest layer passes the client's
+// request through unchanged rather than translating it.
+
+/// `VIRGL_RENDERER_BLOB_MEM_GUEST` (1). The memory is **guest**-allocated: the caller (us) supplies
+/// the pages via `iovecs`, and virglrenderer reads/writes them through that iovec. In Rayland's
+/// no-VM setting "the guest" is the client process, so we allocate a memfd, map it, hand
+/// virglrenderer the mapping, and hand the client the memfd.
+pub const VIRGL_RENDERER_BLOB_MEM_GUEST: u32 = 0x0001;
+
+/// `VIRGL_RENDERER_BLOB_MEM_HOST3D` (2). The memory is **host**-allocated by the 3D driver (for
+/// Venus: real Vulkan device memory). We supply no pages; instead we ask virglrenderer to export a
+/// descriptor for what it allocated (`virgl_renderer_resource_export_blob`) and pass that to the
+/// client. **This is what Mesa's Venus vtest backend actually requests** — for both its command
+/// ring (`vtest_shmem_create`) and its device memory (`vtest_bo_create_from_device_memory`).
+pub const VIRGL_RENDERER_BLOB_MEM_HOST3D: u32 = 0x0002;
+
+/// `VIRGL_RENDERER_BLOB_MEM_HOST3D_GUEST` (3). Host 3D memory that is *also* backed by guest pages;
+/// from the vtest server's point of view it is allocated exactly like `GUEST` (we supply the
+/// iovec), which is why virglrenderer's own server handles the two cases with one branch.
+pub const VIRGL_RENDERER_BLOB_MEM_HOST3D_GUEST: u32 = 0x0003;
+
+// ----- Exported blob descriptor kinds (`VIRGL_RENDERER_BLOB_FD_TYPE_*`, virglrenderer.h:435-437). -----
+
+/// `VIRGL_RENDERER_BLOB_FD_TYPE_DMABUF` (1). The exported descriptor is a dma-buf — GPU memory the
+/// client can `mmap` (and, in a real virtio-gpu stack, share across devices). One of the two types
+/// the vtest protocol accepts.
+pub const VIRGL_RENDERER_BLOB_FD_TYPE_DMABUF: u32 = 0x0001;
+
+/// `VIRGL_RENDERER_BLOB_FD_TYPE_OPAQUE` (2). A driver-private handle with no `mmap` contract. The
+/// vtest protocol **rejects** this: the client's whole use of the descriptor is to map it, so an
+/// opaque handle would be useless — and worse, handing one over would look like success right up
+/// until the client's `mmap` failed.
+#[allow(dead_code)]
+pub const VIRGL_RENDERER_BLOB_FD_TYPE_OPAQUE: u32 = 0x0002;
+
+/// `VIRGL_RENDERER_BLOB_FD_TYPE_SHM` (3). The exported descriptor is POSIX shared memory. The other
+/// type the vtest protocol accepts.
+pub const VIRGL_RENDERER_BLOB_FD_TYPE_SHM: u32 = 0x0003;
 
 // ----------------------------------------------------------------------------------------------
 // #[repr(C)] structs (layouts transcribed from virglrenderer.h).
@@ -351,10 +403,35 @@ unsafe extern "C" {
     /// `VirglEngine::create_blob_resource`. **Empirically has no format/dimension info** (a
     /// subsequent `resource_get_info` on it fails) and is not consumable by
     /// `virgl_renderer_transfer_read_iov` on this virglrenderer version — see
-    /// `VirglEngine::read_back`'s doc comment for what that means for Task 4. Returns 0 on
+    /// `VirglEngine::read_back`'s doc comment for what that means for Task 4b. Returns 0 on
     /// success, errno otherwise.
     pub fn virgl_renderer_resource_create_blob(
         args: *const VirglRendererResourceCreateBlobArgs,
+    ) -> c_int;
+
+    /// `int virgl_renderer_resource_export_blob(uint32_t res_id, uint32_t *fd_type, int *fd)`
+    /// (virglrenderer.h:440). Exports a **host-allocated** blob resource
+    /// (`VIRGL_RENDERER_BLOB_MEM_HOST3D`) as a file descriptor the client can `mmap`, reporting
+    /// through `fd_type` which kind of descriptor it produced (`VIRGL_RENDERER_BLOB_FD_TYPE_*`).
+    ///
+    /// This is the call that makes a live Mesa Venus client possible: the client's command ring and
+    /// its device memory are both HOST3D blobs, and it blocks in `recvmsg` until it receives this
+    /// descriptor. Bound in Task 4a (present in the installed `.so` all along, but never declared).
+    ///
+    /// # Ownership (this is where an fd leak would hide)
+    /// On success (`rc == 0`) virglrenderer writes a descriptor into `*fd` and **transfers
+    /// ownership of it to the caller** — nothing inside the library will ever close it. The caller
+    /// must close it exactly once, including on the error paths *after* a successful export (e.g.
+    /// an unusable `fd_type`), which is why `VirglEngine::create_blob_resource` wraps it in an
+    /// `OwnedFd` the moment the call returns rather than carrying a raw `c_int` any further.
+    ///
+    /// # Returns
+    /// 0 on success (with `*fd_type` and `*fd` written), errno otherwise (with `*fd` left alone —
+    /// so it must never be read on a failed call).
+    pub fn virgl_renderer_resource_export_blob(
+        res_id: u32,
+        fd_type: *mut u32,
+        fd: *mut c_int,
     ) -> c_int;
 
     /// `int virgl_renderer_transfer_read_iov(uint32_t handle, uint32_t ctx_id, uint32_t level,
@@ -383,8 +460,9 @@ unsafe extern "C" {
     /// of `transfer_read_iov`. Not part of the production readback path (Rayland only ever reads
     /// pixels the GPU rendered); pinned and used **only by the Task 3 GPU test** to seed a
     /// resource with known content so `read_back` has something real to prove round-trips
-    /// correctly, standing in for a live Venus client's rendering (Task 4). `#[cfg(test)]` because
-    /// no production code path calls it.
+    /// correctly, standing in for a real render. (Task 4a put a live Venus client on the wire, but
+    /// that client only initializes Vulkan; replaying a client that actually *renders* into a
+    /// readable resource is Task 4b.) `#[cfg(test)]` because no production code path calls it.
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn virgl_renderer_transfer_write_iov(
