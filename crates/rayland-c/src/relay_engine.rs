@@ -77,8 +77,9 @@ pub type RingSlot = Arc<Mutex<Option<RingIdentity>>>;
 /// # Why this is a trait
 /// Two reasons, and the second is the one that matters. The first is testability: a mock link makes
 /// every method of [`RelayEngine`] exercisable with no network and no S, which is what lets Task 3
-/// be tested at all — Task 5 (S) and Task 6 (QUIC) do not exist yet. The second is that (c)1's
-/// transport is genuinely undecided: ring-findings §7 concluded that **latency, not bandwidth, is
+/// be tested at all — when Task 3 was written neither S nor the QUIC transport existed. `rayland-s`
+/// (Task 4) does now, but the two have never been run against each other; Task 6 is the first time a
+/// real link sits between them. The second is that (c)1's transport is genuinely undecided: ring-findings §7 concluded that **latency, not bandwidth, is
 /// what will hurt** — the reply arena was ~12x the command traffic and its replies are *round
 /// trips* the application blocks on. Whatever answers that is what implements this trait.
 ///
@@ -405,8 +406,9 @@ mod tests {
 
     /// A [`RelayLink`] that answers from a script and records everything sent.
     ///
-    /// This is what makes Task 3 testable at all: S (Task 5) and the QUIC transport (Task 6) do not
-    /// exist yet, so a mock is the only S there is.
+    /// This is what makes Task 3 testable at all: when it was written there was no S to talk to.
+    /// `rayland-s` (Task 4) exists now, but nothing wires the two together until Task 6 brings the
+    /// QUIC transport, so a mock is still the only S these tests have.
     struct MockLink {
         /// Replies handed out by `recv`, in order.
         replies: VecDeque<S2C>,

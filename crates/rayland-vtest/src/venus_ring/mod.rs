@@ -96,6 +96,13 @@
 pub mod decode;
 // The live diagnostic that watches a real client write a real ring. Inert unless its env var is set.
 pub mod dump;
+// Recognizing the ring among a session's blobs. Both (c)1 daemons need this and must agree on it,
+// so it lives here rather than in either of them.
+pub mod identity;
+
+// Re-exported at the module root because it is ring *knowledge*, alongside the layout constants,
+// rather than an implementation detail of a submodule.
+pub use identity::RingIdentity;
 
 // The verbatim bytes captured from a live Mesa 26.0.3 Venus client, and the tests that decode them.
 // Test-only: this is a fixture, not a runtime table, and it must never be mistaken for one.

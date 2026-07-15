@@ -26,16 +26,17 @@
 //! until they are read. Both sides wait for the other. A dedicated reader is what breaks it.
 //!
 //! # Status: what has and has not been run
-//! **This binary has never been run end-to-end, because there is nothing to run it against.**
-//! `rayland-s` is (c)1 Task 5 and does not exist; the QUIC transport is Task 6. The pieces with real
+//! **This binary has never been run end-to-end.** `rayland-s` ((c)1 Task 4) now exists, but nothing
+//! connects the two: the QUIC transport is Task 6, and Task 5 still owes the blob synchronisation
+//! without which the application's vertex buffer never reaches S at all. The pieces with real
 //! logic — the ring watcher, the blob shadows, the relay engine — are unit-tested against a
 //! synthetic ring and a mock link (`tests/ring_watch.rs`, and the `tests` modules of [`ring`],
 //! [`shm`] and [`relay_engine`]), as is this file's own [`Progress`] (see its `tests` module).
 //!
 //! What remains uncovered is the *wiring*: the sockets, the three threads, and the vtest session.
-//! That genuinely needs a peer and must be treated as unverified until Task 5 provides one. The
-//! distinction matters, because "there is no S to run against" is a reason to test the parts that do
-//! not need one — not a licence to test nothing. [`Progress`] shipped a real bug behind exactly that
+//! That genuinely needs a live peer on the other end of a link, and must be treated as unverified
+//! until Task 6 provides one. The distinction matters, because "there is no S to run against" is a
+//! reason to test the parts that do not need one — not a licence to test nothing. [`Progress`] shipped a real bug behind exactly that
 //! excuse: it restarted its stall clock on any acknowledgement from S rather than on one that showed
 //! the ring had moved, which would have made the stall timeout unreachable against an S that sent
 //! keepalives. It is three fields and no I/O; nothing about the missing S ever stood in the way.
@@ -780,9 +781,9 @@ fn main() -> Result<()> {
 ///
 /// # Why this struct is tested when the rest of the file is not
 /// The module docs are honest that this file's *wiring* — sockets, threads, the vtest session — has
-/// no peer to run against until (c)1 Task 5 builds S, and so is not covered. [`Progress`] is the
-/// exception and deserves to be: it is three fields and no I/O, its whole job is a decision that is
-/// invisible until it is wrong, and the bug it shipped with (restarting the stall clock on any
+/// no live peer to run against until (c)1 Task 6 links it to S, and so is not covered. [`Progress`]
+/// is the exception and deserves to be: it is three fields and no I/O, its whole job is a decision
+/// that is invisible until it is wrong, and the bug it shipped with (restarting the stall clock on any
 /// acknowledgement, whether or not the ring had moved) was pure logic that any of these tests would
 /// have caught. "There is no S to run against" is a reason to test the parts that do not need one,
 /// not a reason to test nothing.

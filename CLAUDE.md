@@ -69,7 +69,7 @@ Wayland/Vulkan/GPU-remoting — must painstakingly verify **every line** for cor
 
 ## Repository status and layout
 
-A Cargo workspace of ten crates. Each declares its own license per the policy below
+A Cargo workspace of eleven crates. Each declares its own license per the policy below
 (library → LGPL, application/binary → GPL); all are `v0.0.x` and pre-stable.
 
 - **`crates/rayland`** — the published placeholder that reserves the crates.io name; the
@@ -101,6 +101,14 @@ A Cargo workspace of ten crates. Each declares its own license per the policy be
   the ring, and Rayland can be that host — so no Mesa fork and no patch is needed. Its
   `tests/no_gpu_linkage.rs` guards the **binary**, which covers `rayland-vtest`, `rayland-relay`
   and everything they pull in transitively. GPL, `publish = false`.
+- **`crates/rayland-s`** — **S's daemon ((c)1).** The other end of `rayland-c`: it applies the
+  relayed messages to a real `libvirglrenderer`. The thing to know about it is that it does **not**
+  "receive commands and execute them" — a relayed ring delta is *written into the ring blob's
+  memory*, because that is where virglrenderer's own ring thread polls for it
+  (`vkr_ring.c:33-58` points the ring at the blob's pages; `vkr_ring.c:262-266` loops on them).
+  `RenderEngine::submit` is used only for the inline vtest path, which carries the
+  `vkCreateRingMESA` that creates the ring and essentially nothing else. Unlike `rayland-c`, this
+  crate **may** depend on `rayland-engine`: it is the GPU machine. GPL, `publish = false`.
 - **`crates/rayland-engine`** — **the real engine (arc (c)).** FFI-embeds
   `libvirglrenderer` behind `rayland-vtest`'s `RenderEngine` trait, driving a Venus
   context on S's GPU. Since (c)1 Task 1 this crate is *only* the GPU: the `ffi`
