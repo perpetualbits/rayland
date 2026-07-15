@@ -176,7 +176,13 @@ impl<T: RelayLink> RelayEngine<T> {
         self.link.send(request)?;
         let reply = self.link.recv()?;
         // A failure S reported about itself is not a protocol error; report it as what it is.
-        if let S2C::Error { message } = reply {
+        //
+        // `solicited` is ignored here on purpose, and it is not redundant: the daemon's reader
+        // thread routes only *solicited* errors into this channel, precisely so a refusal of a
+        // fire-and-forget message cannot arrive as an answer to a request that has nothing to do
+        // with it. By the time an error reaches here it has already passed that filter, so
+        // re-checking it would only invent a second, weaker copy of the rule. See `S2C::Error`.
+        if let S2C::Error { message, .. } = reply {
             return Err(EngineError::RelayRemoteError { message });
         }
         extract(reply).map_err(|got| EngineError::RelayUnexpectedReply {
@@ -284,8 +290,11 @@ impl<T: RelayLink> RenderEngine for RelayEngine<T> {
         blob_id: u64,
         size: u64,
     ) -> Result<BlobResource, EngineError> {
-        // Local first: Mesa is already waiting on the descriptor this produces.
-        let (blob, fd) = LocalBlob::create(size)?;
+        // Local first: Mesa is already waiting on the descriptor this produces. `blob_id` is
+        // recorded with the shadow because it is the only signal that separates the application's
+        // own memory from Venus's internal plumbing (ring-findings §6), and `crate::blob_sync`
+        // routes on exactly that — see `LocalBlob::is_application_memory`.
+        let (blob, fd) = LocalBlob::create(blob_id, size)?;
 
         // Now ask S for the real, GPU-backed counterpart. Only S can create it; only C can map it.
         let res_id = self.request(
@@ -626,6 +635,9 @@ mod tests {
     fn an_error_reported_by_s_is_surfaced_as_such() {
         let link = MockLink::with_replies([S2C::Error {
             message: "no venus capset: this host has no GPU".into(),
+            // A `GetCapset` is one of the two messages C genuinely blocks on, so its refusal is
+            // solicited and the daemon's reader would legitimately route it here.
+            solicited: true,
         }]);
         let mut engine = RelayEngine::new(link);
 

@@ -241,9 +241,35 @@ pub enum S2C {
     /// A typed failure on S (e.g. a malformed blob request, an engine error). Sent as a
     /// message rather than simply dropping the connection, so that whatever is driving C
     /// can log something a human can act on instead of just observing a dead socket.
+    ///
+    /// # Why this carries `solicited`, and why omitting it desynchronized C permanently
+    /// C runs a single reader thread that routes S's messages: unsolicited ones (`BlobData`,
+    /// `RingProgress`) it handles itself, and everything else it queues for whoever is blocked in a
+    /// request/reply. That rule is correct for an error answering a [`C2S::GetCapset`] or a
+    /// [`C2S::CreateBlob`] — C really is waiting for it.
+    ///
+    /// **It is catastrophic for an error refusing a fire-and-forget message.** Most of this protocol
+    /// is fire-and-forget, and the dangerous ones come from C's *ring watcher* thread, which never
+    /// waits for anything: a [`C2S::RingDelta`], or — since (c)1 Task 5 — a [`C2S::BlobData`] on
+    /// every single delta. If S refuses one of those, an error nobody asked for lands in the reply
+    /// queue and answers the **next** request instead. Every request after that is then answered by
+    /// the previous one's reply, forever: an unbounded desynchronization that surfaces arbitrarily
+    /// far from its cause, and one that looks like anything except an error-routing bug.
+    ///
+    /// S is the only party that can tell the two apart, because S knows which message it was
+    /// refusing and C does not — an `Error` carries no reference to what provoked it. So S says so,
+    /// and C routes on the answer. The alternative designs were both worse: giving every message a
+    /// request id is a protocol C has no other use for, and having S stay silent about
+    /// fire-and-forget failures trades a desynchronization for a silent one.
     Error {
         /// A human-readable description of what went wrong on S.
         message: String,
+        /// Whether this error answers a message C is **blocked waiting for a reply to** — i.e. a
+        /// [`C2S::GetCapset`] or a [`C2S::CreateBlob`].
+        ///
+        /// `false` for a refusal of any fire-and-forget message. C must **not** route those to its
+        /// reply channel; see this variant's docs for the permanent desynchronization that causes.
+        solicited: bool,
     },
 }
 

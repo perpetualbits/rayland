@@ -500,8 +500,18 @@ impl RingWatcher {
     /// crossing a slow link, acknowledged incrementally). It does **not** cover an S that is healthy
     /// but silent inside one long-running command, because C has no evidence to distinguish that from
     /// a wedge, and it does not receive a `RingProgress` during it. Closing that needs a liveness
-    /// signal only S can emit while it executes; it is (c)1 Task 5's protocol surface and does not
-    /// exist yet. `main.rs`'s stall timeout is the backstop that makes the gap safe rather than silent.
+    /// signal only S can emit while it executes.
+    ///
+    /// **That signal still does not exist, and (c)1 Task 5 — which owned it — deliberately did not
+    /// add one.** The reason is that a signal S emits *while executing* is exactly the shape
+    /// ring-findings §5.4 warns about: virglrenderer's own watchdog already emits one
+    /// (`vkr_context_ring_monitor_thread` sets ALIVE unconditionally, `vkr_context.c:536-539`), and
+    /// it is worthless precisely because "S is executing" is not "the ring is progressing".
+    /// Inventing a second such signal without an answer to *what evidence it would carry* would
+    /// rebuild that footgun under a new name. So the gap is left open and named rather than papered
+    /// over. `main.rs`'s stall timeout is the backstop that makes it safe rather than silent: a
+    /// genuinely long command trips it and the session ends in seconds with a message, which is a
+    /// false positive but a loud and diagnosable one — the right direction to fail in.
     ///
     /// The bit is OR'ed in rather than assigned, mirroring Mesa's `atomic_fetch_or`, so `FATAL` and
     /// any concurrently-published `IDLE` survive.

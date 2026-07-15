@@ -26,7 +26,9 @@
 //! - **`CreateBlob`** — creates the real GPU-backed resource *and* maps its pages, because S must
 //!   write into them on the client's behalf (there is no shared page across a network).
 //! - **`BlobData`** — copied into those pages. This is how the application's vertex buffer ever
-//!   reaches S's GPU (ring-findings §6 caught it as `res=3`, decoding float-for-float).
+//!   reaches S's GPU (ring-findings §6 caught it as `res=3`, decoding float-for-float). The return
+//!   direction is [`Applier::poll_progress`]'s, not this function's, because S's GPU writes those
+//!   pages asynchronously and there is no inbound message to answer with them.
 //! - **`RingDelta`** — **the payload the whole project is about.** Written into the ring's memory,
 //!   never submitted. See [`crate::ring_mirror`].
 //! - **`SubmitCmd`** — forwarded to the engine's inline path. Tiny, and indispensable: its one real
@@ -155,6 +157,51 @@ pub enum ApplyError {
     UnexpectedNotifyRing,
 }
 
+/// Whether C is **blocked waiting for a reply** to this message, and will therefore route an
+/// [`S2C::Error`] about it to whoever is waiting.
+///
+/// # Why this exists, and why getting it wrong is unbounded rather than annoying
+/// C's reader thread routes every message that is not `BlobData`/`RingProgress` to its reply
+/// channel. For an error answering a request C is blocked on, that is exactly right. For an error
+/// refusing a **fire-and-forget** message — a `RingDelta` or a `BlobData` from C's ring watcher,
+/// which waits for nothing — it is a permanent desynchronization: the unasked-for error answers the
+/// *next* request, and every request thereafter is answered by the previous one's reply. See
+/// [`S2C::Error`]'s docs for the full argument.
+///
+/// C cannot make this call itself: an `Error` names no message. S can, because S has the message in
+/// hand. So the knowledge lives here, at the only place that has it.
+///
+/// # Inputs / outputs
+/// - `msg`: the message S is about to apply (and may refuse).
+/// - Returns `true` only for the two messages `rayland-c`'s [`RelayEngine`] genuinely blocks on.
+///
+/// # Pitfall: this must be kept in step with `RelayEngine`'s request/reply methods
+/// It is a claim about **C's** behaviour, asserted on S, and nothing mechanically couples the two.
+/// The list is deliberately exhaustive rather than a `_ => false` catch-all: a new C2S variant will
+/// fail to compile here, forcing whoever adds it to answer the question rather than inherit a
+/// default that might be wrong. `rayland-c`'s `RelayEngine::venus_capset` and
+/// `RelayEngine::create_blob_resource` are the only methods that call `request`, i.e. that send and
+/// then block.
+///
+/// [`RelayEngine`]: https://docs.rs/rayland-c
+fn message_is_solicited(msg: &C2S) -> bool {
+    match msg {
+        // The two requests C blocks on. The capset genuinely cannot be answered locally (C has no
+        // GPU), and a blob's resource id is assigned by S — C's Mesa is in `recvmsg` waiting.
+        C2S::GetCapset { .. } | C2S::CreateBlob { .. } => true,
+        // Everything else is fire-and-forget, and an error about any of them must never enter C's
+        // reply channel. `RingDelta` and `BlobData` are the dangerous ones in practice: they come
+        // from C's ring watcher thread, on the application's hot path, many times a second.
+        C2S::Hello { .. }
+        | C2S::CreateContext { .. }
+        | C2S::BlobData { .. }
+        | C2S::RingDelta { .. }
+        | C2S::SubmitCmd { .. }
+        | C2S::NotifyRing { .. }
+        | C2S::UnrefResource { .. } => false,
+    }
+}
+
 /// S's session state: the blobs it has mapped, the rings it mirrors, and the context it is serving.
 ///
 /// # Why a struct and not a free function
@@ -205,9 +252,14 @@ impl Applier {
     ///   fire-and-forget, and [`S2C::RingProgress`] is deliberately *not* produced here for a delta
     ///   S's engine has not consumed yet (see [`Self::poll_progress`]).
     pub fn apply(&mut self, engine: &mut dyn RenderEngine, msg: C2S) -> Vec<S2C> {
+        // Decide this **before** `try_apply` consumes the message: only S knows what it was
+        // refusing, and an `S2C::Error` carries no reference to what provoked it. See
+        // `message_is_solicited` — C's whole reply-routing correctness rests on this bool.
+        let solicited = message_is_solicited(&msg);
         match self.try_apply(engine, msg) {
             Ok(out) => out,
             Err(e) => vec![S2C::Error {
+                solicited,
                 // `ApplyError`'s own `Display` already carries the full story: every
                 // source-bearing variant interpolates `{0}`/`{source}` into its own message
                 // (and `EngineError`'s own variants do the same one level further down), so a
@@ -298,7 +350,7 @@ impl Applier {
                 // resource nobody can reach any more, which is why the error path unrefs it. The fd
                 // is dropped at the end of this scope either way — `mmap` holds its own reference to
                 // the underlying object, so closing it unmaps nothing.
-                let host_blob = HostBlob::map(fd.as_fd(), size).map_err(|source| {
+                let host_blob = HostBlob::map(fd.as_fd(), blob_id, size).map_err(|source| {
                     engine.unref_resource(res_id);
                     ApplyError::from(source)
                 })?;
@@ -440,10 +492,49 @@ impl Applier {
     /// is worthless — it is the exact reason virglrenderer's own watchdog cannot detect a stalled
     /// ring.
     ///
+    /// # The blob sync rides here, and its order is a correctness property
+    /// A ring that moved means S's GPU executed commands, and those commands may have **written the
+    /// application's mapped memory** — C0 Task 4b caught the reference app's readback buffer
+    /// (`res=6`, 16384 B = 64×64×4) holding the blue clear colour, i.e. the rendered picture, in
+    /// exactly such a blob. On one machine the application would simply read those pages. Across a
+    /// network S must copy them out and ship them, and spec §7 pins v1's strategy: **ship back every
+    /// mapped blob the GPU may have written, whole, after S reports the batch retired.**
+    ///
+    /// **Every [`S2C::BlobData`] therefore precedes every [`S2C::RingProgress`] in the returned
+    /// list, and that ordering is the point.** `RingProgress` is what advances C's local `head`, and
+    /// `head` is the **reply-ready signal**: `vn_ring_get_seqno_status` is
+    /// `vn_ring_ge_seqno(ring, vn_ring_load_head(ring), seqno)` (`vn_ring.c:176-179`), which
+    /// `vn_ring_wait_seqno` busy-polls. So the progress message *releases the application's wait*.
+    /// Sent before the pixels, it releases the application onto memory that is still zeros.
+    /// Ring-findings §7 names this exact constraint — *a transport must ship the shmem contents
+    /// before it ships the head update that releases the client's wait* — and warns it produces
+    /// once-an-hour heisenbugs. Here it would not be once an hour: it is every frame the application
+    /// reads back.
+    ///
+    /// # Pitfall: the reply arena does **not** cross here, and (c)1 is not complete without it
+    /// Spec §5's channel 2 — the reply arena, where S's engine writes the answers to synchronous
+    /// commands — is a `blob_id == 0` shmem, so [`HostBlob::is_application_memory`] excludes it and
+    /// **nothing in this daemon sends it**. That is not an oversight to be quietly filled in by
+    /// widening the predicate: the arena and the 8 MiB command-buffer *staging pool* are both
+    /// `blob_id == 0`, and shipping the staging pool back would overwrite the pages C's Mesa is
+    /// actively recording into — which S never writes — with zeros. Telling the two apart needs the
+    /// arena's `res_id`, which Venus declares only inside the ring, in `vkSetReplyCommandStreamMESA`
+    /// (`resourceId=2` in the capture). Reading it means decoding the ring to make a correctness
+    /// decision, which is what spec §7 rules out for v1.
+    ///
+    /// So this is a **recorded gap, not a solved problem**: until channel 2 has an owner, an
+    /// application on C blocks forever on its first synchronous call, because the reply it is
+    /// waiting for never leaves S. See (c)1 Task 5's report.
+    ///
     /// # Inputs / outputs
-    /// - Returns one [`S2C::RingProgress`] per ring that moved; usually empty.
+    /// - Returns the application's blob contents followed by one [`S2C::RingProgress`] per ring that
+    ///   moved. Empty — no blobs, no progress — when nothing moved, which is the overwhelmingly
+    ///   common case on a poll loop.
     pub fn poll_progress(&mut self) -> Vec<S2C> {
-        let mut out = Vec::new();
+        // Ask the rings first, before copying anything: on the overwhelming majority of polls
+        // nothing moved, and shipping a blob per poll regardless would make this loop a bandwidth
+        // source rather than the latency mechanism it is meant to be.
+        let mut progress = Vec::new();
         // Disjoint field borrows: `rings` mutably (the frontier advances), `blobs` immutably.
         for (&res_id, mirror) in self.rings.iter_mut() {
             let Some(blob) = self.blobs.get(&res_id) else {
@@ -453,12 +544,41 @@ impl Applier {
                 continue;
             };
             if let Some(consumed_tail) = mirror.take_progress(blob) {
-                out.push(S2C::RingProgress {
+                progress.push(S2C::RingProgress {
                     ring_res_id: res_id,
                     consumed_tail,
                 });
             }
         }
+        if progress.is_empty() {
+            // Nothing retired, so there is nothing S can honestly claim its GPU wrote — and no wait
+            // to release, so nothing that needs pixels shipped ahead of it.
+            return Vec::new();
+        }
+
+        // Something retired. v1 cannot know *which* of the application's blobs those commands
+        // touched — that would mean decoding the ring, which spec §7 rules out — so it ships all of
+        // them, whole. Over-eager on purpose: the cost is visible and the alternative is guessing.
+        let mut out = Vec::new();
+        for (&res_id, blob) in self.blobs.iter() {
+            // Venus's own shmems are not S's to publish back. The ring carries the `tail` and the
+            // command bytes C owns, and the staging pool holds bytes C's Mesa is recording into
+            // right now; overwriting either with S's copy would corrupt the very stream this daemon
+            // exists to replay. See the pitfall above on the reply arena.
+            if !blob.is_application_memory() {
+                continue;
+            }
+            out.push(S2C::BlobData {
+                res_id,
+                // Always 0 in v1: whole blobs, so they start at their beginning. The field exists
+                // now so a later dirty-range version needs no wire change.
+                offset: 0,
+                bytes: blob.bytes().to_vec(),
+            });
+        }
+        // **Last, always.** See the ordering argument above: this is what releases the application's
+        // wait, and it must not do so before the bytes it is waiting for are on their way.
+        out.extend(progress);
         out
     }
 }

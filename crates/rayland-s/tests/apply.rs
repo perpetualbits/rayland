@@ -115,6 +115,27 @@ impl RecordingEngine {
         unsafe { std::slice::from_raw_parts(mapping.as_ptr().cast::<u8>(), len) }.to_vec()
     }
 
+    /// Fill a blob's pages with `fill`, standing in for **S's GPU** writing the application's
+    /// mapped memory.
+    ///
+    /// This is the half of the `vkMapMemory` problem that runs on S: the GPU writes rendered pixels
+    /// into a `HOST_VISIBLE` blob with no command, no event and nothing on any wire (ring-findings
+    /// §6). C0 Task 4b caught exactly that — `res=6`, 16384 B = 64×64×4, holding the blue clear
+    /// colour. Tests that need S to have pixels worth shipping back use this to play the GPU's part.
+    fn write_blob(&self, res_id: u32, fill: u8) {
+        let fd = self
+            .blob_fds
+            .get(&res_id)
+            .expect("a blob this double created");
+        let size = self.blob_sizes[&res_id];
+        let mapping = ShmMapping::map(fd.as_fd(), size).expect("mapping the double's memfd");
+        // SAFETY: the mapping is live, writable, and exactly `size` bytes for the duration of this
+        // write; nothing else touches these pages while this test runs.
+        unsafe {
+            std::ptr::write_bytes(mapping.as_ptr().cast::<u8>(), fill, size as usize);
+        }
+    }
+
     /// Write a 32-bit control word into a blob's pages, standing in for virglrenderer's ring thread.
     ///
     /// The ring thread is the only thing that ever writes `head` (`vkr_ring_store_head`,
@@ -244,9 +265,12 @@ fn control(blob: &[u8], offset: usize) -> u32 {
 }
 
 /// The sole `S2C::Error` in `out`, or a panic naming what was actually produced.
+///
+/// `solicited` is ignored here — the tests that care about it assert it directly, by name, rather
+/// than through a helper that would make it easy to forget.
 fn sole_error(out: &[S2C]) -> &str {
     match out {
-        [S2C::Error { message }] => message,
+        [S2C::Error { message, .. }] => message,
         other => panic!("expected exactly one S2C::Error, got {other:?}"),
     }
 }
@@ -915,5 +939,290 @@ fn refusals_are_typed_so_a_caller_can_tell_them_apart() {
             }
         ),
         "got {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// (c)1 Task 5: the S->C half of the blob sync — getting the picture back to the application
+// ---------------------------------------------------------------------------------------------
+
+/// The app's readback buffer from the live capture (ring-findings §6): `res=6`, 16384 B = 64×64×4,
+/// `blob_id = 18`. C0 Task 4b caught it holding the blue clear colour — it is how the pixels reach
+/// the application at all.
+const READBACK_BLOB_ID: u64 = 18;
+/// That buffer's size: 64 × 64 × 4, exactly.
+const READBACK_SIZE: u64 = 16384;
+
+/// Bring up a session with a ring **and** the application's readback blob, and return both ids.
+///
+/// Mirrors the live capture's shape: Venus's own shmems carry `blob_id == 0`, the application's
+/// `VkDeviceMemory` allocations carry a non-zero one.
+fn session_with_ring_and_app_blob() -> (Applier, RecordingEngine, u32, u32) {
+    let (mut applier, mut engine, ring) = session_with_ring();
+
+    let out = applier.apply(
+        &mut engine,
+        C2S::CreateBlob {
+            blob_mem: BLOB_MEM_HOST3D,
+            blob_flags: 0,
+            blob_id: READBACK_BLOB_ID,
+            size: READBACK_SIZE,
+        },
+    );
+    let app_blob = match out.as_slice() {
+        [S2C::BlobCreated { res_id }] => *res_id,
+        other => panic!("expected the app's blob to be created, got {other:?}"),
+    };
+    (applier, engine, ring, app_blob)
+}
+
+/// Drive a session to the point where S's engine has retired commands and its GPU has written the
+/// application's readback blob — i.e. exactly the moment S owes C both pixels and progress.
+fn a_retired_batch_with_pixels(fill: u8) -> (Applier, RecordingEngine, u32, u32) {
+    let (mut applier, mut engine, ring, app_blob) = session_with_ring_and_app_blob();
+    applier.apply(
+        &mut engine,
+        C2S::RingDelta {
+            ring_res_id: ring,
+            tail: 64,
+            bytes: vec![0xaa; 64],
+        },
+    );
+    // The GPU renders: the readback blob now holds the picture.
+    engine.write_blob(app_blob, fill);
+    // virglrenderer's ring thread retires the batch and stores `head`.
+    engine.write_control(ring, RING_HEAD_OFFSET, 64);
+    (applier, engine, ring, app_blob)
+}
+
+/// **The mirror of Task 5's central assertion, and the sharper of the two: the pixels must reach C
+/// before the message that releases the application's wait.**
+///
+/// `S2C::RingProgress` is what advances C's local `head`, and `head` is the **reply-ready signal** —
+/// `vn_ring_get_seqno_status` is `vn_ring_ge_seqno(ring, vn_ring_load_head(ring), seqno)`
+/// (`vn_ring.c:176-179`), which `vn_ring_wait_seqno` busy-polls. So progress *releases the
+/// application*. Sent before the blob, it releases the application onto memory that is still zeros.
+///
+/// Ring-findings §7 names this exact ordering constraint — *a transport must ship the shmem contents
+/// before it ships the head update that releases the client's wait* — and warns it produces
+/// once-an-hour heisenbugs. Here it would not be once an hour: it is every frame the app reads back.
+#[test]
+fn the_gpu_s_pixels_are_shipped_before_the_progress_that_releases_the_app_s_wait() {
+    let (mut applier, _engine, _ring, app_blob) = a_retired_batch_with_pixels(0x5a);
+
+    let out = applier.poll_progress();
+
+    let blob_at = out
+        .iter()
+        .position(|m| matches!(m, S2C::BlobData { res_id, .. } if *res_id == app_blob))
+        .expect("S must ship back the blob its GPU wrote; without it the app reads zeros");
+    let progress_at = out
+        .iter()
+        .position(|m| matches!(m, S2C::RingProgress { .. }))
+        .expect("progress must still be reported");
+
+    assert!(
+        blob_at < progress_at,
+        "the pixels must be on their way before the head update that releases the application's \
+         wait, but progress came first (blob at {blob_at}, progress at {progress_at}); the app \
+         would return from its synchronous call and read a buffer S had not yet sent: {out:?}"
+    );
+}
+
+/// The bytes S ships back must be the ones its GPU actually wrote. A message with the right id and
+/// stale contents would satisfy an ordering test and still hand the application the wrong picture.
+#[test]
+fn the_shipped_blob_carries_the_bytes_s_s_gpu_actually_wrote() {
+    let (mut applier, _engine, _ring, app_blob) = a_retired_batch_with_pixels(0x5a);
+
+    let out = applier.poll_progress();
+
+    let (offset, bytes) = out
+        .iter()
+        .find_map(|m| match m {
+            S2C::BlobData {
+                res_id,
+                offset,
+                bytes,
+            } if *res_id == app_blob => Some((*offset, bytes)),
+            _ => None,
+        })
+        .expect("the readback blob");
+    assert_eq!(offset, 0, "v1 ships whole blobs, so they start at 0");
+    assert_eq!(
+        bytes,
+        &vec![0x5au8; READBACK_SIZE as usize],
+        "the application's frame is exactly what S's GPU left in these pages"
+    );
+}
+
+/// **Venus's own shmems must never be shipped S→C.**
+///
+/// The ring is the sharp case: C owns its `tail` and its command buffer, and S shipping its copy
+/// back would overwrite the very commands C is in the middle of relaying. The staging pool is worse
+/// in a quieter way — C's Mesa records command buffers into it and S *never writes it*, so S's copy
+/// is zeros; shipping it back would wipe a recording in progress. This is why "conservative full
+/// sync" cannot mean "everything, both ways": that is not conservative, it is corruption.
+#[test]
+fn venus_s_own_shmems_are_never_shipped_s_to_c() {
+    let (mut applier, _engine, ring, app_blob) = a_retired_batch_with_pixels(0x5a);
+
+    let out = applier.poll_progress();
+
+    let shipped: Vec<u32> = out
+        .iter()
+        .filter_map(|m| match m {
+            S2C::BlobData { res_id, .. } => Some(*res_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        shipped,
+        vec![app_blob],
+        "only the application's own memory may cross S->C; shipping the ring (res={ring}) back \
+         would overwrite the tail and command bytes C owns"
+    );
+}
+
+/// A poll that finds no movement must ship **nothing** — not even the blobs.
+///
+/// This is what keeps the 200 µs poll loop a latency mechanism rather than a bandwidth source. S has
+/// no evidence its GPU wrote anything, so it has nothing to say; shipping a 16 KiB blob 5000 times a
+/// second on the chance something changed would saturate the link the sub-project exists to measure.
+#[test]
+fn a_poll_that_finds_no_movement_ships_nothing_at_all() {
+    let (mut applier, mut engine, ring, app_blob) = session_with_ring_and_app_blob();
+    applier.apply(
+        &mut engine,
+        C2S::RingDelta {
+            ring_res_id: ring,
+            tail: 8,
+            bytes: vec![0u8; 8],
+        },
+    );
+    // The GPU has written something, but the ring thread has not retired anything: `head` is
+    // untouched, so S has no evidence to report and no wait to release.
+    engine.write_blob(app_blob, 0x77);
+
+    assert!(
+        applier.poll_progress().is_empty(),
+        "with `head` unmoved there is no retired batch, so no progress and therefore no reason to \
+         ship a blob; a blob per poll would make this loop a bandwidth source"
+    );
+}
+
+/// Progress reported a second time for the same `head` ships no blobs either.
+///
+/// `take_progress` already gates on movement (a repeat proves only that S's process is scheduled —
+/// ring-findings §5.4), and the blob sync must inherit that gate rather than re-open it. Otherwise
+/// every poll of a quiescent session would re-ship every mapped blob.
+#[test]
+fn a_quiescent_ring_re_ships_nothing_on_subsequent_polls() {
+    let (mut applier, _engine, _ring, _app_blob) = a_retired_batch_with_pixels(0x5a);
+
+    // First poll: the batch retired, so pixels and progress both go.
+    assert!(
+        !applier.poll_progress().is_empty(),
+        "the first poll after a retired batch owes C both"
+    );
+
+    // Nothing has moved since.
+    assert!(
+        applier.poll_progress().is_empty(),
+        "an unmoved `head` is not progress and not a reason to re-ship a blob"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// (c)1 Task 5: `solicited`, the field that keeps C's reply channel from desynchronizing
+// ---------------------------------------------------------------------------------------------
+
+/// Whether the sole `S2C::Error` in `out` claims to answer something C is blocked on.
+fn sole_error_is_solicited(out: &[S2C]) -> bool {
+    match out {
+        [S2C::Error { solicited, .. }] => *solicited,
+        other => panic!("expected exactly one S2C::Error, got {other:?}"),
+    }
+}
+
+/// **A refusal of a fire-and-forget message must be marked unsolicited.**
+///
+/// This is the field C's reply routing depends on, and `C2S::BlobData` is the case (c)1 Task 5 made
+/// dangerous: it is sent from C's **ring watcher** thread, which waits for nothing, on **every ring
+/// delta** — many times a second on the application's hot path. Marked solicited, S's refusal would
+/// be queued by C as an answer, where it would satisfy the *next* `GetCapset` or `CreateBlob` and
+/// desynchronize every request thereafter, permanently and unboundedly.
+///
+/// The blob id here is one S has no resource for, which is precisely the refusal a real
+/// desynchronized session would produce.
+#[test]
+fn a_refusal_of_a_fire_and_forget_blob_data_is_marked_unsolicited() {
+    let (mut applier, mut engine, _ring) = session_with_ring();
+
+    let out = applier.apply(
+        &mut engine,
+        C2S::BlobData {
+            res_id: 999,
+            offset: 0,
+            bytes: vec![1, 2, 3, 4],
+        },
+    );
+
+    assert!(
+        !sole_error_is_solicited(&out),
+        "nothing on C waits for a BlobData — it comes from the ring watcher. Marking its refusal \
+         solicited would have C answer its next request with this error, and every request after \
+         that with the previous one's reply, forever"
+    );
+}
+
+/// The same, for the other message C's watcher fires and forgets: the ring delta itself.
+#[test]
+fn a_refusal_of_a_fire_and_forget_ring_delta_is_marked_unsolicited() {
+    let (mut applier, mut engine, _ring) = session_with_ring();
+
+    // A delta naming a resource that is not a ring: S has no blob for 999 at all.
+    let out = applier.apply(
+        &mut engine,
+        C2S::RingDelta {
+            ring_res_id: 999,
+            tail: 4,
+            bytes: vec![1, 2, 3, 4],
+        },
+    );
+
+    assert!(
+        !sole_error_is_solicited(&out),
+        "a RingDelta comes from the ring watcher, which never waits for a reply"
+    );
+}
+
+/// **The other half: a refusal of a message C genuinely blocks on must stay solicited.**
+///
+/// Without this, the fix above would be a different bug rather than a fix. C's Mesa sits in
+/// `recvmsg` waiting for a blob's descriptor, and `RelayEngine::create_blob_resource` is blocked in
+/// a request/reply; an error S declines to route is an application that hangs forever with no
+/// explanation anywhere — exactly what `Applier::apply` being total exists to prevent.
+#[test]
+fn a_refusal_of_a_request_c_blocks_on_stays_solicited() {
+    let mut engine = RecordingEngine::new();
+    let mut applier = Applier::new();
+    applier.apply(&mut engine, C2S::CreateContext { ctx_id: CTX_ID });
+    engine.fail_blob_with = Some(EngineError::NoVenusCapset);
+
+    let out = applier.apply(
+        &mut engine,
+        C2S::CreateBlob {
+            blob_mem: BLOB_MEM_HOST3D,
+            blob_flags: 0,
+            blob_id: 0,
+            size: 4096,
+        },
+    );
+
+    assert!(
+        sole_error_is_solicited(&out),
+        "C is blocked in a request/reply for this blob's resource id, and its Mesa is blocked in \
+         recvmsg behind that. An error not routed to it is an application that hangs forever"
     );
 }

@@ -50,6 +50,9 @@ use std::os::fd::{AsFd, OwnedFd};
 // shared memory; `ShmMapping` owns our `MAP_SHARED` view of it and `munmap`s on drop.
 use rayland_vtest::EngineError;
 use rayland_vtest::transport::{ShmMapping, create_memfd};
+// Ring-findings §6's blob_id discrimination, held once for both (c)1 daemons. See
+// `LocalBlob::is_application_memory`.
+use rayland_vtest::venus_ring::is_application_memory;
 
 /// One blob resource's **local** shared memory: the pages Mesa maps and writes, and that
 /// `rayland-c` reads in order to relay their contents to S.
@@ -78,6 +81,13 @@ pub struct LocalBlob {
     /// The blob's size in bytes, as Mesa requested it. Equal to `mapping.len()`; kept because it is
     /// the number the wire protocol speaks in, and `u64` is the type it travels as.
     size: u64,
+    /// The client-chosen blob id from `VCMD_RESOURCE_CREATE_BLOB`.
+    ///
+    /// Kept because it is the **only clean signal** separating the application's own memory from
+    /// Venus's internal plumbing (ring-findings §6), and (c)1's blob synchronisation routes on
+    /// exactly that: see [`LocalBlob::is_application_memory`]. It is recorded at creation because it
+    /// is never recoverable afterwards — nothing else on the wire or in the pages carries it.
+    blob_id: u64,
 }
 
 impl LocalBlob {
@@ -85,6 +95,9 @@ impl LocalBlob {
     /// lasting view of it and the descriptor Mesa must receive.
     ///
     /// # Inputs / outputs
+    /// - `blob_id`: the client-chosen blob id, straight from the client's
+    ///   `VCMD_RESOURCE_CREATE_BLOB`. Not used for the allocation itself — it is recorded so that
+    ///   [`LocalBlob::is_application_memory`] can answer later; see that method for why it matters.
     /// - `size`: the blob size in bytes, straight from the client's `VCMD_RESOURCE_CREATE_BLOB`.
     ///   Untrusted input, so it is bounded by the syscalls themselves rather than assumed sane:
     ///   `create_memfd` fails on a size that cannot be an `off_t`, and `ShmMapping::map` fails on
@@ -100,7 +113,7 @@ impl LocalBlob {
     ///   application the instant it wrote its first Venus command.
     /// - [`EngineError::ShmMapFailed`] — `mmap` failed, so there is no view to read the client's
     ///   commands through and the resource cannot be served at all.
-    pub fn create(size: u64) -> Result<(Self, OwnedFd), EngineError> {
+    pub fn create(blob_id: u64, size: u64) -> Result<(Self, OwnedFd), EngineError> {
         // Anonymous, path-less, self-cleaning shared memory: the object lives exactly as long as
         // some fd or mapping refers to it, which is precisely the lifetime we want.
         let fd = create_memfd(size)?;
@@ -109,12 +122,31 @@ impl LocalBlob {
         // would read stale zeros forever — a failure that looks like "the application produced no
         // commands" rather than like a mapping bug.
         let mapping = ShmMapping::map(fd.as_fd(), size)?;
-        Ok((LocalBlob { mapping, size }, fd))
+        Ok((
+            LocalBlob {
+                mapping,
+                size,
+                blob_id,
+            },
+            fd,
+        ))
     }
 
     /// The blob's size in bytes, as Mesa requested it.
     pub fn size(&self) -> u64 {
         self.size
+    }
+
+    /// Whether this blob is the **application's own memory** rather than one of Venus's internal
+    /// shmems — i.e. whether (c)1 must ship its contents across the network.
+    ///
+    /// Delegates to [`rayland_vtest::venus_ring::is_application_memory`], which holds the
+    /// repository's single copy of ring-findings §6's `blob_id` discrimination and documents the
+    /// evidence behind it. It is not reimplemented here: `rayland-s` asks the same question of its
+    /// own blobs, and the two ends disagreeing about which memory belongs to whom would corrupt
+    /// whichever side lost the argument.
+    pub fn is_application_memory(&self) -> bool {
+        is_application_memory(self.blob_id)
     }
 
     /// The blob's pages, for reading — the ring's control words and command buffer, or an
@@ -193,7 +225,10 @@ mod tests {
     #[test]
     fn the_mapping_outlives_the_fd_and_still_sees_a_foreign_writers_bytes() {
         const SIZE: u64 = 4096;
-        let (blob, fd) = LocalBlob::create(SIZE).expect("a local blob");
+        // `blob_id = 0`: this test plays the part of the command ring, which is one of Venus's own
+        // shmems. The id is irrelevant to the mapping mechanics under test — it only classifies the
+        // blob for `crate::blob_sync` — but it is passed honestly rather than arbitrarily.
+        let (blob, fd) = LocalBlob::create(0, SIZE).expect("a local blob");
         assert_eq!(blob.size(), SIZE);
 
         // Stand in for Mesa: an independent mapping of the same object, made through the descriptor
@@ -232,7 +267,8 @@ mod tests {
     #[test]
     fn bytes_written_through_the_shadow_are_visible_to_the_clients_mapping() {
         const SIZE: u64 = 4096;
-        let (mut blob, fd) = LocalBlob::create(SIZE).expect("a local blob");
+        // `blob_id = 0`: this test plays the part of the reply arena, which is Venus-internal.
+        let (mut blob, fd) = LocalBlob::create(0, SIZE).expect("a local blob");
         let mesa_view = ShmMapping::map(fd.as_fd(), SIZE).expect("the client's own mapping");
         drop(fd);
 

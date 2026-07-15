@@ -27,11 +27,15 @@
 //!
 //! # Status: what has and has not been run
 //! **This binary has never been run end-to-end.** `rayland-s` ((c)1 Task 4) now exists, but nothing
-//! connects the two: the QUIC transport is Task 6, and Task 5 still owes the blob synchronisation
-//! without which the application's vertex buffer never reaches S at all. The pieces with real
-//! logic — the ring watcher, the blob shadows, the relay engine — are unit-tested against a
-//! synthetic ring and a mock link (`tests/ring_watch.rs`, and the `tests` modules of [`ring`],
-//! [`shm`] and [`relay_engine`]), as is this file's own [`Progress`] (see its `tests` module).
+//! connects the two: the QUIC transport is Task 6. Task 5 has since shipped the blob
+//! synchronisation, so the application's vertex buffer does now reach S (see [`blob_sync`]) — but
+//! **the reply arena still does not**, and until it does, an application blocks forever on its first
+//! synchronous call. That is spec §5's channel 2, and it has no owner; `rayland-s`'s
+//! `Applier::poll_progress` documents exactly why the obvious fix is a corruption bug. The pieces
+//! with real logic — the ring watcher, the blob shadows, the relay engine, the blob sync — are
+//! unit-tested against a synthetic ring and a mock link (`tests/ring_watch.rs`, and the `tests`
+//! modules of [`ring`], [`shm`], [`relay_engine`] and [`blob_sync`]), as is this file's own
+//! [`Progress`] (see its `tests` module).
 //!
 //! What remains uncovered is the *wiring*: the sockets, the three threads, and the vtest session.
 //! That genuinely needs a live peer on the other end of a link, and must be treated as unverified
@@ -44,12 +48,16 @@
 //! This file is written to be read, and it says where it is guessing.
 
 // The daemon's own pieces.
+use rayland_c::blob_sync::messages_for_delta;
 use rayland_c::relay_engine::{BlobTable, RelayEngine, RelayLink, RingSlot};
 use rayland_c::ring::{ParkDecision, RingWatcher};
 // The relay protocol and its framing.
 use rayland_relay::{C2S, S2C, read_msg, write_msg};
 // The vtest server we present to Mesa, and the error type the engine seam speaks.
 use rayland_vtest::EngineError;
+// Spec §5.1's guard: notice Venus's out-of-line command path rather than relaying a stream that
+// would misbehave on S's GPU with no trace of the cause.
+use rayland_vtest::venus_ring::scan_for_out_of_line_stream;
 use rayland_vtest::vtest::serve_vtest;
 
 use anyhow::{Context, Result};
@@ -404,10 +412,34 @@ fn reader_thread(
                     );
                 }
             }
-            // Solicited (`Capset`, `BlobCreated`, `Error`): queue it for whoever asked. The channel
-            // is unbounded and its receiver lives inside the engine for the whole session, so a
-            // send failure here means only one thing: the engine has been dropped, i.e. the vtest
-            // session is over. That is a reason to stop, not an error to report.
+            // **An error about something nobody asked for must not be queued as an answer.**
+            //
+            // Most of this protocol is fire-and-forget, and the ring watcher — which never waits for
+            // anything — sends a `RingDelta` and a `BlobData` per delta, many times a second. If S
+            // refuses one of those, routing its error to `replies` puts an unasked-for message at the
+            // head of the queue, where it answers the *next* request; every request after that is
+            // then answered by the previous one's reply, permanently. The desynchronization is
+            // unbounded and surfaces arbitrarily far from its cause.
+            //
+            // S is the only party that can tell the two cases apart, because only S knows which
+            // message it was refusing (an `Error` names nothing), which is why `solicited` is on the
+            // wire at all. Logged rather than dropped: this is a genuine failure on S, and it is
+            // C-side evidence for a human who has only C's log in front of them.
+            S2C::Error {
+                message,
+                solicited: false,
+            } => {
+                eprintln!(
+                    "rayland-c: S refused a fire-and-forget message: {message}\n\
+                     rayland-c: nothing on C was waiting for this, so it is reported here rather \
+                     than answered. The session is likely now producing a stream S cannot replay."
+                );
+            }
+            // Solicited (`Capset`, `BlobCreated`, and an `Error` that genuinely answers a request):
+            // queue it for whoever asked. The channel is unbounded and its receiver lives inside the
+            // engine for the whole session, so a send failure here means only one thing: the engine
+            // has been dropped, i.e. the vtest session is over. That is a reason to stop, not an
+            // error to report.
             other => {
                 if replies.send(other).is_err() {
                     return;
@@ -550,6 +582,24 @@ fn ring_watcher_thread(
         // --- 2. Relay, with no lock held. These bytes are the application's Vulkan commands.
         if let Some(delta) = delta {
             let tail = delta.tail;
+            // Before anything crosses: refuse a stream (c)1 v1 cannot faithfully carry. Venus
+            // replaces any submission over `direct_size` (8192 B for the 128 KiB instance ring) with
+            // a `vkExecuteCommandStreamsMESA` pointing at *other* shmems this version never ships —
+            // S would then resolve those ids to blobs it holds and execute their contents, which are
+            // zeros. Spec §5.1 requires that this never be silent, and the scan is deliberately a
+            // sound over-approximation rather than a decode; `scan_for_out_of_line_stream`'s module
+            // docs carry the whole argument and the reason a decode-based check could not work.
+            //
+            // Exiting rather than continuing, for the same reason the stall below exits: this thread
+            // is detached and the vtest thread is blocked inside `serve_vtest`, so there is nothing
+            // to return an error to — and a relay that carried on would corrupt S's stream, which
+            // surfaces as inexplicable GPU misbehaviour nowhere near the cause.
+            if let Err(found) = scan_for_out_of_line_stream(&delta.bytes) {
+                eprintln!(
+                    "rayland-c: refusing to relay the ring delta ending at tail {tail}: {found}"
+                );
+                std::process::exit(1);
+            }
             // Record the frontier *before* the send, not after. `Progress::note_consumed` refuses
             // any acknowledgement past `relayed_tail`, and a fast S can answer this delta before
             // this thread would reacquire the progress lock — so noting it afterwards would race,
@@ -560,18 +610,27 @@ fn ring_watcher_thread(
                 .lock()
                 .expect("the progress lock is never poisoned")
                 .note_relayed(tail);
-            let msg = C2S::RingDelta {
-                ring_res_id: identity.res_id,
-                tail,
-                bytes: delta.bytes,
-            };
-            if let Err(e) = tx
-                .lock()
-                .expect("the link send lock is never poisoned")
-                .send(&msg)
+
+            // Decide what must accompany this delta, and in what order. `messages_for_delta` copies
+            // the application's mapped blobs out under the blob lock and releases it before
+            // returning, so the send below cannot hold it — the discipline `BlobTable` documents,
+            // made structural. The order it returns is a correctness contract: the app's vertices
+            // must be on S before the commands that read them, because S's ring thread dispatches
+            // the instant `tail` lands. See `crate::blob_sync`.
+            let msgs = messages_for_delta(&blobs, identity.res_id, delta);
+
+            // One lock for the whole batch. Not for atomicity against the vtest thread — an
+            // unrelated message interleaving here is harmless — but because taking and dropping it
+            // per message would let this loop's own next iteration overtake the delta it just
+            // queued behind the blobs it queued first.
             {
-                eprintln!("rayland-c: relaying the ring to S failed: {e}");
-                return;
+                let mut link = tx.lock().expect("the link send lock is never poisoned");
+                for msg in &msgs {
+                    if let Err(e) = link.send(msg) {
+                        eprintln!("rayland-c: relaying the ring to S failed: {e}");
+                        return;
+                    }
+                }
             }
             // New work was just produced, so do not even consider parking: go straight back and
             // look again. An application mid-frame produces continuously. IDLE was retracted in

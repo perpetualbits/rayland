@@ -29,8 +29,12 @@
 //!
 //! # Status: never run against a real C
 //! **This binary has never completed a session**, because there is nothing to run it against yet:
-//! the QUIC transport is (c)1 Task 6, and Task 5 still owes the blob synchronisation without which
-//! the application's vertex buffer never reaches S. The piece with the real logic — [`Applier`], and
+//! the QUIC transport is (c)1 Task 6. Task 5 has since shipped the blob synchronisation, so the
+//! application's memory now crosses both ways — but **the reply arena does not** (spec §5's channel
+//! 2, still unowned), so an application on C would block forever on its first synchronous call even
+//! once a transport exists. [`Applier::poll_progress`] documents why the obvious widening of the
+//! blob-sync rule would corrupt C's staging pool instead of fixing it. The piece with the real
+//! logic — [`Applier`], and
 //! the ring arithmetic under it — is tested against a real shared-memory mapping with no GPU and no
 //! network (`tests/apply.rs`). What is uncovered here is the *wiring*: the socket, the two threads,
 //! and the engine's own behaviour. That genuinely needs a peer, and is unverified until Task 6.
@@ -185,10 +189,12 @@ fn serve(
             .apply(engine, msg);
 
         for reply in &out {
-            // Worth a human's attention: C has no handler for an *unsolicited* error (its reader
-            // routes anything that is not BlobData/RingProgress to whoever is waiting on a reply),
-            // so for a fire-and-forget message S's own log is where the refusal is actually visible.
-            if let S2C::Error { message } = reply {
+            // Worth a human's attention either way, and S's log is the more reliable of the two
+            // places it appears: an unsolicited refusal reaches C's reader, which logs it and
+            // deliberately does **not** route it to anyone waiting (see `S2C::Error`), so nothing on
+            // C fails loudly because of it. `solicited` is ignored here because S logs its own
+            // refusals regardless of who was listening.
+            if let S2C::Error { message, .. } = reply {
                 eprintln!("rayland-s: refusing a message from C: {message}");
             }
             let mut stream = tx.lock().expect("the link send lock is never poisoned");

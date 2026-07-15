@@ -24,6 +24,10 @@
 //!   its module docs before touching it; the hang it avoids is subtle, intermittent, and named.
 //! - [`relay_engine`] — the [`RenderEngine`](rayland_vtest::RenderEngine) whose GPU is another
 //!   machine.
+//! - [`blob_sync`] — what must cross the wire *alongside* a ring delta, and in what order. The
+//!   ring is not the whole story: the application writes its vertices straight into mapped memory
+//!   with no API call to intercept (ring-findings §6), so those bytes have to be shipped, and they
+//!   have to arrive **before** the commands that read them.
 //!
 //! A reader looking for "where the application's Vulkan commands are handled" will instinctively go
 //! to [`relay_engine`], because that is where the trait methods are. **They are not there.**
@@ -45,3 +49,5 @@ pub mod shm;
 pub mod ring;
 // The RenderEngine implementation that forwards to S.
 pub mod relay_engine;
+// The C->S half of (c)1's coherence strategy: which blobs accompany a ring delta, and in what order.
+pub mod blob_sync;

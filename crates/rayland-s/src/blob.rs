@@ -54,6 +54,9 @@
 // `MAP_SHARED` + `PROT_READ | PROT_WRITE` and owns the `munmap`, which is precisely what S needs.
 use rayland_vtest::EngineError;
 use rayland_vtest::transport::ShmMapping;
+// Ring-findings §6's blob_id discrimination, held once for both (c)1 daemons. See
+// `HostBlob::is_application_memory`.
+use rayland_vtest::venus_ring::is_application_memory;
 
 use std::os::fd::BorrowedFd;
 
@@ -88,6 +91,13 @@ pub struct HostBlob {
     /// The blob's size in bytes, as the client requested it. Every bound checked against remote
     /// input is checked against this.
     size: u64,
+    /// The client-chosen blob id, forwarded verbatim from C's `C2S::CreateBlob`.
+    ///
+    /// Kept because it is the **only clean signal** separating the application's own memory from
+    /// Venus's internal plumbing (ring-findings §6), and it is what decides whether S ships this
+    /// blob's contents back to C after its GPU has written them — see
+    /// [`HostBlob::is_application_memory`].
+    blob_id: u64,
 }
 
 impl HostBlob {
@@ -97,6 +107,8 @@ impl HostBlob {
     /// - `fd`: the descriptor `RenderEngine::create_blob_resource` returned. Borrowed — `mmap`
     ///   takes its own reference to the underlying object, so the caller may drop the fd
     ///   afterwards.
+    /// - `blob_id`: the client-chosen blob id from the wire. Not used for the mapping — it is
+    ///   recorded so [`HostBlob::is_application_memory`] can answer later.
     /// - `size`: the blob's size in bytes.
     /// - Returns the owning [`HostBlob`].
     ///
@@ -104,14 +116,67 @@ impl HostBlob {
     /// [`EngineError::ShmMapFailed`] if the mapping fails or `size` does not fit this platform's
     /// address space. `size` originates from a remote peer, so that is a real check rather than a
     /// formality.
-    pub fn map(fd: BorrowedFd<'_>, size: u64) -> Result<Self, EngineError> {
+    pub fn map(fd: BorrowedFd<'_>, blob_id: u64, size: u64) -> Result<Self, EngineError> {
         let mapping = ShmMapping::map(fd, size)?;
-        Ok(HostBlob { mapping, size })
+        Ok(HostBlob {
+            mapping,
+            size,
+            blob_id,
+        })
     }
 
     /// The blob's size in bytes — the ceiling every remote-supplied offset is checked against.
     pub fn size(&self) -> u64 {
         self.size
+    }
+
+    /// Whether this blob is the **application's own memory** rather than one of Venus's internal
+    /// shmems — i.e. whether S must ship its contents back to C.
+    ///
+    /// Delegates to [`rayland_vtest::venus_ring::is_application_memory`], which holds the
+    /// repository's single copy of ring-findings §6's `blob_id` discrimination and the evidence
+    /// behind it. `rayland-c` asks the same question of its own shadows through the same function;
+    /// two ends disagreeing about which memory belongs to whom would corrupt whichever side lost.
+    ///
+    /// # Pitfall: `blob_id` is remote input, and this is not a security boundary
+    /// It arrives from C and is not verified against anything. A broken or hostile C could label
+    /// its reply arena as application memory and have S ship it back, or label its readback buffer
+    /// as Venus-internal and never receive its pixels. Neither escapes this blob's mapping — every
+    /// write is still bounds-checked by [`HostBlob::copy_in`] — so the consequence is a corrupt or
+    /// stalled session for that peer, not a mapping overflow. It is a *routing* signal, not a
+    /// permission.
+    pub fn is_application_memory(&self) -> bool {
+        is_application_memory(self.blob_id)
+    }
+
+    /// The blob's pages, for reading — the bytes S's GPU wrote that C is waiting for.
+    ///
+    /// # Why this exists: it is how the application ever sees its own rendered frame
+    /// C0 Task 4b caught the reference app's readback buffer (`res=6`, 16384 B = 64×64×4) holding
+    /// the blue clear colour — the picture, sitting in S's memory. On one machine the application
+    /// would simply read those pages. Across a network somebody has to copy them out and ship them,
+    /// and this is that read. See [`crate::apply::Applier::poll_progress`].
+    ///
+    /// # Pitfall: these bytes have another writer, concurrently
+    /// virglrenderer's ring thread — in the forked render-server subprocess — writes these pages
+    /// with no lock and no notification, exactly as Mesa does on C. Reading them is therefore
+    /// inherently racy, and v1 has nothing that makes it not so: the application never told anyone
+    /// when its GPU writes finished, which is the whole `vkMapMemory` problem (ring-findings §6).
+    /// What bounds the race in practice is that S reads *after* the ring thread advanced `head` past
+    /// the commands that wrote these pages — see `poll_progress`'s ordering — which is evidence the
+    /// writes retired, though not a guarantee the C11 model would recognise.
+    ///
+    /// A `&[u8]` rather than a raw read because a shared reference asserts only that *this* side
+    /// forms no `&mut` to the same pages, which is true: [`HostBlob::copy_in`] takes `&mut self`.
+    /// The cross-process writer is outside Rust's model either way — see the module docs.
+    pub fn bytes(&self) -> &[u8] {
+        // SAFETY: `mapping` is a live `MAP_SHARED` mapping of exactly `size` bytes, unmapped only
+        // when `self` drops, so the pointer is valid for the whole of the returned slice's lifetime,
+        // which `&self` bounds. `size` fits a `usize` because `ShmMapping::map` already proved it.
+        // `u8` has no alignment requirement and no invalid bit patterns, so any byte virglrenderer
+        // writes is a valid `u8`. The concurrent cross-process writer is a data race in the abstract
+        // model, not an aliasing or validity violation — see the module docs.
+        unsafe { std::slice::from_raw_parts(self.as_ptr() as *const u8, self.size as usize) }
     }
 
     /// The mapping's base address.
