@@ -102,6 +102,37 @@ pub enum C2S {
         bytes: Vec<u8>,
     },
 
+    /// An **inline** Venus command batch: the bytes that arrived on the vtest socket itself, in a
+    /// `VCMD_SUBMIT_CMD2` message, rather than through the command ring.
+    ///
+    /// # Why this is a separate message from [`C2S::RingDelta`], and why conflating them breaks S
+    /// It is tempting to reuse `RingDelta` for these bytes — they are the same Venus command
+    /// language, after all (ring-findings §3 proves that twice over). **They must not be**, because
+    /// the two paths are consumed by *different decoders on S*. Ring-findings §3.1 pins both call
+    /// sites: the ring path is `vkr_ring.c:220-223`, which decodes into the ring's own private
+    /// encoder/decoder pair; the inline path is `vkr_context.c:170-173`, which decodes into the
+    /// **context's** decoder and is what `virgl_renderer_submit_cmd` reaches. Same language, same
+    /// dispatch table, different decoder instance — so routing inline bytes into S's ring mirror
+    /// would append them to a byte stream they were never part of and desynchronize it.
+    ///
+    /// This is not a hypothetical tidiness argument. The socket's *one* real command is
+    /// `vkCreateRingMESA` (opcode 188 = `0xbc`), caught in a live `SUBMIT_CMD2` capture that
+    /// predates the ring's discovery (ring-findings §3.2) — it is the message that **creates the
+    /// ring on S in the first place**. Deliver it as a ring delta and S has no ring to deliver it
+    /// to; nothing is ever created, and nothing the application draws is ever executed.
+    ///
+    /// Ring-findings §2 measured this channel at 140–236 bytes for a complete Vulkan
+    /// initialization, against 4024 bytes in the ring: **100% of what crosses here is ring
+    /// management, and 0% of it is application drawing.** It is small, and it is indispensable.
+    SubmitCmd {
+        /// The context these commands target — the context id C's local vtest server assigned, and
+        /// the same one [`C2S::CreateContext`] created.
+        ctx_id: u32,
+        /// The Venus command bytes verbatim, as they arrived in the batch. Length is a multiple of
+        /// 4: virglrenderer counts commands in dwords and rejects anything else.
+        cmd: Vec<u8>,
+    },
+
     /// The doorbell: Mesa's `vkNotifyRingMESA`. Carried here purely for fidelity with
     /// the vtest protocol S's embedded engine expects to see; S's ring-consuming thread
     /// may equally well notice new work from the arrival of [`C2S::RingDelta`] bytes

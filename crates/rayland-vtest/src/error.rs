@@ -428,6 +428,86 @@ pub enum EngineError {
         /// The resource whose descriptor is missing.
         resource_id: u32,
     },
+
+    // ---------------------------------------------------------------------------------------
+    // (c)1 Task 3: the relay engine — a `RenderEngine` whose "GPU" is another machine.
+    //
+    // These variants exist because (c)1 slid an implementation into the `RenderEngine` seam that
+    // nobody anticipated when the trait was written: not a different GPU library, but a *network*.
+    // Most of the trait's contract survives that substitution unchanged. The two methods that do
+    // not are the ones that assume the implementor has a GPU, and they need to fail as clearly as
+    // any C call does — this crate's rule is that a failure never becomes a silent success, and
+    // "the machine you are asking has no GPU" is a failure like any other.
+    // ---------------------------------------------------------------------------------------
+    /// The link carrying the relay protocol to S failed: the connection dropped, a frame could not
+    /// be written or read, or a message could not be (de)serialized.
+    ///
+    /// Carries a description rather than the underlying `RelayError` because this crate must not
+    /// depend on `rayland-relay` — the dependency arrow between them points the other way, and
+    /// reversing it would put the wire protocol into the protocol-agnostic layer.
+    #[error("the relay link to S failed: {detail}")]
+    RelayLinkFailed {
+        /// What went wrong (framing, I/O, serialization).
+        detail: String,
+    },
+
+    /// S answered a request with a message that does not answer it — e.g. a blob id where a capset
+    /// was due.
+    ///
+    /// Reported rather than skipped-past: a reply that is silently ignored leaves the *real* reply
+    /// still queued, so every subsequent request would be answered by the previous one's response.
+    /// That desynchronization is unbounded and surfaces arbitrarily far from its cause.
+    #[error("S answered with {got} where {expected} was expected")]
+    RelayUnexpectedReply {
+        /// The message variant the request required.
+        expected: &'static str,
+        /// A description of what actually arrived.
+        got: String,
+    },
+
+    /// S reported a typed failure of its own (an [`S2C::Error`]-equivalent), relayed here so the
+    /// application on C sees something a human can act on rather than a dead socket.
+    ///
+    /// [`S2C::Error`]: https://docs.rs/rayland-relay
+    #[error("S reported an error: {message}")]
+    RelayRemoteError {
+        /// S's human-readable description of what went wrong on its side.
+        message: String,
+    },
+
+    /// `read_back` was called on Rayland's C side, which never has pixels.
+    ///
+    /// This is not a stub and not a "not yet implemented": it is a statement about where the work
+    /// happens. C is by design the weak machine — the application runs there, the GPU does not.
+    /// Rendering, and therefore any rendered image, exists only on S. There is nothing on C to read
+    /// back and there never will be, so the honest answer is a typed refusal naming the
+    /// architecture, not an `unimplemented!()` that reads like an omission somebody should fix.
+    ///
+    /// Host-side frame extraction — getting S's pixels onto S's screen — is S's job and remains
+    /// open work (ring-findings §8.5).
+    #[error(
+        "read_back(resource_id={resource_id}) is not available on Rayland's C side: C has no GPU and never holds rendered pixels — rendering happens on S, and host-side frame extraction is S's job"
+    )]
+    RelayNoPixelsOnC {
+        /// The resource that was asked for.
+        resource_id: u32,
+    },
+
+    /// `create_resource` — a *classic* (non-blob) 2D resource — was called on Rayland's C side.
+    ///
+    /// Unreachable through the vtest protocol: there is no create-classic-resource opcode in the
+    /// vtest command set at all (see [`crate::vtest::read_command`]'s opcode table), and Mesa's
+    /// Venus ICD allocates everything — command ring, reply arena, device memory — as *blobs* via
+    /// `VCMD_RESOURCE_CREATE_BLOB`. `serve_vtest` therefore has no path that can call this. The
+    /// method exists only because [`crate::RenderEngine`] declares it for the benefit of engines
+    /// that drive a real GPU directly, which the relay engine does not.
+    #[error(
+        "create_resource(ctx_id={ctx_id}) is not available on Rayland's C side: classic 2D resources have no vtest opcode and Venus allocates only blobs — a relay engine has no GPU to create one on"
+    )]
+    RelayNoClassicResourceOnC {
+        /// The context the resource was requested for.
+        ctx_id: u32,
+    },
 }
 
 /// Maps a C return code (an errno, possibly returned as a positive value) to a short readable

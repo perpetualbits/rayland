@@ -69,7 +69,7 @@ Wayland/Vulkan/GPU-remoting — must painstakingly verify **every line** for cor
 
 ## Repository status and layout
 
-A Cargo workspace of eight crates. Each declares its own license per the policy below
+A Cargo workspace of ten crates. Each declares its own license per the policy below
 (library → LGPL, application/binary → GPL); all are `v0.0.x` and pre-stable.
 
 - **`crates/rayland`** — the published placeholder that reserves the crates.io name; the
@@ -90,6 +90,17 @@ A Cargo workspace of eight crates. Each declares its own license per the policy 
   machine), so `tests/no_gpu_linkage.rs` asserts `rayland-engine` is absent from this
   crate's dependency tree. **The dependency arrow points `rayland-engine` →
   `rayland-vtest`, and must never be reversed.** LGPL.
+- **`crates/rayland-relay`** — the **(c)1 relay wire protocol**: the `C2S`/`S2C` messages that
+  cross the network between C and S (ring deltas, blob syncs, replies) and their `postcard`
+  framing. Pure data — no GPU, no sockets, no async runtime — because both `rayland-c` and the
+  future `rayland-s` depend on it and C must never link a GPU stack. LGPL.
+- **`crates/rayland-c`** — **C's daemon ((c)1).** A local vtest server that a stock, unmodified
+  Mesa Venus ICD connects to: it hands the application plain local memfds for its ring and blobs,
+  **watches the ring** (where 100% of the application's Vulkan commands actually live), and relays
+  the bytes to S. The insight it rests on is that the vtest protocol's "host" is whoever allocates
+  the ring, and Rayland can be that host — so no Mesa fork and no patch is needed. Its
+  `tests/no_gpu_linkage.rs` guards the **binary**, which covers `rayland-vtest`, `rayland-relay`
+  and everything they pull in transitively. GPL, `publish = false`.
 - **`crates/rayland-engine`** — **the real engine (arc (c)).** FFI-embeds
   `libvirglrenderer` behind `rayland-vtest`'s `RenderEngine` trait, driving a Venus
   context on S's GPU. Since (c)1 Task 1 this crate is *only* the GPU: the `ffi`
