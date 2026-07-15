@@ -9,6 +9,78 @@ hand-emitted toy protocol with a real capture/replay engine so *unmodified* appl
 
 ---
 
+## Amendments — where reality overruled this plan (2026-07-15)
+
+> **This block was added after C0 was built. The sections below it are the plan as written on
+> 2026-07-14 and are deliberately left intact**, because a reader must be able to see *what was
+> planned*, *what actually happened*, and *why they differ*. Each superseded claim is annotated in
+> place with a pointer back here. Nothing below has been silently rewritten.
+>
+> The full evidence for every correction is in
+> [`2026-07-15-venus-ring-findings.md`](2026-07-15-venus-ring-findings.md); how to run what was
+> actually built is in [`../c0-venus-first-light.md`](../c0-venus-first-light.md).
+
+### Amendment 1 — the **app** writes the PNG, not the host (supersedes §1, §2, §3, §7)
+
+**The plan says C0's host "extracts the rendered image, and writes a PNG". That did not happen, and
+the evidence says it could not.** Owner decision, taken during Task 4b.
+
+Why the planned host-side extraction was not merely inconvenient but impossible:
+
+- The app's `VkImage` is created by **Venus commands inside the shared-memory ring**. It never
+  enters our engine's resource table, so `RenderEngine::read_back` could not see it in principle.
+- Task 4b confirmed it independently from the other direction: a **`DEVICE_LOCAL` image produces no
+  blob at all.** The host-side readback the plan describes had **nothing to read**.
+- The blobs a live client actually creates are its command ring and its staging/reply pools — not
+  rendered images (Task 4a). Blob resources also have no queryable pixel format (Task 3), so "read
+  back the last blob" is not a shortcut to a frame either.
+
+**What was built instead:** the reference app performs its own `vkMapMemory` readback and writes its
+own PNG — which is what any ordinary offscreen Vulkan program does, and therefore *strengthens* the
+"unmodified real app" claim rather than weakening it. That readback creates its own shared blob
+(`res=6`, 16384 B = 64×64×4, caught holding the clear colour): **the pixel return path.**
+
+**Consequence — do not mistake this for dead code.** `RenderEngine::read_back` and `EngineFrame`
+(Task 3) are **off C0's critical path but are not wasted**: SP1 and (c)1 must put a frame **on a
+screen**, which requires **host-side pixels**. C0's app-side readback deliberately sidesteps that
+question rather than answering it. The host-side frame-extraction spike (Task 4c) was **deferred by
+the owner** and remains an **open question that (c)1/SP1 must close**. Lead on record: `blob_id != 0`
+cleanly discriminates the app's own memory from Venus's internal plumbing.
+
+### Amendment 2 — the transport seam is not a seam (supersedes §6)
+
+**§6's claim that "(c)1 only swaps the stream source" is disproved.** C0 discovered that the vtest
+socket carries **0% of the application's Vulkan commands** — only ring management (one
+`vkCreateRingMESA`, then `vkNotifyRingMESA` doorbells). **100% of the commands are written directly
+into shared memory**, which the host allocates and the client `mmap`s after we pass it a file
+descriptor over `SCM_RIGHTS`.
+
+**Neither the shared page nor the fd survives a network.** QUIC has no fd-passing, and two machines
+cannot share a page. **There is no socket carrying commands to swap.** (c)1 is a **protocol design
+task**, not a transport substitution, and it is far more entangled with (c)2's coherence work than
+this spec's clean decomposition assumed.
+
+The good news, proven twice independently: the ring's bytes are the **same legible Venus command
+language** as the inline path, so this is a plumbing problem, not an encoding problem. See the
+findings document — it is required reading before (c)1 is designed.
+
+C0 encoded this at the type level rather than leaving a note: `serve_vtest` is generic over a
+`VtestTransport` trait whose `send_fd` is a **required** method, so a future QUIC transport
+confronts the gap **at compile time**.
+
+### Amendment 3 — what C0 proved, precisely
+
+C0 proved the command stream **replays faithfully on one machine, over shared memory** (PNG
+bit-identical to native, 0/16384 bytes differing, 15/15 runs), and that `libvirglrenderer` is
+**reliable** where `virgl_test_server` was flaky — which was §5's gate and the real risk.
+
+**It proved nothing about remoting.** The proof works *because* client and host share memory. It
+also never triggered the out-of-line command path (>8192 B per submission — C0's largest input is a
+1008-byte SPIR-V), never wrapped the ring (7.58% peak), and never exercised the 5 s fence timeout
+(it lives on `read_back`, which C0's path does not reach by design).
+
+---
+
 ## 1. Purpose and the single success criterion
 
 Every slice so far has **hand-emitted a fixed triangle** through a throwaway postcard protocol.
@@ -36,6 +108,11 @@ corners background). Same machine, local Unix socket. **Reliability is part of t
 the host must initialize a Venus context and replay **repeatedly** without the flakiness the
 spike hit with `virgl_test_server`.
 
+> **Amended 2026-07-15 (Amendment 1):** "the rendered image is read back and written to a PNG"
+> describes the **app's** readback, not the host's. The host-side extraction this sentence implies
+> was found impossible and was superseded. The pixel assertion and the reliability criterion both
+> stand and were met.
+
 ## 2. Scope — what C0 is, and is not
 
 C0 **is**: a new **`rayland-engine`** crate that FFI-binds `libvirglrenderer` behind a clean Rust
@@ -43,6 +120,11 @@ trait; a host that speaks the **vtest wire protocol** Mesa's Venus ICD emits, dr
 virglrenderer **venus** context on the real GPU, extracts the rendered image, and writes a PNG;
 and a small unmodified reference Vulkan app used as the captured workload. Local Unix socket, one
 machine, one app, offscreen (no window), verified by pixels.
+
+> **Amended 2026-07-15 (Amendment 1):** "**extracts the rendered image, and writes a PNG**" is
+> **false** — the host does neither, and the evidence says it could not. The **app** does its own
+> `vkMapMemory` readback and writes the PNG. Everything else in this paragraph was built as
+> written.
 
 C0 is deliberately **NOT** (each deferred to a named later slice of arc (c) or beyond):
 
@@ -75,6 +157,17 @@ C0 is deliberately **NOT** (each deferred to a named later slice of arc (c) or b
       no GPU needed on C                        the RenderEngine trait boundary (1a) lives here
 ```
 
+> **Amended 2026-07-15 (Amendments 1 and 2).** This diagram is wrong in two ways, both of which C0
+> discovered rather than assumed:
+> 1. The host's last box (`extract rendered image → readback → PNG`) **does not exist**. The app
+>    writes the PNG.
+> 2. **The `vtest` arrow is not the data path.** It carries ring *management* only — one
+>    `vkCreateRingMESA`, then doorbells. **100% of the application's Vulkan commands travel through
+>    a shared-memory ring** that the host allocates and the client `mmap`s via an fd we pass back
+>    over `SCM_RIGHTS`. The arrow that matters is missing from this picture entirely. See
+>    [the ring findings](2026-07-15-venus-ring-findings.md) and the corrected diagram in
+>    [`../c0-venus-first-light.md`](../c0-venus-first-light.md).
+
 - **C side is unmodified Mesa + configuration.** No Rayland code runs on C in C0. The app loads
   Mesa's Venus ICD (`VK_ICD_FILENAMES=…/virtio_icd.json`) and is pointed at the host's socket
   (the env the spike used: `VTEST_SOCKET_NAME`). Venus does the capture and serialization for us —
@@ -84,6 +177,9 @@ C0 is deliberately **NOT** (each deferred to a named later slice of arc (c) or b
   `libvirglrenderer` via FFI, which replays it on S's real GPU, and (d) extracts the resulting
   image and writes a PNG. This host is the robust, owned replacement for the flaky
   `virgl_test_server`.
+  > **Amended 2026-07-15 (Amendment 1):** step **(d) did not happen** and could not — the app does
+  > its own readback. Steps (a)–(c) were built as written, and the "robust owned replacement" claim
+  > was borne out: §5's reliability gate passed.
 
 ## 4. The FFI boundary (locked-decision 1a made concrete)
 
@@ -125,6 +221,23 @@ host implements enough of that protocol to drive a venus context. That socket **
 so the app runs on a different machine. C0 keeps the boundary clean (the vtest-protocol server
 reads from an abstract byte stream) so (c)1 only swaps the stream source.
 
+> **Amended 2026-07-15 — this entire section's premise is DISPROVED (Amendment 2).**
+>
+> **The socket is not the C→S seam, and "(c)1 only swaps the stream source" is false.** The socket
+> carries **0% of the application's Vulkan commands**. All of them are written straight into shared
+> memory — pages the host allocates and the client `mmap`s via a file descriptor passed over
+> `SCM_RIGHTS` — with **no protocol message when the app draws**.
+>
+> **Neither a shared page nor an fd crosses a network.** So there is nothing here to "swap":
+> (c)1 must *design a protocol that ships the ring's bytes and synthesizes the ring's handshake on
+> both ends* (the client polls `head` while the host writes it — bidirectional state, not one-way
+> streaming). This also makes (c)1 far more entangled with (c)2's coherence work than this spec's
+> decomposition assumed.
+>
+> This section is the single largest thing C0 got wrong, and finding it out was C0's most valuable
+> output. **[The ring findings](2026-07-15-venus-ring-findings.md) supersede this section and are
+> required reading before (c)1 is designed.**
+
 ## 7. Output extraction
 
 virglrenderer replays into a host GPU resource. C0 extracts that resource's pixels by **readback
@@ -132,6 +245,25 @@ into CPU memory** (the SP0 path) and writes a PNG — the simplest, machine-veri
 one that does not depend on the compositor. (Later, (c)1 exports the resource as a **dmabuf** and
 presents it via the SP3 window — the pieces are already built; C0 deliberately stops at the PNG so
 the engine is proven in isolation.)
+
+> **Amended 2026-07-15 — this section describes something that was not built (Amendment 1).**
+>
+> **"virglrenderer replays into a host GPU resource" that C0 can read is false.** There is no such
+> resource. The app's `VkImage` is created by Venus commands *inside the ring* and never enters our
+> resource table; a `DEVICE_LOCAL` image produces **no blob at all**; and blob resources have no
+> queryable pixel format. The planned readback had **nothing to read**.
+>
+> **What was built:** the app performs its own `vkMapMemory` readback and writes its own PNG — what
+> any ordinary offscreen Vulkan program does, which *strengthens* the "unmodified real app" claim.
+>
+> **What this section still gets right, and what it now costs:** the parenthetical is the live
+> problem. **(c)1/SP1 must put a frame on a screen, and that genuinely does require host-side
+> pixels** — which C0's app-side readback sidesteps rather than answers. `RenderEngine::read_back`
+> and `EngineFrame` are therefore **off C0's critical path but are not dead code**; they are
+> waiting for the answer. The bounded host-side frame-extraction spike (Task 4c) was **deferred by
+> the owner** and is an **open question (c)1/SP1 must close**. It will have to work through the
+> ring's object graph, not the resource table; `blob_id != 0` cleanly discriminates the app's own
+> memory from Venus's plumbing and is the most promising lead.
 
 ## 8. Testing strategy
 

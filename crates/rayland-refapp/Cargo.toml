@@ -1,0 +1,39 @@
+# The C0 reference application: an ordinary, off-screen Vulkan program that draws one
+# triangle and writes it to a PNG.
+#
+# This crate is deliberately **Rayland-unaware**. It depends on no `rayland-*` crate and
+# contains no mention of Venus, vtest, virglrenderer, or remoting, because that ignorance
+# is the entire point of the proof it serves: C0 claims that a *real, unmodified* Vulkan
+# application can be rendered on S's GPU by shipping its command stream. An app that knew
+# it was being remoted would prove nothing — the interception has to be invisible to it,
+# and the only way to be sure the interception is invisible is for the app to have no way
+# to see it. Everything Venus-specific lives in the *environment* the app is launched with
+# (`VK_ICD_FILENAMES`, `VN_DEBUG`, `VTEST_SOCKET_NAME`), never in the app.
+#
+# A BINARY crate (it has a main), so per the repository license policy it is
+# GPL-3.0-or-later rather than the LGPL used by this workspace's library crates.
+[package]
+name = "rayland-refapp"                                                        # workspace package name
+version = "0.0.1"                                                              # pre-release; a C0 test fixture, not a product
+edition = "2024"                                                               # Rust 2024 edition, per repo convention
+rust-version = "1.85"                                                          # minimum toolchain that supports edition 2024
+description = "An ordinary off-screen Vulkan triangle program, used as C0's unmodified reference application." # one-line purpose
+license = "GPL-3.0-or-later"                                                   # binary crate → GPL per repo license policy
+repository = "https://github.com/perpetualbits/rayland"                       # upstream source location
+publish = false                                                                # a test fixture for C0; nothing here belongs on crates.io
+
+[[bin]]
+name = "rayland-refapp"        # binary target name, the executable the C0 tests launch
+path = "src/main.rs"           # binary entry point
+
+[dependencies]
+ash = { workspace = true }     # thin Vulkan bindings; the only way this program talks to a GPU
+image = { workspace = true }   # PNG encoding of the pixels read back from the GPU
+anyhow = { workspace = true }  # top-level error handling, per the repo's binary-crate convention
+
+[dev-dependencies]
+# The native test re-reads the PNG the binary wrote and inspects individual pixels.
+# Deliberately NOT a `rayland-*` crate: see the crate-level note above — even this crate's
+# tests must be able to run without any Rayland code in the picture, because "renders
+# correctly on its own" is exactly the baseline they are there to establish.
+image = { workspace = true }
