@@ -6,7 +6,9 @@
 
 **Architecture:** A new `rayland-engine` crate FFI-binds the ~12 `virgl_renderer_*` functions it needs, behind a clean `RenderEngine` trait (`VirglEngine` impl holds all the `unsafe`). A host binary implements enough of the **vtest** wire protocol that Mesa's Venus ICD speaks over a Unix socket, drives a virglrenderer **venus-capset** context, replays the stream on the GPU, reads back the result, and writes a PNG. The captured workload is a small unmodified offscreen Vulkan reference app.
 
-**Tech Stack:** Rust edition 2024; FFI to `libvirglrenderer` 1.10 (`virgl_renderer_*` C API; `bindgen` or hand-written bindings); Mesa 26 Venus ICD on the client side (unmodified); `ash` for the reference app (already in-tree); `image` for the PNG (already in-tree).
+**Tech Stack:** Rust edition 2024; FFI to `libvirglrenderer` **1.2.0** (`virgl_renderer_*` C API; `bindgen` or hand-written bindings); Mesa 26 Venus ICD on the client side (unmodified); `ash` for the reference app (already in-tree); `image` for the PNG (already in-tree).
+
+> **Corrected 2026-07-15 (Task 4d).** This line originally said "1.10". **There is no virglrenderer 1.10** — the installed package is `libvirglrenderer-dev 1.2.0-2ubuntu2`, and `pkg-config --modversion virglrenderer` reports **1.2.0**. The false version was invented, propagated into `ffi.rs`'s module docs, and corrected there in Task 4a; this was the last surviving copy in the repository.
 
 ## Global Constraints
 
@@ -140,6 +142,28 @@ git commit -m "C0 Task 3: engine resource creation + fence-waited readback to En
 
 Assemble the host, the captured workload, the machine-verified end-to-end test, and the doc.
 
+> **Amended 2026-07-15 — Task 4 was SPLIT into 4a/4b/4c/4d, and was not executable as one unit.**
+> It carried three unresolved carry-forwards and a false premise (Step 2, below). The split as
+> executed:
+>
+> | | what it did | status |
+> |---|---|---|
+> | **4a** | SCM_RIGHTS fd-passing; byte-verified `SUBMIT_CMD2` against a live Venus client; first live Vulkan app through the engine | **done** (`75e79f4`) |
+> | **4b** | The reference app; C0's headline proof (PNG bit-identical to native, 15/15); the five research answers | **done** (`b6544f3`) |
+> | **4c** | Bounded host-side frame-extraction spike (can the engine find/export the app's Venus-internal `VkImage`?) | **DEFERRED by the owner — not done.** An open question (c)1/SP1 must close, since putting a frame on a screen requires host-side pixels. |
+> | **4d** | These docs + the corrections C0's findings forced | **this change** |
+>
+> A ring-decoder cleanup landed between 4a and 4b (`9ab55b7`), moving the ring discovery out of
+> git-excluded scratch into `src/venus_ring/` as a CI fixture test.
+>
+> **Step 2's premise is false and was superseded** (owner decision, Task 4b): the host does **not**
+> `read_back` a rendered resource and write a PNG, because **there is no such resource to read** —
+> the app's `VkImage` is created by Venus commands inside the ring and never enters our resource
+> table, a `DEVICE_LOCAL` image produces no blob at all, and blob resources have no queryable
+> format. The **app** does its own `vkMapMemory` readback and writes the PNG. `rayland-engine-host`
+> was **not built**: the existing `examples/vtest_serve` harness covers the live drive, and a binary
+> would only have duplicated it. See the spec's Amendment 1.
+
 **Files:**
 - Create: `crates/rayland-engine-host/` (Cargo.toml + src/main.rs), `crates/rayland-refapp/` (Cargo.toml + src/main.rs)
 - Create: `crates/rayland-engine/tests/e2e_venus.rs`, `docs/c0-venus-first-light.md`
@@ -182,5 +206,23 @@ git commit -m "C0 Task 4: engine host + reference app + end-to-end venus render 
 **2. Placeholder scan** — the intentional discovery points are Task 1 Step 2 (pin the venus capset/callbacks from the header) and Task 2 Step 1 (pin the vtest framing from Mesa source) — genuine spikes that record their findings for later tasks, matching SP2/SP3. No lazy placeholders; every step names concrete symbols/files/assertions.
 
 **3. Type consistency** — `RenderEngine` trait (Task 1) is consumed by `serve_vtest` (Task 2) and the host (Task 4); `VirglEngine` implements it; `EngineFrame`/`read_back` (Task 3) feed the host's PNG (Task 4); `virgl_available()` gates every GPU test. `serve_vtest<S: Read+Write>` is generic so (c)1 swaps the Unix socket for a QUIC stream unchanged.
+
+> **Amended 2026-07-15 — the final sentence is SUPERSEDED and was the plan's most consequential error.**
+>
+> **`serve_vtest<S: Read + Write>` is not "generic so (c)1 swaps in QUIC unchanged".** A live Venus
+> client **cannot work at all** without **`SCM_RIGHTS` fd-passing**: the protocol replies to
+> `VCMD_RESOURCE_CREATE_BLOB` with a **file descriptor**, which is how the client maps the shared
+> memory it writes every command into. A bare `Read + Write` cannot carry a file descriptor, so the
+> generic bound did not abstract the transport — **it hid the one thing that does not port.**
+>
+> The signature is now `serve_vtest<T: VtestTransport>`, where
+> `trait VtestTransport: Read + Write { fn send_fd(&mut self, fd: BorrowedFd) -> …; }` and the
+> `UnixStream` impl does a real `sendmsg`/`SCM_RIGHTS`. **`send_fd` is a required trait method
+> deliberately**, so a future QUIC transport confronts the gap **at compile time** rather than
+> inheriting a broken assumption silently.
+>
+> The deeper point (spec Amendment 2): QUIC has no fd-passing and two machines cannot share a page,
+> so **(c)1 is a protocol design task, not a transport substitution.** Also note `EngineFrame`/
+> `read_back` do **not** feed the host's PNG — nothing does; see the Task 4 amendment.
 
 **Note for the executor — this is the most research-forward plan in the project.** Tasks 1–2 discover real, currently-unread API/protocol against the installed library and Mesa sources; treat their reports as the source of truth for Tasks 3–4, and expect to refine Task 3/4 details once Tasks 1–2 land. If Task 1's reliability spike or Task 2's framing discovery reveals the vtest/venus library path is impractical, that is a real finding to surface — the fallback (vendor `virgl_test_server`'s core, or reconsider the engine) is a decision for the owner, not something to force.

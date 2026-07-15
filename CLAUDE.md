@@ -69,19 +69,62 @@ Wayland/Vulkan/GPU-remoting — must painstakingly verify **every line** for cor
 
 ## Repository status and layout
 
-Currently a single placeholder crate (`rayland` v0.0.x) that reserves the crates.io name;
-no functionality yet. The work is decomposed into sub-projects, each getting its own
-design spec → implementation plan → build cycle, sequenced as a "walking skeleton" (get
-something rendering end-to-end first, then harden):
+A Cargo workspace of seven crates. Each declares its own license per the policy below
+(library → LGPL, application/binary → GPL); all are `v0.0.x` and pre-stable.
 
-- **SP0 — First light:** trivial Vulkan triangle on C → serialized commands over
-  plain TCP/localhost → replay on S's real GPU → write a PNG. Proves the core loop.
-- **SP1 — Onto the screen:** replace PNG-dump with a live Wayland window on S.
-- **SP2 — Real transport:** TCP → QUIC across two machines; first cross-architecture run.
-- **SP3 — Sibling protocol:** mapped-memory coherence, then content-addressed assets.
+- **`crates/rayland`** — the published placeholder that reserves the crates.io name; the
+  future facade. GPL.
+- **`crates/rayland-wire`** — the SP0-era hand-rolled command messages and their framing
+  (`postcard`). LGPL.
+- **`crates/rayland-client`** — SP0-era C side: hand-builds the triangle command stream
+  and sends it. GPL.
+- **`crates/rayland-server`** — SP0-era S side: replays that stream on a real GPU and
+  presents it (PNG / `wl_shm` window / zero-copy dmabuf). GPL.
+- **`crates/rayland-transport`** — QUIC transport: synchronous stream adapters over a
+  `quinn` connection (SP2). LGPL.
+- **`crates/rayland-engine`** — **the real engine (arc (c)).** FFI-embeds
+  `libvirglrenderer` behind the `RenderEngine` trait, and implements the **vtest** wire
+  protocol Mesa's Venus ICD speaks, driving a Venus context on S's GPU. Also holds
+  `venus_ring/` — the repository's knowledge of Mesa's command ring. LGPL.
+- **`crates/rayland-refapp`** — C0's captured workload: an **ordinary** offscreen Vulkan
+  triangle program with **zero `rayland-*` dependencies** and no knowledge of remoting.
+  Its value is that it is boring and typical; keep it that way. GPL, `publish = false`.
+
+The work is decomposed into sub-projects, each getting its own design spec →
+implementation plan → build cycle, sequenced as a "walking skeleton" (get something
+rendering end-to-end first, then harden).
+
+**Arc (s) — SP0–SP3 built Rayland's own hand-rolled `postcard` protocol end to end. All
+complete and merged.** Their code is untouched and their tests still pass; it coexists
+with arc (c) until arc (c) fully supersedes it.
+
+- **SP0 — First light** *(complete)*: trivial Vulkan triangle on C → serialized commands
+  over plain TCP/localhost → replay on S's real GPU → write a PNG. Proves the core loop.
+- **SP1 — Onto the screen** *(complete)*: replace PNG-dump with a live Wayland window on S.
+- **SP2 — Real transport** *(complete)*: TCP → QUIC.
+- **SP3 — Zero-copy presentation** *(complete)*: dmabuf export to the compositor, with a
+  `wl_shm` fallback.
 - **SP4 — Adaptive L3 + session/security:** RTT-adaptive policy, SSH-bootstrap, sandboxing.
 - **SP5 — Proxy completeness:** full Sommelier/waypipe-grade Wayland coverage.
 - **Audio:** a later, separate track (transport reservations already made in the design).
+
+**Arc (c) — the real-engine pivot: replace that hand-rolled protocol with the reused
+Venus/virglrenderer capture/replay engine, so *unmodified* applications run.**
+
+- **C0 — Venus First Light** *(in progress; substance complete)*: a real, unmodified
+  Vulkan app, captured by Mesa's Venus ICD, replayed on S's real GPU through our
+  virglrenderer-embedding host — PNG bit-identical to native. Same machine, local socket,
+  offscreen. See [`docs/c0-venus-first-light.md`](docs/c0-venus-first-light.md).
+- **(c)1 — the network.** **Rescoped by C0's findings.** *Not* "swap the socket for QUIC":
+  C0 proved the vtest socket carries **0% of the application's commands** — they cross via
+  **shared memory** whose fd is passed over `SCM_RIGHTS`, and **neither a shared page nor an
+  fd survives a network**. (c)1 is a protocol design task. It also owes SP1 host-side pixels
+  for on-screen presentation. **Required reading:**
+  [`docs/design/2026-07-15-venus-ring-findings.md`](docs/design/2026-07-15-venus-ring-findings.md).
+- **(c)2 — mapped-memory coherence:** the `vkMapMemory` problem (apps write vertices and
+  textures straight into mapped memory with **no API call to intercept**).
+- **(c)3 — content-addressed assets.**
+- **(c)4 — real/complex applications; GL via Zink.**
 
 ## License
 

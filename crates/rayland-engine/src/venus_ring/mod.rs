@@ -41,7 +41,7 @@
 //! |---------|----------|------------------------------------|
 //! | `0x00`  | `head`   | the host — bytes *consumed*        |
 //! | `0x40`  | `tail`   | the client — bytes *produced*      |
-//! | `0x80`  | `status` | the host (1 = busy, 0 = idle)      |
+//! | `0x80`  | `status` | the host (a bitmask; bit 0 = IDLE) |
 //! | `0xc0`  | buffer   | the client — the command stream    |
 //! | `0x200c0` | extra  | (vestigial; nothing observed here) |
 //!
@@ -114,12 +114,23 @@ pub const RING_HEAD_OFFSET: usize = 0x00;
 /// times in a row with no fitting. It is also what a `vkNotifyRingMESA` doorbell's `seqno` carries.
 pub const RING_TAIL_OFFSET: usize = 0x40;
 
-/// Byte offset of the ring's `status` word: 1 while the host's ring thread is awake, 0 when parked.
+/// Byte offset of the ring's `status` word — a host-written **bitmask**, not a boolean.
 ///
-/// Domain pitfall: this word is why doorbell *counts* measure nothing. Mesa only bothers to send a
-/// `vkNotifyRingMESA` when it sees `status == 0`, so byte-identical ring traffic produced one
-/// doorbell in one capture run and four in another. Any metric built on counting socket messages is
-/// measuring the scheduler, not the workload.
+/// From Mesa's generated headers (`vn_protocol_renderer_defines.h`, and identically in the
+/// driver-side copy): `IDLE = 0x1`, `FATAL = 0x2`, `ALIVE = 0x4`.
+///
+/// # Domain pitfall: the polarity is the opposite of what `status == 1` suggests
+/// **Bit 0 set means the host's ring thread is IDLE (parked); `status == 0` means it is actively
+/// polling.** "1" reads like "busy" and means the reverse. This module's docs originally recorded
+/// the polarity inverted; the raw captured values were never affected (and no code reads this word
+/// — the decoder uses observed *offsets*), but the mechanism below only makes sense the right way
+/// round.
+///
+/// # Domain pitfall: this word is why doorbell *counts* measure nothing
+/// Mesa sends a `vkNotifyRingMESA` only when it observes the **IDLE bit set** — i.e. only when the
+/// host has already given up polling — and then at most once per millisecond. So byte-identical
+/// ring traffic produced **one** doorbell in one capture run and **four** in another. Any metric
+/// built on counting socket messages is measuring the scheduler, not the workload.
 pub const RING_STATUS_OFFSET: usize = 0x80;
 
 /// Byte offset at which the ring's command buffer begins — the end of the 192-byte control area.

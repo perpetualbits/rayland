@@ -61,8 +61,9 @@ const CAPTURED_RING_PREFIX: [u32; 73] = [
     0x000000d8, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
     // 0x000060: still `tail`'s 64-byte slot.
     0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    // 0x000080: `status` = 0 — the host's ring thread was parked at this instant. (Over the full
-    // run it was observed to go 0 -> 1 -> 0; this snapshot simply caught it idle.)
+    // 0x000080: `status` = 0 — no bits set, so the host's ring thread was **actively polling** at
+    // this instant. (Mesa's bitmask: bit 0 = IDLE. Over the full run `status` was observed to go
+    // 0 -> 1 -> 0, i.e. polling, then parked once nothing arrived for 1 ms, then cleared.)
     0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
     // 0x0000a0: still `status`'s 64-byte slot; the control area ends at 0xc0.
     0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
@@ -143,8 +144,9 @@ fn captured_control_words_sit_at_the_declared_offsets() {
         control_word(&ring, RING_HEAD_OFFSET) < control_word(&ring, RING_TAIL_OFFSET),
         "head must trail tail: the host cannot consume what the client has not produced"
     );
-    // `status` = 0: the host's ring thread was parked when this snapshot was taken. This is the
-    // word that makes Mesa bother to send a doorbell at all.
+    // `status` = 0: no bits set (Mesa's bit 0 = IDLE), so the host's ring thread was actively
+    // polling when this snapshot was taken — which is exactly why no doorbell was needed here.
+    // Mesa only sends one once it sees the IDLE bit, i.e. once the host has stopped looking.
     assert_eq!(control_word(&ring, super::RING_STATUS_OFFSET), 0);
 
     // Neither counter had wrapped: both are far below the buffer size, which is precisely why this
