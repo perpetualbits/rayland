@@ -19,16 +19,32 @@
 //! # terminal 2 — any unmodified Vulkan program, via Mesa's Venus ICD
 //! env -u VK_LOADER_DRIVERS_SELECT \
 //!     VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/virtio_icd.json \
+//!     VN_DEBUG=vtest \
 //!     VTEST_SOCKET_NAME=/tmp/rayland-vtest.sock \
 //!     ./some-vulkan-app
 //! ```
 //!
-//! Two environment pitfalls, both of which cost real debugging time:
+//! Three environment/setup pitfalls, all of which cost real debugging time:
 //! - **`env -u VK_LOADER_DRIVERS_SELECT`** — if the host has that set to a driver filter (e.g.
 //!   `*intel*`), the Vulkan loader silently hides the Venus ICD and the client never connects at
 //!   all. The failure looks like "no Vulkan devices", not like a Rayland problem.
+//! - **`VN_DEBUG=vtest` is required, and its absence fails silently.** Mesa's Venus ICD prefers its
+//!   **virtgpu** backend and only tries the vtest backend when told to via `VN_DEBUG=vtest`.
+//!   Setting `VTEST_SOCKET_NAME` alone is *not* sufficient to select vtest: that variable is read
+//!   only inside `vtest_init`, which runs **after** the ICD has already chosen a backend. So the
+//!   socket name cannot cause vtest to be selected — it only configures vtest once vtest has
+//!   already been chosen. Without `VN_DEBUG=vtest` the client fails at
+//!   `STEP enumerate FAILED: ERROR_INITIALIZATION_FAILED` and **never connects to the socket at
+//!   all** — this harness logs no incoming connection, which makes the failure look like a
+//!   Rayland-side hang rather than the client never having tried to reach us.
 //! - **No validation layer.** Validation and Venus do not mix; enabling one produces failures that
 //!   have nothing to do with the code under test.
+//!
+//! A further, more mundane pitfall: **the Unix socket path must be short.** `sockaddr_un::sun_path`
+//! is 108 bytes; a long path (e.g. one nested under a scratchpad or temp-session directory) overflows
+//! it, and `UnixListener::bind` fails with *"path must be shorter than SUN_LEN"*. Unlike the
+//! `VN_DEBUG` trap above, at least this one fails loudly and immediately at `bind`, rather than
+//! silently at the client. Live drives of this harness used the short path `/tmp/rl4a.sock`.
 //!
 //! Set `RAYLAND_VTEST_DUMP=1` on *this* process to dump every `VCMD_SUBMIT_CMD2` payload as hex —
 //! see `vtest::dump_submit_cmd2`.
