@@ -117,6 +117,14 @@ pub struct HostBlob {
     /// It doubles S's memory for every blob — ~9.1 MiB across the live capture's six. That is the
     /// deliberate, measurable cost of v1 (spec §6, §8). It is not new pressure of a *kind* S did not
     /// already have: before §7.2, `poll_progress` copied whole blobs out on every retirement.
+    ///
+    /// **That framing is against the refapp; against a hostile peer the doubling is leverage, not
+    /// merely cost.** `size` in [`HostBlob::map`] is remote-supplied (`C2S::CreateBlob`), and
+    /// building this field allocates exactly `size` more bytes on S's heap. `RenderEngine::
+    /// create_blob_resource` already gates `size` before this type ever sees it, so this field does
+    /// not create a new avenue for a peer to force allocation — it **doubles the existing one**: the
+    /// same `size` S's engine already agreed to allocate for the mapping itself. See
+    /// [`HostBlob::map`]'s failure-modes note for what happens if that doubled allocation fails.
     shadow: Vec<u8>,
 }
 
@@ -144,6 +152,17 @@ impl HostBlob {
     /// [`EngineError::ShmMapFailed`] if the mapping fails or `size` does not fit this platform's
     /// address space. `size` originates from a remote peer, so that is a real check rather than a
     /// formality.
+    ///
+    /// **Not listed above because it is not an `EngineError`, and is worth naming anyway:** taking
+    /// the baseline below (`blob.bytes().to_vec()`) eagerly faults in the whole mapping and
+    /// heap-allocates `size` more bytes, where `size` is the same attacker-controlled value just
+    /// bounds-checked by `ShmMapping::map`. An allocator failure here **aborts the process** (Rust's
+    /// global allocator has no fallible path a caller can catch) rather than returning a
+    /// `Result` this function's signature could report. `RenderEngine::create_blob_resource` gates
+    /// `size` before `map` is ever called, so this does not open new leverage a hostile peer did not
+    /// already have — it doubles the existing one, since S already agreed to allocate `size` bytes
+    /// once for the mapping itself. See the `shadow` field's doc for the same point stated as a cost
+    /// rather than a failure mode.
     pub fn map(fd: BorrowedFd<'_>, size: u64) -> Result<Self, EngineError> {
         let mapping = ShmMapping::map(fd, size)?;
         let mut blob = HostBlob {
@@ -157,7 +176,9 @@ impl HostBlob {
         // is zeros. The two agree for every allocator that matters — a memfd and virglrenderer's
         // SHM blobs are both zero-filled — but if one ever were not, whatever is in there is still
         // not something **S wrote**, and §7.2's rule is that S stays quiet about it. Assuming zeros
-        // would instead ship an engine's leftovers to C as if S's GPU had rendered them.
+        // would instead ship an engine's leftovers to C as if S's GPU had rendered them. See
+        // `map_takes_its_baseline_from_the_real_pages_not_an_assumed_zero` in this module's tests:
+        // this is a tested property, not merely an argued one.
         blob.shadow = blob.bytes().to_vec();
         Ok(blob)
     }
@@ -221,19 +242,42 @@ impl HostBlob {
     /// not shipping it is safe. But it means one logical write can leave as many runs as it has
     /// coincidences.
     ///
-    /// The live capture makes this concrete rather than hypothetical. Ring-findings §6 caught the
-    /// readback buffer holding `00 00 ff ff` repeated — RGBA `(0, 0, 255, 255)`, the blue clear
-    /// colour. Against a freshly mapped blob's zero baseline, **only the `ff ff` pairs differ**, so
-    /// the reference app's very first readback fragments into 4096 two-byte runs instead of one
-    /// 16 KiB run. Subsequent frames are cheap (an unchanged image yields no runs at all), and a
-    /// real, busy image mostly coalesces — the pathological case is specifically a *first* readback
-    /// of a flat colour that shares bytes with zero.
+    /// **This is steady-state and resolution-scaling, not a one-off "first readback" wart.** An
+    /// earlier version of this comment claimed the pathological case was specifically a first write
+    /// of a flat colour sharing bytes with a zero baseline, and measurement disproved that. Ring-
+    /// findings §6 caught the readback buffer holding `00 00 ff ff` repeated — RGBA `(0, 0, 255,
+    /// 255)`, the blue clear colour. Against a freshly mapped blob's zero baseline, only the `ff ff`
+    /// pairs differ, so the reference app's *first* readback fragments into 4096 two-byte runs
+    /// instead of one 16 KiB run (8192 of the blob's 16384 bytes cross). But render a **second**
+    /// frame that rewrites every pixel to a different flat colour — say RGBA `(255, 0, 0, 255)`, red
+    /// over the blue baseline — and it fragments *worse*: the G byte (`0x00`) and the A byte
+    /// (`0xff`) coincide with the previous frame's G and A on every pixel, so only R and B differ,
+    /// giving 4096 pixels × 2 one-byte runs = **8192 runs**, shipping the same 8192 bytes in twice
+    /// the messages. A full rewrite in which *nothing is logically unchanged* fragments worse than
+    /// the very first write, because G and A coincide **per pixel**, not merely at the start of the
+    /// session. Any renderer that keeps its alpha channel constant — i.e. draws only opaque pixels,
+    /// the overwhelmingly common case — reproduces the A-byte coincidence on **every** frame,
+    /// forever, and the effect scales with resolution: roughly two million such runs per frame at
+    /// 1080p. See this module's test
+    /// `a_full_rewrite_fragments_worse_than_the_first_write_and_the_pattern_recurs_every_frame` for
+    /// the pinned frame-2 measurement (named in prose, not as an intra-doc link, because
+    /// `#[cfg(test)]` items are invisible to a non-test `cargo doc`).
     ///
-    /// **This is deliberately not optimized here.** Merging runs across a small gap of unchanged
-    /// bytes is the obvious fix and is exactly the hole above: those skipped bytes are precisely the
-    /// ones S did not write, and shipping them is what clobbers the application. The cost is
-    /// therefore left visible and measurable, which is what spec §6 and §8 ask of v1, and Task 9
-    /// measures it. Pin it with a number before trading correctness for it.
+    /// **Why this matters beyond the arithmetic:** ring-findings §7 measured the return path (reply
+    /// arena + readback) at roughly 12× the command traffic even *before* this fragmentation, and
+    /// per-message framing dominates the return path's cost. Because the fragmentation is steady-
+    /// state rather than a startup-only cost, deferring the fix is not "Task 9 can measure it
+    /// whenever" — it is required before any real (non-toy) workload, not an optimization to reach
+    /// for only "if it ever matters".
+    ///
+    /// **This is deliberately not optimized here anyway — the fix must not be merging.** Merging runs
+    /// across a small gap of unchanged bytes is the obvious-looking fix and is exactly the hole this
+    /// grain exists to close: those skipped bytes are precisely the ones S did not write, and
+    /// shipping them is what clobbers the application. The correct trade, when it is made, is a wire
+    /// change that carries many runs in one message — reducing per-message framing overhead without
+    /// widening any single run past bytes S actually wrote. The cost is left visible and measurable
+    /// here, which is what spec §6 and §8 ask of v1, and Task 9 measures it against this section's
+    /// numbers.
     pub fn take_bytes_s_wrote(&mut self) -> Vec<WrittenRun> {
         // Two phases, because they need different borrows of `self` — and because doing the
         // comparison against a baseline that a copy in the same pass had already begun to overwrite
@@ -463,6 +507,46 @@ mod tests {
         assert_eq!(blob.take_bytes_s_wrote(), Vec::new());
     }
 
+    /// **Minor 1 (review, 2026-07-16): [`HostBlob::map`]'s "read the real pages instead of assuming
+    /// zero" choice *is* distinguishable from `vec![0; size]` by a test — the doc's earlier claim
+    /// that it could not be was wrong, and this is the test that proves it wrong.**
+    ///
+    /// The precondition a `vec![0; size]` baseline cannot reproduce is *non-zero bytes already
+    /// present in a freshly exported descriptor before `map()` ever runs*. A memfd cannot supply
+    /// that by construction (a fresh one is always zero-filled), so this test manufactures the
+    /// precondition directly: write a recognizable byte pattern into the descriptor's pages
+    /// *before* calling [`HostBlob::map`], then confirm the resulting blob reports no runs for
+    /// them. Under the correct (read-the-pages) implementation this passes; under a
+    /// `shadow: vec![0; size]` mutation the pre-existing `0xee` bytes would look like something
+    /// **S** wrote, and this test would fail.
+    #[test]
+    fn map_takes_its_baseline_from_the_real_pages_not_an_assumed_zero() {
+        // Stand in for "an allocator hands S a descriptor that is not already zero-filled" — the
+        // scenario every production allocator (memfd, virglrenderer's SHM blobs) never actually
+        // produces, but which `map()`'s baseline choice is written to be correct for regardless.
+        let fd = create_memfd(64).expect("a memfd");
+        {
+            // Map it once, off to the side, purely to get a writable pointer at the descriptor's
+            // pages before `HostBlob::map` ever sees them — standing in for whatever put non-zero
+            // bytes there before S mapped it. Dropped before `HostBlob::map` below, so the two
+            // mappings never coexist and cannot be confused with virglrenderer's own writer.
+            let pre = ShmMapping::map(fd.as_fd(), 64).expect("a pre-mapping");
+            // SAFETY: `pre` is a live `MAP_SHARED` mapping of exactly 64 bytes, and nothing else
+            // touches this memfd while `pre` is alive.
+            unsafe { std::ptr::write_bytes(pre.as_ptr().cast::<u8>(), 0xee, 64) };
+        }
+
+        let mut blob = HostBlob::map(fd.as_fd(), 64).expect("mapping it");
+
+        assert_eq!(
+            blob.take_bytes_s_wrote(),
+            Vec::new(),
+            "whatever was already sitting in these pages before S mapped them is not something S \
+             wrote, so it must not be reported as a run — a `vec![0; size]` baseline would instead \
+             see every 0xee byte as new and ship the whole blob back as S's own write"
+        );
+    }
+
     /// A partial write of a blob ships **exactly the bytes written**, not the blob and not a page.
     ///
     /// The application's vertex buffer is 64 bytes (`res=3`, ring-findings §6) — smaller than a
@@ -558,6 +642,70 @@ mod tests {
             shipped, 8192,
             "half the blob's bytes cross, in 4096 messages — fewer bytes than the page rule shipped, \
              in far more messages. That trade is v1's to measure (spec §8), not to pre-empt"
+        );
+    }
+
+    /// **Important 2 (review, 2026-07-16): the fragmentation cost is steady-state and
+    /// per-frame, not a one-off "first readback" wart — this pins the frame-2 measurement that
+    /// disproves the weaker claim.**
+    ///
+    /// Frame 1 (above) fragments against a *zero* baseline: only the `ff` bytes of blue's `B` and
+    /// `A` channels differ from zero, so 4096 two-byte runs cross. This test asks what happens on
+    /// **frame 2**, where the GPU rewrites *every* pixel to a different flat colour — nothing is
+    /// logically "unchanged" between the two frames, which is the case the "first readback" framing
+    /// implied would be cheap.
+    ///
+    /// It is not cheap — it is worse. Blue is RGBA `(0, 0, 255, 255)`; red is
+    /// `(255, 0, 0, 255)`. Byte for byte against the blue baseline: `R` differs (`0x00` → `0xff`),
+    /// `G` coincides (`0x00` == `0x00`), `B` differs (`0xff` → `0x00`), `A` coincides
+    /// (`0xff` == `0xff`). The `G`/`A` coincidences split every pixel's run in two, so this frame
+    /// ships **8192** one-byte runs — twice frame 1's run count — carrying the same 8192 bytes.
+    /// `A` staying `0xff` is not a coincidence of this specific test: any renderer that keeps its
+    /// alpha channel constant (i.e. draws only opaque pixels — the ordinary case) reproduces that
+    /// coincidence, and therefore this fragmentation, on **every** frame it ever renders, and the
+    /// run count scales with the image's pixel count, not with the size of any one write.
+    #[test]
+    fn a_full_rewrite_fragments_worse_than_the_first_write_and_the_pattern_recurs_every_frame() {
+        let mut blob = a_blob(16384);
+        // Frame 1: the GPU clears to blue, RGBA (0, 0, 255, 255) per pixel — same as the test above.
+        for pixel in 0..4096 {
+            s_engine_writes(&blob, pixel * 4 + 2, 0xff, 2);
+        }
+        let frame_1_runs = blob.take_bytes_s_wrote();
+        assert_eq!(
+            frame_1_runs.len(),
+            4096,
+            "sanity check: this must reproduce the frame-1 baseline the test above pins"
+        );
+
+        // Frame 2: the GPU rewrites *every* pixel to red, RGBA (255, 0, 0, 255). A full rewrite —
+        // nothing left "unchanged" between the frames — yet G and A coincide with frame 1's values
+        // on every single pixel, because both colours are fully opaque and both have a zero G channel.
+        for pixel in 0..4096 {
+            s_engine_writes(&blob, pixel * 4, 0xff, 1); // R: 0x00 -> 0xff
+            s_engine_writes(&blob, pixel * 4 + 2, 0x00, 1); // B: 0xff -> 0x00
+        }
+
+        let frame_2_runs = blob.take_bytes_s_wrote();
+
+        assert_eq!(
+            frame_2_runs.len(),
+            8192,
+            "a full rewrite of every pixel must fragment *worse* than the first write, not better: \
+             G and A coincide with the previous frame on every pixel, splitting each pixel's R and B \
+             writes into two separate one-byte runs. Got {} runs",
+            frame_2_runs.len()
+        );
+        let shipped: usize = frame_2_runs.iter().map(|r| r.bytes.len()).sum();
+        assert_eq!(
+            shipped, 8192,
+            "the same 8192 bytes changed as in frame 1, but now split across twice as many messages \
+             — this is the steady-state cost, not a first-readback-only one"
+        );
+        assert!(
+            frame_2_runs.iter().all(|r| r.bytes.len() == 1),
+            "every run this frame must be exactly one byte (R alone, or B alone) — a run spanning \
+             both would mean G or A was mistakenly folded in. Got {frame_2_runs:?}"
         );
     }
 

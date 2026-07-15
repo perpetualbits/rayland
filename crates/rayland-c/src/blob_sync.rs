@@ -116,13 +116,52 @@ use rayland_relay::C2S;
 ///   to overwrite a blob the GPU never touched, and shipping whole blobs C→S is no longer racing
 ///   anything on the return leg. The repair had to happen on S because only S can see which bytes S
 ///   wrote; there was no version of this function that could have avoided it.
-/// - **What remains is narrower, and honest about itself.** One hazard survives: **tearing.** A blob
-///   the application writes *while* this copies it is torn, and nothing here can prevent that — it is
-///   the `vkMapMemory` problem itself, since the application is not obliged to tell anyone when it
-///   stops writing and v1 has no flush hook to wait on. For a *correctly synchronized* application it
-///   does not fire on memory the GPU actually wrote, because S's own ordering guarantees the bytes
-///   land before the `head` update that releases the app's fence wait.
-/// - **A second hazard was recorded here until the §7.2 amendment removed it: false sharing at S's
+/// - **What remains is narrower than it once was, but it is *two* hazards, not one — an earlier draft
+///   of this list undercounted them, and this is the correction.**
+///   - **Tearing.** A blob the application writes *while* this copies it is torn, and nothing here
+///     can prevent that — it is the `vkMapMemory` problem itself, since the application is not
+///     obliged to tell anyone when it stops writing and v1 has no flush hook to wait on. For a
+///     *correctly synchronized* application it does not fire on memory the GPU actually wrote,
+///     because S's own ordering guarantees the bytes land before the `head` update that releases the
+///     app's fence wait.
+///   - **C can relay its own stale copy of a blob that S — not C — currently owns the live contents
+///     of, clobbering S's authoritative copy with old news.** This function ships *every* application
+///     blob whole on *every* relay (spec §7's conservative strategy), and that includes `res=6`, the
+///     readback buffer S's GPU writes and C never touches. Concretely: (1) the app submits a draw; C
+///     relays `[BlobData(res=3), BlobData(res=6 = C's zeros), RingDelta]`; (2) S's GPU writes blue
+///     into `res=6`, and the ring thread stores `head`; (3) the app's *next* ring traffic moves
+///     `tail`, so C's watcher relays again — and, because nothing on C ever refreshes its copy of a
+///     blob it never writes, ships `BlobData(res=6, zeros)` a second time; (4) S's `copy_in`
+///     (`blob.rs:417`) lays those zeros over the real pixels *and* re-snapshots its own shadow to
+///     match, so S now itself believes zeros is the last-agreed state; (5) S polls: `head` moved, but
+///     `take_bytes_s_wrote(res=6)` compares live bytes against that same zeroed shadow and finds no
+///     runs, so no correction is shipped — `RingProgress` goes out anyway, releasing the app onto a
+///     frame that was silently overwritten by C's own relay.
+///
+///     **This is not tearing.** C's copy is whole and un-torn; it is simply stale, and this function
+///     ships it with total confidence because ring-findings §6's `blob_id` signal says nothing about
+///     *freshness*, only about *ownership*. The failure is C's conservative sync clobbering the
+///     authoritative copy of a blob that, at this moment, lives on S rather than on C — a silent lost
+///     frame, not a corrupted one.
+///
+///     **It is not a regression.** Before (c)1 Task 5b, S's own return path shipped this exact stale
+///     blob back and lost the frame the same way; the amendment moved which side owns the mistake,
+///     not whether the mistake happens. It is spec §7's declared v1 strategy — "ship the full
+///     contents of every mapped blob, whole ... no dirty tracking, no cleverness" — paid for exactly
+///     where §7 says it would be paid.
+///
+///     **Why the reference app never triggers it:** an application blocked in `vkWaitForFences`
+///     issues no further ring traffic of its own — `vn_ring_wait_seqno` only polls `head` in shared
+///     memory, it writes nothing — so there is no *second* relay event for this function to clobber
+///     the readback with. A real application's frame N+1 command stream is exactly that second
+///     relay, carrying frame N's now-stale readback back over frame N's genuine pixels.
+///
+///     **The eventual fix is symmetry, not cleverness:** give C the same observed-write rule S now
+///     has for the S→C direction — snapshot a blob's shadow the instant C applies an inbound
+///     `BlobData`, diff live bytes against that shadow before every relay, and ship only the bytes
+///     the *application* actually changed. Until that lands, this function's whole-blob-every-relay
+///     behaviour is deliberate, not merely unaddressed.
+/// - **A further hazard was recorded here until the §7.2 amendment removed it: false sharing at S's
 ///   page grain.** S's returned run used to be rounded out to a 4096-byte page, so when S's engine
 ///   wrote one region of a page and the application wrote another region of the same page — legal, and
 ///   needing no Vulkan synchronization between them — the run carried S's stale copy of the

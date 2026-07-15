@@ -336,8 +336,10 @@ not a reading of them.** §7's "no decoding the ring to make a correctness decis
 What falls out, with no knowledge of what any blob *is*: the arena ships (blocker gone); the staging
 pool never does (no wiped recording); app buffers never do (race gone); the readback ships, because
 the GPU genuinely wrote it. It is immune to the reply pool growing, to the shmem cache recycling ids,
-and to Venus adding a fourth internal shmem tomorrow. The cost — roughly 2k page compares per
-retirement, worst case — is exactly the kind of honest, measurable slowness §6 and §8 ask v1 for.
+and to Venus adding a fourth internal shmem tomorrow. The cost — roughly 8 MiB of **byte** compares
+per retirement, worst case (the same volume the retracted page-granular rule would have compared,
+now compared one byte at a time rather than one page at a time — see the amendment below) — is
+exactly the kind of honest, measurable slowness §6 and §8 ask v1 for.
 
 ### 7.1 Where the presented pixels come from — and why it is not zero-copy
 

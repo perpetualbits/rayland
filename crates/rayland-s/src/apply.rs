@@ -545,22 +545,36 @@ impl Applier {
     /// traffic, so the reference app never grows the pool — it would pass every test here and
     /// corrupt the first longer session, S shipping a dead arena while the app read a live one.
     ///
-    /// Rings are excluded **by `res_id`** below, and that exclusion is structural rather than
-    /// heuristic: S already holds `self.rings`, so it costs nothing and cannot be fooled by a number
-    /// a remote peer chose.
+    /// Rings are excluded **by `res_id`** below, keyed off `self.rings` — which is itself populated
+    /// by [`RingIdentity::from_blob_request`], a function whose own docs call it a heuristic over
+    /// wire-supplied `blob_id` and `size`. So this is **not** immune to a remote peer's numbers in
+    /// the sense of using no heuristic at all; overstating that would be its own bug. The genuine
+    /// property is narrower and still worth having: this is the *same* set the `RingDelta` write
+    /// path already keys on, so there is no second, independent interpretation of "is this a ring?"
+    /// for the two to quietly disagree about — and a misclassification here fails **loudly**, as
+    /// [`ApplyError::NotARing`] on the very next `RingDelta` for that resource, rather than silently
+    /// publishing the wrong memory as a ring's contents. In practice nothing misclassifies: the live
+    /// capture's arena (`1048576 - 196` bytes of buffer) and staging pool (`8388608 - 196`) are both
+    /// non-powers-of-two, which `from_blob_request` requires a ring's buffer size to be.
     ///
     /// # Inputs / outputs
     /// - Returns the runs of bytes S wrote, followed by one [`S2C::RingProgress`] per ring that
     ///   moved. Empty — no blobs, no progress — when nothing moved, which is the overwhelmingly
     ///   common case on a poll loop.
     ///
-    /// # Pitfall: one blob can produce many messages, and that is the byte grain's cost
+    /// # Pitfall: one blob can produce many messages, and that cost is steady-state, not a one-off
     /// A blob yields one [`S2C::BlobData`] per *run*, and a run breaks wherever a byte S wrote
     /// happens to equal the byte already there. The reference app's first readback — 16 KiB of flat
-    /// blue, `00 00 ff ff` per pixel over a zero baseline — is 4096 runs, because the zero R and G
-    /// bytes are not bytes S wrote. See [`HostBlob::take_bytes_s_wrote`]: it is a volume cost, it is
-    /// deliberately left visible for Task 9 to measure, and the fix is never to merge runs across
-    /// bytes S did not write.
+    /// blue, `00 00 ff ff` per pixel over a zero baseline — is 4096 runs. **That is not the worst
+    /// case, and it is not a startup-only cost**: a second frame that rewrites every pixel to a
+    /// different flat colour fragments into 8192 one-byte runs, because an opaque render keeps the
+    /// alpha byte constant across frames, and the two frames' green bytes happen to coincide too —
+    /// so the coincidence that fragments the first readback recurs, undiminished, on every
+    /// subsequent frame, and scales with resolution. See [`HostBlob::take_bytes_s_wrote`] for the
+    /// full argument and the pinned measurement of both frames. It is a volume cost, not a
+    /// correctness one, and it is required to be fixed — with a wire change carrying many runs per
+    /// message, never by merging runs across bytes S did not write — before this carries any
+    /// non-toy workload; Task 9 measures the exact numbers.
     pub fn poll_progress(&mut self) -> Vec<S2C> {
         // Ask the rings first, before copying anything: on the overwhelming majority of polls
         // nothing moved, and shipping a blob per poll regardless would make this loop a bandwidth
