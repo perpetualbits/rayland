@@ -31,14 +31,32 @@ use serde::de::DeserializeOwned;
 /// allocation failure rather than returning a recoverable error, so an unbounded length
 /// prefix is a denial-of-service, not merely a slow path.
 ///
-/// 8 MiB is generous for a single (c)1 frame: the largest individual blob observed by
-/// C0's captures (`docs/design/2026-07-15-venus-ring-findings.md` §6) was exactly 8 MiB
-/// (`8388608` bytes, the command-buffer staging pool), and the command ring itself is
-/// 128 KiB. A frame carrying the full contents of that 8 MiB blob plus its message
-/// envelope will sit right at this boundary; if (c)1 later needs to move blobs larger
-/// than 8 MiB whole, this constant — or the "ship the whole blob" strategy in
-/// [`crate::C2S::BlobData`]'s doc comment — will need to be revisited together.
-pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+/// # Why 32 MiB, and the trap this number exists to avoid
+/// The cap must sit **strictly above the largest _legitimate_ payload plus its envelope**, or it
+/// stops being a hostility guard and becomes a bug that rejects real traffic. Two real ceilings
+/// bound a (c)1 frame, and the value must clear **both**:
+///
+/// 1. **8 MiB — the command-buffer staging pool.** C0 measured this blob (`res=4`) at *exactly*
+///    `8388608` bytes (`docs/design/2026-07-15-venus-ring-findings.md` §6), and (c)1 v1 ships
+///    mapped blobs **whole**, deliberately (the spec's §7 rules out dirty tracking as premature
+///    cleverness). A [`crate::C2S::BlobData`] carrying it adds a discriminant, `res_id`, `offset`
+///    and a length prefix on top.
+/// 2. **16 MiB — virglrenderer's maximum ring size** (`VKR_RING_BUFFER_MAX_SIZE`, `vkr_ring.h:20`).
+///    A [`crate::C2S::RingDelta`] is bounded by the ring it came from. Mesa's `buf_size` is a
+///    client-side constant currently set to 128 KiB (`vn_instance.c:149`), so today's deltas are
+///    tiny — but that constant is exactly the sort of thing a later slice raises for throughput,
+///    and the host would accept it.
+///
+/// **This constant was 8 MiB and that was a latent bug**, caught in review before it could bite:
+/// it equalled ceiling (1) *exactly*, so the envelope alone would have pushed the one blob C0 had
+/// already captured past the cap — blob sync would have failed on day one, presenting as a framing
+/// bug rather than a sizing one. 16 MiB would merely relocate the same mistake onto ceiling (2).
+/// 32 MiB clears both with margin while staying a bounded, survivable allocation.
+///
+/// If a future slice needs to move something larger than this whole — (c)4's real applications will
+/// push hundreds of megabytes of texture — the answer is **not** to keep raising this number. It is
+/// to chunk, which [`crate::C2S::BlobData`]'s `offset` field already exists to express.
+pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 
 /// Everything that can go wrong while framing or deframing a message.
 #[derive(Debug, thiserror::Error)]
