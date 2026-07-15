@@ -20,13 +20,35 @@
 //! [`HostBlob::copy_in`] therefore writes through `copy_nonoverlapping`, and the control words are
 //! read and written as **real atomics** (see [`crate::ring_mirror`]) rather than as bytes.
 //!
-//! This is a genuinely stronger position than `rayland-c`'s equivalent, and the reason is worth
-//! stating: C's peer across the mapping is *Mesa, in another process*, so C cannot express the
-//! sharing in Rust's memory model at all and documents two ordering gaps instead
-//! (`rayland-c/src/ring.rs`, "Known gaps"). **S's peer is a thread in S's own process** — the ring
-//! thread virglrenderer spawned. Same address space, so an ordinary Rust atomic pairs with
-//! virglrenderer's C11 atomic exactly as the two languages' memory models promise, and S has no
-//! equivalent gap to document.
+//! This is a genuinely stronger position than `rayland-c`'s equivalent, but it is not, as an earlier
+//! draft of this comment claimed, a *same-process* one. **S's peer is virglrenderer's ring thread,
+//! and that thread runs inside the forked render-server (`vkr` proxy) subprocess** —
+//! `RAYLAND_INIT_FLAGS` (`rayland-engine/src/ffi.rs`) always includes
+//! `VIRGL_RENDERER_RENDER_SERVER`, and without it Venus context creation fails outright
+//! (`ffi.rs`'s doc comment on that flag), so there is no code path on which the ring thread is a
+//! thread in *this* process. `crates/rayland-engine/src/virgl.rs` corroborates it empirically: a
+//! Venus resource is observed to be "served by the render-server *proxy*". So S's mapping and the
+//! ring thread's mapping are two separate `mmap`s of the same shared-memory object, made by two
+//! separate processes — precisely `rayland-c`'s situation, not its opposite, and Rust's memory
+//! model has nothing to say about a peer across a process boundary any more than it does for C's
+//! peer, Mesa.
+//!
+//! What S genuinely has that C does not is **not the absence of a gap** — it is that the gap is
+//! smaller. `rayland-c/src/ring.rs` documents two: Gap 1 (Mesa uses plain, non-atomic loads/stores
+//! on its side of the mapping, so C's atomics do not truly pair with anything) and Gap 2 (the Dekker
+//! StoreLoad park handshake). S closes Gap 1 — virglrenderer's ring thread genuinely uses C11
+//! atomics on its side (`vkr_ring_load_tail` / `vkr_ring_store_head`), so S's `AtomicU32` pairs with
+//! a real atomic rather than a plain load. And Gap 2 has no analogue here because S never parks. The
+//! formal hole that remains — `MAP_SHARED` coherence across two processes' mappings of the same
+//! shared-memory object, honoured by every real implementation but outside what the C11/Rust
+//! abstract machine promises for cross-process memory — is the same hole every lock-free
+//! shared-memory IPC scheme relies on, C's included. It is benign on every real target; it is not
+//! "no gap".
+//!
+//! The subprocess split is not an accident to route around — see `ffi.rs`'s note on
+//! `VIRGL_RENDERER_RENDER_SERVER`: sandboxing the untrusted client's Vulkan away from S's own process
+//! is exactly the point, given Rayland's threat model of an untrusted party driving the host GPU. So
+//! the topology this module lives with is a deliberate feature of that threat model, not a surprise.
 
 // The mapping primitive. Reused from `rayland-vtest` rather than reimplemented: it already maps
 // `MAP_SHARED` + `PROT_READ | PROT_WRITE` and owns the `munmap`, which is precisely what S needs.

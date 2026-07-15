@@ -57,11 +57,23 @@
 //! S deliberately never writes `head` or `status`. They are the ring thread's, and S's job is to
 //! *report* what that thread did — see [`RingMirror::take_progress`].
 //!
-//! # Memory ordering: real atomics, and no gap to document
+//! # Memory ordering: real atomics, and a smaller gap — not "no gap"
 //! `rayland-c`'s equivalent module has to document two ordering gaps, because its peer across the
-//! mapping is Mesa **in another process** and Rust's memory model cannot describe that sharing.
-//! **S's peer is a thread in S's own process** — the one `vkr_ring_start` spawned. So the pairing
-//! can be expressed exactly:
+//! mapping is Mesa **in another process** and Rust's memory model cannot describe that sharing. **S's
+//! peer is likewise in another process**: virglrenderer runs the ring thread (`vkr_ring_start` spawns
+//! it) inside the forked render-server subprocess that `VIRGL_RENDERER_RENDER_SERVER` requires for
+//! Venus (`rayland-engine/src/ffi.rs`) — S's own process never runs this thread. So the pairing rests
+//! on `MAP_SHARED` coherence between two processes' mappings of the same object, plus thread-scoped
+//! release/acquire on each side — the standard shared-memory idiom, formally outside the C11/Rust
+//! abstract machine's cross-process guarantees but honoured by every real implementation, exactly as
+//! it is for C's peer, Mesa.
+//!
+//! What genuinely differs from C is narrower than "no gap": virglrenderer's ring thread uses real
+//! C11 atomics on its side (`vkr_ring_load_tail`, `vkr_ring_store_head`), so S's `AtomicU32` pairs
+//! with an actual atomic — closing `rayland-c`'s Gap 1 (Mesa's plain, non-atomic accesses). And S
+//! never parks, so C's Gap 2 (the Dekker StoreLoad park handshake) has no analogue here. Both are
+//! real advantages; neither removes the cross-process formal hole itself. With that scoped correctly,
+//! the pairing this module relies on can be stated exactly:
 //!
 //! - virglrenderer loads `tail` with `memory_order_acquire` (`vkr_ring_load_tail`,
 //!   `vkr_ring.c:68-75`), with the comment *"the driver is expected to store the tail with
@@ -248,6 +260,29 @@ impl RingMirror {
     /// one longer than the whole buffer, or a blob too small for the layout. In every case **nothing
     /// is written and `tail` is not published**, because a half-applied delta is worse than a
     /// refused one.
+    ///
+    /// # What this does *not* check, and why that is safe by an inherited invariant rather than a
+    /// local one
+    /// This function checks a delta against `self.buffer_size` (the `LongerThanBuffer` guard above),
+    /// but it never checks the *cumulative* distance between `self.applied_tail` and the ring
+    /// thread's `head` — i.e. nothing here refuses a delta merely because applying it would advance
+    /// `tail` past `head + buffer_size` and overwrite bytes the ring thread has not consumed yet.
+    /// That is not an oversight: it is safe only because C's own flow control already guarantees it
+    /// never happens for a well-behaved peer, so the guarantee is *inherited*, not established here.
+    ///
+    /// Mesa's producer refuses to advance its local `tail` past that same bound in the first place
+    /// (`vn_ring_has_space`, `vn_ring.c:206-215`) — and `rayland-c`'s relay only ever forwards deltas
+    /// that a real `vn_ring_has_space`-gated Mesa produced, so C's `tail` (and therefore every
+    /// `RingDelta.tail` S ever receives from a correct C) can never lap S's `head`. **A broken or
+    /// hostile C is a different story**: nothing on the wire proves the sender actually ran Mesa's
+    /// check, so a lapping delta from such a peer is a real possibility this function does not
+    /// itself rule out. Its consequence is bounded and detected rather than silent, though: every
+    /// write here still lands inside `[RING_BUFFER_OFFSET, RING_BUFFER_OFFSET + buffer_size)` (this
+    /// function's own bounds checks guarantee that much regardless of what a hostile C claims), and
+    /// virglrenderer's ring thread independently raises `FATAL` if it ever computes a `cmd_size`
+    /// larger than the buffer (`vkr_ring_thread`, `vkr_ring.c:291-296`). So a hostile C can corrupt
+    /// unconsumed ring bytes and crash the render-server subprocess; it cannot make this function
+    /// write outside the mapping.
     pub fn apply_delta(
         &mut self,
         blob: &mut HostBlob,
@@ -386,13 +421,18 @@ impl RingMirror {
     /// Reinterpret one of the ring's 32-bit control words as an [`AtomicU32`] living in the blob's
     /// shared pages.
     ///
-    /// # Why this is sound, and why it would not be on C
-    /// The other accessor of these words is virglrenderer's ring thread, which is a thread in **this
-    /// process** (`vkr_ring_start` spawns it). So this is ordinary intra-process sharing of a
-    /// `u32`, and an `AtomicU32` is exactly the right way to describe it — the C11 atomics
-    /// virglrenderer uses and Rust's atomics are the same operations on the same memory. `rayland-c`
-    /// cannot make this claim about its ring, because its peer is Mesa in a *different process*, and
-    /// so it documents ordering gaps instead.
+    /// # Why this is sound, and how it actually compares to C
+    /// The other accessor of these words is virglrenderer's ring thread — and that thread runs in
+    /// the forked render-server subprocess `VIRGL_RENDERER_RENDER_SERVER` requires for Venus
+    /// (`rayland-engine/src/ffi.rs`), not in this process. So this is **cross-process** sharing of a
+    /// `u32`, the same topology `rayland-c` has with Mesa, and `AtomicU32` is sound here for the
+    /// same reason it is sound anywhere `MAP_SHARED` pages a real atomic on both sides: `Release`/
+    /// `Acquire` constrain the compiler and the CPU, not the address, and virglrenderer's ring
+    /// thread genuinely uses C11 atomics on its side (`vkr_ring_load_tail` / `vkr_ring_store_head`).
+    /// That is real ground `rayland-c` cannot stand on for Gap 1 (Mesa's side uses plain,
+    /// non-atomic accesses), so this pairing is *more* rigorous than C's — but the pairing itself
+    /// still rests on the same formally-unspecified-but-universally-honoured cross-process
+    /// `MAP_SHARED` coherence C's does, not on being in the same address space.
     ///
     /// # Alignment
     /// [`HostBlob::as_ptr`] is `mmap`'s return value and therefore page-aligned, and the ring's

@@ -788,9 +788,26 @@ fn an_engine_failure_is_reported_as_an_error_not_swallowed() {
         },
     );
 
+    // A substring specific enough that only the engine's own message text could produce it (not,
+    // say, "GUEST/1" or "HOST3D/2" from the same sentence), so `contains` genuinely proves the
+    // engine's complaint survived rather than matching on a stray digit.
+    let needle = "unsupported blob_mem 99";
+    let message = sole_error(&out);
     assert!(
-        sole_error(&out).contains("99"),
+        message.contains(needle),
         "the engine's own complaint must survive to C; got {out:?}"
+    );
+    // Every source-bearing `ApplyError` variant already interpolates its cause into its own
+    // `#[error(...)]` string, so rendering the wire message as `ApplyError`'s plain `Display` must
+    // produce this text exactly once. A rendering path that additionally walks `Error::source()`
+    // on top of that `Display` (as this crate's `render_error_chain` briefly did — (c)1 Task 4 fix
+    // pass, review finding 2) would duplicate it instead, and the earlier `.contains("99")`
+    // assertion could not tell the two apart: it passes whether the text appears once or twice.
+    assert_eq!(
+        message.matches(needle).count(),
+        1,
+        "S's engine refusal must appear exactly once in the wire message, not duplicated by \
+         Applier's error rendering; got {message:?}"
     );
 }
 

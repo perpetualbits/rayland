@@ -190,9 +190,11 @@ impl Applier {
     /// **Total by construction**: a refusal is an [`S2C::Error`] in the returned vector, never a
     /// dropped message. That is not tidiness — C blocks in a request/reply for `Capset` and
     /// `BlobCreated`, so an error S declines to send is an application that hangs forever on an
-    /// answer that is never coming. The rendered message is the full [`ApplyError`] chain (via
-    /// `{:#}`-style manual walking), so the engine's own complaint survives the trip rather than
-    /// being flattened to "S refused".
+    /// answer that is never coming. The rendered message is [`ApplyError`]'s own `Display` (i.e.
+    /// `e.to_string()`): every source-bearing variant already interpolates its cause into its own
+    /// `#[error(...)]` string, so `Display` alone already carries the engine's complaint end to
+    /// end — walking `Error::source()` on top of that would repeat, not add, text. See the note on
+    /// this module's (removed) `render_error_chain` helper in the (c)1 Task 4 fix-pass report.
     ///
     /// # Inputs / outputs
     /// - `engine`: S's real GPU. Borrowed per call rather than owned so the daemon can keep it on
@@ -206,7 +208,15 @@ impl Applier {
         match self.try_apply(engine, msg) {
             Ok(out) => out,
             Err(e) => vec![S2C::Error {
-                message: render_error_chain(&e),
+                // `ApplyError`'s own `Display` already carries the full story: every
+                // source-bearing variant interpolates `{0}`/`{source}` into its own message
+                // (and `EngineError`'s own variants do the same one level further down), so a
+                // single `to_string()` already reaches the engine's actual complaint. Walking
+                // `Error::source()` on top of this, as an earlier version of this function did,
+                // would repeat that same text — see review finding 2 in the (c)1 Task 4 fix-pass
+                // report for the duplicate (and, for `EngineError::ShmCreateFailed` /
+                // `ShmMapFailed`, triplicate) wire message this used to produce.
+                message: e.to_string(),
             }],
         }
     }
@@ -267,16 +277,31 @@ impl Applier {
                 let blob =
                     engine.create_blob_resource(ctx_id, blob_mem, blob_flags, blob_id, size)?;
                 let res_id = blob.resource_id;
+                // From this point on the resource genuinely exists inside the engine (and inside
+                // virglrenderer's own resource table) even though `Applier` has not recorded it
+                // anywhere yet — so every error path below must `unref_resource` before returning,
+                // or the resource outlives this refusal with nothing left able to name it. Before
+                // this fix, `BlobWithoutDescriptor` and a mapping failure both leaked it (finding 3,
+                // (c)1 Task 4 fix-pass): rare in practice (ENOMEM, or an engine that created a
+                // resource but produced no descriptor), and the session is usually dead anyway, but
+                // it made the comment below false, which this repository treats as a bug.
+                //
                 // The descriptor is what makes the pages reachable. Without one S holds a resource
                 // it can never write, so the application's commands would never arrive — refuse
                 // rather than register a blob that is useless by construction.
-                let fd = blob
-                    .fd
-                    .ok_or(ApplyError::BlobWithoutDescriptor { res_id })?;
-                // Map before registering anything: a mapping failure must leave no half-built state.
-                // The fd is dropped at the end of this scope — `mmap` holds its own reference to the
-                // underlying object, so closing it unmaps nothing.
-                let host_blob = HostBlob::map(fd.as_fd(), size)?;
+                let fd = blob.fd.ok_or_else(|| {
+                    engine.unref_resource(res_id);
+                    ApplyError::BlobWithoutDescriptor { res_id }
+                })?;
+                // Map before registering anything in `Applier`'s own tables: a mapping failure must
+                // leave no half-built state *there*. It must also not leave the engine holding a
+                // resource nobody can reach any more, which is why the error path unrefs it. The fd
+                // is dropped at the end of this scope either way — `mmap` holds its own reference to
+                // the underlying object, so closing it unmaps nothing.
+                let host_blob = HostBlob::map(fd.as_fd(), size).map_err(|source| {
+                    engine.unref_resource(res_id);
+                    ApplyError::from(source)
+                })?;
                 self.blobs.insert(res_id, host_blob);
 
                 // A ring-shaped blob gets a mirror. Unlike C, S needs no "first match only" rule:
@@ -436,24 +461,4 @@ impl Applier {
         }
         out
     }
-}
-
-/// Render an error and everything that caused it into one line.
-///
-/// # Why the chain matters
-/// C surfaces an `S2C::Error` as `EngineError::RelayRemoteError`, and that string is frequently the
-/// only thing a human ever sees about a failure that happened on a different machine. Rendering only
-/// the outermost error would send "S's render engine refused" across the network and leave the
-/// engine's actual complaint — the part naming the resource, the errno, the unsupported value — on
-/// the machine nobody is looking at.
-fn render_error_chain(err: &dyn std::error::Error) -> String {
-    let mut out = err.to_string();
-    let mut source = err.source();
-    while let Some(cause) = source {
-        // `: ` rather than a newline: this crosses a wire and lands in a log line.
-        out.push_str(": ");
-        out.push_str(&cause.to_string());
-        source = cause.source();
-    }
-    out
 }
