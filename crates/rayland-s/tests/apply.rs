@@ -20,6 +20,9 @@
 
 // The unit under test.
 use rayland_s::apply::{Applier, ApplyError};
+// The granularity at which S detects and ships its own writes (spec §7.2). Imported rather than
+// restated as 4096, so a test cannot claim a page size the code does not use.
+use rayland_s::blob::SYNC_PAGE_BYTES;
 use rayland_s::ring_mirror::RingDeltaError;
 // The relay protocol S speaks.
 use rayland_relay::{C2S, S2C};
@@ -133,6 +136,37 @@ impl RecordingEngine {
         // write; nothing else touches these pages while this test runs.
         unsafe {
             std::ptr::write_bytes(mapping.as_ptr().cast::<u8>(), fill, size as usize);
+        }
+    }
+
+    /// Fill `len` bytes at `offset` of a blob with `fill`, standing in for **S's engine** writing
+    /// part — and only part — of a blob.
+    ///
+    /// The whole-blob [`RecordingEngine::write_blob`] is the readback buffer's shape: the GPU
+    /// rewrites every pixel. This is the reply arena's shape: virglrenderer writes one reply of a
+    /// few hundred bytes into a 1 MiB pool and leaves the rest alone. Spec §7.2's rule ships *the
+    /// pages S wrote*, so a test that can only write everything cannot tell "the pages" from "the
+    /// blob".
+    fn write_blob_range(&self, res_id: u32, offset: u64, fill: u8, len: usize) {
+        let fd = self
+            .blob_fds
+            .get(&res_id)
+            .expect("a blob this double created");
+        let size = self.blob_sizes[&res_id];
+        assert!(
+            offset + len as u64 <= size,
+            "the test's own write must fit the blob it names"
+        );
+        let mapping = ShmMapping::map(fd.as_fd(), size).expect("mapping the double's memfd");
+        // SAFETY: `offset + len <= size` was just asserted, and the mapping is live, writable and
+        // exactly `size` bytes for the duration of this write; nothing else touches these pages
+        // while this test runs.
+        unsafe {
+            std::ptr::write_bytes(
+                mapping.as_ptr().cast::<u8>().add(offset as usize),
+                fill,
+                len,
+            );
         }
     }
 
@@ -943,44 +977,135 @@ fn refusals_are_typed_so_a_caller_can_tell_them_apart() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// (c)1 Task 5: the S->C half of the blob sync — getting the picture back to the application
+// (c)1 Tasks 5 / 5b: the S->C half of the blob sync — getting the replies and the picture back
+//
+// **Task 5b replaced the rule these tests check.** Task 5 asked "whose memory is this?" and routed
+// on `blob_id` (ring-findings §6). Spec §7.2 retracted that: it never carried the reply arena at
+// all (channel 2 crossed nowhere, so the application was released onto an arena of zeros and
+// `vkCreateInstance` failed on `instance_version = 0`), and for the app's own blobs it was a
+// last-writer-wins race — S shipped back vertex buffers its GPU never wrote.
+//
+// The rule now is **"did I write it?"**: S ships back exactly the pages S wrote, found by diffing
+// each blob against a baseline re-taken whenever C's own bytes land in it. So these tests are
+// written the same way — they never tell S what a blob *is*, only who wrote it.
 // ---------------------------------------------------------------------------------------------
 
 /// The app's readback buffer from the live capture (ring-findings §6): `res=6`, 16384 B = 64×64×4,
 /// `blob_id = 18`. C0 Task 4b caught it holding the blue clear colour — it is how the pixels reach
 /// the application at all.
 const READBACK_BLOB_ID: u64 = 18;
-/// That buffer's size: 64 × 64 × 4, exactly.
+/// That buffer's size: 64 × 64 × 4, exactly. Four [`SYNC_PAGE_BYTES`] pages, which is why it is the
+/// blob the page-granularity tests use.
 const READBACK_SIZE: u64 = 16384;
+
+/// The reply arena from the live capture (ring-findings §6): `res=2`, 1 MiB, `blob_id = 0`.
+///
+/// **This is spec §5's channel 2, and the whole reason Task 5b exists.** It is Venus-internal
+/// memory — `blob_id == 0`, exactly like the ring and the staging pool — which is why Task 5's
+/// ownership predicate excluded it and nothing ever shipped it. S's engine writes every synchronous
+/// command's answer here, so it must cross, and under §7.2's rule it does: not because S knows what
+/// it is, but because S observed itself write it.
+const REPLY_ARENA_BLOB_ID: u64 = 0;
+/// The arena's size: 1 MiB (`vn_renderer_shmem_pool` grows in 1 MiB chunks — `vn_instance.c:160`).
+const REPLY_ARENA_SIZE: u64 = 1_048_576;
+
+/// The command-buffer staging pool from the live capture: `res=4`, 8 MiB, `blob_id = 0`.
+///
+/// C's Mesa records command buffers into it; **S never writes it**. It is the blob that makes
+/// "widen the predicate to cover `blob_id == 0`" a corruption bug rather than a fix — S's copy is
+/// whatever the engine's fresh allocation held, and shipping it back would wipe a recording in
+/// progress.
+const STAGING_POOL_BLOB_ID: u64 = 0;
+/// The staging pool's size: 8 MiB.
+const STAGING_POOL_SIZE: u64 = 8_388_608;
+
+/// The app's vertex buffer from the live capture: `res=3`, 64 B, `blob_id = 16`.
+///
+/// The app writes it; S's GPU only ever **reads** it. It is the blob §7.2's race is about.
+const VERTEX_BUFFER_BLOB_ID: u64 = 16;
+/// That buffer's size: three vertices, decoding float-for-float (C0 Task 4b).
+const VERTEX_BUFFER_SIZE: u64 = 64;
+
+/// Create a blob and return the resource id S assigned it, panicking on any other outcome.
+fn create_blob(
+    applier: &mut Applier,
+    engine: &mut RecordingEngine,
+    blob_id: u64,
+    size: u64,
+) -> u32 {
+    let out = applier.apply(
+        engine,
+        C2S::CreateBlob {
+            blob_mem: BLOB_MEM_HOST3D,
+            blob_flags: 0,
+            blob_id,
+            size,
+        },
+    );
+    match out.as_slice() {
+        [S2C::BlobCreated { res_id }] => *res_id,
+        other => panic!("expected exactly one BlobCreated, got {other:?}"),
+    }
+}
 
 /// Bring up a session with a ring **and** the application's readback blob, and return both ids.
 ///
 /// Mirrors the live capture's shape: Venus's own shmems carry `blob_id == 0`, the application's
-/// `VkDeviceMemory` allocations carry a non-zero one.
+/// `VkDeviceMemory` allocations carry a non-zero one. Nothing S does with them depends on that any
+/// more — see this section's header — but the tests speak the capture's terms so a reader can check
+/// them against ring-findings §6.
 fn session_with_ring_and_app_blob() -> (Applier, RecordingEngine, u32, u32) {
     let (mut applier, mut engine, ring) = session_with_ring();
+    let app_blob = create_blob(&mut applier, &mut engine, READBACK_BLOB_ID, READBACK_SIZE);
+    (applier, engine, ring, app_blob)
+}
 
+/// Relay a delta and have virglrenderer's ring thread retire it, storing `head`.
+///
+/// The two are separate events in reality — the ring thread runs asynchronously and S's daemon has
+/// to *poll* for the result — but every test below wants the moment after both, so they are driven
+/// together here.
+fn relay_and_retire(
+    applier: &mut Applier,
+    engine: &mut RecordingEngine,
+    ring: u32,
+    from_tail: u32,
+    to_tail: u32,
+) {
     let out = applier.apply(
-        &mut engine,
-        C2S::CreateBlob {
-            blob_mem: BLOB_MEM_HOST3D,
-            blob_flags: 0,
-            blob_id: READBACK_BLOB_ID,
-            size: READBACK_SIZE,
+        engine,
+        C2S::RingDelta {
+            ring_res_id: ring,
+            tail: to_tail,
+            bytes: vec![0xaa; (to_tail - from_tail) as usize],
         },
     );
-    let app_blob = match out.as_slice() {
-        [S2C::BlobCreated { res_id }] => *res_id,
-        other => panic!("expected the app's blob to be created, got {other:?}"),
-    };
-    (applier, engine, ring, app_blob)
+    assert!(out.is_empty(), "a relayed delta has no reply; got {out:?}");
+    // virglrenderer's ring thread consumes the bytes and stores `head` (`vkr_ring_store_head`,
+    // `vkr_ring.c:60-67`). This is the only evidence S ever has that anything retired.
+    engine.write_control(ring, RING_HEAD_OFFSET, to_tail);
+}
+
+/// Every `S2C::BlobData` in `out` for `res_id`, as `(offset, bytes)` pairs, in the order S emitted
+/// them.
+fn blob_runs_for(out: &[S2C], res_id: u32) -> Vec<(u64, Vec<u8>)> {
+    out.iter()
+        .filter_map(|m| match m {
+            S2C::BlobData {
+                res_id: r,
+                offset,
+                bytes,
+            } if *r == res_id => Some((*offset, bytes.clone())),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Drive a session to the point where S's engine has retired commands and its GPU has written the
 /// application's readback blob — i.e. exactly the moment S owes C both pixels and progress.
 fn a_retired_batch_with_pixels(fill: u8) -> (Applier, RecordingEngine, u32, u32) {
     let (mut applier, mut engine, ring, app_blob) = session_with_ring_and_app_blob();
-    applier.apply(
+    let out = applier.apply(
         &mut engine,
         C2S::RingDelta {
             ring_res_id: ring,
@@ -988,11 +1113,285 @@ fn a_retired_batch_with_pixels(fill: u8) -> (Applier, RecordingEngine, u32, u32)
             bytes: vec![0xaa; 64],
         },
     );
+    assert!(out.is_empty(), "a relayed delta has no reply; got {out:?}");
     // The GPU renders: the readback blob now holds the picture.
     engine.write_blob(app_blob, fill);
     // virglrenderer's ring thread retires the batch and stores `head`.
     engine.write_control(ring, RING_HEAD_OFFSET, 64);
     (applier, engine, ring, app_blob)
+}
+
+/// **The blocker Task 5b exists to remove: the reply arena must cross S->C.**
+///
+/// Spec §5's channel 2 is where S's engine writes the answer to every synchronous Vulkan command.
+/// Until this test passed, nothing shipped it, and the failure was **not** the hang one would
+/// expect: `head` advances from `S2C::RingProgress` regardless, so `vn_ring_wait_seqno` returns and
+/// the application is released onto an arena that is still zeros.
+/// `vn_instance_init_renderer_versions` reads `instance_version = 0`, fails the
+/// `VN_MIN_RENDERER_VERSION` check, and `vkCreateInstance` fails. Silent garbage.
+///
+/// The arena's `blob_id` is **0** — Venus-internal, indistinguishable by that signal from the ring
+/// and the staging pool. It crosses here for one reason only: S observed itself write those bytes.
+#[test]
+fn the_reply_arena_crosses_because_s_wrote_it_not_because_s_knows_what_it_is() {
+    let (mut applier, mut engine, ring) = session_with_ring();
+    let arena = create_blob(
+        &mut applier,
+        &mut engine,
+        REPLY_ARENA_BLOB_ID,
+        REPLY_ARENA_SIZE,
+    );
+
+    // C relays a reply-bearing command; S's engine answers into the arena and the batch retires.
+    let out = applier.apply(
+        &mut engine,
+        C2S::RingDelta {
+            ring_res_id: ring,
+            tail: 64,
+            bytes: vec![0xaa; 64],
+        },
+    );
+    assert!(out.is_empty(), "a relayed delta has no reply; got {out:?}");
+    engine.write_blob_range(arena, 0, 0x5a, 128);
+    engine.write_control(ring, RING_HEAD_OFFSET, 64);
+
+    let out = applier.poll_progress();
+
+    let runs = blob_runs_for(&out, arena);
+    assert_eq!(
+        runs.len(),
+        1,
+        "S wrote one contiguous region of the arena, so it owes C exactly one run; got {runs:?}"
+    );
+    assert_eq!(runs[0].0, 0, "the reply starts at the arena's beginning");
+    assert_eq!(
+        &runs[0].1[..128],
+        &[0x5a; 128],
+        "the bytes C's Mesa will decode as its reply must be the ones S's engine actually wrote; \
+         without them vn_instance_init_renderer_versions reads instance_version = 0 and \
+         vkCreateInstance fails"
+    );
+}
+
+/// **The race regression test, and the sharpest one in this file: a blob S never wrote must not be
+/// shipped back, even though C wrote it and it is therefore dirty.**
+///
+/// Spec §7.2's scenario, concretely: the application `memcpy`s frame *N+1*'s vertices into `res=3`
+/// and C relays them; S's GPU **reads** them and never writes them; S's poll fires on the `head`
+/// movement and — under Task 5's rule — shipped S's copy of `res=3` straight back, where C's reader
+/// overwrote the application's fresh vertices with it. Nothing detects that: it is a silent,
+/// timing-dependent lost write.
+///
+/// It is invisible in the reference app, which writes its vertices exactly once, so C's and S's
+/// copies converge no matter what — which is precisely why every test passed before this one.
+#[test]
+fn a_blob_s_never_wrote_is_not_shipped_back_even_though_c_wrote_it() {
+    let (mut applier, mut engine, ring) = session_with_ring();
+    let vertices = create_blob(
+        &mut applier,
+        &mut engine,
+        VERTEX_BUFFER_BLOB_ID,
+        VERTEX_BUFFER_SIZE,
+    );
+
+    // C's own C->S sync ships the application's fresh vertices ahead of the delta that draws them.
+    let out = applier.apply(
+        &mut engine,
+        C2S::BlobData {
+            res_id: vertices,
+            offset: 0,
+            bytes: vec![0x33; VERTEX_BUFFER_SIZE as usize],
+        },
+    );
+    assert!(out.is_empty(), "a blob sync has no reply; got {out:?}");
+    // The batch retires. S's GPU read the vertices; a vertex buffer is the app's alone to write, so
+    // S wrote nothing into it.
+    relay_and_retire(&mut applier, &mut engine, ring, 0, 64);
+
+    let out = applier.poll_progress();
+
+    assert_eq!(
+        blob_runs_for(&out, vertices),
+        Vec::new(),
+        "S's GPU never wrote the vertex buffer, so S has nothing to say about it. Shipping it back \
+         would overwrite whatever the application has written into it since — a lost write with \
+         nothing anywhere naming the cause. Got {out:?}"
+    );
+    assert!(
+        out.iter().any(|m| matches!(m, S2C::RingProgress { .. })),
+        "the retirement itself must still be reported, or this test would pass for an S that had \
+         simply stopped: {out:?}"
+    );
+}
+
+/// **The ring is excluded by `res_id` — structurally, not by a guess about its bytes.**
+///
+/// S's engine genuinely writes the ring's pages: `vkr_ring_store_head` (`vkr_ring.c:60-67`) stores
+/// `head` into them after each dispatched command. So the "did I write it?" predicate says **yes**,
+/// and it must not be allowed to answer: `head` and `status` are the ring thread's, C's `tail` and
+/// command bytes are C's, and `S2C::RingProgress` already owns the only part of that C needs.
+/// Shipping the ring back as blob data would overwrite the commands C is in the middle of relaying
+/// with S's copy of them.
+///
+/// S already holds `self.rings`, so this exclusion costs nothing and cannot be fooled — unlike a
+/// `blob_id` test, which is a claim about a number a remote peer chose.
+#[test]
+fn the_ring_is_excluded_by_res_id_even_though_s_wrote_its_head() {
+    let (mut applier, mut engine, ring) = session_with_ring();
+
+    relay_and_retire(&mut applier, &mut engine, ring, 0, 64);
+
+    let out = applier.poll_progress();
+
+    assert_eq!(
+        blob_runs_for(&out, ring),
+        Vec::new(),
+        "S wrote `head` into the ring's own pages, so an observed-writes rule that did not exclude \
+         rings would ship them; `RingProgress` owns that news. Got {out:?}"
+    );
+    assert!(
+        out.iter().any(|m| matches!(m, S2C::RingProgress { .. })),
+        "the `head` movement must still be reported — as progress, not as bytes: {out:?}"
+    );
+}
+
+/// **C's own writes must never come back to it as if they were S's.**
+///
+/// S's baseline for "what does C already have?" is re-taken every time an inbound `C2S::BlobData`
+/// lands bytes in a blob. Without that, the sequence below is an infinite echo: C writes, S's diff
+/// sees pages that differ from an older baseline, S ships them back as its own, C applies them over
+/// whatever the application has written since.
+///
+/// This is the one property that cannot be checked by shipping nothing and cannot be checked by
+/// shipping everything, so it pins the snapshot specifically.
+#[test]
+fn an_inbound_blob_data_re_snapshots_so_c_s_own_write_is_never_shipped_back() {
+    let (mut applier, mut engine, ring, app_blob) = session_with_ring_and_app_blob();
+
+    // Round 1: S's GPU renders and the batch retires, so the pixels legitimately cross.
+    relay_and_retire(&mut applier, &mut engine, ring, 0, 64);
+    engine.write_blob(app_blob, 0x5a);
+    assert!(
+        !blob_runs_for(&applier.poll_progress(), app_blob).is_empty(),
+        "S wrote this blob, so round 1 must ship it — otherwise round 2 proves nothing"
+    );
+
+    // C now writes the whole blob itself and relays another batch. S's GPU writes nothing.
+    let out = applier.apply(
+        &mut engine,
+        C2S::BlobData {
+            res_id: app_blob,
+            offset: 0,
+            bytes: vec![0x77; READBACK_SIZE as usize],
+        },
+    );
+    assert!(out.is_empty(), "a blob sync has no reply; got {out:?}");
+    relay_and_retire(&mut applier, &mut engine, ring, 64, 128);
+
+    let out = applier.poll_progress();
+
+    assert_eq!(
+        blob_runs_for(&out, app_blob),
+        Vec::new(),
+        "those 0x77 bytes are C's own, applied to S's pages by C's message. Shipping them back \
+         would be S echoing C's write as if it were its GPU's, and it would clobber anything the \
+         application wrote in the meantime. Got {out:?}"
+    );
+}
+
+/// **Only the pages S wrote cross — not the blob they are in.**
+///
+/// The reply arena is the case that makes this matter: virglrenderer writes a few hundred bytes of
+/// reply into a 1 MiB pool. Shipping the pool would be ~256x the traffic, and — worse — it would
+/// carry S's stale copy of every byte C has written into the same blob since.
+///
+/// The `offset` field this uses has been on the wire since Task 4 and was always 0 until now.
+#[test]
+fn only_the_pages_s_wrote_cross_not_the_whole_blob() {
+    let (mut applier, mut engine, ring, app_blob) = session_with_ring_and_app_blob();
+
+    // S's engine writes four bytes, in the third of the blob's four pages.
+    engine.write_blob_range(app_blob, 2 * SYNC_PAGE_BYTES as u64, 0xc3, 4);
+    relay_and_retire(&mut applier, &mut engine, ring, 0, 64);
+
+    let out = applier.poll_progress();
+
+    let runs = blob_runs_for(&out, app_blob);
+    assert_eq!(runs.len(), 1, "one page changed, so one run; got {runs:?}");
+    assert_eq!(
+        runs[0].0,
+        2 * SYNC_PAGE_BYTES as u64,
+        "the run must start at the page S wrote, not at the blob's beginning"
+    );
+    assert_eq!(
+        runs[0].1.len(),
+        SYNC_PAGE_BYTES,
+        "the page is the granularity: one page changed, so one page's worth of bytes crosses, not \
+         the blob's {READBACK_SIZE}"
+    );
+    assert_eq!(
+        &runs[0].1[..4],
+        &[0xc3; 4],
+        "and it must carry what S actually wrote"
+    );
+}
+
+/// Neighbouring changed pages cross as **one** run, and a gap between them splits the runs.
+///
+/// A reply larger than a page must not arrive as a scatter of unrelated messages, and two distant
+/// writes must not drag the untouched pages between them along. Both fall out of coalescing
+/// adjacent changed pages, which is what this pins.
+#[test]
+fn contiguous_changed_pages_coalesce_and_a_gap_splits_them() {
+    let (mut applier, mut engine, ring, app_blob) = session_with_ring_and_app_blob();
+
+    // Pages 0 and 1 are written as one region; page 2 is left alone; page 3 is written separately.
+    engine.write_blob_range(app_blob, 0, 0xa1, 2 * SYNC_PAGE_BYTES);
+    engine.write_blob_range(app_blob, 3 * SYNC_PAGE_BYTES as u64, 0xb2, 16);
+    relay_and_retire(&mut applier, &mut engine, ring, 0, 64);
+
+    let out = applier.poll_progress();
+
+    let runs = blob_runs_for(&out, app_blob);
+    let shapes: Vec<(u64, usize)> = runs.iter().map(|(o, b)| (*o, b.len())).collect();
+    assert_eq!(
+        shapes,
+        vec![
+            (0, 2 * SYNC_PAGE_BYTES),
+            (3 * SYNC_PAGE_BYTES as u64, SYNC_PAGE_BYTES)
+        ],
+        "pages 0-1 changed together and must cross as one run; page 2 is untouched and must not be \
+         dragged along; page 3 is its own run"
+    );
+}
+
+/// **The command-buffer staging pool must never cross S->C**, because S never writes it.
+///
+/// This is the blob that made Task 5's obvious fix — "widen the ownership predicate to include
+/// `blob_id == 0` so the arena crosses" — a corruption bug: the pool is `blob_id == 0` too, C's Mesa
+/// is actively recording command buffers into it, and S's copy is whatever its engine's fresh
+/// allocation held. Shipping it back would wipe a recording in progress. Under §7.2's rule the
+/// question never arises: S wrote nothing here, so S says nothing.
+#[test]
+fn the_command_buffer_staging_pool_never_crosses_because_s_never_writes_it() {
+    let (mut applier, mut engine, ring) = session_with_ring();
+    let pool = create_blob(
+        &mut applier,
+        &mut engine,
+        STAGING_POOL_BLOB_ID,
+        STAGING_POOL_SIZE,
+    );
+
+    relay_and_retire(&mut applier, &mut engine, ring, 0, 64);
+
+    let out = applier.poll_progress();
+
+    assert_eq!(
+        blob_runs_for(&out, pool),
+        Vec::new(),
+        "S never writes the staging pool; shipping its copy back would wipe the command buffers \
+         C's Mesa is recording into it. Got {out:?}"
+    );
 }
 
 /// **The mirror of Task 5's central assertion, and the sharper of the two: the pixels must reach C
@@ -1048,39 +1447,15 @@ fn the_shipped_blob_carries_the_bytes_s_s_gpu_actually_wrote() {
             _ => None,
         })
         .expect("the readback blob");
-    assert_eq!(offset, 0, "v1 ships whole blobs, so they start at 0");
+    assert_eq!(
+        offset, 0,
+        "S's GPU rewrote every pixel, so every page changed and the whole blob is one run starting \
+         at its beginning"
+    );
     assert_eq!(
         bytes,
         &vec![0x5au8; READBACK_SIZE as usize],
         "the application's frame is exactly what S's GPU left in these pages"
-    );
-}
-
-/// **Venus's own shmems must never be shipped S→C.**
-///
-/// The ring is the sharp case: C owns its `tail` and its command buffer, and S shipping its copy
-/// back would overwrite the very commands C is in the middle of relaying. The staging pool is worse
-/// in a quieter way — C's Mesa records command buffers into it and S *never writes it*, so S's copy
-/// is zeros; shipping it back would wipe a recording in progress. This is why "conservative full
-/// sync" cannot mean "everything, both ways": that is not conservative, it is corruption.
-#[test]
-fn venus_s_own_shmems_are_never_shipped_s_to_c() {
-    let (mut applier, _engine, ring, app_blob) = a_retired_batch_with_pixels(0x5a);
-
-    let out = applier.poll_progress();
-
-    let shipped: Vec<u32> = out
-        .iter()
-        .filter_map(|m| match m {
-            S2C::BlobData { res_id, .. } => Some(*res_id),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        shipped,
-        vec![app_blob],
-        "only the application's own memory may cross S->C; shipping the ring (res={ring}) back \
-         would overwrite the tail and command bytes C owns"
     );
 }
 

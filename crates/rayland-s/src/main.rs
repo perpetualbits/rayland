@@ -29,12 +29,12 @@
 //!
 //! # Status: never run against a real C
 //! **This binary has never completed a session**, because there is nothing to run it against yet:
-//! the QUIC transport is (c)1 Task 6. Task 5 has since shipped the blob synchronisation, so the
-//! application's memory now crosses both ways — but **the reply arena does not** (spec §5's channel
-//! 2, still unowned), so an application on C would block forever on its first synchronous call even
-//! once a transport exists. [`Applier::poll_progress`] documents why the obvious widening of the
-//! blob-sync rule would corrupt C's staging pool instead of fixing it. The piece with the real
-//! logic — [`Applier`], and
+//! the QUIC transport is (c)1 Task 6. Task 5 shipped the blob synchronisation and Task 5b corrected
+//! its S→C half to spec §7.2's rule — **S ships back exactly the pages S wrote** — which also gave
+//! spec §5's channel 2, the reply arena, the owner it had never had. [`Applier::poll_progress`]
+//! documents both the rule and the two ways its predecessor was wrong, including why the obvious
+//! widening (ship Venus's `blob_id == 0` shmems too) would have wiped C's staging pool rather than
+//! fixed anything. The piece with the real logic — [`Applier`], and
 //! the ring arithmetic under it — is tested against a real shared-memory mapping with no GPU and no
 //! network (`tests/apply.rs`). What is uncovered here is the *wiring*: the socket, the two threads,
 //! and the engine's own behaviour. That genuinely needs a peer, and is unverified until Task 6.

@@ -8,14 +8,22 @@
 //!   100% of the application's Vulkan commands — and [`is_application_memory`] to know which blobs
 //!   to ship to S before a ring delta the GPU may read them from.
 //! - `rayland-s` needs [`RingIdentity`] to know how to lay a relayed delta back down (the ring is
-//!   circular, and re-wrapping a delta correctly requires the buffer's size), and
-//!   [`is_application_memory`] to know which blobs to ship *back* after its GPU has written them.
+//!   circular, and re-wrapping a delta correctly requires the buffer's size).
 //!
-//! Two copies of either rule would be two chances to disagree, and a disagreement would not surface
-//! as an error — it would surface as S writing the application's commands at offsets Mesa never
-//! wrote them to, or as one end shipping a blob the other end considers its own to write. So they
-//! live once, in the crate that already holds the repository's ring knowledge (and which links no
-//! GPU code, so machine C can depend on it).
+//! Two copies of [`RingIdentity`] would be two chances to disagree, and a disagreement would not
+//! surface as an error — it would surface as S writing the application's commands at offsets Mesa
+//! never wrote them to. So it lives once, in the crate that already holds the repository's ring
+//! knowledge (and which links no GPU code, so machine C can depend on it).
+//!
+//! # [`is_application_memory`] is now C's alone, and that is the point of spec §7.2
+//! It used to be listed above for `rayland-s` too — "which blobs to ship *back* after its GPU has
+//! written them" — and (c)1 Task 5b removed that. The predicate answers *"whose memory is this?"*,
+//! which turned out to be the wrong question for the S→C direction: it excluded the reply arena
+//! (Venus-internal, so channel 2 crossed nowhere and applications were released onto zeros), and for
+//! the app's own blobs it was a last-writer-wins race, S shipping back buffers its GPU never wrote.
+//! S now asks *"did I write it?"* instead, of the bytes themselves. See
+//! `rayland_s::blob::HostBlob::take_pages_s_wrote`, and `rayland_c::blob_sync`'s module docs for why
+//! C cannot and need not mirror that.
 
 // The layout constants this recognizer's arithmetic is expressed in terms of, so the two cannot
 // drift: `RING_BUFFER_OFFSET` *is* the control area's size, by construction.
@@ -58,20 +66,32 @@ const RING_EXTRA_BYTES: u64 = 4;
 /// would read as an arbitrary null check, and the next person to touch it would have no idea that
 /// §6's evidence is what makes it true.
 ///
-/// # Why the answer matters so much, in both directions
-/// This predicate is what keeps (c)1's *conservative full sync* (spec §7) from being a corruption
-/// bug. Each blob has an owner, and shipping one the wrong way clobbers live data:
+/// # Why the answer matters, and the one direction it may be asked in
+/// **This is a C→S routing rule only.** It is what keeps C's *conservative full sync* (spec §7) from
+/// being a corruption bug: the application writes its vertices into a mapped blob with **no API call
+/// to intercept** (ring-findings §6 — the `vkMapMemory` problem), so C must ship them or S's GPU
+/// renders from memory the application never wrote — but shipping Venus's own shmems the same way
+/// would clobber S's reply arena with C's stale copy, and would fight `C2S::RingDelta` for the
+/// ring's bytes. `blob_id` is the only clean line available between the two, so "everything, both
+/// ways" is not conservative, it is wrong.
 ///
-/// - **C→S:** the application writes its vertices into a mapped blob with **no API call to
-///   intercept** (ring-findings §6 — the `vkMapMemory` problem), so C must ship them or S's GPU
-///   renders from memory the application never wrote. But shipping Venus's shmems the same way
-///   would clobber S's reply arena with C's stale copy.
-/// - **S→C:** S's GPU writes the rendered pixels into the app's readback blob, so S must ship those
-///   back or the application reads zeros. But shipping Venus's shmems back would clobber C's
-///   *staging pool* — which C's Mesa is actively recording into and S never writes — with zeros.
+/// # Pitfall: do not reach for this on S, however natural it looks
+/// It used to route S's outbound sync as well, and spec §7.2 retracted that for two reasons that
+/// are worth carrying next to the function rather than in a document:
 ///
-/// So "everything, both ways" is not conservative, it is wrong. `blob_id` is the only clean line
-/// available between the two.
+/// - **It silently withheld the reply arena.** The arena is `blob_id == 0`, so this predicate says
+///   "not the application's" and S shipped nothing. Spec §5's channel 2 therefore crossed nowhere,
+///   and the symptom was not a hang: `head` advances from `S2C::RingProgress` anyway, so the
+///   application was *released* onto an arena of zeros, read `instance_version = 0`, and failed
+///   `vkCreateInstance`.
+/// - **For the app's own blobs it was a last-writer-wins race.** S shipped back vertex and uniform
+///   buffers its GPU had only ever *read*, over the application's fresh writes to them.
+///
+/// And widening it to include `blob_id == 0` does not repair the first: the arena and the 8 MiB
+/// command-buffer staging pool are both `blob_id == 0`, and S never writes the pool, so shipping it
+/// back would wipe the command buffers C's Mesa is recording into it. Nothing in a `blob_id`
+/// separates them. S asks a different question now — *"did I write it?"*, of the bytes themselves;
+/// see `rayland_s::blob::HostBlob::take_pages_s_wrote`.
 ///
 /// # Inputs / outputs
 /// - `blob_id`: the client-chosen blob id from `VCMD_RESOURCE_CREATE_BLOB`, carried verbatim on the
@@ -80,12 +100,10 @@ const RING_EXTRA_BYTES: u64 = 4;
 ///
 /// # Pitfall: this does not tell you *which way* a given application blob flows
 /// It separates "the app's memory" from "Venus's plumbing". It does **not** say whether the GPU
-/// reads or writes a particular application blob — nothing available to (c)1 does, which is exactly
-/// why v1 syncs them whole in both directions instead of guessing (spec §7). **That whole-blob sync
-/// is a last-writer-wins race, not a correct algorithm** — see `rayland_c::blob_sync`'s module docs
-/// for the failure scenario it accepts in exchange for not having to guess. It also says nothing
-/// about which of Venus's internal shmems is the reply arena as against the staging pool; both are
-/// `blob_id == 0` and there is no signal here that separates them.
+/// reads or writes a particular application blob — nothing available to C does, which is exactly why
+/// C ships them whole rather than guessing (spec §7). It also says nothing about which of Venus's
+/// internal shmems is the reply arena as against the staging pool; both are `blob_id == 0` and there
+/// is no signal here that separates them.
 pub fn is_application_memory(blob_id: u64) -> bool {
     // Ring-findings §6: zero marks Venus's own shmems, non-zero a client `VkDeviceMemory`.
     blob_id != 0
@@ -198,11 +216,14 @@ mod tests {
     /// The blob classification must match what C0 Task 4b actually measured, blob for blob.
     ///
     /// These are the live capture's six blobs (ring-findings §6), with their real sizes and real
-    /// `blob_id`s. The table is the whole evidence base for (c)1's decision about which memory
-    /// crosses the network in which direction, so it is asserted rather than trusted to a comment:
-    /// if `is_application_memory` ever stopped agreeing with it, `rayland-c` would either ship
-    /// Venus's plumbing to S (clobbering its reply arena) or stop shipping the application's
-    /// vertices (rendering the triangle from memory the application never wrote).
+    /// `blob_id`s. The table is the evidence base for C's decision about which of its memory crosses
+    /// to S, so it is asserted rather than trusted to a comment: if `is_application_memory` ever
+    /// stopped agreeing with it, `rayland-c` would either ship Venus's plumbing to S (clobbering its
+    /// reply arena) or stop shipping the application's vertices (rendering the triangle from memory
+    /// the application never wrote).
+    ///
+    /// It says nothing about the S→C direction any more — spec §7.2 retired the predicate there, so
+    /// `rayland-s` no longer consults this table for anything.
     #[test]
     fn the_captured_blobs_classify_exactly_as_task_4b_measured_them() {
         // Venus's internal shmems: the ring, the reply arena, and the command-buffer staging pool.

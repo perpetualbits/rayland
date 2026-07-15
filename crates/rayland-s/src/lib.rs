@@ -28,12 +28,12 @@
 //!
 //! # Status: what has and has not been run
 //! **This crate has never run against a real `rayland-c`.** The QUIC transport is (c)1 Task 6. Task
-//! 5 has since shipped the blob synchronisation, so the application's vertex buffer reaches S and
-//! its rendered pixels go back (see `Applier::poll_progress`) — but **the reply arena still crosses
-//! neither way**, and until it does, an application on C blocks forever on its first synchronous
-//! call. That is spec §5's channel 2; `poll_progress`'s docs record why widening the blob-sync rule
-//! to cover it would instead corrupt C's staging pool. What *is* covered, and covered hard, is
-//! everything that does not need a peer:
+//! 5 shipped the blob synchronisation and Task 5b corrected its S→C half to spec §7.2's rule — **S
+//! ships back exactly the pages S wrote** — so every channel spec §5 lists as (c)1's now has an
+//! owner: the application's vertex buffer reaches S, its rendered pixels go back, and so do the
+//! command replies in channel 2's reply arena, which nothing carried before 5b. See
+//! `Applier::poll_progress` for the rule and for the two ways the rule it replaced was wrong. What
+//! *is* covered, and covered hard, is everything that does not need a peer:
 //! `tests/apply.rs` exercises every message against a real shared-memory mapping, with no GPU, no
 //! Mesa and no network — including the ring wrap, which ring-findings §8 records has **never been
 //! reached in a live run** and is therefore untested code in Mesa, in virglrenderer, and here.

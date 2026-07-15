@@ -142,9 +142,14 @@ impl LocalBlob {
     ///
     /// Delegates to [`rayland_vtest::venus_ring::is_application_memory`], which holds the
     /// repository's single copy of ring-findings §6's `blob_id` discrimination and documents the
-    /// evidence behind it. It is not reimplemented here: `rayland-s` asks the same question of its
-    /// own blobs, and the two ends disagreeing about which memory belongs to whom would corrupt
-    /// whichever side lost the argument.
+    /// evidence behind it. It is not reimplemented here because that function is where the evidence
+    /// lives, and inlining a `!= 0` at the call site would read as an arbitrary null check.
+    ///
+    /// # This governs C→S only
+    /// Spec §7.2 retired the predicate for the return direction: S decides what to ship back by
+    /// asking which pages **S wrote**, not whose memory it is. So this answer no longer has an
+    /// opposite number on S that it could come to disagree with — see
+    /// [`crate::blob_sync`]'s module docs for why C keeps it and S could not use it.
     pub fn is_application_memory(&self) -> bool {
         is_application_memory(self.blob_id)
     }

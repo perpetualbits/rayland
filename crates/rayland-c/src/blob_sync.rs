@@ -47,6 +47,26 @@
 //! is written by S, and overwriting it with C's stale copy would destroy replies the application is
 //! blocked on. So this ships the application's memory only, on ring-findings §6's `blob_id` signal —
 //! see [`rayland_vtest::venus_ring::is_application_memory`], which holds the evidence.
+//!
+//! # Why C still routes on `blob_id` when S no longer does
+//! Spec §7.2 retracted the ownership predicate for **S→C** and replaced it with "S ships back
+//! exactly the pages S wrote". The natural question is why C does not mirror that, and the answer is
+//! that the mirror image is not available to C and would not be an improvement if it were.
+//!
+//! The rule works on S because S's *own* writes are the thing to be detected, and everything else
+//! that touches S's pages arrives through one function ([`copy_in`]) that can record it. **C is not
+//! in that position.** C's peer across these mappings is Mesa — which is to say the application —
+//! writing with plain stores, from another process, announcing nothing. A blob "C wrote" and a blob
+//! "the application wrote" are the same blob, so the symmetric predicate on C would collapse to "did
+//! anything other than S's replies change?", which is what shipping the application's memory already
+//! means. It would also start shipping the 8 MiB staging pool C's Mesa records into — writes C
+//! genuinely made, harmless but pure waste — where `blob_id` correctly declines to.
+//!
+//! So `blob_id` survives as a **C→S** routing rule for the reason it was always sound in that
+//! direction: it keeps C from publishing memory S owns. The direction where it was a *guess* at
+//! authorship, and therefore wrong, is the one §7.2 fixed.
+//!
+//! [`copy_in`]: https://docs.rs/rayland-s
 
 // The ring's identity and the delta the watcher drained.
 use crate::relay_engine::BlobTable;
@@ -84,32 +104,32 @@ use rayland_relay::C2S;
 ///
 /// # Pitfalls
 /// - **This ships blobs whole, every time, and that is deliberate** (spec §7), and its cost is
-///   *visible* — that part of the trade is real. But **it is not correct for any application; it is
-///   a last-writer-wins race**, safe only because the reference app happens never to trigger it. Do
-///   not add dirty tracking here; that is (c)2's work, and the lever it will use
-///   (`/proc/<pid>/pagemap` soft-dirty, or non-coherent memory plus real flush hooks) is recorded in
-///   the spec's §7.
-/// - **This is only half of the coherence story.** It carries C→S; the pixels S's GPU renders come
-///   back through `S2C::BlobData`, which `rayland-s` sends and this daemon's reader thread applies —
-///   and it is *that* return trip which turns the race above into a real hazard. Concretely: the
-///   application `memcpy`s frame *N+1*'s vertices into `res=3` at `t0`; concurrently, S's ~200 µs
-///   poll (ring-findings §5.2) fires on the `head` movement left over from frame *N* and ships back
-///   S's **stale** copy of `res=3` (S's GPU never wrote that blob — vertex/uniform/staging buffers
-///   are the app's alone to write); this daemon's reader thread applies that `S2C::BlobData` and
-///   overwrites the application's fresh frame-*N+1* vertices with S's stale frame-*N* bytes; the next
-///   time this function runs, it faithfully ships those stale bytes back to S as if they were current.
-///   Nothing anywhere detects this: it is a silent, timing-dependent lost write, not an error.
-/// - **A blob written by the application *while* this copies it is torn**, and nothing here can
-///   prevent that either. It is the same unavoidable race the whole `vkMapMemory` problem consists
-///   of: the application is not obliged to tell anyone when it stops writing, and v1 has no flush
-///   hook to wait on.
-/// - **Why none of this is reachable in the reference app.** The refapp writes its vertex buffer
-///   exactly once, before its first draw, and never again — so C's and S's copies of `res=3`
-///   converge to the same bytes no matter which order the sync and the GPU's (non-existent) writes
-///   happen in. That is a property of *this one workload*, not of the algorithm, which is exactly why
-///   every test here passes and why the spec calls this narrow slice v1's answer rather than the
-///   answer. Any application that updates a mapped buffer once per frame — the common case for
-///   vertex, uniform, or staging buffers — will lose writes to this race.
+///   *visible* — that part of the trade is real. Do not add dirty tracking here; that is (c)2's
+///   work, and the lever it will use (`/proc/<pid>/pagemap` soft-dirty, or non-coherent memory plus
+///   real flush hooks) is recorded in the spec's §7.
+/// - **The lost-write race this used to describe is gone, and it was never fixable here.** Until
+///   (c)1 Task 5b, S's return path shipped back *every application blob its GPU might have written*,
+///   which meant S sent C stale copies of blobs S never wrote at all — vertex and uniform buffers,
+///   the common case — and C's reader laid them over whatever the application had written since.
+///   This function then faithfully relayed the stale bytes back to S. Spec §7.2 retracted that rule:
+///   **S now ships back exactly the pages S is observed to have written**, so nothing arrives here
+///   to overwrite a blob the GPU never touched, and shipping whole blobs C→S is no longer racing
+///   anything on the return leg. The repair had to happen on S because only S can see which pages S
+///   wrote; there was no version of this function that could have avoided it.
+/// - **What remains is narrower, and honest about itself.** Two hazards survive. **(a) Tearing:** a
+///   blob the application writes *while* this copies it is torn, and nothing here can prevent that —
+///   it is the `vkMapMemory` problem itself, since the application is not obliged to tell anyone when
+///   it stops writing and v1 has no flush hook to wait on. **(b) False sharing at S's page grain:**
+///   if S's engine writes one region of a 4096-byte page while the application writes another region
+///   of the same page — legal, and needing no Vulkan synchronization between them — then S's returned
+///   run carries S's stale copy of the application's bytes alongside S's own fresh ones. See
+///   `rayland_s::blob::HostBlob::take_pages_s_wrote`. For a *correctly synchronized* application
+///   neither hazard fires on memory the GPU actually wrote, because S's own ordering guarantees the
+///   pages land before the `head` update that releases the app's fence wait.
+/// - **The reference app reaches none of this**, and that is a property of *this one workload*
+///   rather than of the algorithm: it writes its vertex buffer exactly once, before its first draw,
+///   and never again. Which is exactly why every test here passed while the S→C rule was a race, and
+///   why the spec calls this narrow slice v1's answer rather than the answer.
 pub fn messages_for_delta(blobs: &BlobTable, ring_res_id: u32, delta: RingDelta) -> Vec<C2S> {
     let mut out = Vec::new();
 

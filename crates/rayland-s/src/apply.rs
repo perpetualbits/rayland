@@ -350,7 +350,7 @@ impl Applier {
                 // resource nobody can reach any more, which is why the error path unrefs it. The fd
                 // is dropped at the end of this scope either way — `mmap` holds its own reference to
                 // the underlying object, so closing it unmaps nothing.
-                let host_blob = HostBlob::map(fd.as_fd(), blob_id, size).map_err(|source| {
+                let host_blob = HostBlob::map(fd.as_fd(), size).map_err(|source| {
                     engine.unref_resource(res_id);
                     ApplyError::from(source)
                 })?;
@@ -493,12 +493,12 @@ impl Applier {
     /// ring.
     ///
     /// # The blob sync rides here, and its order is a correctness property
-    /// A ring that moved means S's GPU executed commands, and those commands may have **written the
-    /// application's mapped memory** — C0 Task 4b caught the reference app's readback buffer
-    /// (`res=6`, 16384 B = 64×64×4) holding the blue clear colour, i.e. the rendered picture, in
-    /// exactly such a blob. On one machine the application would simply read those pages. Across a
-    /// network S must copy them out and ship them, and spec §7 pins v1's strategy: **ship back every
-    /// mapped blob the GPU may have written, whole, after S reports the batch retired.**
+    /// A ring that moved means S's engine executed commands, and those commands **wrote memory C
+    /// cannot see**: the answers to every synchronous Vulkan call, into spec §5's channel 2 — the
+    /// reply arena — and the rendered picture, into whatever `HOST_VISIBLE` blob the application
+    /// mapped. C0 Task 4b caught the latter concretely: the reference app's readback buffer,
+    /// `res=6`, 16384 B = 64×64×4, holding the blue clear colour. On one machine the application
+    /// would simply read those pages. Across a network S must copy them out and ship them.
     ///
     /// **Every [`S2C::BlobData`] therefore precedes every [`S2C::RingProgress`] in the returned
     /// list, and that ordering is the point.** `RingProgress` is what advances C's local `head`, and
@@ -511,25 +511,41 @@ impl Applier {
     /// once-an-hour heisenbugs. Here it would not be once an hour: it is every frame the application
     /// reads back.
     ///
-    /// # Pitfall: the reply arena does **not** cross here, and (c)1 is not complete without it
-    /// Spec §5's channel 2 — the reply arena, where S's engine writes the answers to synchronous
-    /// commands — is a `blob_id == 0` shmem, so [`HostBlob::is_application_memory`] excludes it and
-    /// **nothing in this daemon sends it**. That is not an oversight to be quietly filled in by
-    /// widening the predicate: the arena and the 8 MiB command-buffer *staging pool* are both
-    /// `blob_id == 0`, and shipping the staging pool back would overwrite the pages C's Mesa is
-    /// actively recording into — which S never writes — with zeros. Telling the two apart needs the
-    /// arena's `res_id`, which Venus declares only inside the ring, in `vkSetReplyCommandStreamMESA`
-    /// (`resourceId=2` in the capture). Reading it means decoding the ring to make a correctness
-    /// decision, which is what spec §7 rules out for v1.
+    /// # What crosses, and the rule that decides it (spec §7.2 — read this before changing it)
+    /// **S ships back exactly the pages S wrote.** Not "the application's blobs", not "the blobs the
+    /// GPU may have written" — the pages S is *observed* to have written, found by
+    /// [`HostBlob::take_pages_s_wrote`] diffing each blob against a baseline re-taken every time C's
+    /// own bytes land in it. Stop asking *"whose memory is this?"* and ask *"did I write it?"*: on
+    /// one machine every byte S writes is instantly visible to C, so an ownership predicate is a
+    /// *guess* at that relationship while an observed write **is** it.
     ///
-    /// So this is a **recorded gap, not a solved problem**: until channel 2 has an owner, an
-    /// application on C blocks forever on its first synchronous call, because the reply it is
-    /// waiting for never leaves S. See (c)1 Task 5's report.
+    /// This replaced Task 5's rule, which routed on ring-findings §6's `blob_id` and was wrong twice
+    /// over. It never carried the reply arena at all — a `blob_id == 0` shmem, so the predicate
+    /// excluded it, and channel 2 crossed nowhere. That did not present as the hang one would
+    /// expect: `head` advances from `RingProgress` regardless, so `vn_ring_wait_seqno` returns and
+    /// the application is released onto an arena that is still zeros,
+    /// `vn_instance_init_renderer_versions` reads `instance_version = 0`, and `vkCreateInstance`
+    /// fails. And for the application's own blobs it was a last-writer-wins race: S shipped back
+    /// vertex and uniform buffers its GPU had only ever *read*, over the app's fresh writes to them.
+    ///
+    /// The obvious repair — decode `vkSetReplyCommandStreamMESA` (opcode 178) out of the ring to
+    /// learn the arena's `res_id` — is **silently unsound**, and is recorded in spec §7.2 because it
+    /// is the attractive answer: 178 is emitted before *every* reply-bearing command
+    /// (`vn_ring_submit_command` -> `vn_ring_set_reply_shmem_locked`, `vn_ring.c:711-715`), so all
+    /// but the first sit behind a decoder's stop point at the unsizeable `vkCreateInstance`; and
+    /// when the 1 MiB reply pool fills, `vn_renderer_shmem_pool_grow_locked`
+    /// (`vn_renderer_util.c:70-96`) mints a **new `res_id`**. C0 measured 48820 bytes of reply
+    /// traffic, so the reference app never grows the pool — it would pass every test here and
+    /// corrupt the first longer session, S shipping a dead arena while the app read a live one.
+    ///
+    /// Rings are excluded **by `res_id`** below, and that exclusion is structural rather than
+    /// heuristic: S already holds `self.rings`, so it costs nothing and cannot be fooled by a number
+    /// a remote peer chose.
     ///
     /// # Inputs / outputs
-    /// - Returns the application's blob contents followed by one [`S2C::RingProgress`] per ring that
-    ///   moved. Empty — no blobs, no progress — when nothing moved, which is the overwhelmingly
-    ///   common case on a poll loop.
+    /// - Returns the pages S wrote, followed by one [`S2C::RingProgress`] per ring that moved. Empty
+    ///   — no blobs, no progress — when nothing moved, which is the overwhelmingly common case on a
+    ///   poll loop.
     pub fn poll_progress(&mut self) -> Vec<S2C> {
         // Ask the rings first, before copying anything: on the overwhelming majority of polls
         // nothing moved, and shipping a blob per poll regardless would make this loop a bandwidth
@@ -556,25 +572,31 @@ impl Applier {
             return Vec::new();
         }
 
-        // Something retired. v1 cannot know *which* of the application's blobs those commands
-        // touched — that would mean decoding the ring, which spec §7 rules out — so it ships all of
-        // them, whole. Over-eager on purpose: the cost is visible and the alternative is guessing.
+        // Something retired, so S's engine has had the chance to write memory C cannot see. v1 does
+        // not know — and deliberately does not ask — *which* blobs those commands touched: that
+        // would mean decoding the ring, which spec §7 rules out. It asks each blob a question it can
+        // answer from bytes alone: which of your pages did S write? See the rule above.
         let mut out = Vec::new();
-        for (&res_id, blob) in self.blobs.iter() {
-            // Venus's own shmems are not S's to publish back. The ring carries the `tail` and the
-            // command bytes C owns, and the staging pool holds bytes C's Mesa is recording into
-            // right now; overwriting either with S's copy would corrupt the very stream this daemon
-            // exists to replay. See the pitfall above on the reply arena.
-            if !blob.is_application_memory() {
+        for (&res_id, blob) in self.blobs.iter_mut() {
+            // **The ring is excluded structurally, by `res_id`.** S's engine genuinely writes a
+            // ring's pages — `vkr_ring_store_head` (`vkr_ring.c:60-67`) stores `head` into them
+            // after each dispatched command — so the observed-writes rule would rightly report them,
+            // and must not be allowed to: `head` is `RingProgress`'s news to carry, and C's `tail`
+            // and command bytes are C's. Shipping a ring back as blob data would overwrite the very
+            // commands C is in the middle of relaying with S's copy of them. `self.rings` is S's own
+            // record of which blobs it built a mirror for, so this is a fact rather than a guess.
+            if self.rings.contains_key(&res_id) {
                 continue;
             }
-            out.push(S2C::BlobData {
-                res_id,
-                // Always 0 in v1: whole blobs, so they start at their beginning. The field exists
-                // now so a later dirty-range version needs no wire change.
-                offset: 0,
-                bytes: blob.bytes().to_vec(),
-            });
+            for run in blob.take_pages_s_wrote() {
+                out.push(S2C::BlobData {
+                    res_id,
+                    // No longer always 0: `offset` has been on the wire since Task 4 and this is
+                    // what it was reserved for — a run starts where S's writes start.
+                    offset: run.offset,
+                    bytes: run.bytes,
+                });
+            }
         }
         // **Last, always.** See the ordering argument above: this is what releases the application's
         // wait, and it must not do so before the bytes it is waiting for are on their way.
