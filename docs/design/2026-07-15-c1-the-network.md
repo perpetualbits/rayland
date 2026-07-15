@@ -305,13 +305,30 @@ the refapp never grows the pool — this would have passed every test we have an
 longer session, with S shipping a dead arena while the app read a live one. **Not a decoding bug: a
 correct decode of an incomplete picture, which is worse, because there is no bug to find.**
 
-**THE RULE: S ships back exactly the pages S wrote.** Stop asking *"whose memory is this?"* and ask
+**THE RULE: S ships back exactly the bytes S wrote.** Stop asking *"whose memory is this?"* and ask
 *"did I write it?"* — on one machine every byte S writes is instantly visible to C, so ownership
 predicates are a *guess* at that relationship while observed writes **are** it. Mechanically: S
 snapshots each blob after applying an inbound `C2S::BlobData` (so C's own writes never count as S's),
-diffs page-granular at retirement, and ships changed pages via `BlobData`'s existing `offset` field.
-Rings are excluded by `res_id` — S already holds them, and `RingDelta`/`RingProgress` own those
-bytes. That exclusion is **structural, not heuristic**.
+diffs **byte-granular** at retirement, and ships the changed runs via `BlobData`'s existing `offset`
+field. Rings are excluded by `res_id` — S already holds them, and `RingDelta`/`RingProgress` own
+those bytes. That exclusion is **structural, not heuristic**.
+
+> **Amended 2026-07-15, during Task 5b: this said *page*-granular, and that was an unexamined habit
+> of mine rather than a decision.** Dirty-*page* tracking is the usual idiom because page tables are
+> the usual mechanism — but S is not using page tables, it is using `memcmp`, **and a `memcmp` is
+> byte-granular for free.**
+>
+> Page granularity leaves a live hole. If S writes one region of a 4096-byte page while the
+> application writes another region of *the same page* — entirely legal, and requiring no Vulkan
+> synchronization between them — then S's run carries its **stale** copy of the app's bytes and
+> clobbers the app's fresh ones. `VkDeviceMemory` is page-aligned and applications suballocate, so
+> this is realistic rather than theoretical. **It is the same shape as the whole-blob race this very
+> section exists to remove: invisible in the refapp, live for the first real application.**
+>
+> The compare cost is identical and the shipped volume is smaller, so byte granularity is strictly
+> better and the earlier wording bought nothing. Task 5b implemented the page-granular rule as
+> specified and flagged the hole rather than deviating from a binding spec unasked — the right call,
+> which is why this is an amendment and not a bug report.
 
 This is the same epistemological move as §5.1's out-of-line dword scan: **a predicate over bytes,
 not a reading of them.** §7's "no decoding the ring to make a correctness decision" survives intact.
