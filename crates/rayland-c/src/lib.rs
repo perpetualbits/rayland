@@ -24,6 +24,8 @@
 //!   its module docs before touching it; the hang it avoids is subtle, intermittent, and named.
 //! - [`relay_engine`] — the [`RenderEngine`](rayland_vtest::RenderEngine) whose GPU is another
 //!   machine.
+//! - [`link`] — the [`RelayLink`](relay_engine::RelayLink) over SP2's QUIC transport. Thin on
+//!   purpose: `rayland-transport` owns the QUIC, and this is the adapter to the relay's framing.
 //! - [`blob_sync`] — what must cross the wire *alongside* a ring delta, and in what order. The
 //!   ring is not the whole story: the application writes its vertices straight into mapped memory
 //!   with no API call to intercept (ring-findings §6), so those bytes have to be shipped, and they
@@ -51,3 +53,5 @@ pub mod ring;
 pub mod relay_engine;
 // The C->S half of (c)1's coherence strategy: which blobs accompany a ring delta, and in what order.
 pub mod blob_sync;
+// The RelayLink over SP2's QUIC transport: the network itself.
+pub mod link;

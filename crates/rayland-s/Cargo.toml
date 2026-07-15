@@ -25,5 +25,12 @@ repository = "https://github.com/perpetualbits/rayland"
 rayland-engine = { path = "../rayland-engine" }  # the real GPU: FFI-embedded libvirglrenderer
 rayland-vtest = { path = "../rayland-vtest" }    # RenderEngine, EngineError, the ring layout, ShmMapping
 rayland-relay = { path = "../rayland-relay" }    # the (c)1 C<->S message set and its framing
+rayland-transport = { path = "../rayland-transport" } # SP2's QUIC: the network C's commands cross
 anyhow = { workspace = true }                    # ergonomic top-level errors for the daemon binary
 thiserror = { workspace = true }                 # typed, precise refusals of remote input
+
+[dev-dependencies]
+# `tests/loopback_e2e.rs` decodes the two PNGs the reference app writes (native, and rendered across
+# the network) and compares them pixel by pixel. A dev-dependency only: nothing in `rayland-s` itself
+# touches images — S moves command streams and blob bytes, not pictures.
+image = { workspace = true }

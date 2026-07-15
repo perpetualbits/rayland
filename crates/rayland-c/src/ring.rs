@@ -597,6 +597,36 @@ fn read_control(ring: &[u8], offset: usize) -> u32 {
     )
 }
 
+/// The ring's `tail` **right now**, without disturbing any watcher's frontier.
+///
+/// # What this is for, and why it is not [`RingWatcher::take_delta`]
+/// It answers one question — *"how far has Mesa written?"* — for a caller that must **wait** for
+/// that frontier rather than consume it. `take_delta` advances the watcher's `last_tail` and hands
+/// the bytes over exactly once, so a second caller using it would silently steal a delta the
+/// watcher would then never relay. This is a plain read and mutates nothing, so any thread may call
+/// it at any time.
+///
+/// Its caller is `rayland-c`'s inline-command barrier: Mesa stores `tail` **before** it sends the
+/// matching command on the vtest socket, so the value read here at the moment such a command arrives
+/// is a frontier the ring watcher is *obliged* to have shipped before that command may cross. See
+/// the barrier's own docs for the race this closes and the live evidence for it.
+///
+/// # Inputs / outputs
+/// - `ring`: the ring blob's pages, as mapped on C.
+/// - Returns Mesa's free-running `tail` byte counter — **not** an offset into the buffer. See the
+///   module docs: it is never masked in storage.
+///
+/// # Panics
+/// If `ring` is shorter than the control area. Unreachable for a real ring blob (any blob
+/// [`RingIdentity`] recognized is at least 131268 bytes) and preferable to reading adjacent memory
+/// and calling it a `tail`.
+///
+/// See the module docs' memory-ordering gap: this is a plain load, not an Acquire one, for the same
+/// reason every other read of these words here is.
+pub fn current_tail(ring: &[u8]) -> u32 {
+    read_control(ring, RING_TAIL_OFFSET)
+}
+
 /// Write one of the ring's 32-bit control words. See [`read_control`] for the endianness and the
 /// 64-byte-slot pitfall; only `head` and `status` are C's to write.
 fn write_control(ring: &mut [u8], offset: usize, value: u32) {

@@ -52,7 +52,7 @@
 // The C2S / S2C message enums (this module).
 mod message;
 // Re-export the message types at the crate root so callers write `rayland_relay::C2S`.
-pub use message::{C2S, S2C};
+pub use message::{BlobRun, C2S, S2C};
 
 // Length-prefixed framing over byte streams, generic over the message type being framed.
 mod frame;

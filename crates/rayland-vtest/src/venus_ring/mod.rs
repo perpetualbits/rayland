@@ -94,6 +94,11 @@
 
 // The command-stream decoder and its command-size table: the durable, testable half of the finding.
 pub mod decode;
+// Reading a ring's handle out of `vkCreateRingMESA`, and building the `vkNotifyRingMESA` that wakes
+// that ring's consumer. (c)1 Task 6 established that a *host* needs to build doorbells once the
+// client is a network away: Mesa's own doorbell decision reads a `status` word that never crosses.
+// The module's docs carry the whole finding and the ordering contract that makes it safe.
+pub mod doorbell;
 // The live diagnostic that watches a real client write a real ring. Inert unless its env var is set.
 pub mod dump;
 // Recognizing the ring among a session's blobs. Both (c)1 daemons need this and must agree on it,
@@ -105,6 +110,7 @@ pub mod out_of_line;
 
 // Re-exported at the module root because they are ring *knowledge*, alongside the layout constants,
 // rather than implementation details of a submodule.
+pub use doorbell::{notify_ring_command, ring_handle_from_create};
 pub use identity::{RingIdentity, is_application_memory};
 pub use out_of_line::{OutOfLineStream, scan_for_out_of_line_stream};
 

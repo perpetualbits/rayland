@@ -153,34 +153,55 @@ impl HostBlob {
     /// address space. `size` originates from a remote peer, so that is a real check rather than a
     /// formality.
     ///
-    /// **Not listed above because it is not an `EngineError`, and is worth naming anyway:** taking
-    /// the baseline below (`blob.bytes().to_vec()`) eagerly faults in the whole mapping and
-    /// heap-allocates `size` more bytes, where `size` is the same attacker-controlled value just
-    /// bounds-checked by `ShmMapping::map`. An allocator failure here **aborts the process** (Rust's
-    /// global allocator has no fallible path a caller can catch) rather than returning a
-    /// `Result` this function's signature could report. `RenderEngine::create_blob_resource` gates
-    /// `size` before `map` is ever called, so this does not open new leverage a hostile peer did not
-    /// already have — it doubles the existing one, since S already agreed to allocate `size` bytes
-    /// once for the mapping itself. See the `shadow` field's doc for the same point stated as a cost
-    /// rather than a failure mode.
+    /// **Not listed above because it is not an `EngineError`, and is worth naming anyway:** the
+    /// baseline below heap-allocates `size` more bytes, where `size` is the same attacker-controlled
+    /// value just bounds-checked by `ShmMapping::map`. An allocator failure here **aborts the
+    /// process** (Rust's global allocator has no fallible path a caller can catch) rather than
+    /// returning a `Result` this function's signature could report.
+    /// `RenderEngine::create_blob_resource` gates `size` before `map` is ever called, so this does
+    /// not open new leverage a hostile peer did not already have — it doubles the existing one,
+    /// since S already agreed to allocate `size` bytes once for the mapping itself. See the `shadow`
+    /// field's doc for the same point stated as a cost rather than a failure mode.
     pub fn map(fd: BorrowedFd<'_>, size: u64) -> Result<Self, EngineError> {
         let mapping = ShmMapping::map(fd, size)?;
-        let mut blob = HostBlob {
+        // **The baseline is what C has, and C has zeros.** `LocalBlob::create` on C answers every
+        // `CreateBlob` with a brand-new memfd, and a fresh memfd is zero-filled by construction. So
+        // at the moment this blob exists, C's copy of it is all zeros — and the baseline's whole
+        // meaning (see the `shadow` field) is *"the bytes C already has"*.
+        //
+        // # This line was `blob.bytes().to_vec()`, and that was the bug that made (c)1 return a
+        // # blank picture
+        // Reading the live pages looks more careful and is not. It quietly redefines the rule from
+        // *"bytes S wrote"* to *"bytes that changed since S mapped the blob"*, and those differ by
+        // **every write that happened before the mapping existed**. That is not a corner: it is the
+        // readback buffer's normal life. Mesa creates a blob resource lazily, at `vkMapMemory` — so
+        // for a readback buffer the resource is created *after* `vkCmdCopyImageToBuffer` has already
+        // run, and S's very first sight of those pages is of the finished frame. A live-pages
+        // baseline therefore swallows the rendered image into the baseline, `take_bytes_s_wrote`
+        // finds nothing to report, and the application on C reads its own untouched zeros. (c)1 Task
+        // 6 observed exactly this: `created blob res=5 blob_id=17 size=16384` and, on the very next
+        // poll, `res=5 nonzero=8192 first8=[00, 00, ff, ff, ...]` — the blue clear colour, already
+        // present, already invisible. The app wrote a fully transparent PNG.
+        //
+        // # The rejected worry, and why shipping is the *faithful* answer rather than a leak
+        // The old comment feared that a zero baseline would "ship an engine's leftovers to C as if
+        // S's GPU had rendered them". Two things are wrong with that. First, it inverts the risk:
+        // hiding bytes costs correctness on the one blob the whole return path exists for, while
+        // shipping them costs at most some bytes. Second, and decisively — **on one machine the
+        // application maps these very pages and reads whatever is in them, leftovers included.**
+        // Shipping them is what makes C see what a local client would see; withholding them is the
+        // deviation. So a zero baseline is not merely the fix, it is the more faithful rule, and it
+        // exposes nothing Venus would not have exposed anyway.
+        //
+        // A `vec![0; n]` also costs less than the read it replaces: no eager fault-in of the whole
+        // mapping, and the allocator may hand back zeroed pages without touching them. The failure
+        // mode noted above (a `size`-sized allocation that can abort) is unchanged.
+        let shadow = vec![0u8; mapping.len()];
+        Ok(HostBlob {
             mapping,
             size,
-            // Filled immediately below. It cannot be built before the blob exists, because the only
-            // sound read of these pages goes through `bytes()`, which needs the mapping.
-            shadow: Vec::new(),
-        };
-        // Take the baseline from the pages as they actually are, rather than assuming a fresh blob
-        // is zeros. The two agree for every allocator that matters — a memfd and virglrenderer's
-        // SHM blobs are both zero-filled — but if one ever were not, whatever is in there is still
-        // not something **S wrote**, and §7.2's rule is that S stays quiet about it. Assuming zeros
-        // would instead ship an engine's leftovers to C as if S's GPU had rendered them. See
-        // `map_takes_its_baseline_from_the_real_pages_not_an_assumed_zero` in this module's tests:
-        // this is a tested property, not merely an argued one.
-        blob.shadow = blob.bytes().to_vec();
-        Ok(blob)
+            shadow,
+        })
     }
 
     /// Take every run of bytes **S's own side wrote** since C last had this blob, and adopt them as
@@ -498,38 +519,46 @@ mod tests {
 
     /// A freshly mapped blob nobody has written owes C nothing.
     ///
-    /// The baseline is taken from the pages themselves at map time rather than assumed to be zeros:
-    /// if an engine ever handed S a blob with something already in it, that is still not something
-    /// **S wrote**, and §7.2's rule says S stays quiet about it.
+    /// A blob nobody has written since C last had it owes C nothing. This is the overwhelmingly
+    /// common case on the poll loop, and shipping on it would make S a bandwidth source.
+    ///
+    /// `a_blob` builds over a fresh memfd, so the pages and the zero baseline genuinely agree here —
+    /// which is the ordinary case, and is why this test says nothing either way about
+    /// [`HostBlob::map`]'s baseline choice. The test that does is
+    /// `bytes_already_in_the_pages_at_map_time_are_shipped_because_c_has_never_seen_them`.
     #[test]
     fn a_blob_nobody_wrote_has_no_runs() {
         let mut blob = a_blob(8192);
         assert_eq!(blob.take_bytes_s_wrote(), Vec::new());
     }
 
-    /// **Minor 1 (review, 2026-07-16): [`HostBlob::map`]'s "read the real pages instead of assuming
-    /// zero" choice *is* distinguishable from `vec![0; size]` by a test — the doc's earlier claim
-    /// that it could not be was wrong, and this is the test that proves it wrong.**
+    /// **The regression test for (c)1 Task 6's blank-picture finding.** Bytes that were already in
+    /// the pages when S mapped them must still be shipped: C has never seen them.
     ///
-    /// The precondition a `vec![0; size]` baseline cannot reproduce is *non-zero bytes already
-    /// present in a freshly exported descriptor before `map()` ever runs*. A memfd cannot supply
-    /// that by construction (a fresh one is always zero-filled), so this test manufactures the
-    /// precondition directly: write a recognizable byte pattern into the descriptor's pages
-    /// *before* calling [`HostBlob::map`], then confirm the resulting blob reports no runs for
-    /// them. Under the correct (read-the-pages) implementation this passes; under a
-    /// `shadow: vec![0; size]` mutation the pre-existing `0xee` bytes would look like something
-    /// **S** wrote, and this test would fail.
+    /// # This test asserts the exact opposite of the one it replaces, and the live run is the reason
+    /// Its predecessor (`map_takes_its_baseline_from_the_real_pages_not_an_assumed_zero`, added in
+    /// review on 2026-07-16) pinned the belief that pre-existing bytes are *"not something S wrote"*
+    /// and must stay put. That reasoning treats "S wrote it" as meaning "S wrote it **while S was
+    /// watching**", and the difference is the whole return path: Mesa creates a blob resource lazily
+    /// at `vkMapMemory`, so for a readback buffer S's first sight of the pages is **after** the GPU
+    /// has finished rendering into them. Under the old rule the finished frame *was* the baseline,
+    /// nothing was ever reported, and the reference app wrote a fully transparent PNG across a
+    /// working network — which is precisely what Task 6 observed.
+    ///
+    /// The correct predicate is not "did S write it while watching" but **"does C have it?"** — and
+    /// C, whose blob is a fresh zero-filled memfd, does not. Shipping is also what a single machine
+    /// does: there, the application maps these very pages and reads whatever is in them.
+    ///
+    /// The `0xee` pattern stands in for the real case, which a memfd cannot reproduce (a fresh one
+    /// is always zero-filled): a GPU that has already rendered into the memory before the blob
+    /// resource naming it exists.
     #[test]
-    fn map_takes_its_baseline_from_the_real_pages_not_an_assumed_zero() {
-        // Stand in for "an allocator hands S a descriptor that is not already zero-filled" — the
-        // scenario every production allocator (memfd, virglrenderer's SHM blobs) never actually
-        // produces, but which `map()`'s baseline choice is written to be correct for regardless.
+    fn bytes_already_in_the_pages_at_map_time_are_shipped_because_c_has_never_seen_them() {
         let fd = create_memfd(64).expect("a memfd");
         {
-            // Map it once, off to the side, purely to get a writable pointer at the descriptor's
-            // pages before `HostBlob::map` ever sees them — standing in for whatever put non-zero
-            // bytes there before S mapped it. Dropped before `HostBlob::map` below, so the two
-            // mappings never coexist and cannot be confused with virglrenderer's own writer.
+            // Put bytes in the pages *before* `HostBlob::map` sees them — standing in for the GPU
+            // having already written the readback buffer by the time Mesa asks for its blob.
+            // Dropped before `HostBlob::map` below, so the two mappings never coexist.
             let pre = ShmMapping::map(fd.as_fd(), 64).expect("a pre-mapping");
             // SAFETY: `pre` is a live `MAP_SHARED` mapping of exactly 64 bytes, and nothing else
             // touches this memfd while `pre` is alive.
@@ -540,10 +569,20 @@ mod tests {
 
         assert_eq!(
             blob.take_bytes_s_wrote(),
+            vec![WrittenRun {
+                offset: 0,
+                bytes: vec![0xee; 64],
+            }],
+            "bytes present before S mapped the blob must be shipped: C's blob is a fresh memfd and \
+             is all zeros, so C has never seen them. Baselining against the live pages instead \
+             swallows a readback buffer's finished frame — Mesa creates that blob only at \
+             vkMapMemory, i.e. after the GPU has already written it — and the application reads its \
+             own untouched zeros."
+        );
+        assert_eq!(
+            blob.take_bytes_s_wrote(),
             Vec::new(),
-            "whatever was already sitting in these pages before S mapped them is not something S \
-             wrote, so it must not be reported as a run — a `vec![0; size]` baseline would instead \
-             see every 0xee byte as new and ship the whole blob back as S's own write"
+            "and once shipped they are the baseline: C has them now, so they are not news twice"
         );
     }
 

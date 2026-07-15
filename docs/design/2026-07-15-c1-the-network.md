@@ -154,6 +154,12 @@ the delta between them. Likewise every blob has a local shadow on C and its real
 
 ### 4.5 Waking up: the ring `status` bit
 
+> **RETRACTED 2026-07-16 by Task 6's live run — see §4.6.** The section below is kept because its
+> *facts* are right and still load-bearing; its **conclusion is wrong**, and the error is instructive.
+> It reads the IDLE bit as a seam between Mesa and `rayland-c`. It is not: it is a seam between Mesa
+> and **the ring's consumer**, and `rayland-c` is not the consumer. Read §4.6 before relying on any
+> of this.
+
 C0's findings doc records the corrected polarity: **bit 0 of `status` set means the host's ring
 thread is IDLE (parked); `status == 0` means it is actively polling.** Mesa sends
 `vkNotifyRingMESA` **only when the IDLE bit is set** *and* ≥1ms has passed since the last kick
@@ -170,6 +176,81 @@ unchanged. A naive "set IDLE then sleep" will miss work and stall. This is exact
 the inverted-polarity documentation would have caused, and it is called out here because the
 polarity error was live in this repository until 2026-07-15.
 
+### 4.6 The doorbell does not survive the split — and the `status` word is a channel
+
+**Added 2026-07-16, after Task 6 ran C against S for the first time. This was the first thing that
+broke, and the fault is mine: §4.5 is a design error, not an implementation slip.**
+
+§4.5 says *"`rayland-c` sets IDLE before sleeping and Mesa will kick it"*. That sentence quietly
+assumes `rayland-c` is the thing Mesa's kick wakes. **It is not.** The IDLE bit means *"the ring's
+**consumer** is parked"*, and (c)1's consumer is **virglrenderer's ring thread, on S**. `rayland-c`
+is a relay standing between them. So C publishing its own watcher's park state into C's `status`
+word answers a question nobody asked, and the question that matters goes unanswered.
+
+The chain, every link of it in the source:
+
+1. virglrenderer's ring thread parks after `idleTimeout` with no new commands, setting IDLE in **its
+   own** `status` word and blocking on a condvar (`vkr_ring_thread`, `vkr_ring.c:265-285`).
+2. Mesa sets that timeout to **1 ms** (`VN_RING_IDLE_TIMEOUT_NS`, `vn_ring.c:18`) — *shorter than a
+   relay hop*. So on a networked setup the thread is parked **most of the time**, not rarely.
+3. Only `vkNotifyRingMESA` wakes it (`vkr_ring_notify`, `vkr_ring.c:368-378`).
+4. Mesa sends that doorbell only when it reads the IDLE bit — **from C's `status` word**, a different
+   word in a different machine's memory, which nothing in (c)1 connects to S's.
+
+Observed: the application ran ~15 ring round-trips (init worked, because C's watcher happened to be
+parked often enough that Mesa doorbelled anyway), then stalled and Mesa aborted at ~3.5 s on
+`aborting on expired ring alive status`.
+
+**Shipping S's `status` back to C does not fix it.** Mesa decides on the doorbell *at submit time*
+and never revisits it (`vn_ring_submit_command`); by the time C learns S parked, Mesa has already
+made — and throttled — its decision and is blocked in `vn_ring_wait_seqno`. The information arrives
+strictly too late, at any link speed. Forcing IDLE permanently on C does not fix it either: Mesa's
+≥1 ms notify throttle then suppresses exactly the doorbell that is needed. **Both were tried; both
+failed identically.**
+
+**The fix: S rings its own ring's doorbell after every applied delta.** S is the only party that
+knows both that new bytes arrived and what its own consumer is doing. It costs no network bytes.
+`rayland-vtest`'s `venus_ring::doorbell` carries the ordering argument that makes an *unconditional*
+doorbell correct and a *conditional* one (checking S's live `status` first) a hang.
+
+**The general lesson, which is the finding rather than the fix:** §5's inventory lists the four
+shared pages we knew about and missed a fifth — **the ring's `status` word**, which is neither
+command nor reply but *control*, written by the host and read by the client on a path with no API
+call anywhere near it. It is the same shape of surprise as C0's: the interesting state is not in the
+protocol, it is in the memory. That is now four channels found by running the thing and none found by
+reading it, and it is the reason Task 6 is the gate for (c)1 rather than a demo.
+
+### 4.7 The two-producer ordering hazard
+
+**Added 2026-07-16, after Task 6. Also a design error rather than an implementation slip.**
+
+§4.4's diagram shows `rayland-c`'s vtest server and its ring watcher both feeding one link, and says
+nothing about ordering between them. **Venus requires one, and it is invisible because on one machine
+it cannot be broken:** Mesa stores the ring's `tail` into shared memory and *only then* sends
+`vkWaitRingSeqnoMESA` / `vkNotifyRingMESA` on the socket, so a host cannot observe the command without
+also observing the bytes.
+
+(c)1 breaks it. The inline command takes a short, direct path (the vtest thread relays it
+immediately); the ring bytes take a longer one (the watcher must *notice* them by polling, then relay
+them). So the socket command routinely **overtakes** the bytes it depends on. virglrenderer does not
+treat this as "early" — it treats it as a **broken driver** and destroys the context:
+
+```text
+vkr: vkr_ring_thread: ring seqno(7072) unable to reach wait seqno(7144)
+vkr: vkWaitRingSeqnoMESA resulted in CS error
+vkr: destroying context 1 (rayland-venus) with a valid instance
+```
+
+**This is not a timing bug to be tuned away.** No poll interval makes "notice, then relay" beat
+"relay". The fix restores the invariant where it was broken: on receiving an inline command, C waits
+until the watcher has shipped the ring as far as Mesa had written it at that moment — which, because
+Mesa stored `tail` first, necessarily covers everything the command can refer to. See
+`rayland-c`'s `RingFlush`.
+
+**`vkWaitRingSeqnoMESA` (opcode 253) also belongs in §5's inventory** and is not there: it is a
+*blocking* ring wait that arrives on the inline path, and neither this spec nor the ring-findings
+document mentions it.
+
 ---
 
 ## 5. The channel inventory — everything that must cross
@@ -184,6 +265,19 @@ carry, and (c)1's strategy for each:
 | 3 | **Feedback slots** | S→C | Fence/semaphore/event/query status, written by the host so the client can poll without a round-trip (`vn_feedback.h`) | **Disable** (§6) |
 | 4 | **Mapped blobs** | C→S and S→C | The app's `vkMapMemory` memory: vertices out, pixels back | Conservative full sync (§7) |
 | 5 | **Out-of-line streams** | C→S | Submissions >8192 B are replaced in-ring by `vkExecuteCommandStreamsMESA` (opcode 180) pointing at *other* shmems | **Detect and fail loudly** (§5.1) |
+| 6 | **Ring `status` word** | S→C | **Missed until Task 6 ran.** The host's ring thread publishes its own IDLE state here, and Mesa reads it to decide whether to ring the doorbell. Neither command nor reply: *control*, with no API call near it | **Do not relay it — it cannot arrive in time.** S rings its own doorbell instead (§4.6) |
+
+**Row 6 is the entry this table exists to have.** It was missed because the other five are all *data*
+and it is not, and because §4.5 mistook it for a seam between Mesa and `rayland-c` when it is a seam
+between Mesa and **the ring's consumer on S**. Its absence did not present as a missing feature; it
+presented as an application that initialised correctly and then hung. See §4.6.
+
+**And the inventory is of *pages*, which is why it kept missing things.** Task 6 also found an
+ordering requirement between two channels that no row can express (§4.7), and a *lifecycle* fact that
+no row can express either: a blob can be **born with its contents already in it**, because Mesa
+creates a blob resource lazily at `vkMapMemory` — so a readback buffer's blob comes into existence
+after the GPU has already filled it (§7.3). Enumerating the shared memory was necessary and was never
+sufficient.
 
 ### 5.1 The out-of-line path: not implemented, but never silent
 
@@ -332,6 +426,44 @@ those bytes. That exclusion is **structural, not heuristic**.
 
 This is the same epistemological move as §5.1's out-of-line dword scan: **a predicate over bytes,
 not a reading of them.** §7's "no decoding the ring to make a correctness decision" survives intact.
+
+### 7.3 The rule was right; its implementation had two holes, and both were silent
+
+**Added 2026-07-16, after Task 6. Neither is a criticism of Task 5b: the rule §7.2 states is
+correct and survives unchanged. What Task 6 found is that "S ships back exactly the bytes S wrote"
+had been implemented as two subtly different questions, and both differences cost the whole frame.**
+
+**Hole 1 — *"bytes S wrote"* had become *"bytes that changed since S mapped the blob"*.** The baseline
+was taken from the blob's live pages at map time. That looks more careful than assuming zeros and is
+in fact strictly weaker: the two differ by **every write that happened before the mapping existed**.
+That is not a corner case, it is the readback buffer's normal life — **Mesa creates a blob resource
+lazily, at `vkMapMemory`**, so a readback buffer's blob is created *after* `vkCmdCopyImageToBuffer`
+has already run, and S's first sight of those pages is of the finished frame. The frame was therefore
+baked into the baseline, the diff found nothing, and the application read its own zeros.
+
+The correct baseline is **zeros**, and the reason is what the baseline *means*: it is *"the bytes C
+already has"*, and C's blob is a brand-new zero-filled memfd. The rejected worry — that a zero
+baseline would ship an engine's leftovers to C as though S had rendered them — is backwards: **on one
+machine the application maps those very pages and reads whatever is in them**, leftovers included, so
+shipping them is what makes C see what a local client sees. Withholding them was the deviation.
+
+**Hole 2 — blob bytes were shipped only when a *ring* retired.** A sound gate for a running
+application, and a deliberate one (diffing every blob on every 200 µs poll would make the poll loop a
+bandwidth source). But it never fires for the blob that matters: the readback's contents are already
+present when the blob is born, and the application then reads them and exits without touching the ring
+again. **Blob creation is itself an event on the return path**, and the same predicate answers it.
+
+**And a third fact, which is neither a channel nor a rule but an ordering:** a blob's **id and its
+contents must arrive in the same message**. `S2C::BlobCreated` is what unblocks C's vtest thread,
+which hands Mesa the descriptor, which Mesa `mmap`s and the application reads — all while C's reader
+is still getting to the next message. No separate `BlobData`, however promptly sent, can win that
+race, because the gap is not between the two messages but between the reply and Mesa's `mmap`. So
+`BlobCreated` now carries the blob's initial contents, making *"you have an id"* and *"your pages are
+correct"* one event, exactly as they are on one machine.
+
+**What all three have in common is worth more than the fixes.** Each was invisible to a unit test for
+the same reason: **a memfd is zero-filled, and a test never renders into a blob before mapping it.**
+The tests were not weak; they were testing a world in which blobs are born empty. Venus's are not.
 
 What falls out, with no knowledge of what any blob *is*: the arena ships (blocker gone); the staging
 pool never does (no wiped recording); app buffers never do (race gone); the readback ships, because

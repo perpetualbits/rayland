@@ -25,38 +25,51 @@
 //! moment spinning on the ring's `head` waiting for exactly those replies, and `head` cannot advance
 //! until they are read. Both sides wait for the other. A dedicated reader is what breaks it.
 //!
-//! # Status: what has and has not been run
-//! **This binary has never been run end-to-end.** `rayland-s` ((c)1 Task 4) now exists, but nothing
-//! connects the two: the QUIC transport is Task 6. Task 5 has since shipped the blob
-//! synchronisation, so the application's vertex buffer does now reach S (see [`blob_sync`]) — but
-//! **the reply arena still does not**, and until it does, an application does not hang — Mesa's
-//! `head` still advances from `S2C::RingProgress`, so `vn_ring_wait_seqno` returns — but it is
-//! released onto a reply arena that is still zeros, so its first synchronous call fails with garbage
-//! (`vn_instance_init_renderer_versions` reads `instance_version = 0`, trips the
-//! `VN_MIN_RENDERER_VERSION` check, and `vkCreateInstance` returns an error). That is spec §5's
-//! channel 2, and it has no owner; `rayland-s`'s `Applier::poll_progress` documents exactly why the
-//! obvious fix is a corruption bug. The pieces
-//! with real logic — the ring watcher, the blob shadows, the relay engine, the blob sync — are
-//! unit-tested against a synthetic ring and a mock link (`tests/ring_watch.rs`, and the `tests`
-//! modules of [`ring`], [`shm`], [`relay_engine`] and [`blob_sync`]), as is this file's own
-//! [`Progress`] (see its `tests` module).
+//! # Status: this runs, and what running it cost
+//! **As of (c)1 Task 6 this binary works end to end.** `rayland-refapp` — unmodified, unaware —
+//! renders through it across a QUIC link to `rayland-s`, and the PNG it writes is bit-identical to
+//! the same binary run natively (`rayland-s/tests/loopback_e2e.rs`, 10/10 runs).
 //!
-//! What remains uncovered is the *wiring*: the sockets, the three threads, and the vtest session.
-//! That genuinely needs a live peer on the other end of a link, and must be treated as unverified
-//! until Task 6 provides one. The distinction matters, because "there is no S to run against" is a
-//! reason to test the parts that do not need one — not a licence to test nothing. [`Progress`] shipped a real bug behind exactly that
-//! excuse: it restarted its stall clock on any acknowledgement from S rather than on one that showed
-//! the ring had moved, which would have made the stall timeout unreachable against an S that sent
-//! keepalives. It is three fields and no I/O; nothing about the missing S ever stood in the way.
+//! It did not work when it was first run, and every one of the four faults was invisible to the
+//! mock-based tests below, because each was a fact about the *peer* rather than about this code.
+//! They are recorded here because they are the sub-project's actual findings, and each is documented
+//! in full where it was fixed:
+//!
+//! 1. **The doorbell does not survive the split.** virglrenderer's ring thread parks after 1 ms and
+//!    is woken only by `vkNotifyRingMESA`, which Mesa sends only when it reads the IDLE bit — from
+//!    **C's** `status` word, which reports *this daemon's watcher*, not S's consumer. The ring
+//!    `status` word is a shared-memory channel spec §5's inventory never listed. S now rings its own
+//!    doorbell; see `rayland_vtest::venus_ring::doorbell`.
+//! 2. **An inline command can overtake the ring bytes it refers to**, because this daemon has two
+//!    producers ([`serve_vtest`] on this thread, and the watcher) feeding one link, while Mesa's
+//!    protocol assumes the ring is always ahead of the socket. virglrenderer detects it and destroys
+//!    the context. See [`RingFlush`].
+//! 3. **A blob can be born with its contents already in it** — Mesa creates a readback buffer's blob
+//!    at `vkMapMemory`, after the GPU has filled it — so S's baseline swallowed the frame and the
+//!    app read its own zeros. See `rayland-s`'s `HostBlob::map`.
+//! 4. **A blob's id and its contents must arrive together**, because the reply that carries the id is
+//!    what lets Mesa `mmap` the pages. See [`PendingBlob`] and `S2C::BlobCreated`.
+//!
+//! The pieces with real logic — the ring watcher, the blob shadows, the relay engine, the blob sync
+//! — remain unit-tested against a synthetic ring and a mock link (`tests/ring_watch.rs`, and the
+//! `tests` modules of [`ring`], [`shm`], [`relay_engine`] and [`blob_sync`]), as is this file's own
+//! [`Progress`] (see its `tests` module). Those tests were never worthless — [`Progress`] shipped a
+//! real bug they would have caught — but Task 6 is the honest measure of what they could not reach:
+//! **not one of the four faults above was a bug in this crate's logic.** Every one was an assumption
+//! about Mesa or virglrenderer that only a live peer could refute. That is the lesson, and it is why
+//! the loopback e2e is now the gate rather than a demo.
 //!
 //! This file is written to be read, and it says where it is guessing.
 
 // The daemon's own pieces.
 use rayland_c::blob_sync::messages_for_delta;
-use rayland_c::relay_engine::{BlobTable, RelayEngine, RelayLink, RingSlot};
-use rayland_c::ring::{ParkDecision, RingWatcher};
-// The relay protocol and its framing.
-use rayland_relay::{C2S, S2C, read_msg, write_msg};
+use rayland_c::link::{QuicRecvLink, QuicSendLink};
+use rayland_c::relay_engine::{
+    BlobTable, PendingBlob, RelayEngine, RelayLink, RingFlush, RingSlot, commit_pending_blob,
+};
+use rayland_c::ring::{ParkDecision, RingWatcher, current_tail};
+// The relay protocol.
+use rayland_relay::{C2S, S2C};
 // The vtest server we present to Mesa, and the error type the engine seam speaks.
 use rayland_vtest::EngineError;
 // Spec §5.1's guard: notice Venus's out-of-line command path rather than relaying a stream that
@@ -65,10 +78,6 @@ use rayland_vtest::venus_ring::scan_for_out_of_line_stream;
 use rayland_vtest::vtest::serve_vtest;
 
 use anyhow::{Context, Result};
-// `flush` on the link to S: `write_msg` hands bytes to the stream, but an unflushed request is a
-// request S never sees.
-use std::io::Write;
-use std::net::TcpStream;
 use std::os::unix::net::UnixListener;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -87,13 +96,18 @@ const ENV_VTEST_SOCKET: &str = "RAYLAND_C1_SOCKET";
 
 /// Environment variable naming S's address, as `host:port`.
 ///
-/// # Why this is TCP, and why that is temporary
-/// (c)1 Task 6 replaces this with QUIC. TCP is the placeholder that lets Task 3 be a real program
-/// rather than a sketch: `rayland-relay`'s framing works over any [`Read`]/[`Write`], so swapping
-/// the transport touches [`TcpLink`] and nothing else. Ring-findings §7 is the reason the real
-/// answer is not TCP — **latency, not bandwidth, is what will hurt**, and head-of-line blocking on
-/// a single TCP stream is exactly the wrong property for a protocol whose replies are round trips
-/// the application blocks on.
+/// # The transport is QUIC (SP2's), as of (c)1 Task 6
+/// Ring-findings §7 is why it is not TCP: **latency, not bandwidth, is what will hurt** — the reply
+/// arena was ~12x the command traffic and its replies are round trips the application blocks on, so
+/// head-of-line blocking on a single stream is exactly the wrong property.
+///
+/// **v1 does not yet collect on that**, and the honest statement belongs here rather than in a
+/// report: everything still shares **one** QUIC stream, which has the same head-of-line behaviour
+/// TCP does. What is bought today is that the endpoint, the handshake and the congestion control
+/// exist, so giving the reply path its own stream is a change to [`rayland_c::link`] rather than a
+/// transport project.
+///
+/// QUIC is UDP, so this is a UDP endpoint despite the surrounding talk of connections.
 const ENV_S_ADDR: &str = "RAYLAND_C1_S_ADDR";
 
 /// Default address for S.
@@ -152,39 +166,107 @@ const PARK_SLEEP: Duration = Duration::from_micros(500);
 /// before the application has produced a single command.
 const RING_WAIT_SLEEP: Duration = Duration::from_millis(2);
 
-/// The relay link to S over a TCP stream.
+/// How long [`RingBarrier`] will wait for the watcher to ship the ring before giving up.
 ///
-/// A placeholder for Task 6's QUIC transport; see [`ENV_S_ADDR`] for why TCP is the wrong final
-/// answer. Split into a send half and a receive half via `try_clone` so the reader thread can block
-/// in `recv` without holding a lock that the watcher's `send` needs — the whole point of the
-/// three-thread arrangement.
-struct TcpLink {
-    /// The stream. `try_clone` duplicates the descriptor, so two `TcpLink`s over one connection
-    /// share the socket without sharing a lock.
-    stream: TcpStream,
+/// # Why it gives up at all, rather than waiting as long as it takes
+/// The barrier's guarantee is only worth having while there is a watcher to make it: if the watcher
+/// thread has exited (S vanished, the ring was unref'd, the out-of-line guard fired), the frontier
+/// it is waiting on will never move and a patient barrier becomes a **silent hang inside the vtest
+/// thread** — which is the one failure shape (c)1 has spent a whole sub-project learning to avoid.
+/// So it bounds the wait and says what it saw.
+///
+/// Generously sized against what it actually measures. The watcher notices Mesa's write within one
+/// [`PARK_SLEEP`] (500 µs) and ships it in one network hop; a second is three orders of magnitude
+/// more than a healthy loopback needs and still comfortable for a WAN. It is a *liveness* bound, not
+/// a latency target — reaching it means something is broken, not that the network is slow.
+const FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How long [`RingBarrier`] sleeps between checks of the watcher's frontier.
+///
+/// Short against [`PARK_SLEEP`], because this is pure added latency on the inline path and the thing
+/// it waits for arrives on the watcher's own poll interval. It costs nothing in aggregate:
+/// ring-findings §2 measured the entire inline path at 140–236 bytes for a whole Vulkan
+/// initialization, so this loop runs a few dozen times per session, not per frame.
+const FLUSH_POLL: Duration = Duration::from_micros(50);
+
+/// The barrier that stops an inline command overtaking the ring bytes it refers to.
+///
+/// **See [`RingFlush`] for the finding, the live evidence, and why polling faster is not a fix.**
+/// This is the implementation: it reads the ring's `tail` as Mesa left it, then waits for the
+/// watcher to report having shipped that far.
+///
+/// # Why it waits on the watcher instead of draining the ring itself
+/// Draining is [`RingWatcher::take_delta`]'s job and it hands each byte over exactly once. A second
+/// drainer would consume deltas the watcher then never relays — trading an ordering bug for a
+/// **data-loss** bug, which is strictly worse and far harder to see. So this thread does not touch
+/// the ring's frontier; it only waits for the thread that owns it.
+struct RingBarrier {
+    /// The blob shadows, for reading the ring's `tail`. See [`BlobTable`]'s lock discipline.
+    blobs: BlobTable,
+    /// Which resource is the ring. `None` until Mesa creates it — before that there is nothing to
+    /// wait for, which is exactly the case for `vkCreateRingMESA` itself.
+    ring: RingSlot,
+    /// The watcher's frontier, which is what this waits on.
+    progress: Arc<Mutex<Progress>>,
 }
 
-impl RelayLink for TcpLink {
-    /// Frame and write one message. See [`RelayLink::send`].
-    fn send(&mut self, m: &C2S) -> Result<(), EngineError> {
-        write_msg(&mut self.stream, m).map_err(|e| EngineError::RelayLinkFailed {
-            detail: format!("writing {m:?} to S failed: {e}"),
-        })?;
-        // `write_msg` hands bytes to the kernel but a buffered stream may hold them. Flushing is
-        // not politeness here: an unflushed `GetCapset` is a request S never sees, and the
-        // application blocks forever on a reply that was never asked for.
-        self.stream
-            .flush()
-            .map_err(|e| EngineError::RelayLinkFailed {
-                detail: format!("flushing the link to S failed: {e}"),
-            })
-    }
+impl RingFlush for RingBarrier {
+    /// Block until the watcher has shipped everything Mesa wrote before this call.
+    ///
+    /// # Why reading `tail` *now* is the correct target
+    /// Mesa stores `tail` and only then sends the command that brought us here, so the value read on
+    /// this line is at least as far as anything that command can refer to. Waiting for exactly it is
+    /// therefore sufficient — and waiting for more would be waiting for bytes Mesa has not written.
+    ///
+    /// # Failure modes
+    /// Never fails: it returns after [`FLUSH_TIMEOUT`] having said what it saw. Letting the command
+    /// cross unordered will probably end the session on S — but it will end it *loudly*, with
+    /// virglrenderer naming the seqno it could not reach, and with this message on C's side saying
+    /// why. That is a strictly better outcome than a vtest thread parked forever in a barrier.
+    fn flush_ring(&self) {
+        // No ring, nothing to order against. This is the `vkCreateRingMESA` case: the command that
+        // creates the ring cannot be overtaken by bytes in a ring that does not exist yet.
+        let Some(identity) = *self.ring.lock().expect("the ring slot lock is never poisoned") else {
+            return;
+        };
 
-    /// Block for the next message. See [`RelayLink::recv`].
-    fn recv(&mut self) -> Result<S2C, EngineError> {
-        read_msg(&mut self.stream).map_err(|e| EngineError::RelayLinkFailed {
-            detail: format!("reading from S failed: {e}"),
-        })
+        // The frontier Mesa had reached when it sent the command that brought us here.
+        let target = {
+            let table = self.blobs.lock().expect("the blob table lock is never poisoned");
+            let Some(blob) = table.get(&identity.res_id) else {
+                // The ring's shadow is gone: the session is being torn down. Nothing to order.
+                return;
+            };
+            current_tail(blob.bytes())
+        };
+
+        let started = Instant::now();
+        loop {
+            // `shipped_tail` is recorded *after* the bytes are on the wire, which is the whole point
+            // — `relayed_tail` moves before the send and would let this barrier pass while the delta
+            // was still queued behind us for the very link lock we are about to take.
+            let shipped = self
+                .progress
+                .lock()
+                .expect("the progress lock is never poisoned")
+                .shipped_tail;
+            // A wrapping compare, like every other frontier comparison here: `tail` is a free-running
+            // 2^32 counter, and a plain `>=` would read the wrap as "not there yet" and stall the
+            // session permanently once per 4 GiB of commands.
+            if shipped.wrapping_sub(target) as i32 >= 0 {
+                return;
+            }
+            if started.elapsed() > FLUSH_TIMEOUT {
+                eprintln!(
+                    "rayland-c: the ring watcher has not shipped tail {target} within \
+                     {FLUSH_TIMEOUT:?} (it stands at {shipped}); letting an inline command cross \
+                     ahead of it. If S reports 'ring seqno unable to reach wait seqno' and destroys \
+                     the context, this is why — the watcher thread has most likely stopped."
+                );
+                return;
+            }
+            std::thread::sleep(FLUSH_POLL);
+        }
     }
 }
 
@@ -199,8 +281,24 @@ impl RelayLink for TcpLink {
 /// liveness rather than ring progress.
 #[derive(Debug)]
 struct Progress {
-    /// The highest ring `tail` C has relayed to S.
+    /// The highest ring `tail` C has **begun** relaying to S. Recorded *before* the send.
+    ///
+    /// This is the ceiling [`Progress::note_consumed`] checks S's acknowledgements against, and it
+    /// must move first: a fast S can answer a delta before the watcher would get the progress lock
+    /// back, so recording it afterwards would see S's legitimate first ack arrive past the frontier
+    /// and reject it.
     relayed_tail: u32,
+    /// The highest ring `tail` C has **finished** putting on the wire. Recorded *after* the send.
+    ///
+    /// # Why this is not the same field as `relayed_tail`, and why collapsing them breaks a fix
+    /// They differ by exactly the duration of the send, and [`RingBarrier`] lives in that gap. The
+    /// barrier's guarantee is *"the delta is on the wire ahead of this inline command"*; against
+    /// `relayed_tail` it would pass as soon as the watcher had *decided* to send — while the delta
+    /// was still queued behind the very link lock the inline command is about to take. The barrier
+    /// would then be satisfied by a delta that crosses second, which is the bug it exists to fix,
+    /// reintroduced inside the fix. So the two frontiers are deliberately distinct: one bounds what
+    /// S may claim, the other reports what S has been told.
+    shipped_tail: u32,
     /// The highest `tail` S has reported fully replaying, from [`S2C::RingProgress`].
     consumed_tail: u32,
     /// When `relayed_tail` last moved ahead of `consumed_tail`. `None` when the two agree, i.e.
@@ -234,9 +332,19 @@ impl Progress {
     fn new() -> Self {
         Progress {
             relayed_tail: 0,
+            shipped_tail: 0,
             consumed_tail: 0,
             outstanding_since: None,
         }
+    }
+
+    /// Record that C has finished putting everything up to `tail` on the wire.
+    ///
+    /// Called by the watcher **after** its batch has been sent, and read only by [`RingBarrier`].
+    /// See [`Progress::shipped_tail`] for why this is a separate frontier from
+    /// [`Progress::note_relayed`]'s, and why merging the two would silently disarm the barrier.
+    fn note_shipped(&mut self, tail: u32) {
+        self.shipped_tail = tail;
     }
 
     /// Record that C has relayed up to `tail`, starting the stall clock if S is now behind.
@@ -328,7 +436,7 @@ impl Progress {
 /// tests — intact.
 struct ChannelLink {
     /// The shared send half. Also used by the ring watcher, which is why it is behind a mutex.
-    tx: Arc<Mutex<TcpLink>>,
+    tx: Arc<Mutex<QuicSendLink>>,
     /// Solicited replies, routed here by the reader thread.
     replies: Receiver<S2C>,
 }
@@ -364,12 +472,15 @@ impl RelayLink for ChannelLink {
 /// - `rx`: the receive half of the link. Owned exclusively — nothing else may `recv`.
 /// - `replies`: where solicited replies are sent.
 /// - `blobs` / `progress`: shared state this thread writes.
+/// - `pending`: the shadow awaiting S's id. This thread commits it on `S2C::BlobCreated`, because it
+///   is the only thread that learns the id before the blob's own data arrives — see `PendingBlob`.
 /// - Returns when S closes the link or a read fails; the session is over either way.
 fn reader_thread(
-    mut rx: TcpLink,
+    mut rx: QuicRecvLink,
     replies: Sender<S2C>,
     blobs: BlobTable,
     progress: Arc<Mutex<Progress>>,
+    pending: PendingBlob,
 ) {
     loop {
         let msg = match rx.recv() {
@@ -445,6 +556,16 @@ fn reader_thread(
             // has been dropped, i.e. the vtest session is over. That is a reason to stop, not an
             // error to report.
             other => {
+                // **Commit the staged shadow here, before the reply is forwarded.** Both halves of
+                // that matter. Registering it here rather than on the vtest thread means S's next
+                // message — routinely this blob's own data — finds a shadow to land in. And doing it
+                // *before* forwarding is what makes the blob's initial contents safe: this reply
+                // releases the vtest thread, which hands Mesa the descriptor, which Mesa `mmap`s and
+                // the application reads. `PendingBlob` and `S2C::BlobCreated` carry the full
+                // argument and the run each cost.
+                if let S2C::BlobCreated { res_id, initial } = &other {
+                    commit_pending_blob(&pending, &blobs, *res_id, initial);
+                }
                 if replies.send(other).is_err() {
                     return;
                 }
@@ -527,7 +648,7 @@ fn apply_blob_data(blobs: &BlobTable, res_id: u32, offset: u64, bytes: &[u8]) ->
 fn ring_watcher_thread(
     ring_slot: RingSlot,
     blobs: BlobTable,
-    tx: Arc<Mutex<TcpLink>>,
+    tx: Arc<Mutex<QuicSendLink>>,
     progress: Arc<Mutex<Progress>>,
     stall_timeout: Duration,
 ) {
@@ -638,6 +759,16 @@ fn ring_watcher_thread(
                         return;
                     }
                 }
+                // Publish the shipped frontier **while still holding the link lock**. This is what
+                // `RingBarrier` waits on, and the placement is the whole of its correctness: an
+                // inline command can only cross by taking this same lock, so a barrier released here
+                // is released with the delta already ahead of it on the wire. Moving this line after
+                // the unlock would open exactly the gap the barrier exists to close — the inline
+                // command could win the lock and overtake the delta between the two statements.
+                progress
+                    .lock()
+                    .expect("the progress lock is never poisoned")
+                    .note_shipped(tail);
             }
             // New work was just produced, so do not even consider parking: go straight back and
             // look again. An application mid-frame produces continuously. IDLE was retracted in
@@ -757,23 +888,21 @@ fn main() -> Result<()> {
 
     // --- Connect to S first. If the GPU machine is unreachable there is no point letting an
     // application start and then fail halfway through its Vulkan initialization.
-    let stream = TcpStream::connect(&s_addr)
-        .with_context(|| format!("connecting to S at {s_addr} (set {ENV_S_ADDR} to change it)"))?;
-    // Nagle would coalesce small writes, which is exactly wrong here: a doorbell or a small ring
-    // delta delayed by up to 40 ms is 40 ms the application spends blocked on a reply.
-    // Ring-findings §7: latency is what will hurt, not bandwidth.
-    stream
-        .set_nodelay(true)
-        .context("disabling Nagle on the link to S")?;
-    // Two independent handles to one connection: the reader thread blocks in `recv` on one while
-    // the vtest thread and the watcher send on the other. Without this split, a `recv` would hold
-    // whatever lock a `send` needs.
-    let rx = TcpLink {
-        stream: stream
-            .try_clone()
-            .context("cloning the link to S for the reader thread")?,
-    };
-    let tx = Arc::new(Mutex::new(TcpLink { stream }));
+    //
+    // QUIC needs no Nagle switch: the TCP placeholder this replaces had to disable it, because
+    // coalescing a doorbell or a small ring delta by up to 40 ms is 40 ms the application spends
+    // blocked on a reply (ring-findings §7: latency is what will hurt, not bandwidth). quinn sends
+    // what it is given when it is given it, so there is nothing to turn off.
+    //
+    // The split gives the reader thread its own half: it blocks in `recv` while the vtest thread and
+    // the watcher send on the other, with no lock between them. That is not an optimization — see
+    // the module docs for the deadlock a single-owner design causes.
+    let s_socket = s_addr
+        .parse()
+        .with_context(|| format!("{ENV_S_ADDR}={s_addr:?} is not a valid host:port address"))?;
+    let (tx, rx) = rayland_c::link::connect(s_socket)
+        .map_err(|e| anyhow::anyhow!("connecting to S at {s_addr} (set {ENV_S_ADDR} to change it): {e}"))?;
+    let tx = Arc::new(Mutex::new(tx));
 
     // The session handshake belongs to whoever owns the connection, not to the engine.
     tx.lock()
@@ -795,6 +924,16 @@ fn main() -> Result<()> {
     let blobs = engine.blobs();
     let ring_slot = engine.ring();
 
+    // **Arm the barrier.** Without this an inline `vkWaitRingSeqnoMESA` can reach S ahead of the
+    // ring delta that satisfies it, and virglrenderer answers by destroying the context rather than
+    // waiting — see `RingFlush`. It is installed here, after the engine exists, because it needs the
+    // blob table and the ring slot that the engine owns.
+    engine.set_ring_flush(Arc::new(RingBarrier {
+        blobs: Arc::clone(&blobs),
+        ring: Arc::clone(&ring_slot),
+        progress: Arc::clone(&progress),
+    }));
+
     // --- The reader: the only thing that may `recv`. See the module docs for why a design without
     // it deadlocks.
     std::thread::Builder::new()
@@ -802,7 +941,8 @@ fn main() -> Result<()> {
         .spawn({
             let blobs = Arc::clone(&blobs);
             let progress = Arc::clone(&progress);
-            move || reader_thread(rx, reply_tx, blobs, progress)
+            let pending = engine.pending();
+            move || reader_thread(rx, reply_tx, blobs, progress, pending)
         })
         .context("spawning the reader thread")?;
 

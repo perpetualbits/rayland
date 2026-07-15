@@ -27,17 +27,32 @@
 //! blocked on a reply — and therefore sending nothing — would wait forever for the reply it is
 //! blocked on, while S sat idle holding the answer. The poll loop is what breaks that.
 //!
-//! # Status: never run against a real C
-//! **This binary has never completed a session**, because there is nothing to run it against yet:
-//! the QUIC transport is (c)1 Task 6. Task 5 shipped the blob synchronisation and Task 5b corrected
-//! its S→C half to spec §7.2's rule — **S ships back exactly the bytes S wrote** — which also gave
-//! spec §5's channel 2, the reply arena, the owner it had never had. [`Applier::poll_progress`]
-//! documents both the rule and the two ways its predecessor was wrong, including why the obvious
-//! widening (ship Venus's `blob_id == 0` shmems too) would have wiped C's staging pool rather than
-//! fixed anything. The piece with the real logic — [`Applier`], and
-//! the ring arithmetic under it — is tested against a real shared-memory mapping with no GPU and no
-//! network (`tests/apply.rs`). What is uncovered here is the *wiring*: the socket, the two threads,
-//! and the engine's own behaviour. That genuinely needs a peer, and is unverified until Task 6.
+//! # Status: this runs, and what running it cost
+//! **As of (c)1 Task 6 this binary completes real sessions.** `rayland-refapp` — unmodified, and
+//! running against `rayland-c` a QUIC link away — renders through it and gets back a PNG
+//! bit-identical to a native run (`tests/loopback_e2e.rs`, 10/10 runs).
+//!
+//! Task 5b had already given spec §5's channel 2, the reply arena, the owner it never had, by
+//! correcting the S→C rule to spec §7.2's **S ships back exactly the bytes S wrote**.
+//! [`Applier::poll_progress`] documents that rule and the two ways its predecessor was wrong. Task 6
+//! found that the rule was right and its **implementation had two holes**, both invisible without a
+//! live Mesa:
+//!
+//! - *"bytes S wrote"* was implemented as *"bytes that changed since S mapped the blob"*, and those
+//!   differ by every write that happened before the mapping existed — which, for a readback buffer,
+//!   is the whole frame. See [`HostBlob::map`](rayland_s::blob::HostBlob::map).
+//! - Blob bytes were shipped only when a **ring retired**, but a blob can be born with its contents
+//!   already in it and no ring traffic need follow. See the `CreateBlob` arm of [`Applier::apply`].
+//!
+//! S also now rings its own ring's doorbell after every applied delta, because Mesa's doorbell
+//! decision reads a `status` word that never crosses the network — see
+//! `rayland_vtest::venus_ring::doorbell` for the finding.
+//!
+//! [`Applier`] and the ring arithmetic under it remain tested against a real shared-memory mapping
+//! with no GPU and no network (`tests/apply.rs`). Those tests are still the right shape — but note
+//! that **both holes above sat underneath them**, because a memfd is zero-filled and a test never
+//! renders into a blob before mapping it. The live e2e is what closed them, and is why it is now the
+//! gate.
 //!
 //! This file is written to be read, and it says where it is guessing.
 
@@ -48,11 +63,13 @@ use rayland_relay::{C2S, S2C, read_msg, write_msg};
 // The message applier: everything this daemon actually knows how to do.
 use rayland_s::apply::Applier;
 
+// SP2's QUIC transport: the network C's commands cross.
+use rayland_transport::{QuicRecv, QuicSend};
+
 use anyhow::{Context, Result};
 // `flush` on the link to C: `write_msg` hands bytes to the stream, but an unflushed reply is a
 // reply C never sees.
 use std::io::Write;
-use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -66,12 +83,9 @@ const ENV_LISTEN: &str = "RAYLAND_C1_S_LISTEN";
 /// `0.0.0.0` because S is, by construction, the machine on the *other* end of a network — (c)1
 /// Task 8's two-machine bring-up connects to it from a different host.
 ///
-/// # Why this is TCP, and why that is temporary
-/// (c)1 Task 6 replaces this with QUIC, exactly as it does for `rayland-c`'s matching placeholder.
-/// TCP is what lets this task be a real program rather than a sketch: `rayland-relay`'s framing
-/// works over any `Read`/`Write`. Ring-findings §7 is the reason the real answer is not TCP —
-/// head-of-line blocking on a single stream is precisely the wrong property for a protocol whose
-/// replies are round trips the application blocks on.
+/// **QUIC is UDP**, so this is a UDP endpoint despite the surrounding talk of connections. See
+/// `rayland-c`'s matching `ENV_S_ADDR` for why the transport is QUIC and what v1 does not yet
+/// collect on (everything still shares one stream, which has TCP's head-of-line behaviour).
 const DEFAULT_LISTEN: &str = "0.0.0.0:9401";
 
 /// Environment variable naming the DRM render node to open.
@@ -112,7 +126,7 @@ fn env_or(name: &str, default: &str) -> String {
 /// Flushing is not politeness: an unflushed `Capset` is an answer C never sees, and C is blocked in
 /// a request/reply waiting for exactly it — so the application stalls on a reply that was computed
 /// and then sat in a buffer.
-fn send(stream: &mut TcpStream, msg: &S2C) -> Result<()> {
+fn send(stream: &mut QuicSend, msg: &S2C) -> Result<()> {
     write_msg(stream, msg).with_context(|| format!("writing {msg:?} to C"))?;
     stream.flush().context("flushing the link to C")
 }
@@ -127,7 +141,7 @@ fn send(stream: &mut TcpStream, msg: &S2C) -> Result<()> {
 /// - `applier`: shared with the message thread. The lock is held only for the poll itself.
 /// - `tx`: the link to C.
 /// - Returns when the link fails; the session is over either way.
-fn progress_thread(applier: Arc<Mutex<Applier>>, tx: Arc<Mutex<TcpStream>>) {
+fn progress_thread(applier: Arc<Mutex<Applier>>, tx: Arc<Mutex<QuicSend>>) {
     loop {
         // Poll with the lock held, send without it. The poll is a handful of atomic loads, so the
         // message thread is never blocked behind anything slow — and crucially never behind a
@@ -163,8 +177,8 @@ fn progress_thread(applier: Arc<Mutex<Applier>>, tx: Arc<Mutex<TcpStream>>) {
 ///   never be blocked behind GPU work.
 /// - Returns when C closes the link or a read fails.
 fn serve(
-    mut rx: TcpStream,
-    tx: Arc<Mutex<TcpStream>>,
+    mut rx: QuicRecv,
+    tx: Arc<Mutex<QuicSend>>,
     applier: Arc<Mutex<Applier>>,
     engine: &mut VirglEngine,
 ) -> Result<()> {
@@ -178,15 +192,31 @@ fn serve(
             }
         };
 
-        // The lock is held across `apply`, which is deliberate and cheap for the message that
-        // matters: a `C2S::RingDelta` is a `memcpy` and one atomic store — the GPU work happens
-        // later, on virglrenderer's own ring thread, not in here. The messages that *do* enter the
-        // engine (`CreateBlob`, `SubmitCmd`) are rare: ring-findings §2 measured the whole inline
-        // path at 140–236 bytes across an entire Vulkan initialization.
-        let out = applier
-            .lock()
-            .expect("the applier lock is never poisoned")
-            .apply(engine, msg);
+        // **The applier lock is held across `apply` *and* the replies it produced.** Both halves
+        // matter, for different reasons.
+        //
+        // Holding it across `apply` is deliberate and cheap for the message that matters: a
+        // `C2S::RingDelta` is a `memcpy` and one atomic store — the GPU work happens later, on
+        // virglrenderer's own ring thread, not in here. The messages that *do* enter the engine
+        // (`CreateBlob`, `SubmitCmd`) are rare: ring-findings §2 measured the whole inline path at
+        // 140–236 bytes across an entire Vulkan initialization.
+        //
+        // **Holding it across the sends is what keeps a blob's announcement ahead of its data**, and
+        // (c)1 Task 6 found out the hard way what happens without it. `apply` maps a new blob and
+        // makes it visible in `Applier`; the `S2C::BlobCreated` that tells C its `res_id` is only
+        // sent afterwards. Release the lock in between and the progress thread — which locks the
+        // same `Applier` — polls, finds the new blob, and ships an `S2C::BlobData` for a `res_id` C
+        // has never been told about. C then logs "S sent BlobData for resource 5, which C has no
+        // shadow of" and **drops the bytes**, which for the readback buffer means the application
+        // renders correctly across the network and then reads its own zeros. That is not a
+        // theoretical window: it is the readback blob's normal case, because Mesa creates that blob
+        // at `vkMapMemory`, i.e. when the GPU has *already* filled it — so there is data to ship the
+        // instant it is mapped, and the race is on every single run.
+        //
+        // No deadlock: the progress thread takes `applier` and releases it **before** taking `tx`,
+        // so it never holds both, and this is the only path that holds them together.
+        let mut session = applier.lock().expect("the applier lock is never poisoned");
+        let out = session.apply(engine, msg);
 
         for reply in &out {
             // Worth a human's attention either way, and S's log is the more reliable of the two
@@ -200,6 +230,10 @@ fn serve(
             let mut stream = tx.lock().expect("the link send lock is never poisoned");
             send(&mut stream, reply).context("answering C")?;
         }
+        // Explicit rather than waiting for the loop's end: the next iteration blocks reading C's
+        // link, and holding the applier across that would stop the progress thread dead — it is the
+        // only thing that ever releases the application's synchronous Vulkan calls.
+        drop(session);
     }
 }
 
@@ -230,32 +264,42 @@ fn main() -> Result<()> {
         )
     })?;
 
-    let listener = TcpListener::bind(&listen).with_context(|| {
+    let bind_addr = listen
+        .parse()
+        .with_context(|| format!("{ENV_LISTEN}={listen:?} is not a valid host:port address"))?;
+    let listener = rayland_transport::listen(bind_addr).with_context(|| {
         format!("binding S's listen address {listen} (set {ENV_LISTEN} to change it)")
     })?;
+    // Report the address actually bound, not the one requested: a caller may pass port 0 to let the
+    // OS choose, and printing the request back would then name a port nobody can connect to.
+    let bound = listener
+        .local_addr()
+        .context("reading S's bound listen address")?;
     eprintln!(
-        "rayland-s: listening on {listen}, rendering on {}",
+        "rayland-s: listening on {bound}, rendering on {}",
         render_node.display()
     );
 
     // One connection, then done: vtest is one context per connection, and (c)1's walking skeleton
     // serves a single application. This mirrors `rayland-c`, which likewise accepts exactly one.
-    let (stream, peer) = listener.accept().context("accepting C's connection")?;
-    eprintln!("rayland-s: C connected from {peer}");
-    // Nagle would coalesce small writes, which is exactly wrong here: an `S2C::RingProgress` delayed
-    // by up to 40 ms is 40 ms the application on C spends blocked on a reply S already has.
-    // Ring-findings §7: latency is what will hurt, not bandwidth.
-    stream
-        .set_nodelay(true)
-        .context("disabling Nagle on the link to C")?;
+    //
+    // `accept_bi` rather than SP2's `accept`: that one hands back a **read-only** view plus a
+    // `Liveness` whose send half is contractually silent, which suits SP0–SP3's one-directional
+    // command stream and cannot serve (c)1 at all. S owes C real answers on this connection — the
+    // capset, every blob's resource id, the reply-arena bytes the application is blocked on, and the
+    // ring progress that is the only thing that ever releases a synchronous Vulkan call.
+    //
+    // QUIC needs no Nagle switch: the TCP placeholder this replaces had to disable it, because an
+    // `S2C::RingProgress` coalesced by up to 40 ms is 40 ms the application on C spends blocked on a
+    // reply S already has (ring-findings §7).
+    let stream = listener.accept_bi().context("accepting C's connection")?;
+    eprintln!("rayland-s: C connected");
 
-    // Two independent handles to one connection: the message thread blocks reading one while the
-    // progress thread writes on the other. Without the split, a blocking read would hold whatever
-    // lock a write needs — the same deadlock the module docs describe, rebuilt one layer down.
-    let rx = stream
-        .try_clone()
-        .context("cloning the link to C for the reader")?;
-    let tx = Arc::new(Mutex::new(stream));
+    // Two halves, two threads: the message thread blocks reading one while the progress thread writes
+    // on the other. Without the split, a blocking read would hold whatever lock a write needs — the
+    // same deadlock the module docs describe, rebuilt one layer down.
+    let (tx, rx) = stream.split();
+    let tx = Arc::new(Mutex::new(tx));
     let applier = Arc::new(Mutex::new(Applier::new()));
 
     // The poller: the only thing that ever releases the application's synchronous calls.

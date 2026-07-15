@@ -17,7 +17,7 @@ pub mod tls;
 pub mod sync_stream;
 
 // Public re-exports so callers write `rayland_transport::QuicStream`, etc.
-pub use sync_stream::{Liveness, QuicListener, QuicRecv, QuicStream};
+pub use sync_stream::{Liveness, QuicListener, QuicRecv, QuicSend, QuicStream};
 
 // Standard networking types.
 use std::net::SocketAddr;

@@ -283,7 +283,7 @@ fn session_with_ring() -> (Applier, RecordingEngine, u32) {
         },
     );
     let res_id = match out.as_slice() {
-        [S2C::BlobCreated { res_id }] => *res_id,
+        [S2C::BlobCreated { res_id, .. }] => *res_id,
         other => panic!("expected exactly one BlobCreated, got {other:?}"),
     };
 
@@ -582,7 +582,7 @@ fn a_ring_delta_for_a_resource_that_is_not_a_ring_is_refused() {
         },
     );
     let vertex_buffer = match out.as_slice() {
-        [S2C::BlobCreated { res_id }] => *res_id,
+        [S2C::BlobCreated { res_id, .. }] => *res_id,
         other => panic!("expected BlobCreated, got {other:?}"),
     };
 
@@ -621,7 +621,7 @@ fn blob_data_past_the_end_of_the_blob_is_refused() {
         },
     );
     let res_id = match out.as_slice() {
-        [S2C::BlobCreated { res_id }] => *res_id,
+        [S2C::BlobCreated { res_id, .. }] => *res_id,
         other => panic!("expected BlobCreated, got {other:?}"),
     };
 
@@ -657,7 +657,7 @@ fn blob_data_whose_offset_overflows_is_refused() {
         },
     );
     let res_id = match out.as_slice() {
-        [S2C::BlobCreated { res_id }] => *res_id,
+        [S2C::BlobCreated { res_id, .. }] => *res_id,
         other => panic!("expected BlobCreated, got {other:?}"),
     };
 
@@ -775,7 +775,7 @@ fn blob_data_is_written_into_s_blob_pages() {
         },
     );
     let res_id = match out.as_slice() {
-        [S2C::BlobCreated { res_id }] => *res_id,
+        [S2C::BlobCreated { res_id, .. }] => *res_id,
         other => panic!("expected BlobCreated, got {other:?}"),
     };
 
@@ -1054,7 +1054,7 @@ fn create_blob(
         },
     );
     match out.as_slice() {
-        [S2C::BlobCreated { res_id }] => *res_id,
+        [S2C::BlobCreated { res_id, .. }] => *res_id,
         other => panic!("expected exactly one BlobCreated, got {other:?}"),
     }
 }

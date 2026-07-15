@@ -27,5 +27,6 @@ repository = "https://github.com/perpetualbits/rayland"
 [dependencies]
 rayland-vtest = { path = "../rayland-vtest" }   # protocol only — NEVER rayland-engine (see Task 1)
 rayland-relay = { path = "../rayland-relay" }   # the (c)1 C<->S message set and its framing
+rayland-transport = { path = "../rayland-transport" } # SP2's QUIC: the network C's commands cross
 anyhow = { workspace = true }                   # ergonomic top-level errors for the daemon binary
 libc = { workspace = true }                     # mmap-adjacent POSIX bits the daemon needs directly

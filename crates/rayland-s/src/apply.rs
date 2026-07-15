@@ -43,10 +43,10 @@
 //! wire value is done in a width that could truncate before it is checked.
 
 // The engine seam C0 built, and the errors it speaks.
-use rayland_vtest::venus_ring::RingIdentity;
+use rayland_vtest::venus_ring::{RingIdentity, notify_ring_command, ring_handle_from_create};
 use rayland_vtest::{EngineError, RenderEngine};
 // The relay protocol.
-use rayland_relay::{C2S, S2C};
+use rayland_relay::{BlobRun, C2S, S2C};
 
 use crate::blob::{HostBlob, OutOfRange};
 use crate::ring_mirror::{RingDeltaError, RingMirror};
@@ -224,12 +224,65 @@ pub struct Applier {
     /// The context C created, remembered because [`C2S::CreateBlob`] does not carry one and
     /// `RenderEngine::create_blob_resource` needs one. `None` until [`C2S::CreateContext`] arrives.
     ctx_id: Option<u32>,
+    /// The Venus ring handle, read out of the `vkCreateRingMESA` that crosses on the inline path.
+    ///
+    /// # Why S has to know this at all, and why it is one value rather than a map
+    /// S rings its own ring's doorbell after every applied delta — the (c)1 Task 6 finding, whose
+    /// evidence and ordering contract live in
+    /// [`venus_ring::doorbell`](rayland_vtest::venus_ring::doorbell). The doorbell names its ring by
+    /// this handle, which is a Mesa pointer value S cannot derive and can only read off the wire.
+    ///
+    /// It is a single `Option` rather than a `res_id -> handle` map because the handle and the
+    /// resource id arrive in **different messages that cannot be correlated without decoding
+    /// `VkRingCreateInfoMESA`'s variable-size body** — which is exactly the kind of decode the spec
+    /// (§7) tells us not to acquire a taste for. Under (c)1's pinned `VN_PERF=no_multi_ring` (spec
+    /// §6) there is exactly one ring, so there is nothing to correlate; [`Self::latch_ring_handle`]
+    /// refuses a second rather than silently picking one, so the day that crutch is removed presents
+    /// as a named refusal instead of a doorbell delivered to the wrong ring.
+    venus_ring_handle: Option<u64>,
 }
 
 impl Applier {
     /// A session with nothing created yet.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record the ring's handle if `cmd` is the `vkCreateRingMESA` that declares it.
+    ///
+    /// Called for every inline batch. Most are not ring creations and this does nothing; the one
+    /// that is happens once per session, before any ring delta can arrive (Mesa cannot write a ring
+    /// it has not created).
+    ///
+    /// # Why a second ring is refused rather than latched
+    /// (c)1 pins `VN_PERF=no_multi_ring` (spec §6), under which Mesa runs exactly one ring — so a
+    /// second creation means that crutch is gone or was never applied. S cannot tell which ring a
+    /// later doorbell should name without correlating handles to resource ids, which it has no way
+    /// to do (see [`Self::venus_ring_handle`]). Keeping the first and complaining makes that day
+    /// arrive as a named, visible refusal; overwriting would silently start ringing the wrong ring's
+    /// doorbell, and the other ring would simply stop making progress with nothing to point at.
+    ///
+    /// # Inputs / outputs
+    /// - `cmd`: an inline command batch as it arrived from C.
+    /// - Returns nothing; the handle, if found, is recorded on `self`.
+    fn latch_ring_handle(&mut self, cmd: &[u8]) {
+        let Some(handle) = ring_handle_from_create(cmd) else {
+            // Not a ring creation. By far the common case — this runs on every inline batch.
+            return;
+        };
+        match self.venus_ring_handle {
+            None => self.venus_ring_handle = Some(handle),
+            // A repeat of the one we have. Harmless and worth no noise.
+            Some(existing) if existing == handle => {}
+            Some(existing) => {
+                eprintln!(
+                    "rayland-s: ignoring a second ring creation (handle {handle:#x}); this session \
+                     already has ring {existing:#x}. (c)1 supports exactly one ring and pins \
+                     VN_PERF=no_multi_ring to guarantee it — without that, S cannot tell which ring \
+                     a delta's doorbell should name, and the extra ring will stall."
+                );
+            }
+        }
     }
 
     /// Apply one message from C, returning everything S owes in reply.
@@ -363,7 +416,51 @@ impl Applier {
                         .insert(res_id, RingMirror::new(identity.buffer_size));
                 }
 
-                Ok(vec![S2C::BlobCreated { res_id }])
+
+
+                // **Ship whatever is already in the blob, right now.** (c)1 Task 6's finding, and the
+                // last thing standing between a working relay and a blank picture.
+                //
+                // [`Self::poll_progress`] is S's return path, and it ships blob bytes only when a
+                // ring **retires** — a sound gate for a running application, and a deliberate one
+                // (diffing every blob on every 200 µs poll would make that loop a bandwidth source).
+                // But it never fires for the bytes that matter most, because **a blob can be born
+                // with its contents already in it**: Mesa creates a blob resource lazily, at
+                // `vkMapMemory`, so a readback buffer's blob comes into existence *after*
+                // `vkCmdCopyImageToBuffer` has already run. S's first sight of those pages is of the
+                // finished frame. The application then maps its own copy, reads it, and exits —
+                // there is no further ring traffic to trigger a poll, so under the retirement gate
+                // alone the frame is simply never sent. The reference app rendered correctly across
+                // the network and wrote a fully transparent PNG.
+                //
+                // So creation is itself an event on the return path, and the same predicate answers
+                // it: every byte that differs from the baseline is a byte C has never seen. For a
+                // fresh blob that is nothing (C's memfd is zeros too, so the diff is empty and this
+                // costs one `memcmp`); for a readback buffer it is the frame.
+                //
+                // **Carried inside `BlobCreated`, not sent after it.** Two messages cannot work here,
+                // and the reason is not the obvious one: it is not that C would drop data for a
+                // resource it has no shadow of (it would, but the reader commits the shadow first).
+                // It is that `BlobCreated` is what unblocks C's vtest thread, which then hands Mesa
+                // the descriptor — and Mesa `mmap`s it and the application reads it while C's reader
+                // is still getting to the next message. Riding along makes "you have an id" and "your
+                // pages are correct" one event, as they are on one machine. See `S2C::BlobCreated`.
+                //
+                // `expect` is unreachable: the blob was inserted a few lines above.
+                let created = self
+                    .blobs
+                    .get_mut(&res_id)
+                    .expect("the blob was just inserted");
+                let initial = created
+                    .take_bytes_s_wrote()
+                    .into_iter()
+                    .map(|run| BlobRun {
+                        offset: run.offset,
+                        bytes: run.bytes,
+                    })
+                    .collect();
+
+                Ok(vec![S2C::BlobCreated { res_id, initial }])
             }
 
             // The application's own memory, crossing a boundary it was never designed to cross:
@@ -425,6 +522,27 @@ impl Applier {
                         source,
                     })?;
 
+                // **Wake S's ring thread — and do it here, after `apply_delta`, never before.**
+                //
+                // `apply_delta` has just stored `tail` with `Release`. That ordering is the entire
+                // correctness of the doorbell: every interleaving with virglrenderer's park sequence
+                // is safe *because* the new `tail` is already visible when the consumer looks, and
+                // ringing first reintroduces the lost wakeup this exists to prevent.
+                //
+                // Without this the application hangs and Mesa aborts at ~3.5 s. The chain — and why
+                // shipping S's `status` word back to C cannot fix it, and why a *conditional*
+                // doorbell would still hang — is in `venus_ring::doorbell`'s module docs. The short
+                // version: virglrenderer's ring thread parks after 1 ms and only `vkNotifyRingMESA`
+                // wakes it, but Mesa decides whether to send one by reading **C's** `status` word,
+                // which reports C's relay watcher rather than S's consumer.
+                //
+                // A failure is reported rather than swallowed: this doorbell is the only thing that
+                // will ever make these bytes execute, so an error here is the session ending, not a
+                // missed optimization.
+                if let (Some(handle), Some(ctx_id)) = (self.venus_ring_handle, self.ctx_id) {
+                    engine.submit(ctx_id, &notify_ring_command(handle))?;
+                }
+
                 // **No `RingProgress` here, and that is the point.** The ring thread runs
                 // asynchronously; at this instant it has almost certainly consumed nothing. Reporting
                 // `tail` back would release the application's wait on a reply that does not exist
@@ -437,6 +555,11 @@ impl Applier {
             // (ring-findings §2) — and it carries the `vkCreateRingMESA` that makes S create the
             // ring, so nothing else works without it.
             C2S::SubmitCmd { ctx_id, cmd } => {
+                // Read the ring's handle before forwarding, if this is the command that declares it.
+                // This is the only place it is ever stated (`vn_ring.c:366-369`), and S needs it to
+                // ring its own doorbell — see `venus_ring::doorbell` for why a host on the far side
+                // of a network has to do that at all.
+                self.latch_ring_handle(&cmd);
                 engine.submit(ctx_id, &cmd)?;
                 Ok(Vec::new())
             }

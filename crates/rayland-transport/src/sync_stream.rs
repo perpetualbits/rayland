@@ -31,6 +31,37 @@ impl QuicStream {
         Self { rt, send, recv }
     }
 
+    /// Split this stream into its independently-owned write and read halves.
+    ///
+    /// # Why this exists (it did not, for SP2, and (c)1 cannot work without it)
+    /// SP2's traffic was one-directional: the client streamed commands and the server only read
+    /// them, so one thread owning the whole [`QuicStream`] was enough. **(c)1's is a conversation.**
+    /// Both `rayland-c` and `rayland-s` must have one thread blocked in a read *while another writes*
+    /// — `rayland-c`'s module docs spell out the deadlock a single-threaded design causes: while the
+    /// vtest thread is blocked reading Mesa's socket, nobody drains the link, so S's replies sit
+    /// unread while the application spins on a `head` that only those replies can advance.
+    ///
+    /// Both daemons expressed that with `TcpStream::try_clone`, which has no QUIC analogue: a
+    /// `quinn::SendStream` and `quinn::RecvStream` are already distinct objects, so the split is a
+    /// move rather than a duplication. That is why this consumes `self` — the halves are not two
+    /// views of one thing, they *are* the two things this type was holding together.
+    ///
+    /// # Concurrency
+    /// Both halves clone the same [`Arc<Runtime>`], and each calls `block_on` from its own
+    /// (non-runtime) thread. That is sound and is the established pattern in this module — see
+    /// [`QuicListener::accept`], which already hands the same runtime to a [`QuicRecv`] and a
+    /// [`Liveness`]. `block_on` takes `&self`, so concurrent callers block only themselves while the
+    /// runtime's worker threads keep driving the connection.
+    pub fn split(self) -> (QuicSend, QuicRecv) {
+        (
+            QuicSend {
+                rt: Arc::clone(&self.rt),
+                send: self.send,
+            },
+            QuicRecv::new(self.rt, self.recv),
+        )
+    }
+
     /// Finish the client's send half of the stream: no more bytes will be written.
     ///
     /// This is how the client signals "no more commands" to the peer's blocking reader (its
@@ -72,6 +103,43 @@ impl Write for QuicStream {
     /// Block until the bytes are accepted by the QUIC stream.
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         // `write` returns how many bytes were accepted.
+        self.rt
+            .block_on(self.send.write(buf))
+            .map_err(std::io::Error::other)
+    }
+    /// QUIC streams are not user-buffered here, so flush is a no-op success.
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The write half of a split [`QuicStream`]. See [`QuicStream::split`].
+///
+/// Holds no reference to the read half, which is the point: one thread may block indefinitely in a
+/// read while another writes, with no lock between them.
+pub struct QuicSend {
+    // Keeps the runtime alive and drives the writes.
+    rt: Arc<Runtime>,
+    // The QUIC send half of the bi-stream.
+    send: quinn::SendStream,
+}
+
+impl QuicSend {
+    /// Finish this send half: no more bytes will be written, and the peer's reader sees EOF.
+    ///
+    /// Mirrors [`QuicStream::finish`]; see its doc comment for why no `block_on` is needed.
+    ///
+    /// # Errors
+    /// Returns an error if the stream was already finished or reset.
+    pub fn finish(&mut self) -> std::io::Result<()> {
+        self.send.finish().map_err(std::io::Error::other)
+    }
+}
+
+impl Write for QuicSend {
+    /// Block until the bytes are accepted by the QUIC stream. Same semantics as
+    /// [`QuicStream::write`].
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.rt
             .block_on(self.send.write(buf))
             .map_err(std::io::Error::other)
@@ -261,6 +329,51 @@ impl QuicListener {
         let quic_recv = QuicRecv::new(self.rt.clone(), recv);
         let liveness = Liveness::new(self.rt.clone(), conn, send, disconnect, pipe_write);
         Ok((quic_recv, liveness))
+    }
+
+    /// Accept one connection and its bidirectional stream, returning the server's **read/write**
+    /// view of it.
+    ///
+    /// # Why this exists alongside [`Self::accept`], rather than replacing it
+    /// [`Self::accept`] serves SP0–SP3's shape, where the conversation is one-directional: the
+    /// client streams rendering commands and the server answers with nothing but an eventual
+    /// disconnect. It therefore returns a read-only [`QuicRecv`] plus a [`Liveness`] whose send half
+    /// is deliberately **held open and never written** — the FIN is the only thing it ever says.
+    ///
+    /// **(c)1 inverted that.** `rayland-s` owes `rayland-c` real answers on the same connection: the
+    /// capset (which C, having no GPU, cannot invent), every blob's resource id, the reply-arena
+    /// bytes the application is blocked on, and the ring progress that is the *only* thing that ever
+    /// releases a synchronous Vulkan call. None of that can travel over a send half that by contract
+    /// stays silent. So this is an addition rather than a change: SP2's callers keep the semantics
+    /// they were built against, and nothing about their teardown moves.
+    ///
+    /// # Pitfall: there is no [`Liveness`] here, and therefore no disconnect fd
+    /// The caller owns both halves and closes the session by dropping them. That suits a daemon
+    /// whose reader thread already treats EOF as end-of-session; it does **not** suit SP1's calloop
+    /// window loop, which needs an fd to poll. Use [`Self::accept`] for that.
+    ///
+    /// # Errors
+    /// Returns an error if accepting the connection or its bidirectional stream fails.
+    pub fn accept_bi(&self) -> anyhow::Result<QuicStream> {
+        // Accept the connection and its first bi-stream on the runtime.
+        let (send, recv) = self.rt.block_on(async {
+            // Wait for an incoming connection and finish its handshake.
+            let incoming = self
+                .endpoint
+                .accept()
+                .await
+                .ok_or_else(|| anyhow::anyhow!("endpoint closed before a connection arrived"))?;
+            let conn = incoming.await?;
+            // Accept the peer's single bi-stream. Unlike `accept`, both halves go to the caller.
+            //
+            // `conn` is dropped at the end of this block, exactly as it is in this crate's
+            // `connect`: quinn's stream handles keep the connection's state alive, so the session
+            // outlives this binding. `connect` has relied on that since SP2 and its round-trip test
+            // proves it, so this is the established pattern here rather than a new assumption.
+            let (send, recv) = conn.accept_bi().await?;
+            anyhow::Ok((send, recv))
+        })?;
+        Ok(QuicStream::new(self.rt.clone(), send, recv))
     }
 }
 

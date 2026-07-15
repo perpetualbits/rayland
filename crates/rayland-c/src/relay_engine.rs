@@ -38,7 +38,7 @@
 use crate::ring::RingIdentity;
 use crate::shm::LocalBlob;
 // The relay message set and the two engine-facing types the trait speaks in.
-use rayland_relay::{C2S, S2C};
+use rayland_relay::{BlobRun, C2S, S2C};
 use rayland_vtest::{BlobResource, EngineError, EngineFrame, RenderEngine};
 // Blob shadows are addressed by the resource id S assigns them.
 use std::collections::HashMap;
@@ -72,16 +72,122 @@ pub type BlobTable = Arc<Mutex<HashMap<u32, LocalBlob>>>;
 /// ring does not exist until the application has started running.
 pub type RingSlot = Arc<Mutex<Option<RingIdentity>>>;
 
+/// A blob shadow that has been allocated on C but does not yet know the id **S** will give it.
+///
+/// # Why a staging slot exists at all — the (c)1 Task 6 finding
+/// The obvious code registers the shadow in [`BlobTable`] as soon as the `S2C::BlobCreated` reply
+/// comes back, since that reply is what carries the id. **That is too late, and it loses the
+/// readback buffer's pixels every single run.**
+///
+/// C's *reader thread* is the one that sees the id first. If the shadow is only registered afterwards,
+/// by the vtest thread waking from its request/reply, then S's very next message — routinely an
+/// `S2C::BlobData` for that same blob — reaches a reader that has no shadow to put it in, and the
+/// bytes are dropped with *"S sent BlobData for resource 5, which C has no shadow of"*.
+///
+/// That is not a narrow window a faster machine would close. Mesa creates a blob resource lazily at
+/// `vkMapMemory`, so a readback buffer's blob is created *after* the GPU has already rendered into
+/// it: S has data to send the instant it maps the blob, every run.
+///
+/// So the shadow is **staged before the request is sent**, and the reader commits it — with the
+/// blob's initial contents, which [`S2C::BlobCreated`] carries for a related but distinct reason
+/// (this reply is what lets Mesa `mmap` the pages, so the bytes must be down *before* it is
+/// forwarded, and no separate message can be early enough). See [`commit_pending_blob`].
+///
+/// # Why one slot rather than a queue
+/// `RelayEngine::create_blob_resource` blocks for its reply, and the vtest thread is the only caller,
+/// so at most one blob is ever in flight. A queue would model a concurrency that cannot occur and
+/// would hide a real bug — two stages without an intervening commit — behind plausible behaviour.
+pub type PendingBlob = Arc<Mutex<Option<LocalBlob>>>;
+
+/// Register the staged shadow under the id S has just assigned it.
+///
+/// **C's reader thread must call this on every `S2C::BlobCreated`, before forwarding the reply and
+/// before reading another message.** See [`PendingBlob`] for what goes wrong otherwise; the short
+/// version is that S's next message is routinely the blob's own data, and a shadow that is not in
+/// the table yet means those bytes are dropped on the floor.
+///
+/// # Inputs / outputs
+/// - `pending`: the staging slot; emptied by this call.
+/// - `blobs`: the live shadow table.
+/// - `res_id`: the id from [`S2C::BlobCreated`].
+/// - `initial`: whatever was already in the blob on S, laid into the shadow **before** the blob is
+///   published. See [`S2C::BlobCreated`]: a readback buffer arrives with the finished frame already
+///   in it, and this reply is what lets Mesa map the pages — so the bytes must be down first.
+/// - Returns nothing. A `BlobCreated` with nothing staged is **ignored**: S answering a request C
+///   never made is S's protocol error, and C's reader reports the ones it can attribute. Panicking
+///   here would take out the reader thread — the one thing that delivers every reply — over a
+///   message that harms nothing by being dropped.
+///
+/// # Failure modes
+/// An `initial` run that does not fit the shadow is **skipped, with a message**, and the blob is
+/// still registered. The runs are remote input and a bad one is S's protocol error, but refusing the
+/// whole blob over it would strand Mesa in `recvmsg` waiting for a descriptor that never comes —
+/// trading S's bug for a hang on C. The bounds check itself is not optional: `offset` and the run's
+/// length arrive over the network, and an unchecked write would be a remote peer scribbling past a
+/// mapping.
+pub fn commit_pending_blob(
+    pending: &PendingBlob,
+    blobs: &BlobTable,
+    res_id: u32,
+    initial: &[BlobRun],
+) {
+    let Some(mut blob) = pending
+        .lock()
+        .expect("the pending blob lock is never poisoned")
+        .take()
+    else {
+        return;
+    };
+
+    // Lay S's bytes down *before* the blob is reachable, so nothing can observe it half-filled.
+    for run in initial {
+        // Computed in `u64` first: a `usize` cast before the check could wrap on a 32-bit target —
+        // and C is meant to be the weak machine, so a 32-bit C is a real target rather than a
+        // hypothetical one — turning an out-of-range write into an in-range one.
+        let end = match run.offset.checked_add(run.bytes.len() as u64) {
+            Some(end) if end <= blob.size() => end,
+            _ => {
+                eprintln!(
+                    "rayland-c: S's initial contents for resource {res_id} claim bytes \
+                     {}..{} of a {}-byte blob; skipping the run. This is a protocol error on S, and \
+                     the blob is still registered — refusing it would leave Mesa waiting forever for \
+                     a descriptor.",
+                    run.offset,
+                    run.offset.saturating_add(run.bytes.len() as u64),
+                    blob.size()
+                );
+                continue;
+            }
+        };
+        blob.bytes_mut()[run.offset as usize..end as usize].copy_from_slice(&run.bytes);
+    }
+
+    // Keyed by **S's** id, because that is what every later message naming this resource uses.
+    // Deriving the key from the wire rather than from a local counter means there is no translation
+    // table that can drift.
+    blobs
+        .lock()
+        .expect("the blob table lock is never poisoned")
+        .insert(res_id, blob);
+}
+
 /// The transport that carries the relay protocol to S.
 ///
 /// # Why this is a trait
 /// Two reasons, and the second is the one that matters. The first is testability: a mock link makes
 /// every method of [`RelayEngine`] exercisable with no network and no S, which is what lets Task 3
-/// be tested at all — when Task 3 was written neither S nor the QUIC transport existed. `rayland-s`
-/// (Task 4) does now, but the two have never been run against each other; Task 6 is the first time a
-/// real link sits between them. The second is that (c)1's transport is genuinely undecided: ring-findings §7 concluded that **latency, not bandwidth, is
-/// what will hurt** — the reply arena was ~12x the command traffic and its replies are *round
-/// trips* the application blocks on. Whatever answers that is what implements this trait.
+/// be tested at all — when Task 3 was written neither S nor the QUIC transport existed. Task 6 has
+/// since put a real link ([`crate::link::QuicSendLink`]) behind this trait and run the two against
+/// each other, and the mock remains what keeps these tests GPU-free. It is worth recording what that
+/// division bought and what it did not: the mock tests caught real logic bugs, and **not one of the
+/// four faults Task 6 found was in this crate's logic** — every one was an assumption about Mesa or
+/// virglrenderer that only a live peer could refute.
+///
+/// The second reason is that (c)1's transport is genuinely undecided: ring-findings §7 concluded
+/// that **latency, not bandwidth, is what will hurt** — the reply arena was ~12x the command traffic
+/// and its replies are *round trips* the application blocks on. v1 puts everything on one QUIC
+/// stream, which has TCP's head-of-line behaviour; splitting the reply path onto its own stream is a
+/// change behind this trait and nowhere else. Whatever answers that is what implements it.
 ///
 /// # Contract: `send` and `recv` are not independently safe to interleave
 /// [`RelayEngine`] uses this as a strict request/reply channel: it sends, then blocks for the
@@ -107,6 +213,63 @@ pub trait RelayLink {
     fn recv(&mut self) -> Result<S2C, EngineError>;
 }
 
+/// Guarantees that everything Mesa wrote into the ring **before now** has reached S, before an
+/// inline command that depends on it is allowed to cross.
+///
+/// # The race this exists to close, and the live evidence for it
+/// **Found by (c)1 Task 6, the first run of C against a real S.** Mesa's ring protocol has an
+/// ordering rule it never states, because on one machine it cannot be broken: *the ring bytes are
+/// visible before the socket command that refers to them.* Mesa stores `tail` into shared memory and
+/// only then sends `vkWaitRingSeqnoMESA` / `vkNotifyRingMESA` on the vtest socket, so the host
+/// cannot observe the command without also observing the bytes.
+///
+/// **(c)1 breaks that rule, because C has two independent producers feeding one link:**
+///
+/// - the **vtest thread**, which relays inline commands the instant Mesa sends them — a short,
+///   direct path;
+/// - the **ring watcher**, which must first *notice* the bytes by polling `tail`, and only then
+///   relays them — a path with a poll interval in it.
+///
+/// So the socket command routinely **overtakes** the ring bytes it depends on. virglrenderer catches
+/// it and refuses to guess, which is a mercy — it kills the context outright
+/// (`vkr_ring_thread`, `vkr_ring.c`):
+///
+/// ```text
+/// vkr: vkr_ring_thread: ring seqno(7072) unable to reach wait seqno(7144)
+/// vkr: vkWaitRingSeqnoMESA resulted in CS error
+/// vkr: destroying context 1 (rayland-venus) with a valid instance
+/// ```
+///
+/// Those are real numbers from a real run: Mesa wrote 72 bytes, stored `tail = 7144`, and sent the
+/// wait; the wait arrived while S's ring still stood at 7072, and virglrenderer concluded — quite
+/// reasonably — that the driver had emitted an invalid asynchronous ring wait.
+///
+/// **This is not a timing bug to be tuned away.** Polling faster shortens the window; it cannot
+/// close it, because there is no interval at which "notice, then relay" beats "relay". The barrier
+/// restores the invariant where it was broken: on receiving an inline command, C waits until the
+/// watcher has shipped the ring as far as Mesa had written it at that moment. Since Mesa stored
+/// `tail` *before* sending the command, that frontier necessarily covers everything the command can
+/// refer to.
+///
+/// # Why this is a trait rather than a direct call
+/// [`RelayEngine`] must not know about threads, sockets or the daemon's shared state — its whole
+/// value is being testable against a mock link with none of those present. The barrier's real
+/// implementation lives in `main.rs`, where those things are; here it is a seam, and its tests use a
+/// recording stub.
+pub trait RingFlush: Send + Sync {
+    /// Block until the ring watcher has relayed everything Mesa wrote before this call.
+    ///
+    /// Must be **infallible from the caller's point of view**: it returns `()` because there is
+    /// nothing useful the engine could do with a failure. An implementation that cannot make the
+    /// guarantee (a dead watcher, a vanished S) must report the fact itself and return, rather than
+    /// block forever — the session is over either way, and hanging inside a barrier converts a
+    /// diagnosable failure into a silent one.
+    ///
+    /// Must be a **no-op before the ring exists**: `vkCreateRingMESA` is itself an inline command,
+    /// and it necessarily precedes any ring byte.
+    fn flush_ring(&self);
+}
+
 /// A [`RenderEngine`] that owns no GPU and forwards everything to S.
 ///
 /// Holds the local blob shadows for the whole session: Mesa maps those pages and writes into them,
@@ -120,6 +283,16 @@ pub struct RelayEngine<T: RelayLink> {
     /// The command ring's identity, published here the moment Mesa allocates it so the ring watcher
     /// can start work. See [`RingSlot`].
     ring: RingSlot,
+    /// The shadow awaiting the id S will assign it. Committed by the reader thread, not here — see
+    /// [`PendingBlob`] for the run-losing race that forces the split.
+    pending: PendingBlob,
+    /// The barrier that keeps an inline command from overtaking the ring bytes it refers to. See
+    /// [`RingFlush`] for the race, and the live evidence that it is not hypothetical.
+    ///
+    /// `None` means no barrier is installed, which is correct **only** where no ring watcher is
+    /// running — i.e. this module's own tests. `main.rs` always installs one; see
+    /// [`RelayEngine::set_ring_flush`].
+    flush: Option<Arc<dyn RingFlush>>,
 }
 
 impl<T: RelayLink> RelayEngine<T> {
@@ -133,7 +306,33 @@ impl<T: RelayLink> RelayEngine<T> {
             link,
             blobs: Arc::new(Mutex::new(HashMap::new())),
             ring: Arc::new(Mutex::new(None)),
+            pending: Arc::new(Mutex::new(None)),
+            // Installed by `main.rs` once the watcher's shared state exists; see `set_ring_flush`.
+            flush: None,
         }
+    }
+
+    /// A handle to the staging slot, for the daemon's reader thread.
+    ///
+    /// The reader must pair this with [`commit_pending_blob`] on every `S2C::BlobCreated`. See
+    /// [`PendingBlob`] for why the engine cannot do it itself.
+    pub fn pending(&self) -> PendingBlob {
+        Arc::clone(&self.pending)
+    }
+
+    /// Install the barrier that stops an inline command overtaking the ring bytes it refers to.
+    ///
+    /// **`main.rs` must call this**, and the consequence of forgetting is not subtle: without it,
+    /// `vkWaitRingSeqnoMESA` can reach S ahead of the delta that satisfies it, and virglrenderer
+    /// destroys the context. [`RingFlush`]'s docs carry the evidence.
+    ///
+    /// It is a setter rather than a constructor argument because of an ordering knot in the daemon's
+    /// startup: the barrier needs the blob table and the ring slot, and both are **owned by the
+    /// engine** and only reachable through [`Self::blobs`] and [`Self::ring`] once it exists. So the
+    /// engine has to be built first and told second. Leaving it unset is legitimate only where there
+    /// is no watcher to race with, which in practice means tests.
+    pub fn set_ring_flush(&mut self, flush: Arc<dyn RingFlush>) {
+        self.flush = Some(flush);
     }
 
     /// A handle to the blob shadows, for the daemon's reader thread and ring watcher.
@@ -219,12 +418,28 @@ impl<T: RelayLink> RenderEngine for RelayEngine<T> {
     /// command language, different decoder instance; routing them into the ring mirror would splice
     /// them into a byte stream they were never part of.
     ///
+    /// # The barrier, and why it is the first thing this does
+    /// Mesa stores the ring's `tail` **before** it sends the command that refers to it, and
+    /// virglrenderer relies on that ordering absolutely — a `vkWaitRingSeqnoMESA` naming a seqno S's
+    /// ring has not reached is not treated as "early", it is treated as a **broken driver** and the
+    /// context is destroyed. C's two producers (this thread, and the ring watcher) would otherwise
+    /// deliver them in whichever order won the race. See [`RingFlush`] for the live evidence.
+    ///
+    /// The barrier runs before the dword check on purpose: the check is about *this* command's
+    /// shape, while the barrier is about everything Mesa wrote *before* it. Refusing a malformed
+    /// command is no reason to leave the ring un-shipped, and the two have nothing to do with each
+    /// other.
+    ///
     /// # Failure modes
     /// [`EngineError::UnalignedCommand`] if `cmd` is not a whole number of dwords — virglrenderer
     /// counts commands in dwords and would reject it on S. Checked here so the error names the byte
     /// length, on the machine where the mistake is visible, rather than arriving as a remote
     /// rejection a network away from its cause.
     fn submit(&mut self, ctx_id: u32, cmd: &[u8]) -> Result<(), EngineError> {
+        // Everything Mesa wrote before it sent this command must be on S before this command is.
+        if let Some(flush) = &self.flush {
+            flush.flush_ring();
+        }
         if cmd.len() % 4 != 0 {
             return Err(EngineError::UnalignedCommand { len: cmd.len() });
         }
@@ -296,7 +511,18 @@ impl<T: RelayLink> RenderEngine for RelayEngine<T> {
         // routes on exactly that — see `LocalBlob::is_application_memory`.
         let (blob, fd) = LocalBlob::create(blob_id, size)?;
 
+        // **Stage the shadow before the request goes out**, so that the reader thread can commit it
+        // the instant S names it — before it reads whatever S sends next, which for a readback
+        // buffer is that blob's own pixels. See `PendingBlob`: doing this after the reply instead
+        // loses those bytes on every run, and the application reads its own zeros.
+        *self
+            .pending
+            .lock()
+            .expect("the pending blob lock is never poisoned") = Some(blob);
+
         // Now ask S for the real, GPU-backed counterpart. Only S can create it; only C can map it.
+        // By the time this returns, the reader has already moved the shadow into `blobs` under the
+        // id in the reply.
         let res_id = self.request(
             &C2S::CreateBlob {
                 blob_mem,
@@ -306,17 +532,13 @@ impl<T: RelayLink> RenderEngine for RelayEngine<T> {
             },
             "BlobCreated",
             |reply| match reply {
-                S2C::BlobCreated { res_id } => Ok(res_id),
+                // `initial` is ignored here on purpose, and it is not dropped: the reader thread has
+                // already laid those bytes into the shadow via `commit_pending_blob`, before this
+                // reply was ever forwarded. It has to be that way round — see `S2C::BlobCreated`.
+                S2C::BlobCreated { res_id, .. } => Ok(res_id),
                 other => Err(other),
             },
         )?;
-
-        // Keep the shadow alive under S's id: the mapping must outlive the resource, and every
-        // later message names the resource by exactly this id.
-        self.blobs
-            .lock()
-            .expect("the blob table lock is never poisoned")
-            .insert(res_id, blob);
 
         // Only now, with the pages actually in the table, announce the ring to the watcher. The
         // order is load-bearing: the watcher looks the ring up in the blob table the instant it
@@ -416,8 +638,9 @@ mod tests {
     /// A [`RelayLink`] that answers from a script and records everything sent.
     ///
     /// This is what makes Task 3 testable at all: when it was written there was no S to talk to.
-    /// `rayland-s` (Task 4) exists now, but nothing wires the two together until Task 6 brings the
-    /// QUIC transport, so a mock is still the only S these tests have.
+    /// Task 6 has since wired the two together over QUIC, and `rayland-s/tests/loopback_e2e.rs` is
+    /// where a real S is exercised; a mock is still the right S *here*, because these tests must run
+    /// on a machine with no GPU.
     struct MockLink {
         /// Replies handed out by `recv`, in order.
         replies: VecDeque<S2C>,
@@ -448,16 +671,130 @@ mod tests {
         }
     }
 
-    /// A blob request must produce a **usable** descriptor for Mesa, and register the shadow under
-    /// the id **S** chose — not a locally invented one.
+    /// A [`RingFlush`] that records whether it was called, and when relative to the link's traffic.
+    ///
+    /// The ordering matters more than the count, so it records the link's send-count at the moment
+    /// it ran: that is what distinguishes "the barrier fired" from "the barrier fired *before the
+    /// command crossed*", and only the second is the property worth having.
+    struct RecordingFlush {
+        /// How many times `flush_ring` was called.
+        calls: Mutex<u32>,
+        /// The number of messages already sent at each call. Empty until the first call.
+        sends_at_call: Mutex<Vec<usize>>,
+        /// The link's send log, shared so the barrier can observe it as the engine sees it.
+        sent: Arc<Mutex<Vec<C2S>>>,
+    }
+
+    impl RingFlush for RecordingFlush {
+        fn flush_ring(&self) {
+            *self.calls.lock().unwrap() += 1;
+            let sends = self.sent.lock().unwrap().len();
+            self.sends_at_call.lock().unwrap().push(sends);
+        }
+    }
+
+    /// A [`RelayLink`] that appends to a shared log, so a [`RingFlush`] can see the same history.
+    struct SharedLogLink {
+        /// Everything sent, shared with the barrier under test.
+        sent: Arc<Mutex<Vec<C2S>>>,
+    }
+
+    impl RelayLink for SharedLogLink {
+        fn send(&mut self, m: &C2S) -> Result<(), EngineError> {
+            self.sent.lock().unwrap().push(m.clone());
+            Ok(())
+        }
+        fn recv(&mut self) -> Result<S2C, EngineError> {
+            Err(EngineError::RelayLinkFailed {
+                detail: "this link never receives".into(),
+            })
+        }
+    }
+
+    /// **The regression test for (c)1 Task 6's ordering finding.**
+    ///
+    /// An inline command must not cross until the ring watcher has shipped everything Mesa wrote
+    /// before it. Mesa stores `tail` and *then* sends the socket command, and virglrenderer treats a
+    /// `vkWaitRingSeqnoMESA` whose seqno its ring has not reached as a **broken driver**, destroying
+    /// the context — it does not wait. A live run produced exactly that: `ring seqno(7072) unable to
+    /// reach wait seqno(7144)`.
+    ///
+    /// So the assertion is specifically that the barrier ran **before** the send, not merely that it
+    /// ran: a barrier that fires afterwards is decoration.
+    #[test]
+    fn an_inline_command_flushes_the_ring_before_it_crosses() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let flush = Arc::new(RecordingFlush {
+            calls: Mutex::new(0),
+            sends_at_call: Mutex::new(Vec::new()),
+            sent: Arc::clone(&sent),
+        });
+        let mut engine = RelayEngine::new(SharedLogLink {
+            sent: Arc::clone(&sent),
+        });
+        engine.set_ring_flush(Arc::clone(&flush) as Arc<dyn RingFlush>);
+
+        // `0xfd` = opcode 253 = `vkWaitRingSeqnoMESA`: the exact command that destroyed the context
+        // in the live run, and the reason this barrier exists.
+        engine.submit(1, &[0xfd, 0, 0, 0]).expect("the submit");
+
+        assert_eq!(
+            *flush.calls.lock().unwrap(),
+            1,
+            "every inline command must be preceded by a ring flush"
+        );
+        assert_eq!(
+            *flush.sends_at_call.lock().unwrap(),
+            vec![0],
+            "the flush must run BEFORE the command is sent; firing afterwards would let \
+             vkWaitRingSeqnoMESA overtake the ring delta that satisfies it, which virglrenderer \
+             treats as a broken driver and answers by destroying the context"
+        );
+        assert_eq!(sent.lock().unwrap().len(), 1, "and the command still crosses");
+    }
+
+    /// A malformed command is still refused, and the barrier still runs.
+    ///
+    /// The two are independent: the barrier is about everything Mesa wrote *before* this command,
+    /// which is no less owed to S because this particular command is the wrong shape.
+    #[test]
+    fn a_malformed_inline_command_is_refused_but_the_ring_is_still_flushed() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let flush = Arc::new(RecordingFlush {
+            calls: Mutex::new(0),
+            sends_at_call: Mutex::new(Vec::new()),
+            sent: Arc::clone(&sent),
+        });
+        let mut engine = RelayEngine::new(SharedLogLink {
+            sent: Arc::clone(&sent),
+        });
+        engine.set_ring_flush(Arc::clone(&flush) as Arc<dyn RingFlush>);
+
+        let err = engine.submit(1, &[0xbc, 0, 0]).expect_err("a refusal");
+        assert!(matches!(err, EngineError::UnalignedCommand { len: 3 }));
+        assert_eq!(*flush.calls.lock().unwrap(), 1);
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "nothing malformed may reach the wire"
+        );
+    }
+
+    /// A blob request must produce a **usable** descriptor for Mesa, adopt the id **S** chose, and
+    /// leave the shadow staged for the reader to commit under that id.
     ///
     /// The id matters more than it looks: every subsequent message naming this resource uses S's
     /// id, so a local counter that merely happened to agree today would silently address the wrong
     /// resource the moment the two drifted.
+    ///
+    /// The **staging** is (c)1 Task 6's finding: the engine deliberately does not register the
+    /// shadow itself, because by the time its reply arrives S has often already sent the blob's data
+    /// and C's reader has already dropped it for want of a shadow. See [`PendingBlob`].
     #[test]
-    fn creating_a_blob_allocates_a_local_shadow_and_adopts_s_s_resource_id() {
-        let link = MockLink::with_replies([S2C::BlobCreated { res_id: 7 }]);
+    fn creating_a_blob_stages_a_local_shadow_and_adopts_s_s_resource_id() {
+        let link = MockLink::with_replies([S2C::BlobCreated { res_id: 7, initial: Vec::new() }]);
         let mut engine = RelayEngine::new(link);
+        let pending = engine.pending();
+        let blobs = engine.blobs();
 
         let blob = engine
             .create_blob_resource(1, 2, 0, 0, 131268)
@@ -471,10 +808,44 @@ mod tests {
             blob.fd.is_some(),
             "Mesa blocks in recvmsg forever without a descriptor"
         );
-        // The shadow is registered under S's id and is the size Mesa asked for.
-        let blobs = engine.blobs();
-        let table = blobs.lock().unwrap();
-        assert_eq!(table.get(&7).expect("a shadow under S's id").size(), 131268);
+        // Staged, not yet registered: in the daemon the reader thread has already committed it by
+        // now, but nothing here plays that role, so this is the honest intermediate state.
+        assert_eq!(
+            pending.lock().unwrap().as_ref().expect("a staged shadow").size(),
+            131268
+        );
+        assert!(
+            blobs.lock().unwrap().is_empty(),
+            "the engine must not register the shadow itself; the reader commits it under S's id \
+             before it reads the blob's data, which S often sends immediately"
+        );
+
+        // What the reader does on `S2C::BlobCreated`.
+        commit_pending_blob(&pending, &blobs, blob.resource_id, &[]);
+
+        assert_eq!(
+            blobs.lock().unwrap().get(&7).expect("a shadow under S's id").size(),
+            131268
+        );
+        assert!(
+            pending.lock().unwrap().is_none(),
+            "the staging slot must be empty again, or the next blob's commit would find this one"
+        );
+    }
+
+    /// A `BlobCreated` with nothing staged must be ignored rather than panic.
+    ///
+    /// It means S answered a request C never made — S's protocol error. This runs on the **reader
+    /// thread**, which is the one thing that delivers every reply and writes every byte S sends, so
+    /// panicking here would end the session over a message that harms nothing by being dropped.
+    #[test]
+    fn committing_with_nothing_staged_is_ignored() {
+        let pending: PendingBlob = Arc::new(Mutex::new(None));
+        let blobs: BlobTable = Arc::new(Mutex::new(HashMap::new()));
+
+        commit_pending_blob(&pending, &blobs, 7, &[]);
+
+        assert!(blobs.lock().unwrap().is_empty());
     }
 
     /// Allocating the ring must publish its identity, because the watcher has no other way to learn
@@ -484,7 +855,7 @@ mod tests {
     /// published under must be **S's**, since that is what every `RingDelta` will be addressed to.
     #[test]
     fn allocating_the_ring_publishes_its_identity_for_the_watcher() {
-        let link = MockLink::with_replies([S2C::BlobCreated { res_id: 4 }]);
+        let link = MockLink::with_replies([S2C::BlobCreated { res_id: 4, initial: Vec::new() }]);
         let mut engine = RelayEngine::new(link);
         let ring = engine.ring();
         assert_eq!(
@@ -513,7 +884,7 @@ mod tests {
     #[test]
     fn allocating_a_non_ring_blob_does_not_publish_a_ring() {
         // The 1 MiB reply arena from the live capture.
-        let link = MockLink::with_replies([S2C::BlobCreated { res_id: 2 }]);
+        let link = MockLink::with_replies([S2C::BlobCreated { res_id: 2, initial: Vec::new() }]);
         let mut engine = RelayEngine::new(link);
         let ring = engine.ring();
 
@@ -529,7 +900,7 @@ mod tests {
     /// (ring-findings §6), so corrupting it would destroy information S cannot recover.
     #[test]
     fn a_blob_request_reaches_s_with_its_fields_intact() {
-        let link = MockLink::with_replies([S2C::BlobCreated { res_id: 3 }]);
+        let link = MockLink::with_replies([S2C::BlobCreated { res_id: 3, initial: Vec::new() }]);
         let mut engine = RelayEngine::new(link);
 
         // The app's 64-byte vertex buffer from the live capture: blob_id 16, i.e. non-zero, i.e.
@@ -613,7 +984,7 @@ mod tests {
     #[test]
     fn a_reply_that_does_not_answer_the_request_is_refused() {
         // A blob id where a capset was due.
-        let link = MockLink::with_replies([S2C::BlobCreated { res_id: 1 }]);
+        let link = MockLink::with_replies([S2C::BlobCreated { res_id: 1, initial: Vec::new() }]);
         let mut engine = RelayEngine::new(link);
 
         let err = engine.venus_capset(0).expect_err("a refusal");
@@ -669,12 +1040,15 @@ mod tests {
     /// sit in S's resource table for the whole session.
     #[test]
     fn unref_drops_the_local_shadow_and_tells_s() {
-        let link = MockLink::with_replies([S2C::BlobCreated { res_id: 9 }]);
+        let link = MockLink::with_replies([S2C::BlobCreated { res_id: 9, initial: Vec::new() }]);
         let mut engine = RelayEngine::new(link);
         let blobs = engine.blobs();
+        let pending = engine.pending();
         engine
             .create_blob_resource(1, 2, 0, 0, 4096)
             .expect("a blob");
+        // Stand in for the reader thread, which commits the staged shadow on `S2C::BlobCreated`.
+        commit_pending_blob(&pending, &blobs, 9, &[]);
         assert!(
             blobs.lock().unwrap().contains_key(&9),
             "the shadow exists before the unref"

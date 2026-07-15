@@ -171,6 +171,25 @@ pub enum C2S {
     },
 }
 
+/// A contiguous run of bytes at an offset within a blob.
+///
+/// The unit S's return path speaks in. It exists as a named type because [`S2C::BlobCreated`] must
+/// carry *several* of them — see that variant for why a blob's initial contents cannot follow as
+/// separate messages — while [`S2C::BlobData`] carries one inline. Both mean the same thing: *these
+/// bytes, at this offset, are bytes C does not have.*
+///
+/// The grain is deliberately the **run**, never the page. Spec §7.2 amended itself to say so during
+/// Task 5b: S finds these by comparison, and a comparison is byte-granular for free, so a page-grain
+/// run would carry S's stale copy of whatever the application owns in the rest of that page and
+/// clobber the app's own fresh writes to it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobRun {
+    /// Byte offset within the blob where `bytes` begins.
+    pub offset: u64,
+    /// The bytes themselves.
+    pub bytes: Vec<u8>,
+}
+
 /// Messages travelling **S → C**: the GPU's side of the conversation.
 ///
 /// S is the strong machine: real GPU, real display, a live virglrenderer/Venus engine.
@@ -185,12 +204,38 @@ pub enum S2C {
         bytes: Vec<u8>,
     },
 
-    /// The S-side resource id assigned to a [`C2S::CreateBlob`]. C records this id and
-    /// attaches it to all future [`C2S::BlobData`] / [`C2S::RingDelta`] messages for the
-    /// same blob so S can find the matching resource.
+    /// The S-side resource id assigned to a [`C2S::CreateBlob`], **and whatever is already in the
+    /// blob**. C records this id and attaches it to all future [`C2S::BlobData`] /
+    /// [`C2S::RingDelta`] messages for the same blob so S can find the matching resource.
+    ///
+    /// # Why the contents ride along instead of following as an [`S2C::BlobData`]
+    /// **(c)1 Task 6's finding, and the last thing between a working relay and a blank picture.** A
+    /// blob can be born with data already in it: Mesa creates a blob resource lazily, at
+    /// `vkMapMemory`, so a readback buffer's blob only comes into existence *after*
+    /// `vkCmdCopyImageToBuffer` has already filled it. S's very first sight of those pages is the
+    /// finished frame.
+    ///
+    /// Sending that frame as a following `BlobData` **loses the race, every time**. This reply is
+    /// what unblocks C's vtest thread, which immediately hands Mesa the blob's descriptor; Mesa
+    /// `mmap`s it and returns the pointer, and the application reads it — all while C's reader thread
+    /// is still getting to the next message. The application therefore reads its own untouched zeros
+    /// and writes a fully transparent PNG, across a network that carried every command perfectly.
+    ///
+    /// There is no ordering of two messages that fixes this, because the gap is not between the two
+    /// messages — it is between *this* message and Mesa's `mmap`. So the contents must be **in** it:
+    /// C applies `initial` and only then answers Mesa, which makes "the descriptor is valid" and
+    /// "the descriptor's pages are correct" the same event, exactly as they are on one machine.
+    ///
+    /// Empty for a genuinely fresh blob, which is the common case — C's shadow is a new zero-filled
+    /// memfd and so is S's, so there is nothing to say.
     BlobCreated {
         /// The engine-assigned resource id.
         res_id: u32,
+        /// The runs of bytes already present in the blob when S created it, which C must lay into
+        /// its shadow **before** letting Mesa map it. Runs, not the whole blob, for the reason
+        /// [`S2C::BlobData`] carries an `offset`: S ships the bytes it has, not the pages holding
+        /// them.
+        initial: Vec<BlobRun>,
     },
 
     /// The contents of a blob that **S wrote**, sent S → C. This is how C's local Mesa
