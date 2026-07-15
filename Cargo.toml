@@ -10,6 +10,7 @@ members = [
     "crates/rayland-server",         # off-screen Vulkan renderer (this task)
     "crates/rayland-client",         # client: builds and sends the triangle stream (this task)
     "crates/rayland-transport",      # QUIC transport foundation + loopback spike (SP2 Task 1)
+    "crates/rayland-vtest",          # the Venus vtest wire protocol + command-ring knowledge; no GPU deps ((c)1 Task 1)
     "crates/rayland-engine",         # S-side render engine: FFI-embedded libvirglrenderer + Venus context (C0 Task 1)
     "crates/rayland-refapp",         # C0's unmodified reference app: a plain offscreen Vulkan triangle (C0 Task 4b)
 ]
@@ -19,12 +20,14 @@ members = [
 serde = { version = "1", features = ["derive"] }   # (de)serialization derives for wire types
 postcard = { version = "1", features = ["use-std"] }  # compact, deterministic, pure-Rust wire format
 thiserror = "2"                      # precise error enums for library crates
-# Raw POSIX bindings. Needed by `rayland-engine` for the four syscalls the vtest wire protocol
+# Raw POSIX bindings. Needed by `rayland-vtest` for the four syscalls the vtest wire protocol
 # requires but `std` does not expose: `sendmsg` (SCM_RIGHTS fd passing), `memfd_create`+`mmap`
 # (server-allocated blob shared memory), and `eventfd` (the pollable VCMD_SYNC_WAIT reply fd).
 # Chosen over `nix`/`sendfd` because libc is already in this workspace's dependency graph
 # (transitively, via ash/quinn/tokio), adds no new crates to audit, and the four call sites are
-# small enough to keep the `unsafe` reviewable in one file (`rayland-engine/src/transport.rs`).
+# small enough to keep the `unsafe` reviewable in one file (`rayland-vtest/src/transport.rs`).
+# Note these are *syscalls*, not GPU calls: depending on libc costs `rayland-vtest` nothing on the
+# GPU-less machine C is meant to be.
 libc = "0.2"
 anyhow = "1"                         # ergonomic top-level errors for binary crates
 ash = "0.38"                         # thin Vulkan bindings (used by the server)

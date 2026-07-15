@@ -204,7 +204,7 @@ impl VtestTransport for UnixStream {
 /// # Failure modes
 /// - [`EngineError::ShmCreateFailed`] if `memfd_create` or `ftruncate` fails (typically
 ///   `ENOMEM`, or an `RLIMIT_NOFILE`/memlock limit).
-pub(crate) fn create_memfd(size: u64) -> Result<OwnedFd, EngineError> {
+pub fn create_memfd(size: u64) -> Result<OwnedFd, EngineError> {
     // A debug name; the kernel shows it as `/memfd:rayland-blob (deleted)` in `/proc/*/maps`,
     // which is worth having when diagnosing a live client's mappings. It is not an identifier —
     // memfd names need not be unique.
@@ -254,13 +254,21 @@ pub(crate) fn create_memfd(size: u64) -> Result<OwnedFd, EngineError> {
 /// mapping's lifetime to a Rust value the engine stores alongside the resource — and unrefing the
 /// resource *before* this drops — is what makes that ordering structural rather than a comment
 /// someone must remember.
-pub(crate) struct ShmMapping {
+pub struct ShmMapping {
     /// Start of the mapping. Never null (`mmap` failure is turned into an error at construction).
     ptr: *mut c_void,
     /// Mapping length in bytes, needed verbatim by `munmap`.
     len: usize,
 }
 
+// `len` below reports a fixed mapping size, not a collection's element count, so clippy's usual
+// "a public `len` wants an `is_empty`" pairing does not apply: `map` rejects a zero-sized mapping
+// outright (`mmap` itself returns EINVAL for one), so an `is_empty` here could only ever return a
+// constant `false` — a method that answers a question no caller has, and implies this type might
+// sometimes be empty when by construction it never is. Silencing the lint is the honest option.
+// The lint only began firing at all when (c)1 Task 1 widened these methods from `pub(crate)` to
+// `pub` for the crate split; nothing about the type itself changed.
+#[allow(clippy::len_without_is_empty)]
 impl ShmMapping {
     /// Maps all `size` bytes of `fd` shared and read/write, for handing to virglrenderer as an
     /// iovec.
@@ -278,7 +286,7 @@ impl ShmMapping {
     /// # Failure modes
     /// - [`EngineError::ShmMapFailed`] if `mmap` fails, or if `size` is 0 (which `mmap` rejects
     ///   with `EINVAL` anyway; reported honestly rather than papered over with a 1-page mapping).
-    pub(crate) fn map(fd: BorrowedFd<'_>, size: u64) -> Result<Self, EngineError> {
+    pub fn map(fd: BorrowedFd<'_>, size: u64) -> Result<Self, EngineError> {
         // `size` originates from an untrusted client's wire message; it must fit this platform's
         // address space before we ask the kernel for a mapping of it.
         let len = usize::try_from(size).map_err(|_| EngineError::ShmMapFailed {
@@ -312,12 +320,12 @@ impl ShmMapping {
     /// The mapping's base address, for filling in the `iov_base` of the iovec handed to
     /// virglrenderer. The pointer is valid for exactly as long as this `ShmMapping` lives — which
     /// is the invariant [`ShmMapping`]'s doc comment explains the resource lifecycle around.
-    pub(crate) fn as_ptr(&self) -> *mut c_void {
+    pub fn as_ptr(&self) -> *mut c_void {
         self.ptr
     }
 
     /// The mapping's length in bytes, for the iovec's `iov_len`.
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.len
     }
 }

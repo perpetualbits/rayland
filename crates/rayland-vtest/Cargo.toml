@@ -1,0 +1,28 @@
+# The Mesa **Venus vtest** wire protocol, and this repository's knowledge of Venus's command ring.
+#
+# Split out of `rayland-engine` by (c)1 Task 1 for one structural reason: `rayland-engine`
+# FFI-links `libvirglrenderer`, a GPU stack, and Rayland's **C** side (where the *application*
+# runs) speaks this protocol but must never need a GPU. C is by design the weak machine —
+# headless, possibly a different CPU architecture. This crate therefore has **no GPU
+# dependencies**, and `tests/no_gpu_linkage.rs` enforces that mechanically rather than by
+# convention.
+#
+# This is a LIBRARY crate (no `main`), so per the repository license policy it is
+# LGPL-3.0-or-later (binaries in the workspace are GPL-3.0-or-later).
+[package]
+name = "rayland-vtest"                                                         # workspace / crates.io package name
+version = "0.0.1"                                                              # pre-release; arc (c) walking skeleton, not a stable API
+edition = "2024"                                                               # Rust 2024 edition, per repo convention
+rust-version = "1.85"                                                          # minimum toolchain that supports edition 2024
+description = "Mesa Venus vtest wire protocol and command-ring knowledge. No GPU dependencies."  # one-line purpose
+license = "LGPL-3.0-or-later"                                                  # library crate → LGPL per repo policy
+repository = "https://github.com/perpetualbits/rayland"                        # upstream source location
+
+[dependencies]
+thiserror = { workspace = true }   # precise, typed error enum (EngineError) mapping every failure
+# The POSIX syscalls the vtest protocol needs but `std` does not expose: `sendmsg` (SCM_RIGHTS fd
+# passing to a live Mesa Venus client), `memfd_create`/`mmap`/`munmap` (blob shared memory), and
+# `eventfd` (the pollable VCMD_SYNC_WAIT reply fd). See the workspace manifest for why libc rather
+# than nix/sendfd. Note this is a *syscall* dependency, not a GPU one: libc is present on every
+# target C could run on, including a headless RISC-V box.
+libc = { workspace = true }

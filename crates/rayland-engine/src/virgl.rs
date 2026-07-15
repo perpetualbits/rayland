@@ -23,14 +23,19 @@
 //! 2. `virgl_renderer_transfer_read_iov`/`transfer_write_iov` must be called with `ctx_id = 0`, not
 //!    the resource's real (Venus) owning context — the render-server proxy does not support them.
 
-// The raw FFI surface (constants, structs, C functions, callbacks).
+// The raw FFI surface (constants, structs, C functions, callbacks). The one module still in this
+// crate, because it is the one that names the C library.
 use crate::ffi;
-// The typed error every C return code maps into, and the errno→name helper its messages use.
-use crate::error::{EngineError, errno_name};
-// The POSIX primitives a blob resource's shared memory needs (`std` exposes none of them).
-use crate::transport::{ShmMapping, create_memfd};
-// The trait this engine implements.
-use crate::RenderEngine;
+// The typed error every C return code maps into, and the errno→name helper its messages use. Now
+// across a crate boundary ((c)1 Task 1): the error type is protocol-level, not GPU-level, so it
+// lives with the protocol.
+use rayland_vtest::error::{EngineError, errno_name};
+// The POSIX primitives a blob resource's shared memory needs (`std` exposes none of them). These
+// are plain syscalls, not GPU calls, which is why they live in `rayland-vtest` — the vtest protocol
+// needs the same memfd/mmap machinery on a machine with no GPU at all.
+use rayland_vtest::transport::{ShmMapping, create_memfd};
+// The trait this engine implements, and the two data types its methods hand back.
+use rayland_vtest::{BlobResource, EngineFrame, RenderEngine};
 // Raw C string / char for the context debug label.
 use std::ffi::{CString, c_char, c_int, c_void};
 // Resource-id -> context-id tracking (Task 3): which context a resource was attached to, so
@@ -50,66 +55,6 @@ use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 /// Process-global "an engine is initialized" flag. virglrenderer is a global singleton, so this
 /// serializes the whole init→use→cleanup lifecycle to one engine at a time. `false` = no engine.
 static ENGINE_ACTIVE: AtomicBool = AtomicBool::new(false);
-
-/// A blob resource that was just created, and the file descriptor the vtest client must receive
-/// for it — the result of [`RenderEngine::create_blob_resource`].
-///
-/// # Why the fd is part of the result (Task 4a)
-/// Tasks 2/3 returned a bare `u32` resource id, which was not merely incomplete but *unusable*: a
-/// blob is shared memory, and the client cannot use memory it has no descriptor for. It blocks in
-/// `recvmsg` until the descriptor arrives. This type is what lets the engine express "here is the
-/// resource, and here is the descriptor that makes it real to the client".
-///
-/// # Ownership contract (read this before touching the fd)
-/// The `fd` is **owned by the receiver of this struct** and is closed when it drops. The intended
-/// lifecycle, which mirrors virglrenderer's own vtest server exactly, is:
-/// 1. write the in-band `[len=1][VCMD_RESOURCE_CREATE_BLOB][res_id]` reply,
-/// 2. `send_fd(fd.as_fd())` — the kernel *duplicates* the descriptor into the client, so this
-///    borrows rather than consumes it,
-/// 3. drop it (the C server's `close(fd)` at the same point).
-///
-/// Dropping the fd does **not** release the resource, and does not unmap anything: for a
-/// `GUEST`-family blob the pages stay alive because the *engine* holds a mapping of them for the
-/// resource's lifetime (see `VirglEngine::create_blob_resource`), and for a `HOST3D` blob the
-/// memory belongs to the 3D driver. The resource itself is released only by
-/// [`RenderEngine::unref_resource`] (or `Drop` of the engine). "Closing the file descriptor does
-/// not unmap the region", as virglrenderer's own comment at this exact step puts it.
-#[derive(Debug)]
-pub struct BlobResource {
-    /// The engine-assigned resource id, which the in-band reply reports to the client.
-    pub resource_id: u32,
-    /// The descriptor the client must receive over `SCM_RIGHTS` in order to `mmap` this blob's
-    /// memory.
-    ///
-    /// `None` means "this blob has no client-visible descriptor". [`VirglEngine`] never produces
-    /// that — both blob paths it serves always yield one — but the type admits it so that an engine
-    /// implementation which genuinely cannot supply an fd is *forced* to say so, and the vtest
-    /// layer can turn it into a typed [`EngineError::BlobFdMissing`] instead of leaving a live
-    /// client hanging on a descriptor that is never coming.
-    pub fd: Option<OwnedFd>,
-}
-
-/// A CPU-side copy of a rendered resource's pixels, produced by [`RenderEngine::read_back`].
-///
-/// `pixels` is always **tightly packed**: exactly `width * height * bytes_per_pixel(format)`
-/// bytes, one row immediately after another with no padding, regardless of the GPU resource's
-/// real row stride (`read_back` strips that padding — see its doc comment). `format` is the raw
-/// `VIRGL_FORMAT_*` code virglrenderer reported for the resource (pinned from
-/// `virgl_renderer_resource_get_info`, never guessed), so callers can interpret the byte layout
-/// correctly (e.g. `VIRGL_FORMAT_B8G8R8A8_UNORM = 1` is `[B, G, R, A]` per pixel, little-endian
-/// byte order).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EngineFrame {
-    /// Image width in pixels.
-    pub width: u32,
-    /// Image height in pixels.
-    pub height: u32,
-    /// Tightly-packed pixel bytes, `width * height * bytes_per_pixel(format)` long.
-    pub pixels: Vec<u8>,
-    /// The raw `VIRGL_FORMAT_*` code (from `virgl_renderer_resource_get_info`) describing how to
-    /// interpret `pixels`.
-    pub format: u32,
-}
 
 /// How long [`VirglEngine`]'s fence-wait poll loop (used by `read_back`) waits for a fence to
 /// retire before giving up. Generous for varied/loaded hardware while still bounding a hang if

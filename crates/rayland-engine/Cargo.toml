@@ -14,18 +14,25 @@ license = "LGPL-3.0-or-later"                                                 # 
 repository = "https://github.com/perpetualbits/rayland"                       # upstream source location
 
 [dependencies]
-thiserror = { workspace = true }   # precise, typed error enum (EngineError) mapping every C return code
-# The POSIX syscalls the vtest protocol needs but `std` does not expose: `sendmsg` (SCM_RIGHTS fd
-# passing to a live Mesa Venus client), `memfd_create`/`mmap`/`munmap` (server-allocated blob
-# shared memory), and `eventfd` (the pollable VCMD_SYNC_WAIT reply fd). See the workspace manifest
-# for why libc rather than nix/sendfd.
-libc = { workspace = true }
+# The vtest wire protocol, the `RenderEngine`/`VtestTransport` traits, `EngineError`, and the
+# Venus command-ring knowledge — everything C0 kept here that does *not* touch a GPU. (c)1 Task 1
+# moved it out so Rayland's C side can depend on the protocol without dragging in this crate's
+# `libvirglrenderer` link; the dependency arrow points this way and must never be reversed.
+rayland-vtest = { path = "../rayland-vtest" }
+# `thiserror` and `libc` are deliberately absent: the error enum and the POSIX syscalls both left
+# with `rayland-vtest`, and this crate reaches them through it. `virgl.rs` needs no raw syscalls of
+# its own — it uses `rayland_vtest::transport`'s `ShmMapping`/`create_memfd` for blob memory.
 
 [dev-dependencies]
 # `refapp_venus_e2e.rs` decodes the two PNGs the reference app writes (native and Venus-rendered)
 # and compares them pixel by pixel. A dev-dependency only: nothing in the engine itself touches
 # images — the engine moves command streams, not pictures.
 image = { workspace = true }
+# `live_socket.rs` plays the *client* half of the vtest protocol: it must `recvmsg` the SCM_RIGHTS
+# descriptor the server sends, which `std` cannot express. A dev-dependency only — until (c)1 Task 1
+# this test borrowed the engine's own `libc`, which left it looking as though the *engine* needed
+# raw syscalls after its protocol code had moved to `rayland-vtest`. It does not; only this test does.
+libc = { workspace = true }
 
 [build-dependencies]
 # `pkg-config` locates the installed `libvirglrenderer` (its `.so` and, for the record, its

@@ -69,7 +69,7 @@ Wayland/Vulkan/GPU-remoting — must painstakingly verify **every line** for cor
 
 ## Repository status and layout
 
-A Cargo workspace of seven crates. Each declares its own license per the policy below
+A Cargo workspace of eight crates. Each declares its own license per the policy below
 (library → LGPL, application/binary → GPL); all are `v0.0.x` and pre-stable.
 
 - **`crates/rayland`** — the published placeholder that reserves the crates.io name; the
@@ -82,10 +82,19 @@ A Cargo workspace of seven crates. Each declares its own license per the policy 
   presents it (PNG / `wl_shm` window / zero-copy dmabuf). GPL.
 - **`crates/rayland-transport`** — QUIC transport: synchronous stream adapters over a
   `quinn` connection (SP2). LGPL.
+- **`crates/rayland-vtest`** — the **vtest** wire protocol Mesa's Venus ICD speaks, the
+  `RenderEngine` / `VtestTransport` traits, `EngineError`, and `venus_ring/` — the
+  repository's knowledge of Mesa's command ring. **Has no GPU dependencies, by
+  construction:** only `libc` and `thiserror`. Rayland's **C** side speaks this protocol
+  but must never link a GPU stack (C is the weak, possibly headless, possibly RISC-V
+  machine), so `tests/no_gpu_linkage.rs` asserts `rayland-engine` is absent from this
+  crate's dependency tree. **The dependency arrow points `rayland-engine` →
+  `rayland-vtest`, and must never be reversed.** LGPL.
 - **`crates/rayland-engine`** — **the real engine (arc (c)).** FFI-embeds
-  `libvirglrenderer` behind the `RenderEngine` trait, and implements the **vtest** wire
-  protocol Mesa's Venus ICD speaks, driving a Venus context on S's GPU. Also holds
-  `venus_ring/` — the repository's knowledge of Mesa's command ring. LGPL.
+  `libvirglrenderer` behind `rayland-vtest`'s `RenderEngine` trait, driving a Venus
+  context on S's GPU. Since (c)1 Task 1 this crate is *only* the GPU: the `ffi`
+  declarations and the `VirglEngine` that drives them. It re-exports `rayland-vtest`'s
+  types, so its public paths are unchanged. LGPL.
 - **`crates/rayland-refapp`** — C0's captured workload: an **ordinary** offscreen Vulkan
   triangle program with **zero `rayland-*` dependencies** and no knowledge of remoting.
   Its value is that it is boring and typical; keep it that way. GPL, `publish = false`.

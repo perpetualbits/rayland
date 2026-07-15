@@ -412,11 +412,15 @@ pub enum EngineError {
     },
 
     /// A `RenderEngine` implementation returned a [`crate::BlobResource`] with no file descriptor,
-    /// but the client is waiting for one. Unreachable for [`crate::VirglEngine`] (both of its blob
-    /// paths always produce a descriptor); this variant is what turns a *different* engine
+    /// but the client is waiting for one. Unreachable for `rayland-engine`'s `VirglEngine` (both of
+    /// its blob paths always produce a descriptor); this variant is what turns a *different* engine
     /// implementation's mistake into a clear error instead of a client hang, since writing the
     /// in-band reply and then simply not sending an fd is indistinguishable, from the client's
     /// side, from the server having crashed.
+    ///
+    /// `VirglEngine` is named in prose rather than linked deliberately: this crate must not depend
+    /// on `rayland-engine` (see `tests/no_gpu_linkage.rs`), so there is no such link to make — the
+    /// unresolvable doc link is the crate boundary doing its job.
     #[error(
         "the engine created blob resource {resource_id} without a file descriptor, but the vtest client requires one"
     )]
@@ -434,7 +438,7 @@ pub enum EngineError {
 /// - `rc`: the raw return code from a `virgl_renderer_*` call (treated by absolute value, since
 ///   these functions variously return positive or negative errnos).
 /// - Returns an owned `String` like `"EINVAL"` or `"os error 22"`.
-pub(crate) fn errno_name(rc: c_int) -> String {
+pub fn errno_name(rc: c_int) -> String {
     // Normalize sign: virglrenderer returns errnos both as +22 (context create) and, elsewhere,
     // as negatives; `std::io::Error` wants the positive errno.
     let errno = rc.unsigned_abs() as i32;
