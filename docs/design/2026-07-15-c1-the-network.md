@@ -260,8 +260,10 @@ and v1 relays the ring as opaque bytes without parsing them. The only boundary v
 observe is **its own relay event** — i.e. "we are about to ship ring bytes to S". So:
 
 - **C→S:** before shipping a ring delta, ship every mapped blob whose shadow is dirty.
-- **S→C:** after S reports the replayed batch retired, ship back every mapped blob the GPU may have
-  written.
+- **S→C:** ~~after S reports the replayed batch retired, ship back every mapped blob the GPU may have
+  written.~~ **RETRACTED 2026-07-15 — see §7.2. The S→C half was both incomplete (it never carried
+  the reply arena at all) and unsound (it is a last-writer-wins race). The corrected rule: S ships
+  back exactly the pages S actually wrote.**
 
 This is deliberately over-eager: it syncs blobs that may not have changed, and it syncs on relays
 that contain no submit at all. That is the intended cost. **The precision upgrade is already in
@@ -273,6 +275,52 @@ than debug that.
 **Why this is honest rather than lazy:** it is *correct* for any app, and its cost is *visible*.
 The alternative — guessing at an optimization before we have numbers — is how projects acquire
 subtle corruption bugs.
+
+### 7.2 The S→C rule, corrected: ship what S wrote, not what S owns
+
+**Added 2026-07-15, after Task 5.** The original S→C rule above was wrong twice over, and both
+faults were mine rather than an implementer's.
+
+**It never carried the reply arena.** §5's channel 2 lists the arena as S→C traffic, but no task
+owned it, so nothing shipped it. The symptom is not the hang one might expect: `head` *does* advance
+from `S2C::RingProgress`, so `vn_ring_wait_seqno` returns and the application is **released onto an
+arena that is still zeros**. `vn_instance_init_renderer_versions` reads `instance_version = 0`,
+fails the `VN_MIN_RENDERER_VERSION` check, and `vkCreateInstance` fails. **Silent garbage, not a
+stall** — worth knowing before debugging it.
+
+**And "every blob the GPU *may* have written" is a last-writer-wins race.** S ships back app blobs
+its GPU never touched — vertex and uniform buffers, the common case. Concretely: the app memcpys
+frame N+1's vertices into `res=3`; S's poll fires on head movement from frame N and ships S's
+**stale** `res=3`; C's reader overwrites the app's fresh vertices; C then relays the stale bytes
+back. Invisible in the refapp, which writes its vertices exactly once — which is precisely why every
+test passed.
+
+**A rejected fix, recorded because it is the attractive one.** Identify the arena by decoding
+`vkSetReplyCommandStreamMESA` (opcode 178) out of the ring. It is **silently unsound**: 178 is
+emitted before *every* reply-bearing command (`vn_ring_submit_command` → `vn_ring_set_reply_shmem_locked`,
+`vn_ring.c:711-715`), so all but the first sit behind the decoder's stop point at the unsizeable
+`vkCreateInstance`; and when the 1 MiB reply pool fills, `vn_renderer_shmem_pool_grow_locked`
+(`vn_renderer_util.c:70-96`) mints a **new `res_id`**. C0 measured 48820 bytes of reply traffic, so
+the refapp never grows the pool — this would have passed every test we have and corrupted the first
+longer session, with S shipping a dead arena while the app read a live one. **Not a decoding bug: a
+correct decode of an incomplete picture, which is worse, because there is no bug to find.**
+
+**THE RULE: S ships back exactly the pages S wrote.** Stop asking *"whose memory is this?"* and ask
+*"did I write it?"* — on one machine every byte S writes is instantly visible to C, so ownership
+predicates are a *guess* at that relationship while observed writes **are** it. Mechanically: S
+snapshots each blob after applying an inbound `C2S::BlobData` (so C's own writes never count as S's),
+diffs page-granular at retirement, and ships changed pages via `BlobData`'s existing `offset` field.
+Rings are excluded by `res_id` — S already holds them, and `RingDelta`/`RingProgress` own those
+bytes. That exclusion is **structural, not heuristic**.
+
+This is the same epistemological move as §5.1's out-of-line dword scan: **a predicate over bytes,
+not a reading of them.** §7's "no decoding the ring to make a correctness decision" survives intact.
+
+What falls out, with no knowledge of what any blob *is*: the arena ships (blocker gone); the staging
+pool never does (no wiped recording); app buffers never do (race gone); the readback ships, because
+the GPU genuinely wrote it. It is immune to the reply pool growing, to the shmem cache recycling ids,
+and to Venus adding a fourth internal shmem tomorrow. The cost — roughly 2k page compares per
+retirement, worst case — is exactly the kind of honest, measurable slowness §6 and §8 ask v1 for.
 
 ### 7.1 Where the presented pixels come from — and why it is not zero-copy
 
