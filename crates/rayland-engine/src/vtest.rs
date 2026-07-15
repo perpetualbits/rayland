@@ -571,10 +571,21 @@ fn decode_submit_cmd2(p: &[u32]) -> Result<VtestCommand, EngineError> {
     }
     let batch_count = p[0] as usize;
     // Bound the batch headers: 1 count dword + 8 dwords per batch must fit in the payload. This
-    // both rejects a lie and prevents the indexing below from panicking. (Multiplication is on
-    // usize; a malicious `batch_count` near `u32::MAX` cannot overflow usize on 64-bit and would
-    // fail this check anyway since the payload is bounded to 64 MiB.)
-    let headers_end = 1 + batch_count * 8;
+    // both rejects a lie and prevents the indexing below from panicking. `batch_count` is
+    // attacker-controlled (it comes straight off the wire), so the multiplication is `checked_mul`
+    // rather than bare `*` — matching the neighbouring `cmd_offset.checked_add(cmd_size)` and
+    // `sync_count.checked_mul(3)` below, which take the same care with the same kind of untrusted
+    // arithmetic. On today's 64-bit targets this can only overflow if `batch_count` is already so
+    // large it could never fit in the (64 MiB-bounded) payload anyway, but a 32-bit target has no
+    // such margin, and leaving this one instance as bare arithmetic would silently contradict the
+    // checked style the rest of this function uses for exactly this reason.
+    let headers_end = 1usize
+        .checked_add(
+            batch_count
+                .checked_mul(8)
+                .ok_or_else(|| protocol_err("SUBMIT_CMD2: batch_count*8 overflow"))?,
+        )
+        .ok_or_else(|| protocol_err("SUBMIT_CMD2: 1+batch_count*8 overflow"))?;
     if headers_end > p.len() {
         return Err(protocol_err(format!(
             "SUBMIT_CMD2: {batch_count} batch headers do not fit in a {}-dword payload",

@@ -20,7 +20,8 @@
 //!
 //! The consequence for Rayland's architecture is direct: [`crate::RenderEngine::submit`] — the path
 //! the vtest socket feeds — never sees a single application Vulkan command. It sees the ring's
-//! *address* and then a series of pokes. A network transport (SP2's QUIC work) cannot simply
+//! *address* and then a series of pokes. A network transport for this path — (c)1's job, since SP2
+//! is complete arc-(s) work carrying the unrelated hand-rolled `postcard` protocol — cannot simply
 //! forward the socket; it must carry the ring's bytes and synthesize the ring's *handshake* on both
 //! ends, because the client polls `head` while the host writes it. That is bidirectional state, not
 //! one-way streaming.

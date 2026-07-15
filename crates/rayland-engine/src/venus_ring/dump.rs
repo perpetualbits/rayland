@@ -379,8 +379,13 @@ fn sample_watched(w: &mut Watched) {
     // Track how far into the mapping non-zero data has ever reached.
     for i in (0..w.dwords).rev() {
         if snap[i] != 0 {
-            let hw = w.high_water_dword.unwrap_or(0);
-            if i > hw {
+            // `None` means "no non-zero dword observed yet", which is distinct from "the highest
+            // one so far was index 0" — collapsing the two with `unwrap_or(0)` would make a mapping
+            // whose *only* ever-non-zero dword is index 0 register as never-seen (`0 > 0` is
+            // false), and `report_watched` would then print the false claim that the mapping was
+            // zero at every sample. `is_none_or` keeps the two cases distinct: a `None` always
+            // updates, and a `Some` updates only on a strictly higher index.
+            if w.high_water_dword.is_none_or(|hw| i > hw) {
                 w.high_water_dword = Some(i);
             }
             break;

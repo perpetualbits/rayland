@@ -482,7 +482,7 @@ app has is a 1008-byte SPIR-V module**, nowhere near 8192.
 > threshold is a per-submission byte count, not a property of the workload class. Any real
 > application — non-trivial SPIR-V, large descriptor writes, a big `vkCmdUpdateBuffer`, or simply a
 > longer command buffer — crosses 8192 routinely, and the ring becomes *pointers into other
-> shmems*. **Anything in (c)1/SP2 that assumes otherwise is correct only for triangles.**
+> shmems*. **Anything in (c)1 that assumes otherwise is correct only for triangles.**
 
 **The trap 4b found, which is exactly the shape of mistake this will cause.** Venus *does* stage
 command-buffer recording into a **separate 8 MiB shmem** (`res=4`), and the agent found its app's

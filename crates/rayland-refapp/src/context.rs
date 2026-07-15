@@ -89,7 +89,16 @@ impl VulkanContext {
         // works" is the right policy here and not laziness: this program is a fixture whose job is
         // to render on whatever device the environment put in front of it, so any cleverness about
         // picking the *best* GPU would actively work against its purpose.
-        let physical_devices = unsafe { instance.enumerate_physical_devices() }?;
+        let physical_devices = match unsafe { instance.enumerate_physical_devices() } {
+            Ok(physical_devices) => physical_devices,
+            Err(error) => {
+                // Same reasoning as the queue-family and device-creation failures below: no
+                // `VulkanContext` exists yet, so this error path owns the instance and must free it
+                // itself, rather than leaving that inconsistent with its two neighbours.
+                unsafe { instance.destroy_instance(None) };
+                return Err(error.into());
+            }
+        };
         let (physical_device, queue_family_index) = physical_devices
             .iter()
             .find_map(|&pd| {
@@ -150,7 +159,11 @@ impl Drop for VulkanContext {
     /// Nothing here can fail or be reported: `Drop` returns nothing, and a Vulkan destroy call has
     /// no failure mode to begin with. The caller's responsibility, which this type cannot enforce,
     /// is that every object created *from* `device` has already been destroyed by the time this
-    /// runs; the render path does that before returning.
+    /// runs. That holds **on the success path only**: `render::render_triangle` destroys its child
+    /// objects itself before returning `Ok`. On the error path it destroys nothing (a fence timeout
+    /// can mean the GPU is still executing), and `main.rs`'s `run()` deliberately leaks the whole
+    /// `VulkanContext` with `std::mem::forget` in that case — precisely so this `Drop` never runs
+    /// while work may still be in flight.
     fn drop(&mut self) {
         // SAFETY: both handles are still live (nothing else destroys them), and by contract every
         // object created from `device` is already gone by the time this runs.

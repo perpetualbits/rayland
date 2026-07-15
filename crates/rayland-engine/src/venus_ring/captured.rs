@@ -324,16 +324,42 @@ fn reply_command_streams_chain_and_name_the_reply_arena() {
     assert_eq!(decode_reply_command_stream(stream, &commands[1]), None);
 }
 
-/// Truncating the captured stream mid-command is reported, not silently mis-decoded.
+/// Truncating the captured stream inside a command's *body* — after a complete, readable
+/// prologue — is reported, not silently mis-decoded.
 ///
 /// Built from the real fixture rather than synthetic bytes so it exercises the same path the live
 /// window does: the capture itself preserved 100 of the client's 216 produced bytes, so decoding a
 /// window that cuts through a command is the *normal* case here, and it must never manufacture a
-/// command from bytes that are not all present.
+/// command from bytes that are not all present. This specific cut point exercises the "the command
+/// is sizeable but its bytes are not all here" branch (`decode.rs`'s `offset + encoded_size >
+/// stream.len()` check) — the one that only ever fires once a command's size is already known from
+/// a whole prologue, as distinct from the prologue-truncation test below.
 #[test]
-fn a_stream_cut_mid_command_stops_as_truncated() {
+fn a_stream_cut_mid_command_body_stops_as_truncated() {
     let ring = captured_ring_bytes();
-    // Cut two bytes into command 2, so its prologue is readable but its body is not.
+    // Command 2 starts at offset 36. Take its full 8-byte `[type][flags]` prologue (so its
+    // `encoded_size` — 16 bytes — is known) plus 2 of its 8 remaining body bytes, so the prologue
+    // read succeeds but the subsequent bounds check on the whole command does not.
+    let stream = &ring[RING_BUFFER_OFFSET..RING_BUFFER_OFFSET + 46];
+
+    let (commands, stop) = decode_commands(stream);
+
+    // Command 1 is whole and is still reported: a partial tail does not discard good commands.
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].encoded_size, 36);
+    // Command 2 is not: 16 bytes were needed and only 10 (8-byte prologue + 2 body bytes) remain.
+    assert_eq!(stop, DecodeStop::Truncated { offset: 36 });
+}
+
+/// Truncating the captured stream *before* a command's prologue is even fully readable is reported
+/// the same way — `DecodeStop::Truncated` at the command's offset — but through a different guard
+/// in the decoder: the `[type][flags]` read itself comes up short, before any command size is ever
+/// known. Kept as its own test (rather than folded into the body-truncation test above) so this
+/// earlier guard has direct coverage independent of the later bounds check.
+#[test]
+fn a_stream_cut_before_command_prologue_stops_as_truncated() {
+    let ring = captured_ring_bytes();
+    // Cut two bytes into command 2's 8-byte prologue, so not even `[type][flags]` can be read.
     let stream = &ring[RING_BUFFER_OFFSET..RING_BUFFER_OFFSET + 38];
 
     let (commands, stop) = decode_commands(stream);
@@ -341,7 +367,7 @@ fn a_stream_cut_mid_command_stops_as_truncated() {
     // Command 1 is whole and is still reported: a partial tail does not discard good commands.
     assert_eq!(commands.len(), 1);
     assert_eq!(commands[0].encoded_size, 36);
-    // Command 2 is not: 16 bytes were needed and only 2 remain.
+    // Command 2's prologue itself is incomplete: only 2 of its 8 bytes are present.
     assert_eq!(stop, DecodeStop::Truncated { offset: 36 });
 }
 

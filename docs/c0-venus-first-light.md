@@ -180,9 +180,10 @@ It is worth being honest about this, because "bit-identical" invites over-readin
 It is **expected**, on reflection. Both runs execute on the **same physical GPU** with the **same
 Mesa stack underneath**. Venus does not re-render or re-interpret anything — it serializes the
 commands, and virglrenderer replays them onto that same driver and that same hardware. Identical
-commands, identical hardware, identical rasterisation. **A cross-machine or cross-vendor run (SP2,
-(c)1) is the first place bit-equality could legitimately break**, and that is exactly the kind of
-thing the test is built to report rather than fail on.
+commands, identical hardware, identical rasterisation. **A cross-machine or cross-vendor run — (c)1's
+job, since this is the Venus/engine path, not SP2's already-complete and unrelated `postcard`
+transport — is the first place bit-equality could legitimately break**, and that is exactly the kind
+of thing the test is built to report rather than fail on.
 
 What the result *does* prove is real and worth having: **the command stream survives the round trip
 through Venus, our vtest server, our FFI boundary, and virglrenderer without a single byte of the

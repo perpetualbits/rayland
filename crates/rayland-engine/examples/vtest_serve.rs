@@ -7,9 +7,16 @@
 //! that mattered — that the protocol requires passing real file descriptors, and a real Mesa Venus
 //! ICD blocks forever without them. This harness is what puts a real client on the other end.
 //!
-//! It is deliberately *minimal*: bind, accept once, serve, report, exit. The full
-//! `rayland-engine-host` (with frame readback and PNG output) is Task 4b's; building it here would
-//! mean guessing at questions this task exists to answer.
+//! It is deliberately *minimal*: bind, accept once, serve, report, exit. This is C0's live-drive
+//! instrument, not a placeholder for something else that will be built later: the reference app
+//! (`rayland-refapp`) produces the PNG itself, exactly as an ordinary offscreen Vulkan program
+//! would — see Amendment 1 of the C0 design spec
+//! (`docs/design/2026-07-14-c0-venus-first-light.md`) and
+//! `docs/c0-venus-first-light.md`'s "Who writes the PNG" section for why. There is no separate
+//! `rayland-engine-host` binary to build: the app already produces the picture, so a host-side
+//! equivalent would only duplicate it. Host-side frame *extraction* — reading a rendered image back
+//! out of the engine without the app's cooperation — remains an open question, deferred by the
+//! owner as Task 4c; it is not this task's job either.
 //!
 //! # Running it against a real client
 //! ```text

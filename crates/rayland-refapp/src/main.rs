@@ -130,7 +130,20 @@ fn run() -> anyhow::Result<()> {
     let ctx = context::VulkanContext::new()?;
 
     // Draw the frame and get the pixels back. Everything Vulkan happens inside this call.
-    let pixels = render::render_triangle(&ctx, IMAGE_WIDTH, IMAGE_HEIGHT, CLEAR_COLOR, &VERTICES)?;
+    let pixels =
+        match render::render_triangle(&ctx, IMAGE_WIDTH, IMAGE_HEIGHT, CLEAR_COLOR, &VERTICES) {
+            Ok(pixels) => pixels,
+            // The render path deliberately destroys nothing on failure (see `render.rs`): on a fence
+            // timeout the GPU may still be executing the submission, so tearing its objects down would be
+            // undefined behaviour. Dropping `ctx` here would call `vkDestroyDevice` out from under that
+            // same in-flight work — the identical UB, one level up. Leak the context instead and let
+            // process exit return every GPU allocation to the driver and the kernel, which is the only
+            // teardown that is sound while work may still be running.
+            Err(error) => {
+                std::mem::forget(ctx);
+                return Err(error);
+            }
+        };
 
     // Write the PNG. The bytes are already tightly-packed RGBA8 in the order the encoder wants,
     // because the render target's format was chosen to make that true (see `pipeline::COLOR_FORMAT`),

@@ -356,10 +356,14 @@ unsafe fn render_triangle_inner(
     // Distinguishing "failed before submit, nothing in flight, safe to destroy" from "failed after
     // submit, work in flight, unsafe to destroy" is possible but is exactly the kind of subtle
     // condition that rots. So this takes the simple, always-correct option: on any error, destroy
-    // nothing. Every error path here leads to `main` printing the cause and calling
-    // `std::process::exit(1)` within microseconds, and process exit returns all of it — GPU
-    // allocations included — to the driver and the kernel. Leaking on the way out of a failing
-    // one-shot program costs nothing; the undefined behaviour would cost a great deal.
+    // nothing here — and this function does not own `VulkanContext`, so it cannot leak it either.
+    // The caller (`main.rs`'s `run()`) is the one that owns `ctx`, and on this `Err` path it
+    // `std::mem::forget`s it rather than letting it drop, precisely so that `VulkanContext::drop`
+    // (`vkDestroyDevice`) never runs over a submission that may still be executing. Only with that
+    // in place is it true that every error path here leads to `main` printing the cause and calling
+    // `std::process::exit(1)`, and process exit returns all of it — GPU allocations included — to
+    // the driver and the kernel. Leaking on the way out of a failing one-shot program costs
+    // nothing; the undefined behaviour would cost a great deal.
     //
     // On the success path the fence has already proven the GPU is finished, so every destroy below
     // is safe. Destroying the pool frees the command buffer allocated from it, which is why that

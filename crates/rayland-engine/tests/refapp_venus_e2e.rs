@@ -284,14 +284,38 @@ fn refapp_renders_the_same_triangle_through_venus_as_it_does_natively() {
 
     // Serve the session. This is the call that replays the app's Vulkan command stream on the real
     // GPU. It returns when the app disconnects at a message boundary, i.e. when it has exited.
-    let outcome = serve_vtest(&mut stream, &mut engine).expect("the vtest session must complete");
+    //
+    // `expect` here can panic, and Rust does not kill a `Child` when it is dropped (unlike the
+    // accept loop above, which explicitly reports and lets the child be reaped by `wait`/`try_wait`
+    // on every path). An unhandled panic here would unwind straight out of this function, skipping
+    // the `child.wait()` below and leaving a `rayland-refapp` process behind still holding a GPU
+    // context — exactly the kind of leak this test is supposed to catch elsewhere, not commit
+    // itself. So on this one path, kill the child before propagating the panic.
+    let outcome = match serve_vtest(&mut stream, &mut engine) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            // Best-effort: the child may already have exited, in which case `kill` harmlessly fails.
+            let _ = child.kill();
+            let _ = std::fs::remove_file(&socket_path);
+            panic!("the vtest session must complete: {error}");
+        }
+    };
     assert_eq!(
         outcome.context_id,
         Some(1),
         "the session must have created a Venus context"
     );
 
-    let status = child.wait().expect("the reference app must be waitable");
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(error) => {
+            // As above: an unhandled panic here must not leave the child behind. `wait` failing is
+            // not proof the child already exited, so still make the best-effort attempt to kill it.
+            let _ = child.kill();
+            let _ = std::fs::remove_file(&socket_path);
+            panic!("the reference app must be waitable: {error}");
+        }
+    };
     // Clean up the socket file regardless of what the assertions below decide.
     let _ = std::fs::remove_file(&socket_path);
     assert!(
