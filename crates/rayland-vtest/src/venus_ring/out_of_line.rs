@@ -74,23 +74,35 @@
 //! res1 (  131268 B, 8 samples): dwords ever == 180 -> 0     (the command ring)
 //! ```
 //!
-//! # Why the false-positive risk is bounded by v1's actual scope
-//! A false positive breaks a working application, so the precision genuinely matters. It is
-//! acceptable here for a reason specific to what v1 supports:
+//! # Why the false-positive risk is bounded, but not nil
+//! A false positive breaks a working application, so the precision genuinely matters, and the risk
+//! is real rather than theoretical: SPIR-V is dword-granular and is inlined directly into the ring
+//! (Mesa hands the shader module's words straight through), so **a shader with 180 or more result
+//! ids contains the dword `180` routinely** — result ids are allocated densely from 1 upward, so any
+//! shader past that size is all but guaranteed to carry it somewhere in its module, as an id operand
+//! rather than a command header. `direct_size` is 8192 bytes = 2048 SPIR-V words for the 128 KiB
+//! instance ring, so such a shader fits comfortably under the threshold and would use the *inline*
+//! ring path this scan inspects — meaning this is a session v1 could otherwise have served, and the
+//! scan would refuse it anyway. That is a real cost, not a hypothetical one.
+//!
+//! What keeps the cost *bounded* rather than open-ended is what v1 already cannot serve regardless:
 //!
 //! - **On the reference application it cannot fire.** C0 Task 4b's result is conclusive rather than
 //!   a sampling artefact: `tail` is monotonic and never wrapped, so the final sample's ring buffer
 //!   contained *every byte the client ever wrote*, and 180 was not among them.
-//! - **On a real application it fires — and a real application is exactly the case v1 cannot serve
-//!   anyway.** Any workload with non-trivial SPIR-V, large descriptor writes, or a longer command
-//!   buffer crosses 8192 routinely and genuinely uses the out-of-line path. Such a session is
-//!   unserviceable by v1 whether or not the dword that tripped the scan was a real command header.
+//! - **On an application whose single submission genuinely exceeds `direct_size`, the scan's
+//!   imprecision is moot.** Any workload with large descriptor writes or a long command buffer
+//!   crosses 8192 routinely and genuinely uses the out-of-line path; such a session is unserviceable
+//!   by v1 whether or not the dword that tripped the scan was a real command header.
 //!
-//! So the scan's imprecision costs (c)1 nothing it could otherwise have had, and its soundness buys
-//! the one guarantee §5.1 asks for. **The honest statement, which callers must not overstate: a
-//! refusal from this module means "a dword equal to 180 is present", not "an out-of-line stream is
-//! definitely present".** [`OutOfLineStream`]'s message says so, because a human debugging a
-//! refusal needs to know which claim is being made.
+//! The SPIR-V case above is the gap between those two: an application that fits under `direct_size`
+//! byte-for-byte, and that v1's transport could otherwise carry, but whose shader happens to contain
+//! the bit pattern 180 and gets refused for it. No better check exists to close that gap — a
+//! decode-based scan is blind past ring command #2 (see above) — so the false positive is accepted
+//! as the price of a check that cannot miss a real out-of-line stream. **The honest statement, which
+//! callers must not overstate: a refusal from this module means "a dword equal to 180 is present",
+//! not "an out-of-line stream is definitely present".** [`OutOfLineStream`]'s message says so,
+//! because a human debugging a refusal needs to know which claim is being made.
 //!
 //! # The alignment argument, which the soundness rests on
 //! Scanning only 4-byte-aligned dwords is what makes this cheap, and it is sound because the Venus

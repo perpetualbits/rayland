@@ -81,7 +81,9 @@ const RING_EXTRA_BYTES: u64 = 4;
 /// # Pitfall: this does not tell you *which way* a given application blob flows
 /// It separates "the app's memory" from "Venus's plumbing". It does **not** say whether the GPU
 /// reads or writes a particular application blob — nothing available to (c)1 does, which is exactly
-/// why v1 syncs them whole in both directions rather than guessing (spec §7). It also says nothing
+/// why v1 syncs them whole in both directions instead of guessing (spec §7). **That whole-blob sync
+/// is a last-writer-wins race, not a correct algorithm** — see `rayland_c::blob_sync`'s module docs
+/// for the failure scenario it accepts in exchange for not having to guess. It also says nothing
 /// about which of Venus's internal shmems is the reply arena as against the staging pool; both are
 /// `blob_id == 0` and there is no signal here that separates them.
 pub fn is_application_memory(blob_id: u64) -> bool {

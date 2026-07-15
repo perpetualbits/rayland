@@ -29,9 +29,13 @@
 //! **This binary has never been run end-to-end.** `rayland-s` ((c)1 Task 4) now exists, but nothing
 //! connects the two: the QUIC transport is Task 6. Task 5 has since shipped the blob
 //! synchronisation, so the application's vertex buffer does now reach S (see [`blob_sync`]) — but
-//! **the reply arena still does not**, and until it does, an application blocks forever on its first
-//! synchronous call. That is spec §5's channel 2, and it has no owner; `rayland-s`'s
-//! `Applier::poll_progress` documents exactly why the obvious fix is a corruption bug. The pieces
+//! **the reply arena still does not**, and until it does, an application does not hang — Mesa's
+//! `head` still advances from `S2C::RingProgress`, so `vn_ring_wait_seqno` returns — but it is
+//! released onto a reply arena that is still zeros, so its first synchronous call fails with garbage
+//! (`vn_instance_init_renderer_versions` reads `instance_version = 0`, trips the
+//! `VN_MIN_RENDERER_VERSION` check, and `vkCreateInstance` returns an error). That is spec §5's
+//! channel 2, and it has no owner; `rayland-s`'s `Applier::poll_progress` documents exactly why the
+//! obvious fix is a corruption bug. The pieces
 //! with real logic — the ring watcher, the blob shadows, the relay engine, the blob sync — are
 //! unit-tested against a synthetic ring and a mock link (`tests/ring_watch.rs`, and the `tests`
 //! modules of [`ring`], [`shm`], [`relay_engine`] and [`blob_sync`]), as is this file's own
@@ -619,10 +623,13 @@ fn ring_watcher_thread(
             // the instant `tail` lands. See `crate::blob_sync`.
             let msgs = messages_for_delta(&blobs, identity.res_id, delta);
 
-            // One lock for the whole batch. Not for atomicity against the vtest thread — an
-            // unrelated message interleaving here is harmless — but because taking and dropping it
-            // per message would let this loop's own next iteration overtake the delta it just
-            // queued behind the blobs it queued first.
+            // One lock for the whole batch. This loop is the only ring watcher there is, so it
+            // cannot overtake itself — the reason to hold one lock is the *other* thread sharing
+            // `tx`. The vtest thread's `RelayEngine` sends over this same `Arc<Mutex<TcpLink>>` (via
+            // `ChannelLink`, e.g. for blob creation), and dropping the lock between messages would
+            // let one of its sends land in the middle of this batch, between a blob and the delta
+            // that must follow it. Holding one lock for the whole batch keeps it atomic against that
+            // thread — and it is also simply cheaper than re-locking per message.
             {
                 let mut link = tx.lock().expect("the link send lock is never poisoned");
                 for msg in &msgs {

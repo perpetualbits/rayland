@@ -285,8 +285,10 @@ mod tests {
         assert_eq!(
             u32::from_le_bytes(seen),
             0x0040_4155,
-            "a reply written into a blob shadow must be visible to the application's mapping, or \
-             every synchronous Vulkan call blocks forever on stale zeros"
+            "a reply written into a blob shadow must be visible to the application's mapping — \
+             `vn_ring_wait_seqno` is released by the ring's `head`, independently of this write, so \
+             a broken shadow does not hang the application; it releases it onto stale zeros, which \
+             fails whatever check the reply's real value would have passed"
         );
     }
 }

@@ -453,9 +453,22 @@ Deferred purely to keep one unknown at a time: x86→x86 must work first.
    assumed.
 3. **Does disabling all four feedback types actually work?** Each `VN_PERF` switch exists, but the
    combination is untested, and Venus may have paths that assume feedback is present.
-4. **What is the 1 MiB blob?** C0 identified it by *behaviour* as the reply arena
-   (`vkSetReplyCommandStreamMESA` names `resourceId=2`), but three independent 1 MiB allocations
-   exist in the Venus source and *which* one it is remains `[UNKNOWN]`.
+4. **What is the 1 MiB blob? Resolved, by source, during (c)1 Task 5's review.** C0 identified it
+   by *behaviour* as the reply arena (`vkSetReplyCommandStreamMESA` names `resourceId=2`), but left
+   open which of Venus's independent 1 MiB allocations that is. Tracing the emitter settles it:
+   `vn_instance.c:328-332` shows `instance->cs_shmem_pool` is sized `8u << 20` (8 MiB) and
+   `instance->reply_shmem_pool` is sized `1u << 20` (1 MiB) — the only 1 MiB pool the instance owns.
+   The only place a `vkSetReplyCommandStreamMESA` is ever emitted is
+   `vn_ring_set_reply_shmem_locked` (`vn_ring.c:672-687`), and its `shmem` argument always comes from
+   `vn_ring_submit_command`'s call to `vn_instance_reply_shmem_alloc` (`vn_ring.c:701`), which is a
+   thin wrapper (`vn_instance.h:92-98`) over `vn_renderer_shmem_pool_alloc(..., &instance->
+   reply_shmem_pool, ...)`. So C0's captured `resourceId=2` **is** `instance->reply_shmem_pool`, by
+   construction of the code rather than by having observed it behave one way. The third 1 MiB
+   candidate, `ring->upload` (`vn_ring.c:322`), is excluded on the same evidence C0 already had: the
+   refapp emits zero opcode-180s (ring-findings §5.3), and `ring->upload` backs exactly that
+   out-of-line path (`vn_ring.c:605`), so it is never allocated in the captured session. This entry
+   is kept, rather than deleted now that it is answered, because how it was resolved — reasoning from
+   the source rather than from another capture — is itself worth having on record.
 5. **Does the fence path's 5s `FENCE_WAIT_TIMEOUT` survive a real networked workload?** It has
    never been exercised — C0's path never reached it.
 6. **Residual on presentation (the decision itself is made — see §7.1):** the host presents from

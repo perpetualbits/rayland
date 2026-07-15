@@ -83,19 +83,33 @@ use rayland_relay::C2S;
 /// delta may be relayed at all, and the caller runs it.
 ///
 /// # Pitfalls
-/// - **This ships blobs whole, every time, and that is deliberate** (spec §7). It is *correct* for
-///   any application and its cost is *visible*, which is the trade v1 chose over a guessed
-///   optimization. Do not add dirty tracking here; that is (c)2's work, and the lever it will use
+/// - **This ships blobs whole, every time, and that is deliberate** (spec §7), and its cost is
+///   *visible* — that part of the trade is real. But **it is not correct for any application; it is
+///   a last-writer-wins race**, safe only because the reference app happens never to trigger it. Do
+///   not add dirty tracking here; that is (c)2's work, and the lever it will use
 ///   (`/proc/<pid>/pagemap` soft-dirty, or non-coherent memory plus real flush hooks) is recorded in
 ///   the spec's §7.
 /// - **This is only half of the coherence story.** It carries C→S; the pixels S's GPU renders come
-///   back through `S2C::BlobData`, which `rayland-s` sends and this daemon's reader thread applies.
+///   back through `S2C::BlobData`, which `rayland-s` sends and this daemon's reader thread applies —
+///   and it is *that* return trip which turns the race above into a real hazard. Concretely: the
+///   application `memcpy`s frame *N+1*'s vertices into `res=3` at `t0`; concurrently, S's ~200 µs
+///   poll (ring-findings §5.2) fires on the `head` movement left over from frame *N* and ships back
+///   S's **stale** copy of `res=3` (S's GPU never wrote that blob — vertex/uniform/staging buffers
+///   are the app's alone to write); this daemon's reader thread applies that `S2C::BlobData` and
+///   overwrites the application's fresh frame-*N+1* vertices with S's stale frame-*N* bytes; the next
+///   time this function runs, it faithfully ships those stale bytes back to S as if they were current.
+///   Nothing anywhere detects this: it is a silent, timing-dependent lost write, not an error.
 /// - **A blob written by the application *while* this copies it is torn**, and nothing here can
-///   prevent that. It is the same unavoidable race the whole `vkMapMemory` problem consists of: the
-///   application is not obliged to tell anyone when it stops writing, and v1 has no flush hook to
-///   wait on. The reference app writes its vertices once, before any draw, so the race is not
-///   reachable there — but it is real, and it is why the spec calls this narrow slice v1's answer
-///   rather than the answer.
+///   prevent that either. It is the same unavoidable race the whole `vkMapMemory` problem consists
+///   of: the application is not obliged to tell anyone when it stops writing, and v1 has no flush
+///   hook to wait on.
+/// - **Why none of this is reachable in the reference app.** The refapp writes its vertex buffer
+///   exactly once, before its first draw, and never again — so C's and S's copies of `res=3`
+///   converge to the same bytes no matter which order the sync and the GPU's (non-existent) writes
+///   happen in. That is a property of *this one workload*, not of the algorithm, which is exactly why
+///   every test here passes and why the spec calls this narrow slice v1's answer rather than the
+///   answer. Any application that updates a mapped buffer once per frame — the common case for
+///   vertex, uniform, or staging buffers — will lose writes to this race.
 pub fn messages_for_delta(blobs: &BlobTable, ring_res_id: u32, delta: RingDelta) -> Vec<C2S> {
     let mut out = Vec::new();
 
@@ -125,8 +139,6 @@ pub fn messages_for_delta(blobs: &BlobTable, ring_res_id: u32, delta: RingDelta)
 
     // **Last, always.** Everything above must be on S before the commands that may read it. See the
     // module docs: S's ring thread runs asynchronously the instant this delta's `tail` lands.
-    // **Last, always.** Everything above must be on S before the commands that may read it. See the
-    // module docs: S's ring thread runs asynchronously the instant this delta's `tail` lands.
     out.push(C2S::RingDelta {
         ring_res_id,
         tail: delta.tail,
@@ -154,7 +166,7 @@ mod tests {
     /// The app's readback buffer (`res=6`, 16384 bytes) — the one that carries the picture back.
     const READBACK_BLOB_ID: u64 = 18;
 
-    /// Build a blob table from `(res_id, blob_id, size)` triples, filling each blob with a
+    /// Build a blob table from `(res_id, blob_id, size, fill)` 4-tuples, filling each blob with a
     /// recognizable byte so a test can tell whose bytes arrived.
     fn table_of(blobs: &[(u32, u64, u64, u8)]) -> BlobTable {
         let mut map = HashMap::new();
