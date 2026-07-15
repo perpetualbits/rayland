@@ -41,6 +41,11 @@ mod error;
 // The Unix-socket transport: the real `sendmsg`/SCM_RIGHTS `VtestTransport` impl, plus the POSIX
 // primitives (memfd, mmap, eventfd) the vtest protocol needs and `std` does not expose.
 mod transport;
+// Mesa's Venus command ring: the shared-memory layout a live client declares, a decoder for the
+// Vulkan command stream it carries, and the live diagnostic that discovered both. This is where the
+// application's Vulkan commands actually travel — *not* the vtest socket. Read its module docs
+// before building anything that assumes `RenderEngine::submit` sees real commands; it does not.
+pub mod venus_ring;
 // The engine, error type, and availability probe.
 mod virgl;
 // The vtest wire-protocol server: parses what Mesa's Venus ICD emits and drives a `RenderEngine`.

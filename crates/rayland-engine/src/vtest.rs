@@ -865,8 +865,13 @@ pub fn serve_vtest<T: VtestTransport>(
         match read_command(stream)? {
             // A decoded command: handle it (may write a reply, send an fd, and/or call the engine).
             Some(cmd) => dispatch(cmd, stream, engine, &mut session)?,
-            // Clean EOF: the session is over; hand back what we accumulated.
-            None => return Ok(session.outcome),
+            // Clean EOF: the session is over; hand back what we accumulated. The ring dump's
+            // end-of-session report is printed here, while its mappings are still alive and the
+            // socket-side counters are final. Inert unless `RAYLAND_RING_DUMP` is set.
+            None => {
+                crate::venus_ring::dump::final_report();
+                return Ok(session.outcome);
+            }
         }
     }
 }
@@ -977,6 +982,14 @@ fn dispatch<T: VtestTransport>(
                 });
             };
 
+            // DIAGNOSTIC (`RAYLAND_RING_DUMP`): map the *same* pages the client is about to map,
+            // before it has had a chance to write a single byte into them, so the watcher sees the
+            // memory from its initial state onward. This is the hook through which the Venus
+            // command ring was found: the client's Vulkan commands go into these pages, never onto
+            // this socket. Inert unless the env var is set; cannot fail the session. See
+            // `crate::venus_ring`.
+            crate::venus_ring::dump::watch_blob(blob.resource_id, fd.as_fd(), size);
+
             // (4) the in-band reply.
             write_reply(stream, VCMD_RESOURCE_CREATE_BLOB, &[blob.resource_id])?;
             // (5) the descriptor. Borrowed: the kernel duplicates it into the client.
@@ -1045,6 +1058,17 @@ fn dispatch<T: VtestTransport>(
             Ok(())
         }
         VtestCommand::SubmitCmd2 { batches } => {
+            // DIAGNOSTIC (`RAYLAND_RING_DUMP`): stamp this message onto the same timeline as the
+            // ring samples, and count the command dwords it carries *inline on the socket*. That
+            // count was the denominator of the "is the ring where the traffic is?" question, and
+            // the answer was emphatic: every dword counted here is ring *management*
+            // (`vkCreateRingMESA`, then `vkNotifyRingMESA` doorbells), never an application Vulkan
+            // command. Inert unless the env var is set.
+            crate::venus_ring::dump::doorbell(
+                batches.len() as u64,
+                batches.iter().map(|b| b.cmd.len() as u64).sum(),
+            );
+
             // The load-bearing path: replay each batch's Venus command dwords on the GPU. A submit
             // has no reply at all — not an empty one — which a live capture confirms. (The C server
             // does send a descriptor for a batch that sets `VCMD_SUBMIT_CMD2_FLAG_OUT_FENCE_FD`,
