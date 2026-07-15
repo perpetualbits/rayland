@@ -83,21 +83,54 @@
 //!
 //! [`RingWatcher::take_delta`] mirrors that producer exactly, in both halves.
 //!
-//! # Known gap: memory ordering (read this before running on aarch64 or riscv64)
-//! Mesa stores `tail` with `memory_order_seq_cst` and expects its consumer to load it with at least
-//! **Acquire** ordering: that load is what makes the `memcpy`ed command bytes written *before* the
-//! store visible to the reader. This module reads the control words through a plain `&[u8]` with
-//! `u32::from_le_bytes`, which is **not** an atomic acquire load.
+//! # Known gaps: memory ordering. There are **two**, and they are not the same gap
+//! This module reads and writes the ring's control words through a plain `&[u8]`/`&mut [u8]` with
+//! `u32::from_le_bytes` / `to_le_bytes`. Those are ordinary loads and stores, not atomic ones. Mesa's
+//! side of every one of these words *is* atomic, so both gaps below are formal data races. They are
+//! recorded rather than fixed because a correct fix is a cross-process atomics question this task did
+//! not scope, and a half-correct one would look solved. **Both are about the ordering of the
+//! accesses, not about the logic below** — which is why the logic is testable exactly as written.
 //!
-//! In practice this works on x86-64 — C0's only tested target — because aligned 32-bit loads have
-//! acquire semantics in that hardware's memory model, leaving compiler reordering as the only
-//! risk. It is nonetheless a formal data race, and on a **weakly-ordered target it can genuinely
-//! reorder**: the reader could observe the new `tail` before the buffer bytes it published, and
-//! ship uninitialized memory to S's GPU as Vulkan commands. CLAUDE.md names RISC-V as an explicit
-//! target for machine C, so this must be closed before C runs anywhere but x86-64. It is recorded
-//! here rather than fixed because a correct fix is a cross-process atomics question this task did
-//! not scope, and a half-correct one would look solved. **This gap is about the ordering of the
-//! accesses, not about the logic below**, which is why the logic is testable exactly as written.
+//! ## Gap 1 — the `tail` load and the buffer bytes it publishes (a load-load pair)
+//! Mesa stores `tail` with `memory_order_seq_cst` *after* `memcpy`ing the command bytes, and expects
+//! its consumer to load `tail` with at least **Acquire**: that load is what makes the bytes written
+//! before the store visible to the reader. [`RingWatcher::take_delta`]'s load is plain.
+//!
+//! On x86-64 — C0's only tested target — the hardware does not reorder loads with other loads (TSO),
+//! so the risk here is compiler reordering only. On a **weakly-ordered target it can genuinely
+//! reorder**: the reader could observe the new `tail` before the buffer bytes it publishes, and ship
+//! uninitialized memory to S's GPU as Vulkan commands. CLAUDE.md names RISC-V as an explicit target
+//! for machine C, so this must be closed before C runs anywhere but x86-64.
+//!
+//! ## Gap 2 — the IDLE/`tail` handshake (a **store-load** pair, and x86-64 does not save us)
+//! This one is distinct, and the reassurance that "x86-64 is fine, only the compiler can reorder"
+//! is **false** for it. The park protocol — publish IDLE, then re-read `tail`
+//! ([`RingWatcher::publish_idle`] then [`RingWatcher::decide_park`]) — against Mesa's submit path —
+//! store `tail`, then load `status` — is **Dekker's algorithm**. Each side stores its own flag and
+//! then loads the other's, and the pattern is only correct if *both* sides order that store before
+//! that load. Nothing weaker than seq_cst does that.
+//!
+//! Mesa holds up its half explicitly, and its comments say why (`vn_ring.c:100-111`): the tail store
+//! is seq_cst because that "has required a full mfence instruction", and `vn_ring_load_status` is
+//! annotated "must be called and ordered after vn_ring_store_tail for idle status".
+//!
+//! C's half is a plain store to `status` followed by a plain load of `tail`, and **x86-64's TSO
+//! explicitly permits StoreLoad reordering** — the store sits in the store buffer while the later
+//! load is satisfied. So this interleaving is legal on the one target C0 tested:
+//!
+//! ```text
+//! C:    load tail (old)       [satisfied ahead of the still-buffered status store]
+//! Mesa: store tail (new); load status -> sees IDLE clear -> sends no doorbell
+//! C:    store status(IDLE) drains
+//! C:    Park                  [parked, with work pending and no doorbell coming]
+//! ```
+//!
+//! The consequence is **bounded by the watcher's timed sleep** (`PARK_SLEEP`, 500 µs, in the daemon's
+//! `main.rs`), so it is added latency rather than a hang — which is precisely what that bounded
+//! sleep's belt-and-braces rationale exists for, and the one place on this branch where "if the park
+//! logic were ever wrong, a bounded sleep degrades to latency" has turned out to be load-bearing
+//! rather than decorative. Closing it properly means a seq_cst store and a seq_cst load on C's side,
+//! i.e. the same cross-process atomics work Gap 1 needs.
 
 // The ring's field offsets, and the buffer size the observed client declared. These come from
 // `rayland-vtest` (which links no GPU code) rather than being restated here, so there is exactly
@@ -112,6 +145,18 @@ use rayland_vtest::venus_ring::{
 /// whether a doorbell is even worth sending. See the module docs' polarity pitfall: this reads
 /// backwards to almost everyone, including this repository until 2026-07-15.
 const RING_STATUS_IDLE_BIT: u32 = 0x0000_0001;
+
+/// `VK_RING_STATUS_ALIVE_BIT_MESA` — bit 2 of the ring's `status` word.
+///
+/// **Set means "this ring's consumer has proved it is still there"**, and it is the bit Mesa's
+/// watchdog aborts the application over when it is missing. The value is taken from Mesa's generated
+/// header (`vn_protocol_renderer_defines.h:475-477`: `IDLE = 0x1`, `FATAL = 0x2`, `ALIVE = 0x4`),
+/// not inferred — the same discipline `venus_ring/mod.rs` applied to the IDLE bit, and for the same
+/// reason: guessing a bit here would be a silent, plausible-looking wrong answer.
+///
+/// See [`RingWatcher::set_alive`] for why C has to write this at all, and why Rayland's version of
+/// the heartbeat is gated on evidence when virglrenderer's own is not.
+const RING_STATUS_ALIVE_BIT: u32 = 0x0000_0004;
 
 /// The control area's size in bytes: three 64-byte-aligned words (`head`, `tail`, `status`).
 ///
@@ -171,8 +216,23 @@ impl RingIdentity {
     /// perfectly legal — and `blob_id` is what stops that from being mistaken for a ring.
     ///
     /// Checked against every blob the live capture observed (ring-findings §6), this matches the
-    /// ring and nothing else: the 1 MiB reply arena, the 8 MiB staging pool, and the 64/4096/16384
-    /// byte application buffers all fail the power-of-two test on `size - 196`.
+    /// instance ring and nothing else *in that capture*: the 1 MiB reply arena, the 8 MiB staging
+    /// pool, and the 64/4096/16384 byte application buffers all fail the power-of-two test on
+    /// `size - 196`.
+    ///
+    /// # Pitfall: it is **not** true that only the ring can match — Mesa's TLS ring does too
+    /// The capture was single-threaded, and that is the only reason it saw one match. Mesa creates a
+    /// per-thread *TLS ring* for synchronous commands (`vn_common.c:322-327`) with `buf_size =
+    /// 16 KiB` and `extra_size = 4`, giving a shmem of `192 + 16384 + 4 = 16580` and, like every
+    /// Venus-internal shmem, `blob_id == 0`. Both tests below pass: `16580 - 196 = 16384 = 2^14`. So
+    /// a second thread issuing a synchronous call produces a blob this function calls a ring.
+    ///
+    /// Multi-ring support is out of (c)1's scope — the plan pins `VN_PERF=no_multi_ring`, and
+    /// `vn_tls_get_ring` honours that by handing back the instance ring instead. The hazard is
+    /// narrower than "we cannot tell them apart": it is that the caller must not *replace* an
+    /// already-latched ring with a later match, because the instance ring is the one that carries the
+    /// application's drawing and the one Mesa's watchdog reads. See the caller in
+    /// [`crate::relay_engine`], which latches the first match and refuses to overwrite it.
     ///
     /// # Inputs / outputs
     /// - `res_id`: the S-side resource id assigned to this blob.
@@ -476,9 +536,90 @@ impl RingWatcher {
             return ParkDecision::Park;
         }
         // Work arrived. Retract the IDLE claim before looping, so Mesa stops treating us as parked.
-        let status = read_control(ring, RING_STATUS_OFFSET);
-        write_control(ring, RING_STATUS_OFFSET, status & !RING_STATUS_IDLE_BIT);
+        self.clear_idle(ring);
         ParkDecision::StayAwake
+    }
+
+    /// Clear the IDLE bit, announcing to Mesa that this ring's consumer is awake and polling, and
+    /// that a doorbell would therefore be wasted work.
+    ///
+    /// # Why a caller must do this on every path that stays awake, not just when parking is refused
+    /// IDLE is a *claim about the consumer's state*, and Mesa acts on it on the application's hot
+    /// path: `vn_ring_submit_internal` (`vn_ring.c:475-483`) tests it on **every** submit and, if it
+    /// is set and the 1 ms throttle has elapsed, sends a `vkNotifyRingMESA` doorbell. Leaving it set
+    /// through a busy burst therefore does not merely waste a bit — it makes Mesa pay for up to 1000
+    /// doorbells a second to wake a watcher that is demonstrably already awake, each of which is a
+    /// socket write on C and a relayed message to S. That inverts ring-findings §5.2's headline
+    /// result, which is that the steady state emits **zero** notifications.
+    ///
+    /// The bit is masked out rather than the word assigned, mirroring Mesa's `atomic_fetch_and`:
+    /// `status` also carries `FATAL` (0x2) and `ALIVE` (0x4), and clobbering the word destroys them.
+    ///
+    /// # Inputs / outputs
+    /// - `ring`: the ring blob's bytes, mutable because `status` is a word C writes and Mesa reads.
+    /// - Nothing is returned; the effect is the retracted bit.
+    pub fn clear_idle(&mut self, ring: &mut [u8]) {
+        let status = read_control(ring, RING_STATUS_OFFSET);
+        // Preserve FATAL/ALIVE; only retract the IDLE claim.
+        write_control(ring, RING_STATUS_OFFSET, status & !RING_STATUS_IDLE_BIT);
+    }
+
+    /// Set the ALIVE bit: the heartbeat that stops Mesa's watchdog from aborting the application.
+    ///
+    /// # Why C must write this word at all (ring-findings §5.4)
+    /// Every Venus ring is monitored — `VkRingMonitorInfoMESA` is placed in `VkRingCreateInfoMESA`'s
+    /// `pNext` **unconditionally** (`vn_ring.c:346-353`), so there is no configuration in which this
+    /// does not apply. Mesa's side of the contract is:
+    ///
+    /// - `vn_relax_init` (`vn_common.c:234-236`) **clears** ALIVE on entry to *every* wait.
+    /// - At the first warning threshold — iteration 4096, roughly 3.5 s of accumulated sleep —
+    ///   `vn_relax` (`vn_common.c:268-283`) re-reads `status`. If ALIVE is still clear it calls
+    ///   `vn_watchdog_acquire(watchdog, false)`, which sets `watchdog->alive = false`, so
+    ///   `vn_watchdog_timeout()` returns true and Mesa calls **`abort()`** on the application.
+    ///
+    /// In a local vtest setup virglrenderer's `vkr-ringmon` thread re-sets the bit every ~3 s and the
+    /// application never notices. Under `rayland-c` there is no such thread on C: S's virglrenderer
+    /// sets ALIVE on **S's mirror** of the ring, and that store never crosses the network. So unless
+    /// C writes this word itself, a legitimately slow-but-healthy S — a pipeline compile, a busy GPU,
+    /// a cold shader cache, or simply a large command stream in flight over a slow link — kills the
+    /// application at 3.5 s. It also makes `rayland-c`'s own 30 s stall timeout unreachable by
+    /// default, since Mesa would always abort first.
+    ///
+    /// # Why Rayland's heartbeat is more honest than virglrenderer's, and where it still is not
+    /// The caller must set this bit **only on evidence that the ring actually moved** — an
+    /// `S2C::RingProgress` whose `consumed_tail` advanced. That is what ring-findings §5.4 asks for:
+    /// *"a correct transport must gate the heartbeat on evidence of actual ring progress"*. Contrast
+    /// `vkr_context_ring_monitor_thread` (`vkr_context.c:532-539`), which walks the context's rings
+    /// and sets ALIVE on every monitored one **without consulting any ring state whatsoever** — it
+    /// proves only that the host process is being scheduled, which is exactly the property the
+    /// findings call worthless.
+    ///
+    /// **The honest limit of this gate:** it can only fire when S reports progress, so it covers a
+    /// slow S that is *streaming* progress (the case Rayland most cares about — a big command stream
+    /// crossing a slow link, acknowledged incrementally). It does **not** cover an S that is healthy
+    /// but silent inside one long-running command, because C has no evidence to distinguish that from
+    /// a wedge, and it does not receive a `RingProgress` during it. Closing that needs a liveness
+    /// signal only S can emit while it executes; it is (c)1 Task 5's protocol surface and does not
+    /// exist yet. `main.rs`'s stall timeout is the backstop that makes the gap safe rather than silent.
+    ///
+    /// The bit is OR'ed in rather than assigned, mirroring Mesa's `atomic_fetch_or`, so `FATAL` and
+    /// any concurrently-published `IDLE` survive.
+    ///
+    /// # Inputs / outputs
+    /// - `ring`: the ring blob's bytes, mutable because `status` is a word C writes and Mesa reads.
+    /// - Nothing is returned; the effect is the published bit.
+    ///
+    /// # Pitfall: this widens the module's Gap 1/Gap 2 data race, deliberately
+    /// C's read-modify-write of `status` is not atomic, while Mesa's clear of ALIVE
+    /// (`atomic_fetch_and`) is. The two can therefore lose each other's update. The only direction
+    /// that matters here is C re-setting an ALIVE that Mesa has just cleared, which delays a
+    /// would-be abort by one warning period — the safe direction, and bounded. It is nonetheless a
+    /// real race, and it is why every write to `status` is kept on the single watcher thread rather
+    /// than being done from the reader thread where the `RingProgress` actually arrives.
+    pub fn set_alive(&mut self, ring: &mut [u8]) {
+        let status = read_control(ring, RING_STATUS_OFFSET);
+        // Preserve IDLE/FATAL; only claim the ALIVE bit.
+        write_control(ring, RING_STATUS_OFFSET, status | RING_STATUS_ALIVE_BIT);
     }
 
     /// Publish `upto` as the ring's `head`: the byte count C has consumed, which is what tells Mesa

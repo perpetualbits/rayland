@@ -21,14 +21,24 @@
 //!
 //! - [`C2S::RingDelta`] carries the new ring bytes themselves — **this is the payload the
 //!   whole project exists to move**, since it *is* the serialized Vulkan command stream.
+//! - [`C2S::SubmitCmd`] carries the bytes that arrive on the vtest socket itself, in a
+//!   `VCMD_SUBMIT_CMD2`. It is tiny — ring-findings §2 measured 140–236 bytes for an
+//!   entire Vulkan initialization — and it is **indispensable**, because the socket's one
+//!   real command is `vkCreateRingMESA`: the message that makes S create the ring in the
+//!   first place. An S that handles `RingDelta` but not `SubmitCmd` has no ring to deliver
+//!   anything to, and nothing the application draws is ever executed.
 //! - [`S2C::BlobData`] carries the reply arena the application blocks on, and the
 //!   readback buffer the GPU renders into — without it the application never learns the
 //!   answer to a synchronous call, or sees its own pixels.
-//! - [`C2S::NotifyRing`] carries the doorbell. Mesa only rings it when its ring-consumer
-//!   thread on the host has been idle for a while, so **the number of `NotifyRing`
-//!   messages observed is a fact about scheduling timing, never a fact about how much
-//!   work was done** — C0 measured 1 and 4 notifications for two runs that produced
-//!   byte-identical ring traffic. Do not build a metric on this field.
+//! - [`C2S::NotifyRing`] would carry the doorbell — but **nothing constructs it today**,
+//!   and an implementor of S must not wait for one. `rayland-c`'s relay engine forwards
+//!   *everything* off the vtest socket as [`C2S::SubmitCmd`], and Mesa's `vkNotifyRingMESA`
+//!   arrives on that socket like any other command, so the doorbell reaches S **inside**
+//!   `SubmitCmd`, already in the Venus command language S's context decoder expects. The
+//!   variant is kept because the doorbell may yet deserve to be hoisted out of the command
+//!   stream — recognising it costs a decode S would otherwise not do — and removing it now
+//!   would only have to be undone. See its own doc comment for why counting doorbells is
+//!   meaningless regardless of how they arrive.
 //!
 //! # Framing
 //!

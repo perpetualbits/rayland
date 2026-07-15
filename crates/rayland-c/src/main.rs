@@ -30,9 +30,17 @@
 //! `rayland-s` is (c)1 Task 5 and does not exist; the QUIC transport is Task 6. The pieces with real
 //! logic — the ring watcher, the blob shadows, the relay engine — are unit-tested against a
 //! synthetic ring and a mock link (`tests/ring_watch.rs`, and the `tests` modules of [`ring`],
-//! [`shm`] and [`relay_engine`]). The *wiring* in this file is not covered by any test and must be
-//! treated as unverified until Task 5 gives it a peer. It is written to be read, and it says where
-//! it is guessing.
+//! [`shm`] and [`relay_engine`]), as is this file's own [`Progress`] (see its `tests` module).
+//!
+//! What remains uncovered is the *wiring*: the sockets, the three threads, and the vtest session.
+//! That genuinely needs a peer and must be treated as unverified until Task 5 provides one. The
+//! distinction matters, because "there is no S to run against" is a reason to test the parts that do
+//! not need one — not a licence to test nothing. [`Progress`] shipped a real bug behind exactly that
+//! excuse: it restarted its stall clock on any acknowledgement from S rather than on one that showed
+//! the ring had moved, which would have made the stall timeout unreachable against an S that sent
+//! keepalives. It is three fields and no I/O; nothing about the missing S ever stood in the way.
+//!
+//! This file is written to be read, and it says where it is guessing.
 
 // The daemon's own pieces.
 use rayland_c::relay_engine::{BlobTable, RelayEngine, RelayLink, RingSlot};
@@ -95,6 +103,25 @@ const ENV_STALL_TIMEOUT: &str = "RAYLAND_C1_STALL_TIMEOUT";
 /// one. This timeout is the gate on real evidence of progress that the watchdog cannot provide, and
 /// it **must exist before anyone sets `VN_DEBUG=no_abort`** — disabling Mesa's abort without it
 /// removes the only thing that currently makes a stall visible at all.
+///
+/// # How this interacts with the ALIVE heartbeat, and why 30 s is reachable at all
+/// `rayland-c` does write the ring's ALIVE bit — it has to, or Mesa aborts every slow-but-healthy
+/// session at ~3.5 s (see [`RingWatcher::set_alive`](rayland_c::ring::RingWatcher::set_alive)). That
+/// could look like the very mistake the findings warn about, and it is not, because of the division
+/// of labour between the two mechanisms:
+///
+/// - The heartbeat is **gated on evidence**: it is set only where an `S2C::RingProgress` has
+///   actually advanced `consumed_tail`, never on a timer and never merely because S is reachable.
+///   A wedged S therefore stops setting it, exactly as it should.
+/// - This timeout is the **independent** backstop, and it is what the findings' "gate on real
+///   evidence of progress" ultimately cashes out as. It measures the one thing that matters — the
+///   ring not moving — and it is not derived from Mesa's watchdog in any way.
+///
+/// So the 895-second hang the findings describe cannot happen here: the two are wired to the same
+/// evidence, and whichever notices first, the session ends in seconds with a message naming the
+/// cause. Note the ordering this implies in the default configuration — the ALIVE gate is what makes
+/// *this* 30 s limit reachable at all, since before it existed Mesa would always have aborted at
+/// 3.5 s first.
 const DEFAULT_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long the ring watcher sleeps when it has parked.
@@ -168,6 +195,27 @@ struct Progress {
     outstanding_since: Option<Instant>,
 }
 
+/// What [`Progress::note_consumed`] made of an acknowledgement from S.
+///
+/// This is a type rather than a `bool` because the caller treats the three outcomes differently —
+/// one is the hot path, one is silently ignorable, and one is a protocol violation worth a human's
+/// attention — and because two of them look identical from the outside while meaning opposite
+/// things about S's health.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ack {
+    /// `consumed_tail` moved forward: S genuinely replayed more of the ring. **This is the only
+    /// outcome that counts as evidence of progress**, and therefore the only one that may restart
+    /// the stall clock or set the ring's ALIVE bit.
+    Advanced,
+    /// A repeat of a `consumed_tail` already acknowledged. Ignored: see [`Progress::note_consumed`]
+    /// for why treating this as progress reintroduces the exact footgun the stall detector exists
+    /// to avoid.
+    Stale,
+    /// An acknowledgement of bytes C never relayed. A protocol error on S's side; ignored, and
+    /// reported by the caller.
+    PastFrontier,
+}
+
 impl Progress {
     /// A session with nothing relayed and nothing outstanding.
     fn new() -> Self {
@@ -189,17 +237,66 @@ impl Progress {
         }
     }
 
-    /// Record S's acknowledgement, clearing the stall clock if it has caught up.
-    fn note_consumed(&mut self, tail: u32) {
+    /// Record S's acknowledgement, but only if it is real evidence that the ring moved.
+    ///
+    /// # Why this checks that the tail moved, and why "it arrived" is not the same thing
+    /// The obvious implementation restarts the stall clock on any `RingProgress` where S is behind.
+    /// That is **the exact footgun ring-findings §5.4 documents**, rebuilt inside the mechanism
+    /// written to avoid it. If S ever sends periodic `RingProgress` keepalives — an entirely natural
+    /// Task 5 design — then an S that wedges mid-frame while its keepalive thread keeps running
+    /// resends `consumed_tail = 4024` forever. Every one of those restarts the clock, and
+    /// [`DEFAULT_STALL_TIMEOUT`] never fires. The message would then prove only that S's process is
+    /// being scheduled, which is precisely what the findings say the engine's own watchdog proves
+    /// and why it is worthless: *"it proves the host process is being scheduled; it proves nothing
+    /// whatsoever about the ring making progress"*. So the clock is restarted on **movement**, never
+    /// on arrival.
+    ///
+    /// # Why the frontier is a bound and not a formality
+    /// `tail` arrives over the network and is not trusted. Accepting a regressing or over-eager ack
+    /// would corrupt `consumed_tail`, which the watcher publishes verbatim as the ring's `head` —
+    /// and [`RingWatcher::advance_head`](rayland_c::ring::RingWatcher::advance_head) asserts against
+    /// exactly that. Concretely: C relays past one buffer's worth (`relayed_tail = 262144`) and S
+    /// resends a stale `consumed = 4024`; the assert computes `262144 - 4024 = 258120 > 131072` and
+    /// **panics the watcher thread**. That thread is detached, so the panic does not stop the daemon
+    /// — it kills the only thread that relays commands and poisons the `blobs` mutex, after which
+    /// every `.expect("the blob table lock is never poisoned")` in this file is a lie. Clamping here
+    /// makes that assert unreachable, and matches the standard [`apply_blob_data`] already holds for
+    /// remote input.
+    ///
+    /// Both comparisons are wrapping differences, so they stay correct across the `tail` counter's
+    /// 2^32 overflow — the same reason Mesa computes ring occupancy as a difference rather than a
+    /// comparison.
+    ///
+    /// # Inputs / outputs
+    /// - `tail`: the `consumed_tail` S reported.
+    /// - Returns what was made of it; only [`Ack::Advanced`] mutated any state.
+    fn note_consumed(&mut self, tail: u32) -> Ack {
+        // How far this ack would move the frontier forward, and how far it *could* legitimately
+        // move it. S cannot have replayed bytes C never sent, so `relayed_tail` is the ceiling.
+        let advance = tail.wrapping_sub(self.consumed_tail);
+        let outstanding = self.relayed_tail.wrapping_sub(self.consumed_tail);
+
+        if advance == 0 {
+            // A duplicate of what we already have. Not progress, so the clock keeps running: this
+            // is the branch that makes a keepalive-while-wedged S detectable.
+            return Ack::Stale;
+        }
+        if advance > outstanding {
+            // Either a regression (which wraps to something enormous) or an ack of bytes we never
+            // relayed. Both are S misbehaving; refuse the value rather than publish it as `head`.
+            return Ack::PastFrontier;
+        }
+
         self.consumed_tail = tail;
         if self.relayed_tail == self.consumed_tail {
             // Fully acknowledged: nothing is outstanding, so nothing can be stalled.
             self.outstanding_since = None;
         } else {
-            // Still behind, but it moved — S is slow, not stopped. Restart the clock so progress,
-            // however gradual, is never mistaken for a stall.
+            // Still behind, but it genuinely moved — S is slow, not stopped. Restart the clock so
+            // progress, however gradual, is never mistaken for a stall.
             self.outstanding_since = Some(Instant::now());
         }
+        Ack::Advanced
     }
 
     /// How long work has been outstanding, or `None` if S is fully caught up.
@@ -288,10 +385,23 @@ fn reader_thread(
             // S's acknowledgement. Under this daemon's design this is what drives `head`, so it is
             // load-bearing rather than diagnostic — see `ring_watcher_thread`.
             S2C::RingProgress { consumed_tail, .. } => {
-                progress
+                let ack = progress
                     .lock()
                     .expect("the progress lock is never poisoned")
                     .note_consumed(consumed_tail);
+                // A stale repeat is unremarkable — a Task 5 keepalive would produce them by design,
+                // and `note_consumed` deliberately ignores them. An ack of bytes C never relayed is
+                // not: it means S and C disagree about the ring's contents, which is the kind of
+                // desynchronization that surfaces later as inexplicable GPU errors, so name it here
+                // where the cause is visible.
+                if ack == Ack::PastFrontier {
+                    eprintln!(
+                        "rayland-c: S acknowledged ring tail {consumed_tail}, which is past \
+                         anything C has relayed. Ignoring it — publishing it as `head` would let \
+                         Mesa overwrite commands that were never shipped. This is a protocol error \
+                         on S."
+                    );
+                }
             }
             // Solicited (`Capset`, `BlobCreated`, `Error`): queue it for whoever asked. The channel
             // is unbounded and its receiver lives inside the engine for the whole session, so a
@@ -402,10 +512,17 @@ fn ring_watcher_thread(
     // The last value written to the ring's `head`. A fresh ring's `head` is already 0, so starting
     // here means the first pass writes nothing until S has genuinely acknowledged something.
     let mut published_head: u32 = 0;
+    // Whether the IDLE bit currently stands published. Tracked rather than recomputed for the same
+    // reason `published_head` is: `status` is a word Mesa polls from another thread on every submit,
+    // and this loop runs every few hundred microseconds. Clearing a bit that is already clear on
+    // every pass of a busy burst would dirty that shared cache line continuously — precisely the
+    // coherence traffic Mesa's 64-byte `alignas` on these words exists to prevent (ring-findings §4).
+    let mut idle_published = false;
 
     loop {
-        // --- 1. Drain. The lock is held only long enough to copy the bytes out, never across the
-        // network send below: the reader thread needs this table to deliver replies.
+        // --- 1. Drain, and retract IDLE if we found anything. The lock is held only long enough to
+        // copy the bytes out, never across the network send below: the reader thread needs this
+        // table to deliver replies.
         let delta = {
             let mut table = blobs.lock().expect("the blob table lock is never poisoned");
             let Some(blob) = table.get_mut(&identity.res_id) else {
@@ -413,12 +530,35 @@ fn ring_watcher_thread(
                 eprintln!("rayland-c: the command ring is gone; watcher stopping");
                 return;
             };
-            watcher.take_delta(blob.bytes())
+            let delta = watcher.take_delta(blob.bytes());
+            // Draining bytes proves this watcher is awake, so the IDLE claim published before the
+            // last park must go — and it must go *here*, before the network send below, not on some
+            // later pass. Mesa tests IDLE on every submit (`vn_ring.c:475-483`) and doorbells if it
+            // is set; leaving it standing through a busy burst means an application at 60 fps drives
+            // ~1000 spurious `vkNotifyRingMESA` calls a second, each one a socket write on C and a
+            // relayed message to S, all to wake a thread that never slept. Ring-findings §5.2's
+            // headline result is that the steady state emits *zero* notifications; this is the line
+            // that keeps that true. `RingWatcher::clear_idle` documents the mechanism.
+            if delta.is_some() && idle_published {
+                watcher.clear_idle(blob.bytes_mut());
+                idle_published = false;
+            }
+            delta
         };
 
         // --- 2. Relay, with no lock held. These bytes are the application's Vulkan commands.
         if let Some(delta) = delta {
             let tail = delta.tail;
+            // Record the frontier *before* the send, not after. `Progress::note_consumed` refuses
+            // any acknowledgement past `relayed_tail`, and a fast S can answer this delta before
+            // this thread would reacquire the progress lock — so noting it afterwards would race,
+            // and S's legitimate first ack would be rejected as `Ack::PastFrontier`. Doing it first
+            // is also strictly conservative for the stall clock: it starts marginally earlier
+            // (it now includes the time the send itself takes), never later.
+            progress
+                .lock()
+                .expect("the progress lock is never poisoned")
+                .note_relayed(tail);
             let msg = C2S::RingDelta {
                 ring_res_id: identity.res_id,
                 tail,
@@ -432,12 +572,9 @@ fn ring_watcher_thread(
                 eprintln!("rayland-c: relaying the ring to S failed: {e}");
                 return;
             }
-            progress
-                .lock()
-                .expect("the progress lock is never poisoned")
-                .note_relayed(tail);
             // New work was just produced, so do not even consider parking: go straight back and
-            // look again. An application mid-frame produces continuously.
+            // look again. An application mid-frame produces continuously. IDLE was retracted in
+            // step 1, so this shortcut leaves no stale claim behind.
             continue;
         }
 
@@ -474,8 +611,20 @@ fn ring_watcher_thread(
             if let Some(blob) = table.get_mut(&identity.res_id) {
                 // Only ever the frontier we have relayed *and* S has acknowledged. `advance_head`
                 // refuses anything past what this watcher drained, which is the backstop against
-                // S reporting a tail we never sent.
+                // S reporting a tail we never sent (`Progress::note_consumed` is the first line of
+                // that defence and makes this assert unreachable).
                 watcher.advance_head(blob.bytes_mut(), consumed);
+                // Reaching here *is* the evidence of ring progress: `consumed` only ever advances
+                // (`note_consumed` clamps it) and it differs from what we last published, so S has
+                // demonstrably replayed more of the ring since the last heartbeat. That is exactly
+                // the gate ring-findings §5.4 demands — and the reason this is not simply forwarding
+                // Mesa's own watchdog, which would set ALIVE on a wedged ring just as happily.
+                //
+                // Without this, C's ring never has ALIVE set by anyone (S's virglrenderer sets it on
+                // S's mirror, which never crosses back), and Mesa aborts the application ~3.5 s into
+                // any wait. `RingWatcher::set_alive` documents the abort path and the honest limit of
+                // this gate: it cannot cover an S that is healthy but silent inside one long command.
+                watcher.set_alive(blob.bytes_mut());
             }
             published_head = consumed;
         }
@@ -495,9 +644,18 @@ fn ring_watcher_thread(
         match decision {
             // Nothing pending and IDLE is published, so Mesa knows to kick us. Sleep — but only for
             // a bounded time; see `PARK_SLEEP`.
-            ParkDecision::Park => std::thread::sleep(PARK_SLEEP),
-            // Mesa wrote while we were announcing. IDLE has been retracted; go straight back.
-            ParkDecision::StayAwake => continue,
+            ParkDecision::Park => {
+                // The claim now stands, and step 1 owes Mesa its retraction the moment we drain
+                // anything. This is the only place that becomes true.
+                idle_published = true;
+                std::thread::sleep(PARK_SLEEP);
+            }
+            // Mesa wrote while we were announcing. `decide_park` has already retracted IDLE on our
+            // behalf, so record that and go straight back.
+            ParkDecision::StayAwake => {
+                idle_published = false;
+                continue;
+            }
         }
     }
 }
@@ -616,4 +774,206 @@ fn main() -> Result<()> {
         outcome.context_id, outcome.submitted_batches
     );
     Ok(())
+}
+
+/// Unit tests for [`Progress`], the daemon's stall detector.
+///
+/// # Why this struct is tested when the rest of the file is not
+/// The module docs are honest that this file's *wiring* — sockets, threads, the vtest session — has
+/// no peer to run against until (c)1 Task 5 builds S, and so is not covered. [`Progress`] is the
+/// exception and deserves to be: it is three fields and no I/O, its whole job is a decision that is
+/// invisible until it is wrong, and the bug it shipped with (restarting the stall clock on any
+/// acknowledgement, whether or not the ring had moved) was pure logic that any of these tests would
+/// have caught. "There is no S to run against" is a reason to test the parts that do not need one,
+/// not a reason to test nothing.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The frontier from the live capture: 4024 bytes of ring traffic for the reference app's whole
+    /// Vulkan initialization (ring-findings §2). Used throughout so the numbers are the real ones.
+    const FIRST_FRONTIER: u32 = 4024;
+
+    /// Nothing relayed means nothing outstanding: an idle session must never look stalled. Without
+    /// this, an application that simply is not drawing would be killed by the stall timeout.
+    #[test]
+    fn an_idle_session_has_nothing_outstanding() {
+        let p = Progress::new();
+        assert_eq!(p.outstanding_for(), None);
+    }
+
+    /// Relaying bytes S has not acknowledged starts the stall clock. This is the "tail advanced but
+    /// no progress arrived" case, and it is the one the timeout exists to fire on.
+    #[test]
+    fn relaying_unacknowledged_bytes_starts_the_stall_clock() {
+        let mut p = Progress::new();
+        p.note_relayed(FIRST_FRONTIER);
+
+        assert!(
+            p.outstanding_for().is_some(),
+            "work relayed but unacknowledged must be visible to the stall timeout"
+        );
+    }
+
+    /// The clock, once started, is not restarted by C's own continued relaying. Otherwise a steadily
+    /// producing application would mask an S that had been silent for hours: the daemon would be
+    /// measuring its own liveness rather than S's.
+    #[test]
+    fn c_relaying_more_does_not_restart_the_clock() {
+        let mut p = Progress::new();
+        p.note_relayed(FIRST_FRONTIER);
+        let started_at = p.outstanding_since;
+
+        p.note_relayed(FIRST_FRONTIER * 2);
+
+        assert_eq!(
+            p.outstanding_since, started_at,
+            "only S's progress may restart the clock; C's own relaying is not evidence about S"
+        );
+    }
+
+    /// A full acknowledgement stops the clock: nothing is outstanding, so nothing can be stalled.
+    #[test]
+    fn a_full_acknowledgement_clears_the_clock() {
+        let mut p = Progress::new();
+        p.note_relayed(FIRST_FRONTIER);
+
+        assert_eq!(p.note_consumed(FIRST_FRONTIER), Ack::Advanced);
+
+        assert_eq!(
+            p.outstanding_for(),
+            None,
+            "S has caught up entirely; there is nothing left to be stalled on"
+        );
+    }
+
+    /// A partial but genuine acknowledgement restarts the clock: S is slow, not stopped, and gradual
+    /// progress must never be mistaken for a stall.
+    #[test]
+    fn a_genuinely_advancing_acknowledgement_restarts_the_clock() {
+        let mut p = Progress::new();
+        p.note_relayed(FIRST_FRONTIER);
+        // Backdate the clock so a failure to restart it is unambiguous rather than a matter of
+        // microseconds: `Instant::now()` twice in a row can be indistinguishable.
+        p.outstanding_since = Some(backdated(Duration::from_secs(20)));
+
+        assert_eq!(p.note_consumed(FIRST_FRONTIER / 2), Ack::Advanced);
+
+        let waited = p
+            .outstanding_for()
+            .expect("still behind, so still outstanding");
+        assert!(
+            waited < Duration::from_secs(1),
+            "a genuinely advancing ack must restart the clock, but it still reads {waited:?}"
+        );
+    }
+
+    /// **The regression test for the stall detector's original bug.**
+    ///
+    /// A repeated acknowledgement is not progress. If S ever sends periodic `RingProgress`
+    /// keepalives — an entirely natural Task 5 design — then an S that wedges mid-frame while its
+    /// keepalive thread keeps running resends the same `consumed_tail` forever. Restarting the clock
+    /// on those makes `RAYLAND_C1_STALL_TIMEOUT` unreachable and rebuilds ring-findings §5.4's
+    /// footgun ("it proves the host process is being scheduled; it proves nothing whatsoever about
+    /// the ring making progress") inside the mechanism written to avoid it.
+    #[test]
+    fn a_repeated_acknowledgement_does_not_restart_the_clock() {
+        let mut p = Progress::new();
+        p.note_relayed(FIRST_FRONTIER);
+        // S acknowledges half, then wedges.
+        assert_eq!(p.note_consumed(FIRST_FRONTIER / 2), Ack::Advanced);
+        // Twenty seconds pass with the ring not moving.
+        p.outstanding_since = Some(backdated(Duration::from_secs(20)));
+
+        // The keepalive: the same tail, resent. The ring has not moved by one byte.
+        assert_eq!(
+            p.note_consumed(FIRST_FRONTIER / 2),
+            Ack::Stale,
+            "an unchanged consumed_tail is not evidence of progress"
+        );
+
+        let waited = p
+            .outstanding_for()
+            .expect("still behind, so still outstanding");
+        assert!(
+            waited >= Duration::from_secs(20),
+            "a stale ack must leave the stall clock running, but it was reset to {waited:?}; \
+             a wedged S with a live keepalive thread would never be detected"
+        );
+    }
+
+    /// A regressing acknowledgement is refused rather than applied.
+    ///
+    /// This is the exact scenario that panics the watcher: C has relayed past one buffer's worth and
+    /// S resends a stale, much lower `consumed`. Accepting it would let the watcher publish it as
+    /// `head`, and `RingWatcher::advance_head`'s guard computes `262144 - 4024 = 258120 > 131072`
+    /// and panics — on a *detached* thread, so the daemon does not die loudly; it loses the only
+    /// thread that relays commands and poisons the blob table's mutex.
+    #[test]
+    fn a_regressing_acknowledgement_is_refused() {
+        let mut p = Progress::new();
+        // Two buffers' worth relayed, and S has acknowledged the first frontier.
+        p.note_relayed(262144);
+        assert_eq!(p.note_consumed(131072), Ack::Advanced);
+
+        // A stale duplicate from before, arriving late.
+        assert_eq!(
+            p.note_consumed(FIRST_FRONTIER),
+            Ack::PastFrontier,
+            "an ack below the one already recorded must not be applied"
+        );
+        assert_eq!(
+            p.consumed_tail, 131072,
+            "the frontier must not regress: the watcher publishes it verbatim as the ring's head"
+        );
+    }
+
+    /// An acknowledgement of bytes C never relayed is refused. S cannot have replayed what it was
+    /// never sent, so this is a protocol error — and publishing it as `head` would invite Mesa to
+    /// overwrite commands still waiting to be shipped.
+    #[test]
+    fn an_acknowledgement_past_the_relayed_frontier_is_refused() {
+        let mut p = Progress::new();
+        p.note_relayed(FIRST_FRONTIER);
+
+        assert_eq!(
+            p.note_consumed(FIRST_FRONTIER + 4),
+            Ack::PastFrontier,
+            "S claims to have replayed 4 bytes C never sent it"
+        );
+        assert_eq!(
+            p.consumed_tail, 0,
+            "a refused ack must not move the frontier"
+        );
+    }
+
+    /// The frontier arithmetic survives the `tail` counter's 2^32 wrap, which happens once per 4 GiB
+    /// of commands. Both the "did it move" and the "is it past the frontier" tests are wrapping
+    /// differences for this reason — a plain `<` comparison would read the wrap as a regression and
+    /// refuse every acknowledgement from then on, permanently wedging the session.
+    #[test]
+    fn acknowledgements_survive_the_counter_wrap() {
+        let mut p = Progress::new();
+        // Relayed frontier sits just past the wrap; S's last ack sits just before it.
+        p.consumed_tail = u32::MAX - 100;
+        p.note_relayed(24); // i.e. 124 bytes further on, having wrapped through 0.
+
+        assert_eq!(
+            p.note_consumed(12),
+            Ack::Advanced,
+            "an ack that wrapped past 0 is forward progress, not a regression"
+        );
+        assert_eq!(p.consumed_tail, 12);
+    }
+
+    /// An `Instant` `ago` in the past, for tests that must observe a clock that has genuinely run.
+    ///
+    /// `checked_sub` rather than plain subtraction because `Instant`'s epoch is unspecified and may
+    /// be close to the process start on some platforms; a panic here would be a broken test rather
+    /// than a broken daemon, so it says so.
+    fn backdated(ago: Duration) -> Instant {
+        Instant::now()
+            .checked_sub(ago)
+            .expect("the test clock must be able to reach into the past")
+    }
 }

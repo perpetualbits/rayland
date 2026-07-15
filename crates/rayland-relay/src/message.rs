@@ -133,13 +133,27 @@ pub enum C2S {
         cmd: Vec<u8>,
     },
 
-    /// The doorbell: Mesa's `vkNotifyRingMESA`. Carried here purely for fidelity with
-    /// the vtest protocol S's embedded engine expects to see; S's ring-consuming thread
-    /// may equally well notice new work from the arrival of [`C2S::RingDelta`] bytes
-    /// themselves. **Never** treat a count of these messages as a measurement of work
-    /// done: the ring-findings document (§5.2) measured 1 notification in one run and 4
+    /// The doorbell: Mesa's `vkNotifyRingMESA`, hoisted out of the command stream into a
+    /// message of its own.
+    ///
+    /// # Currently unused — an S that waits for this will wait forever
+    /// **Nothing constructs this variant.** `rayland-c`'s `RelayEngine::submit` forwards
+    /// everything that arrives on the vtest socket as [`C2S::SubmitCmd`], and
+    /// `vkNotifyRingMESA` arrives on that socket like any other command — so the doorbell
+    /// does reach S, but *inside* `SubmitCmd`, in the Venus command language S's context
+    /// decoder already handles. There is deliberately no separate signal.
+    ///
+    /// It is kept rather than deleted because hoisting the doorbell out may yet earn its
+    /// place: recognising it as a distinct event would let a transport prioritise or
+    /// coalesce it, at the cost of a decode on C that nothing currently does. Implementing
+    /// that is a protocol decision, not an oversight to be quietly filled in — so if you
+    /// are here to write S's handler, write the [`C2S::SubmitCmd`] one instead.
+    ///
+    /// # Do not build a metric on this
+    /// **Never** treat a count of doorbells as a measurement of work done, however they
+    /// arrive: the ring-findings document (§5.2) measured 1 notification in one run and 4
     /// in another for **byte-identical** ring traffic, because Mesa rings this doorbell
-    /// only when its host-side ring-consumer thread has been idle for a while — the
+    /// only when it observes the consumer's IDLE bit and a 1 ms throttle has elapsed — the
     /// count is a fact about scheduling timing, not about the workload.
     NotifyRing {
         /// Which ring this doorbell is for.
@@ -195,13 +209,28 @@ pub enum S2C {
         bytes: Vec<u8>,
     },
 
-    /// S has replayed and retired every ring command up to `consumed_tail`. This is
-    /// **not** how C advances its own local ring `head` (Task 3's design note covers
-    /// why C does not need a network round trip on this hot path); it exists purely for
-    /// progress *detection* — Task 3's stall timeout consults it to tell "S is slow" from
-    /// "S has stopped", the exact distinction the ring-findings document's §5.4 says the
-    /// engine's own watchdog cannot make, because Mesa's watchdog reports host liveness,
-    /// not ring progress.
+    /// S has replayed and retired every ring command up to `consumed_tail`. **This is the
+    /// message C's local ring `head` is driven from**, and it is on the application's
+    /// critical path — it is not a diagnostic.
+    ///
+    /// # Why this costs a round trip, and why the alternative is a heisenbug
+    /// Task 3's brief originally specified that C would advance `head` locally as soon as it
+    /// had *relayed* the bytes, avoiding this round trip on the hot path. That is wrong, and
+    /// `rayland-c`'s ring watcher deliberately does not do it: `head` is not only "space is
+    /// free". Mesa polls it as the **reply-ready signal** (`vn_ring_wait_seqno`,
+    /// `vn_ring.c:181-198`), so a locally-forged `head` releases the application's wait
+    /// before S has answered and it reads a reply arena that is still zeros. Ring-findings §7
+    /// names the ordering constraint — a transport must ship the reply contents before the
+    /// head update that releases the wait — and only S knows when that has happened.
+    ///
+    /// # It is also the progress signal, and the only trustworthy one
+    /// `rayland-c`'s stall timeout consults `consumed_tail` to tell "S is slow" from "S has
+    /// stopped", the exact distinction the ring-findings document's §5.4 says the engine's
+    /// own watchdog cannot make, because Mesa's watchdog reports host liveness, not ring
+    /// progress. **A recipient must gate on `consumed_tail` having actually moved**, never on
+    /// this message merely arriving: an S that sends these periodically as a keepalive while
+    /// wedged would otherwise be indistinguishable from a healthy one, which is the same
+    /// footgun in a new place.
     RingProgress {
         /// Which ring this progress report is about.
         ring_res_id: u32,
@@ -242,6 +271,19 @@ mod tests {
             blob_flags: 0,
             blob_id: 16,
             size: 64,
+        };
+        assert_eq!(round_trip(&original), original);
+    }
+
+    #[test]
+    fn submit_cmd_round_trips() {
+        // A representative C2S::SubmitCmd carrying the real payload from the live capture:
+        // `0xbc` = opcode 188 = `vkCreateRingMESA` (ring-findings §3.2). This is the socket's
+        // one genuine command and the message that makes S create the ring at all, so it is
+        // the variant an S implementor must handle first — `NotifyRing` never arrives.
+        let original = C2S::SubmitCmd {
+            ctx_id: 1,
+            cmd: vec![0xbc, 0, 0, 0],
         };
         assert_eq!(round_trip(&original), original);
     }

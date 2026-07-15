@@ -314,10 +314,29 @@ impl<T: RelayLink> RenderEngine for RelayEngine<T> {
         // exist yet. It has nothing to do until the ring appears, and a ring it never learns about
         // is a silent hang rather than an error — see `RingIdentity`.
         if let Some(identity) = RingIdentity::from_blob_request(res_id, blob_id, size) {
-            *self
+            let mut slot = self
                 .ring
                 .lock()
-                .expect("the ring slot lock is never poisoned") = Some(identity);
+                .expect("the ring slot lock is never poisoned");
+            // **First match only.** `from_blob_request` is a shape heuristic and Mesa's per-thread
+            // TLS ring fits it too (16580 bytes, `blob_id == 0`; see `RingIdentity`). Mesa creates
+            // the instance ring first and it is the one that carries the application's drawing, so
+            // latching it and refusing later matches keeps the watcher pointed at the right ring.
+            // Overwriting unconditionally would silently repoint it at a 16 KiB ring carrying
+            // nothing the application draws — and the watcher, which latches this slot once at
+            // startup, would not even notice the change.
+            if slot.is_none() {
+                *slot = Some(identity);
+            } else {
+                // Worth a human's attention rather than silence: it means the session is doing
+                // something (c)1 has not scoped. The plan pins `VN_PERF=no_multi_ring`, under which
+                // `vn_tls_get_ring` hands back the instance ring and this should never fire.
+                eprintln!(
+                    "rayland-c: ignoring a second ring-shaped blob (res_id={res_id}, size={size}); \
+                     the command ring is already latched. This is probably Mesa's per-thread TLS \
+                     ring, which (c)1 does not support relaying — set VN_PERF=no_multi_ring."
+                );
+            }
         }
 
         Ok(BlobResource {

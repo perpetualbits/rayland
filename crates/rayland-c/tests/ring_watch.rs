@@ -118,6 +118,63 @@ fn park_is_allowed_only_when_the_ring_is_fully_drained() {
     );
 }
 
+/// A watcher that drains work must retract IDLE, and `clear_idle` is what the daemon's drain path
+/// calls to do it.
+///
+/// # Why this is not a cosmetic bit
+/// Mesa tests IDLE on **every** submit (`vn_ring.c:475-483`) and fires a `vkNotifyRingMESA` doorbell
+/// if it is set and the 1 ms throttle has elapsed. A daemon that publishes IDLE, parks, then wakes
+/// and relays a busy burst without retracting it makes Mesa pay for ~1000 doorbells a second to wake
+/// a thread that is demonstrably awake — inverting ring-findings §5.2's headline result (the steady
+/// state emits *zero* notifications) inside the program written to exploit it.
+#[test]
+fn clearing_idle_retracts_the_claim_without_disturbing_the_other_status_bits() {
+    let mut ring = vec![0u8; 131268];
+    // FATAL (0x2) and ALIVE (0x4) set by other parties, alongside our own IDLE claim.
+    let mut w = RingWatcher::new(1, 131072);
+    w.publish_idle(&mut ring);
+    let with_other_bits = read_u32(&ring, RING_STATUS_OFFSET) | 0x2 | 0x4;
+    write_u32(&mut ring, RING_STATUS_OFFSET, with_other_bits);
+
+    w.clear_idle(&mut ring);
+
+    assert_eq!(
+        read_u32(&ring, RING_STATUS_OFFSET),
+        0x2 | 0x4,
+        "clear_idle must mask out only IDLE; assigning the word instead of masking would destroy \
+         FATAL and ALIVE, and losing ALIVE aborts the application at Mesa's next warning threshold"
+    );
+}
+
+/// The ALIVE heartbeat must be OR'ed in, preserving whatever else `status` carries.
+///
+/// # Why the bit and the merge both matter
+/// The value is `0x4` from Mesa's generated header (`vn_protocol_renderer_defines.h:475-477`), not a
+/// guess — a wrong bit here would be silent and plausible. And clobbering the word rather than
+/// merging would drop a concurrently-published IDLE, which is the claim that tells Mesa a parked
+/// watcher needs a doorbell at all: losing it is the module's named hang.
+#[test]
+fn setting_alive_publishes_the_heartbeat_bit_and_preserves_idle() {
+    let mut ring = vec![0u8; 131268];
+    let mut w = RingWatcher::new(1, 131072);
+    w.publish_idle(&mut ring);
+
+    w.set_alive(&mut ring);
+
+    let status = read_u32(&ring, RING_STATUS_OFFSET);
+    assert_eq!(
+        status & 0x4,
+        0x4,
+        "ALIVE must be set, or Mesa's watchdog aborts the application ~3.5s into any wait \
+         (vn_common.c:268-283); nothing else writes this bit on C's ring"
+    );
+    assert_eq!(
+        status & 0x1,
+        0x1,
+        "set_alive must preserve a standing IDLE claim rather than assign the word"
+    );
+}
+
 /// **Ring wrap: the case the repository has never once executed.**
 ///
 /// Ring-findings §8.3 records that peak `tail` was 9936 bytes of 131072 (7.58%) for a full render,

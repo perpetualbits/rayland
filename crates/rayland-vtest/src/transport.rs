@@ -114,10 +114,18 @@ fn send_fd_over_socket(socket: BorrowedFd<'_>, fd: BorrowedFd<'_>) -> Result<(),
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
-    // Taking the address of the union's byte arm (a raw-pointer expression, so no `unsafe` and no
-    // read of a union field actually happens). The union is live for the whole call; we only ever
-    // hand the kernel this pointer plus its length.
-    msg.msg_control = (&raw mut cmsg_buffer.bytes) as *mut c_void;
+    // Take the address of the union's byte arm. Nothing is *read* here — `&raw mut` only computes
+    // an address — but Rust 1.85, the MSRV this crate declares, still classes any access to a union
+    // field as unsafe and rejects the bare expression (E0133). Rust 1.87 later relaxed exactly this
+    // case, which is why the `unsafe` looks redundant on a modern toolchain and is not optional on
+    // the floor we promise; `unused_unsafe` is allowed below rather than the MSRV being bumped,
+    // because CLAUDE.md names RISC-V as a target for machine C and that floor is a deliberate claim.
+    // SAFETY: no union field is read. `&raw mut` yields an address without loading the (zeroed, and
+    // therefore anyway fully initialized) bytes, `cmsg_buffer` is live for the whole call, and the
+    // kernel receives only this pointer plus the matching `CMSG_BUF_LEN` length.
+    #[allow(unused_unsafe)]
+    let control = unsafe { (&raw mut cmsg_buffer.bytes) as *mut c_void };
+    msg.msg_control = control;
     msg.msg_controllen = CMSG_BUF_LEN as _;
 
     // Fill in the single SCM_RIGHTS control message.
@@ -447,8 +455,14 @@ mod tests {
         let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
         msg.msg_iov = &mut iov;
         msg.msg_iovlen = 1;
-        // Address of the live union's byte arm; see `send_fd_over_socket` for why it is aligned.
-        msg.msg_control = (&raw mut cmsg_buffer.bytes) as *mut c_void;
+        // Address of the live union's byte arm; see `send_fd_over_socket` for why it is aligned, and
+        // for why the `unsafe` that reads as redundant on a modern toolchain is what the declared
+        // 1.85 MSRV requires.
+        // SAFETY: no union field is read — `&raw mut` only computes an address into the live,
+        // zeroed `cmsg_buffer` above.
+        #[allow(unused_unsafe)]
+        let control = unsafe { (&raw mut cmsg_buffer.bytes) as *mut c_void };
+        msg.msg_control = control;
         msg.msg_controllen = CMSG_BUF_LEN as _;
 
         // SAFETY: `socket` is live; `msg` and its buffers are live for the call.

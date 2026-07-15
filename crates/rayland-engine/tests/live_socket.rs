@@ -125,7 +125,14 @@ fn receive_fd(stream: &UnixStream) -> OwnedFd {
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
-    msg.msg_control = (&raw mut cmsg_buffer.bytes) as *mut libc::c_void;
+    // The `unsafe` reads as redundant on a modern toolchain and is not: Rust 1.85, this crate's
+    // declared MSRV, classes any access to a union field as unsafe (E0133) and only 1.87 relaxed
+    // the `&raw mut` case. See `rayland-vtest`'s `send_fd_over_socket` for the full note.
+    // SAFETY: no union field is read — `&raw mut` only computes an address into the live, zeroed
+    // `cmsg_buffer` above.
+    #[allow(unused_unsafe)]
+    let control = unsafe { (&raw mut cmsg_buffer.bytes) as *mut libc::c_void };
+    msg.msg_control = control;
     msg.msg_controllen = 64;
 
     // SAFETY: `stream` is a live connected socket; `msg` and its buffers are live for the call.
