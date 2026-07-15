@@ -105,6 +105,19 @@ It reports:
     client connected; serving vtest
     session ended cleanly: VtestOutcome { rendered_resource_id: Some(6), context_id: Some(1), submitted_batches: 8 }
 
+**`submitted_batches` will very likely differ on your machine — 8 and 10 have both been seen on
+this one, and neither is wrong.** The other two fields are deterministic and should match:
+`context_id: Some(1)` is the one context per connection, and `rendered_resource_id: Some(6)` is the
+application's readback buffer (64×64×4 = 16384 bytes — the blob it maps to read its own pixels).
+
+The batch count varies because **it is timing-dependent, not a property of the workload**. Mesa
+only rings the doorbell when our ring thread has actually parked (see
+[the ring findings](design/2026-07-15-venus-ring-findings.md)), so the number of batches counts *how
+often the host happened to be asleep*, not how much work the application did — byte-identical ring
+traffic has produced anywhere from 1 to 4 notifications. **Never read this number as a measure of
+anything.** It is printed because it proves the session carried real traffic, not because its value
+means something.
+
 Terminal B — the unmodified application, pointed at Mesa's Venus ICD:
 
     env -u VK_LOADER_DRIVERS_SELECT \
