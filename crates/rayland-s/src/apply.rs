@@ -512,12 +512,19 @@ impl Applier {
     /// reads back.
     ///
     /// # What crosses, and the rule that decides it (spec §7.2 — read this before changing it)
-    /// **S ships back exactly the pages S wrote.** Not "the application's blobs", not "the blobs the
-    /// GPU may have written" — the pages S is *observed* to have written, found by
-    /// [`HostBlob::take_pages_s_wrote`] diffing each blob against a baseline re-taken every time C's
-    /// own bytes land in it. Stop asking *"whose memory is this?"* and ask *"did I write it?"*: on
-    /// one machine every byte S writes is instantly visible to C, so an ownership predicate is a
-    /// *guess* at that relationship while an observed write **is** it.
+    /// **S ships back exactly the bytes S wrote.** Not "the application's blobs", not "the blobs the
+    /// GPU may have written", and not the pages containing S's writes — the bytes S is *observed* to
+    /// have written, found by [`HostBlob::take_bytes_s_wrote`] diffing each blob against a baseline
+    /// re-taken every time C's own bytes land in it. Stop asking *"whose memory is this?"* and ask
+    /// *"did I write it?"*: on one machine every byte S writes is instantly visible to C, so an
+    /// ownership predicate is a *guess* at that relationship while an observed write **is** it.
+    ///
+    /// The grain is the **byte** and not the page, which §7.2 says explicitly after amending itself
+    /// during Task 5b. A page-grain run would carry S's stale copy of whatever the application owns
+    /// in the rest of that page — legal for the app to be writing concurrently, since it is
+    /// different memory — and C's reader would lay the lot down. `VkDeviceMemory` is page-aligned
+    /// and applications suballocate, so that is the whole-blob race again at 4096-byte scale. The
+    /// comparison costs the same either way, so the page bought nothing.
     ///
     /// This replaced Task 5's rule, which routed on ring-findings §6's `blob_id` and was wrong twice
     /// over. It never carried the reply arena at all — a `blob_id == 0` shmem, so the predicate
@@ -543,9 +550,17 @@ impl Applier {
     /// a remote peer chose.
     ///
     /// # Inputs / outputs
-    /// - Returns the pages S wrote, followed by one [`S2C::RingProgress`] per ring that moved. Empty
-    ///   — no blobs, no progress — when nothing moved, which is the overwhelmingly common case on a
-    ///   poll loop.
+    /// - Returns the runs of bytes S wrote, followed by one [`S2C::RingProgress`] per ring that
+    ///   moved. Empty — no blobs, no progress — when nothing moved, which is the overwhelmingly
+    ///   common case on a poll loop.
+    ///
+    /// # Pitfall: one blob can produce many messages, and that is the byte grain's cost
+    /// A blob yields one [`S2C::BlobData`] per *run*, and a run breaks wherever a byte S wrote
+    /// happens to equal the byte already there. The reference app's first readback — 16 KiB of flat
+    /// blue, `00 00 ff ff` per pixel over a zero baseline — is 4096 runs, because the zero R and G
+    /// bytes are not bytes S wrote. See [`HostBlob::take_bytes_s_wrote`]: it is a volume cost, it is
+    /// deliberately left visible for Task 9 to measure, and the fix is never to merge runs across
+    /// bytes S did not write.
     pub fn poll_progress(&mut self) -> Vec<S2C> {
         // Ask the rings first, before copying anything: on the overwhelming majority of polls
         // nothing moved, and shipping a blob per poll regardless would make this loop a bandwidth
@@ -575,7 +590,7 @@ impl Applier {
         // Something retired, so S's engine has had the chance to write memory C cannot see. v1 does
         // not know — and deliberately does not ask — *which* blobs those commands touched: that
         // would mean decoding the ring, which spec §7 rules out. It asks each blob a question it can
-        // answer from bytes alone: which of your pages did S write? See the rule above.
+        // answer from bytes alone: which of your bytes did S write? See the rule above.
         let mut out = Vec::new();
         for (&res_id, blob) in self.blobs.iter_mut() {
             // **The ring is excluded structurally, by `res_id`.** S's engine genuinely writes a
@@ -588,7 +603,7 @@ impl Applier {
             if self.rings.contains_key(&res_id) {
                 continue;
             }
-            for run in blob.take_pages_s_wrote() {
+            for run in blob.take_bytes_s_wrote() {
                 out.push(S2C::BlobData {
                     res_id,
                     // No longer always 0: `offset` has been on the wire since Task 4 and this is

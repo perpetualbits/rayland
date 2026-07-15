@@ -29,7 +29,7 @@
 //! # Status: what has and has not been run
 //! **This crate has never run against a real `rayland-c`.** The QUIC transport is (c)1 Task 6. Task
 //! 5 shipped the blob synchronisation and Task 5b corrected its S→C half to spec §7.2's rule — **S
-//! ships back exactly the pages S wrote** — so every channel spec §5 lists as (c)1's now has an
+//! ships back exactly the bytes S wrote** — so every channel spec §5 lists as (c)1's now has an
 //! owner: the application's vertex buffer reaches S, its rendered pixels go back, and so do the
 //! command replies in channel 2's reply arena, which nothing carried before 5b. See
 //! `Applier::poll_progress` for the rule and for the two ways the rule it replaced was wrong. What

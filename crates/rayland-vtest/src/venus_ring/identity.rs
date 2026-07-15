@@ -22,7 +22,7 @@
 //! (Venus-internal, so channel 2 crossed nowhere and applications were released onto zeros), and for
 //! the app's own blobs it was a last-writer-wins race, S shipping back buffers its GPU never wrote.
 //! S now asks *"did I write it?"* instead, of the bytes themselves. See
-//! `rayland_s::blob::HostBlob::take_pages_s_wrote`, and `rayland_c::blob_sync`'s module docs for why
+//! `rayland_s::blob::HostBlob::take_bytes_s_wrote`, and `rayland_c::blob_sync`'s module docs for why
 //! C cannot and need not mirror that.
 
 // The layout constants this recognizer's arithmetic is expressed in terms of, so the two cannot
@@ -91,7 +91,7 @@ const RING_EXTRA_BYTES: u64 = 4;
 /// command-buffer staging pool are both `blob_id == 0`, and S never writes the pool, so shipping it
 /// back would wipe the command buffers C's Mesa is recording into it. Nothing in a `blob_id`
 /// separates them. S asks a different question now — *"did I write it?"*, of the bytes themselves;
-/// see `rayland_s::blob::HostBlob::take_pages_s_wrote`.
+/// see `rayland_s::blob::HostBlob::take_bytes_s_wrote`.
 ///
 /// # Inputs / outputs
 /// - `blob_id`: the client-chosen blob id from `VCMD_RESOURCE_CREATE_BLOB`, carried verbatim on the

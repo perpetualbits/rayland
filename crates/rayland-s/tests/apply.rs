@@ -20,9 +20,6 @@
 
 // The unit under test.
 use rayland_s::apply::{Applier, ApplyError};
-// The granularity at which S detects and ships its own writes (spec §7.2). Imported rather than
-// restated as 4096, so a test cannot claim a page size the code does not use.
-use rayland_s::blob::SYNC_PAGE_BYTES;
 use rayland_s::ring_mirror::RingDeltaError;
 // The relay protocol S speaks.
 use rayland_relay::{C2S, S2C};
@@ -145,8 +142,8 @@ impl RecordingEngine {
     /// The whole-blob [`RecordingEngine::write_blob`] is the readback buffer's shape: the GPU
     /// rewrites every pixel. This is the reply arena's shape: virglrenderer writes one reply of a
     /// few hundred bytes into a 1 MiB pool and leaves the rest alone. Spec §7.2's rule ships *the
-    /// pages S wrote*, so a test that can only write everything cannot tell "the pages" from "the
-    /// blob".
+    /// bytes S wrote*, so a test that can only write everything cannot tell "the bytes S wrote" from
+    /// "the blob they are in" — nor, since the Task 5b amendment, from "the page they are in".
     fn write_blob_range(&self, res_id: u32, offset: u64, fill: u8, len: usize) {
         let fd = self
             .blob_fds
@@ -985,18 +982,32 @@ fn refusals_are_typed_so_a_caller_can_tell_them_apart() {
 // `vkCreateInstance` failed on `instance_version = 0`), and for the app's own blobs it was a
 // last-writer-wins race — S shipped back vertex buffers its GPU never wrote.
 //
-// The rule now is **"did I write it?"**: S ships back exactly the pages S wrote, found by diffing
+// The rule now is **"did I write it?"**: S ships back exactly the bytes S wrote, found by diffing
 // each blob against a baseline re-taken whenever C's own bytes land in it. So these tests are
 // written the same way — they never tell S what a blob *is*, only who wrote it.
+//
+// The grain is the **byte**, not the page. §7.2 said "page" until Task 5b amended it: a page-grain
+// run carries S's stale copy of whatever the application owns in the rest of that page, which is the
+// whole-blob race again at 4096-byte scale. A `memcmp` is byte-granular for free, so the page bought
+// nothing. Several tests below are written specifically to fail under the page rule — that is the
+// point of them, not an incidental property.
 // ---------------------------------------------------------------------------------------------
 
 /// The app's readback buffer from the live capture (ring-findings §6): `res=6`, 16384 B = 64×64×4,
 /// `blob_id = 18`. C0 Task 4b caught it holding the blue clear colour — it is how the pixels reach
 /// the application at all.
 const READBACK_BLOB_ID: u64 = 18;
-/// That buffer's size: 64 × 64 × 4, exactly. Four [`SYNC_PAGE_BYTES`] pages, which is why it is the
-/// blob the page-granularity tests use.
+/// That buffer's size: 64 × 64 × 4, exactly. Large enough to place writes several pages apart, which
+/// is why it is the blob the granularity tests use.
 const READBACK_SIZE: u64 = 16384;
+
+/// The grain the **retracted** page rule used (spec §7.2, as amended in Task 5b).
+///
+/// Nothing in `rayland-s` knows this number any more — S diffs byte-granular. It survives here only
+/// so these tests can place writes at page boundaries and inside single pages, which is what makes
+/// them able to tell the byte rule from the page rule at all. A test that cannot distinguish the two
+/// is not testing the rule it names.
+const A_PAGE: usize = 4096;
 
 /// The reply arena from the live capture (ring-findings §6): `res=2`, 1 MiB, `blob_id = 0`.
 ///
@@ -1299,7 +1310,7 @@ fn an_inbound_blob_data_re_snapshots_so_c_s_own_write_is_never_shipped_back() {
     );
 }
 
-/// **Only the pages S wrote cross — not the blob they are in.**
+/// **Only the bytes S wrote cross — not the blob they are in, and not the page they are in.**
 ///
 /// The reply arena is the case that makes this matter: virglrenderer writes a few hundred bytes of
 /// reply into a 1 MiB pool. Shipping the pool would be ~256x the traffic, and — worse — it would
@@ -1307,47 +1318,38 @@ fn an_inbound_blob_data_re_snapshots_so_c_s_own_write_is_never_shipped_back() {
 ///
 /// The `offset` field this uses has been on the wire since Task 4 and was always 0 until now.
 #[test]
-fn only_the_pages_s_wrote_cross_not_the_whole_blob() {
+fn only_the_bytes_s_wrote_cross_not_the_whole_blob() {
     let (mut applier, mut engine, ring, app_blob) = session_with_ring_and_app_blob();
 
-    // S's engine writes four bytes, in the third of the blob's four pages.
-    engine.write_blob_range(app_blob, 2 * SYNC_PAGE_BYTES as u64, 0xc3, 4);
+    // S's engine writes four bytes, partway into the blob.
+    engine.write_blob_range(app_blob, 2 * A_PAGE as u64, 0xc3, 4);
     relay_and_retire(&mut applier, &mut engine, ring, 0, 64);
 
     let out = applier.poll_progress();
 
     let runs = blob_runs_for(&out, app_blob);
-    assert_eq!(runs.len(), 1, "one page changed, so one run; got {runs:?}");
     assert_eq!(
-        runs[0].0,
-        2 * SYNC_PAGE_BYTES as u64,
-        "the run must start at the page S wrote, not at the blob's beginning"
-    );
-    assert_eq!(
-        runs[0].1.len(),
-        SYNC_PAGE_BYTES,
-        "the page is the granularity: one page changed, so one page's worth of bytes crosses, not \
-         the blob's {READBACK_SIZE}"
-    );
-    assert_eq!(
-        &runs[0].1[..4],
-        &[0xc3; 4],
-        "and it must carry what S actually wrote"
+        runs,
+        vec![(2 * A_PAGE as u64, vec![0xc3; 4])],
+        "S wrote four bytes, so four bytes cross — not the blob's {READBACK_SIZE}, and not the \
+         4096-byte page containing them, of which 4092 bytes are memory S never touched. Got \
+         {runs:?}"
     );
 }
 
-/// Neighbouring changed pages cross as **one** run, and a gap between them splits the runs.
+/// Neighbouring changed bytes cross as **one** run, and a gap of bytes S did not write splits them.
 ///
-/// A reply larger than a page must not arrive as a scatter of unrelated messages, and two distant
-/// writes must not drag the untouched pages between them along. Both fall out of coalescing
-/// adjacent changed pages, which is what this pins.
+/// A reply spanning a large region must not arrive as a scatter of unrelated messages, and two
+/// distant writes must not drag the untouched bytes between them along. Both fall out of coalescing
+/// contiguous changed bytes, which is what this pins.
 #[test]
-fn contiguous_changed_pages_coalesce_and_a_gap_splits_them() {
+fn contiguous_changed_bytes_coalesce_and_a_gap_splits_them() {
     let (mut applier, mut engine, ring, app_blob) = session_with_ring_and_app_blob();
 
-    // Pages 0 and 1 are written as one region; page 2 is left alone; page 3 is written separately.
-    engine.write_blob_range(app_blob, 0, 0xa1, 2 * SYNC_PAGE_BYTES);
-    engine.write_blob_range(app_blob, 3 * SYNC_PAGE_BYTES as u64, 0xb2, 16);
+    // One region spanning two pages, to prove a run is not chopped at a page boundary; then a gap;
+    // then a second, small write, to prove the gap is not bridged and the run is not padded out.
+    engine.write_blob_range(app_blob, 0, 0xa1, 2 * A_PAGE);
+    engine.write_blob_range(app_blob, 3 * A_PAGE as u64, 0xb2, 16);
     relay_and_retire(&mut applier, &mut engine, ring, 0, 64);
 
     let out = applier.poll_progress();
@@ -1356,13 +1358,74 @@ fn contiguous_changed_pages_coalesce_and_a_gap_splits_them() {
     let shapes: Vec<(u64, usize)> = runs.iter().map(|(o, b)| (*o, b.len())).collect();
     assert_eq!(
         shapes,
-        vec![
-            (0, 2 * SYNC_PAGE_BYTES),
-            (3 * SYNC_PAGE_BYTES as u64, SYNC_PAGE_BYTES)
-        ],
-        "pages 0-1 changed together and must cross as one run; page 2 is untouched and must not be \
-         dragged along; page 3 is its own run"
+        vec![(0, 2 * A_PAGE), (3 * A_PAGE as u64, 16)],
+        "the 8192-byte write is one run across a page boundary; the untouched bytes after it must \
+         not be dragged along; and the 16-byte write is 16 bytes, not the page holding it"
     );
+}
+
+/// **The amendment's test: S writes one region of a page, the application owns another region of
+/// the *same* page, and only S's bytes cross.**
+///
+/// This is the hole the page grain left, and the reason spec §7.2 was amended during Task 5b.
+/// `VkDeviceMemory` is page-aligned and applications suballocate, so an application's buffer sharing
+/// a 4096-byte page with something S's engine writes is ordinary rather than contrived — and the two
+/// need **no Vulkan synchronization between them**, because they are different memory. The
+/// application is entitled to be writing its region at the very moment S writes its own.
+///
+/// Under the page rule S's run was rounded out to the whole page, so it carried S's copy of the
+/// application's region — which is stale by construction, being whatever C last sent — and C's reader
+/// laid it down over whatever the application had written since. That is the whole-blob race §7.2
+/// exists to remove, reappearing at 4096-byte scale: invisible in the reference app, which writes its
+/// vertices exactly once, and live for the first real application.
+///
+/// The assertion is therefore not merely that the run is short. It is that **no byte of the
+/// application's region crosses at all**, which is the property the length is evidence for.
+#[test]
+fn s_s_run_does_not_carry_the_application_s_bytes_from_the_same_page() {
+    let (mut applier, mut engine, ring, app_blob) = session_with_ring_and_app_blob();
+
+    // The application's bytes arrive from C and land in this page, as they do in production: through
+    // `C2S::BlobData`, which is also what re-takes S's baseline over exactly this range.
+    const APP_REGION: u64 = 64;
+    const APP_LEN: usize = 64;
+    let out = applier.apply(
+        &mut engine,
+        C2S::BlobData {
+            res_id: app_blob,
+            offset: APP_REGION,
+            bytes: vec![0xaa; APP_LEN],
+        },
+    );
+    assert!(out.is_empty(), "a blob sync has no reply; got {out:?}");
+
+    // S's engine writes its own region of the very same page — the first four bytes.
+    engine.write_blob_range(app_blob, 0, 0xc3, 4);
+    relay_and_retire(&mut applier, &mut engine, ring, 0, 64);
+
+    let out = applier.poll_progress();
+
+    let runs = blob_runs_for(&out, app_blob);
+    assert_eq!(
+        runs,
+        vec![(0, vec![0xc3; 4])],
+        "S wrote bytes 0..4 and nothing else in this page; the application owns bytes 64..128 of it. \
+         Only S's four bytes may cross. Got {runs:?}"
+    );
+
+    // The property the length above is evidence for, asserted directly: whatever the shape of the
+    // runs, not one byte of the application's region may be inside any of them. A page-grain run
+    // starting at 0 spans the application's region and would clobber it on C.
+    for (offset, bytes) in &runs {
+        let end = offset + bytes.len() as u64;
+        assert!(
+            end <= APP_REGION || *offset >= APP_REGION + APP_LEN as u64,
+            "a run covering [{offset}, {end}) overlaps the application's region \
+             [{APP_REGION}, {}) — S never wrote those bytes, so S's copy of them is stale by \
+             construction, and shipping them clobbers whatever the application has written since",
+            APP_REGION + APP_LEN as u64
+        );
+    }
 }
 
 /// **The command-buffer staging pool must never cross S->C**, because S never writes it.

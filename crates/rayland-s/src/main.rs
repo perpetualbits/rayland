@@ -30,7 +30,7 @@
 //! # Status: never run against a real C
 //! **This binary has never completed a session**, because there is nothing to run it against yet:
 //! the QUIC transport is (c)1 Task 6. Task 5 shipped the blob synchronisation and Task 5b corrected
-//! its S→C half to spec §7.2's rule — **S ships back exactly the pages S wrote** — which also gave
+//! its S→C half to spec §7.2's rule — **S ships back exactly the bytes S wrote** — which also gave
 //! spec §5's channel 2, the reply arena, the owner it had never had. [`Applier::poll_progress`]
 //! documents both the rule and the two ways its predecessor was wrong, including why the obvious
 //! widening (ship Venus's `blob_id == 0` shmems too) would have wiped C's staging pool rather than

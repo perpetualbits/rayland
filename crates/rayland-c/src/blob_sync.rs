@@ -50,7 +50,7 @@
 //!
 //! # Why C still routes on `blob_id` when S no longer does
 //! Spec §7.2 retracted the ownership predicate for **S→C** and replaced it with "S ships back
-//! exactly the pages S wrote". The natural question is why C does not mirror that, and the answer is
+//! exactly the bytes S wrote". The natural question is why C does not mirror that, and the answer is
 //! that the mirror image is not available to C and would not be an improvement if it were.
 //!
 //! The rule works on S because S's *own* writes are the thing to be detected, and everything else
@@ -112,20 +112,23 @@ use rayland_relay::C2S;
 ///   which meant S sent C stale copies of blobs S never wrote at all — vertex and uniform buffers,
 ///   the common case — and C's reader laid them over whatever the application had written since.
 ///   This function then faithfully relayed the stale bytes back to S. Spec §7.2 retracted that rule:
-///   **S now ships back exactly the pages S is observed to have written**, so nothing arrives here
+///   **S now ships back exactly the bytes S is observed to have written**, so nothing arrives here
 ///   to overwrite a blob the GPU never touched, and shipping whole blobs C→S is no longer racing
-///   anything on the return leg. The repair had to happen on S because only S can see which pages S
+///   anything on the return leg. The repair had to happen on S because only S can see which bytes S
 ///   wrote; there was no version of this function that could have avoided it.
-/// - **What remains is narrower, and honest about itself.** Two hazards survive. **(a) Tearing:** a
-///   blob the application writes *while* this copies it is torn, and nothing here can prevent that —
-///   it is the `vkMapMemory` problem itself, since the application is not obliged to tell anyone when
-///   it stops writing and v1 has no flush hook to wait on. **(b) False sharing at S's page grain:**
-///   if S's engine writes one region of a 4096-byte page while the application writes another region
-///   of the same page — legal, and needing no Vulkan synchronization between them — then S's returned
-///   run carries S's stale copy of the application's bytes alongside S's own fresh ones. See
-///   `rayland_s::blob::HostBlob::take_pages_s_wrote`. For a *correctly synchronized* application
-///   neither hazard fires on memory the GPU actually wrote, because S's own ordering guarantees the
-///   pages land before the `head` update that releases the app's fence wait.
+/// - **What remains is narrower, and honest about itself.** One hazard survives: **tearing.** A blob
+///   the application writes *while* this copies it is torn, and nothing here can prevent that — it is
+///   the `vkMapMemory` problem itself, since the application is not obliged to tell anyone when it
+///   stops writing and v1 has no flush hook to wait on. For a *correctly synchronized* application it
+///   does not fire on memory the GPU actually wrote, because S's own ordering guarantees the bytes
+///   land before the `head` update that releases the app's fence wait.
+/// - **A second hazard was recorded here until the §7.2 amendment removed it: false sharing at S's
+///   page grain.** S's returned run used to be rounded out to a 4096-byte page, so when S's engine
+///   wrote one region of a page and the application wrote another region of the same page — legal, and
+///   needing no Vulkan synchronization between them — the run carried S's stale copy of the
+///   application's bytes alongside S's own fresh ones, and this side laid the lot down. S now diffs
+///   **byte-granular**, so every byte arriving from S is a byte S actually wrote. See
+///   `rayland_s::blob::HostBlob::take_bytes_s_wrote`.
 /// - **The reference app reaches none of this**, and that is a property of *this one workload*
 ///   rather than of the algorithm: it writes its vertex buffer exactly once, before its first draw,
 ///   and never again. Which is exactly why every test here passed while the S→C rule was a race, and

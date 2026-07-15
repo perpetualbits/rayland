@@ -56,24 +56,6 @@ use rayland_vtest::EngineError;
 use rayland_vtest::transport::ShmMapping;
 use std::os::fd::BorrowedFd;
 
-/// The granularity at which S detects, and ships, the bytes its own side wrote.
-///
-/// # What this is, and the thing it is deliberately *not*
-/// Spec §7.2 pins S's rule to *"the pages S wrote"*, and this is that page. It is **the chunk size
-/// of a byte comparison**, not a property of any mapping: nothing in this module asks the kernel
-/// about page boundaries, and a host whose MMU page is 16 KiB (aarch64) or 64 KiB (ppc64le) does
-/// not make any of the arithmetic below wrong. It would only change how many unchanged bytes ride
-/// along with each changed one. **Do not "fix" this to `sysconf(_SC_PAGESIZE)`**: that would tie a
-/// wire-visible decision on S to a property of whatever machine S happens to be, for no correctness
-/// gain.
-///
-/// 4096 is chosen because it is the common page size and therefore the natural grain of the writes
-/// being detected, and because §7.2 budgets for the cost it implies: the live capture's blobs are
-/// 8 MiB of staging pool plus 1 MiB of reply arena plus 16 KiB of readback, i.e. **roughly 2300
-/// comparisons per retirement**. That is the intended, measured slowness of v1 (spec §6, §8), not
-/// something to optimize ahead of Task 9's numbers.
-pub const SYNC_PAGE_BYTES: usize = 4096;
-
 /// A contiguous run of bytes **S wrote** into a blob and has not yet told C about.
 ///
 /// It goes on the wire as one [`S2C::BlobData`](rayland_relay::S2C::BlobData) — `offset` is that
@@ -151,7 +133,7 @@ impl HostBlob {
     /// # Why there is no `blob_id` parameter any more
     /// There was, until spec §7.2. It was recorded so `is_application_memory` could later answer
     /// "whose memory is this?" and route S's outbound blob sync on the answer. That rule is retired
-    /// on S — see [`HostBlob::take_pages_s_wrote`] — and with it the wart that `blob_id` is a number
+    /// on S — see [`HostBlob::take_bytes_s_wrote`] — and with it the wart that `blob_id` is a number
     /// a remote peer chose, unverified against anything, silently deciding what S publishes.
     /// `blob_id` still reaches
     /// [`RingIdentity::from_blob_request`](rayland_vtest::venus_ring::RingIdentity::from_blob_request)
@@ -199,40 +181,64 @@ impl HostBlob {
     /// GPU genuinely wrote it. It is immune to the reply pool growing a new `res_id`, to the shmem
     /// cache recycling ids, and to Venus adding a fourth internal shmem tomorrow.
     ///
-    /// **The ring is the one thing this must not be asked about**, and its caller excludes it by
-    /// `res_id` rather than by anything here: S's engine really does write the ring's `head`, so
-    /// this function would rightly report it. See [`crate::apply::Applier::poll_progress`].
+    /// # The grain is the **byte**, and that is load-bearing rather than fastidious
+    /// Spec §7.2 originally said *page*, and was amended during Task 5b because the page bought
+    /// nothing and cost correctness. Dirty-*page* tracking is the usual idiom because *page tables*
+    /// are the usual mechanism — but nothing here uses a page table, it uses a comparison, **and a
+    /// comparison is byte-granular for free**.
+    ///
+    /// Rounding runs out to a 4096-byte grain would reintroduce the very race §7.2 exists to
+    /// remove, just narrower. If S's engine writes one region of a page while the application writes
+    /// another region of *the same* page — entirely legal, and requiring no Vulkan synchronization
+    /// between them, since they are different memory — then a page-grain run carries S's **stale**
+    /// copy of the application's bytes alongside S's own fresh ones, and C's reader lays the lot
+    /// down over what the application has written since. `VkDeviceMemory` is page-aligned and
+    /// applications suballocate, so that is realistic rather than theoretical. It is the same
+    /// species as the whole-blob race — invisible in the reference app, live for the first real
+    /// application. **Every byte in a returned run is a byte S is observed to have written.**
     ///
     /// # Inputs / outputs
-    /// - Returns the changed runs, in ascending offset order, with adjacent changed pages coalesced
-    ///   into one run. Empty — the overwhelmingly common case — when S has written nothing.
+    /// - Returns the changed runs, in ascending offset order, with contiguous changed bytes
+    ///   coalesced into one run. Empty — the overwhelmingly common case — when S has written
+    ///   nothing.
     /// - **Taking is consuming**: each returned run becomes the new baseline, so the same bytes are
     ///   never shipped twice. Two callers would therefore split one retirement's news between them.
     ///
     /// # Pitfall: this races S's engine, and cannot not
     /// virglrenderer's ring thread writes these pages from another process with no lock and no
-    /// notification — the whole `vkMapMemory` problem (ring-findings §6). A page written *during*
-    /// this call may be read torn, and a page written between the comparison and the copy is
-    /// shipped in its newer state. Neither is silent data loss: a page that changes after being
+    /// notification — the whole `vkMapMemory` problem (ring-findings §6). A region written *during*
+    /// this call may be read torn, and a byte written between the comparison and the copy is
+    /// shipped in its newer state. Neither is silent data loss: a byte that changes after being
     /// compared is left out of the baseline too, so the next retirement sees it and ships it. What
     /// bounds the race in practice is the caller's ordering — S only asks after `head` moved past
     /// the commands that wrote these pages, which is evidence the writes retired, though not a
     /// guarantee the C11 model would recognise.
     ///
-    /// # Pitfall: the page is the grain, so a page can be *falsely shared*
-    /// If S's engine writes one region of a page while the application writes another region of the
-    /// same page — legal, and needing no Vulkan synchronization between them, since they are
-    /// different memory — then the run S ships carries S's stale copy of the application's bytes
-    /// alongside S's own fresh ones, and C's reader lays the lot down. That is a genuine residual
-    /// of the page grain: it is far narrower than the whole-blob race §7.2 removed (which fired
-    /// whenever the app touched *any* blob S had), but it is the same species, and a byte-granular
-    /// diff would close it at the same comparison cost. Recorded rather than fixed because §7.2
-    /// specifies the page, and because (c)2 owns mapped-memory coherence.
-    pub fn take_pages_s_wrote(&mut self) -> Vec<WrittenRun> {
+    /// # Pitfall: a write whose bytes *coincide* with the baseline fragments into many runs
+    /// This is the byte grain's real cost, and it is a **volume** cost rather than a correctness
+    /// one. A run breaks wherever a written byte happens to equal the byte already there, because
+    /// from a comparison's point of view nothing happened — which is true, and which is exactly why
+    /// not shipping it is safe. But it means one logical write can leave as many runs as it has
+    /// coincidences.
+    ///
+    /// The live capture makes this concrete rather than hypothetical. Ring-findings §6 caught the
+    /// readback buffer holding `00 00 ff ff` repeated — RGBA `(0, 0, 255, 255)`, the blue clear
+    /// colour. Against a freshly mapped blob's zero baseline, **only the `ff ff` pairs differ**, so
+    /// the reference app's very first readback fragments into 4096 two-byte runs instead of one
+    /// 16 KiB run. Subsequent frames are cheap (an unchanged image yields no runs at all), and a
+    /// real, busy image mostly coalesces — the pathological case is specifically a *first* readback
+    /// of a flat colour that shares bytes with zero.
+    ///
+    /// **This is deliberately not optimized here.** Merging runs across a small gap of unchanged
+    /// bytes is the obvious fix and is exactly the hole above: those skipped bytes are precisely the
+    /// ones S did not write, and shipping them is what clobbers the application. The cost is
+    /// therefore left visible and measurable, which is what spec §6 and §8 ask of v1, and Task 9
+    /// measures it. Pin it with a number before trading correctness for it.
+    pub fn take_bytes_s_wrote(&mut self) -> Vec<WrittenRun> {
         // Two phases, because they need different borrows of `self` — and because doing the
         // comparison against a baseline that a copy in the same pass had already begun to overwrite
-        // would compare each page against the wrong thing.
-        let ranges = self.changed_page_ranges();
+        // would compare each byte against the wrong thing.
+        let ranges = self.changed_byte_ranges();
 
         let mut runs = Vec::with_capacity(ranges.len());
         for (start, end) in ranges {
@@ -251,35 +257,52 @@ impl HostBlob {
         runs
     }
 
-    /// The half-open byte ranges of every page that diverges from the baseline, with adjacent
-    /// changed pages merged into one range.
+    /// The half-open ranges of every **byte** that diverges from the baseline, with contiguous
+    /// changed bytes merged into one range.
     ///
-    /// Merging is not an optimization for its own sake: a reply spanning several pages is one write
-    /// by S, and splitting it into a message per page would put 256 `S2C::BlobData` on the wire for
-    /// a fully-written arena, each describing a fragment of one thing. A run is what the message
-    /// shape actually means. The **page** remains the unit of *detection*; the run is only the unit
-    /// of description.
+    /// # Why a byte at a time, and why the merging is not an optimization
+    /// The grain is the byte because the mechanism is a comparison and a comparison costs the same
+    /// either way — see [`HostBlob::take_bytes_s_wrote`] for why any coarser grain would ship bytes
+    /// S did not write and clobber the application's.
     ///
-    /// Borrows `&self` alone, so the baseline it compares against cannot shift underneath it.
-    fn changed_page_ranges(&self) -> Vec<(usize, usize)> {
+    /// Merging is what makes that affordable to *describe*: a 4 KiB reply is one write by S, and
+    /// emitting an `S2C::BlobData` per byte would be absurd where one message says the same thing.
+    /// So the **byte** is the unit of detection; the **run** is only the unit of description, and
+    /// merging never widens a run beyond bytes that actually changed.
+    ///
+    /// # Inputs / outputs
+    /// - Returns half-open `(start, end)` ranges in ascending order, none empty, none adjacent (two
+    ///   adjacent ranges would have been merged). Empty when nothing changed.
+    ///
+    /// Borrows `&self` alone, so the baseline it compares against cannot shift underneath it. No
+    /// range can exceed the blob's length, because both slices are the blob's length — which is why
+    /// a 64-byte vertex buffer yields a 64-byte run at most, never a padded one that C would have to
+    /// refuse as past the end of its own shadow.
+    fn changed_byte_ranges(&self) -> Vec<(usize, usize)> {
+        // `shadow` is built from `bytes()` at map time and only ever written in place, so the two
+        // are the same length and one bound governs both.
         let live = self.bytes();
-        let len = live.len();
         let mut ranges: Vec<(usize, usize)> = Vec::new();
-        let mut start = 0usize;
-        while start < len {
-            // `min(len)` is what makes a blob that is not a whole number of pages work: the
-            // application's vertex buffer is 64 bytes, and a run claiming a padded 4096 would be a
-            // `BlobData` C must refuse as past the end of its own 64-byte shadow.
-            let end = (start + SYNC_PAGE_BYTES).min(len);
-            if live[start..end] != self.shadow[start..end] {
-                match ranges.last_mut() {
-                    // The previous page changed too and ended exactly here, so this is more of the
-                    // same run rather than a new one.
-                    Some(last) if last.1 == start => last.1 = end,
-                    _ => ranges.push((start, end)),
-                }
+        // Where the run currently being accumulated began, if one is open.
+        let mut open: Option<usize> = None;
+        // Zipped rather than indexed: the pairing of each live byte with *its own* baseline byte is
+        // the entire predicate, and `zip` states it in the types instead of leaving it to two index
+        // expressions that must be kept identical by hand.
+        for (i, (&now, &then)) in live.iter().zip(self.shadow.iter()).enumerate() {
+            if now != then {
+                // A byte S wrote. Extend the open run, or start one here — `get_or_insert` keeps an
+                // already-open run's start rather than resetting it to `i`.
+                open.get_or_insert(i);
+            } else if let Some(start) = open.take() {
+                // A byte S did not write, so the run stops *before* it. Shipping it would be
+                // shipping a byte S has no claim to — precisely the clobber this grain avoids.
+                ranges.push((start, i));
             }
-            start = end;
+        }
+        // A run still open at the end of the blob is closed by the blob's end rather than by an
+        // unchanged byte. Without this, a write reaching the final byte would be silently dropped.
+        if let Some(start) = open {
+            ranges.push((start, live.len()));
         }
         ranges
     }
@@ -386,7 +409,7 @@ impl HostBlob {
             );
         }
         // C now demonstrably has these bytes — it is the side that sent them — so record that S and
-        // C agree about this range and `take_pages_s_wrote` must not report it as S's own write.
+        // C agree about this range and `take_bytes_s_wrote` must not report it as S's own write.
         // Exactly this range, and no more: re-snapshotting the whole blob here would swallow every
         // unshipped write S had made elsewhere in it, and the arena's replies would vanish the
         // moment C synced anything that shared it. Indexing is in range because `end <= self.size`
@@ -422,6 +445,13 @@ mod tests {
         }
     }
 
+    /// The grain the **retracted** page rule used, kept only so these tests can build cases that
+    /// distinguish it from the byte grain that replaced it (spec §7.2, as amended in Task 5b).
+    ///
+    /// Nothing in the module under test knows this number any more. It is here because a test that
+    /// cannot tell the two rules apart is not testing the rule it names.
+    const A_PAGE: usize = 4096;
+
     /// A freshly mapped blob nobody has written owes C nothing.
     ///
     /// The baseline is taken from the pages themselves at map time rather than assumed to be zeros:
@@ -430,48 +460,104 @@ mod tests {
     #[test]
     fn a_blob_nobody_wrote_has_no_runs() {
         let mut blob = a_blob(8192);
-        assert_eq!(blob.take_pages_s_wrote(), Vec::new());
+        assert_eq!(blob.take_bytes_s_wrote(), Vec::new());
     }
 
-    /// A blob smaller than a page ships its **real length**, not a padded page.
+    /// A partial write of a blob ships **exactly the bytes written**, not the blob and not a page.
     ///
-    /// The application's vertex buffer is 64 bytes (`res=3`, ring-findings §6). A run that claimed
-    /// 4096 bytes for it would be a `BlobData` C must refuse as past the end of its own 64-byte
-    /// shadow — so the whole sync would collapse on the smallest blob in the capture.
+    /// The application's vertex buffer is 64 bytes (`res=3`, ring-findings §6) — smaller than a
+    /// page in its entirety, so under the retracted page rule *any* write to it shipped all 64
+    /// bytes, including the ones the application owns. Under the byte rule the run is the write.
     #[test]
-    fn a_blob_shorter_than_a_page_ships_its_real_length() {
+    fn a_partial_write_ships_only_the_bytes_written() {
         let mut blob = a_blob(64);
-        s_engine_writes(&blob, 0, 0xc3, 64);
+        s_engine_writes(&blob, 8, 0xc3, 8);
 
-        let runs = blob.take_pages_s_wrote();
+        let runs = blob.take_bytes_s_wrote();
 
         assert_eq!(
             runs,
             vec![WrittenRun {
-                offset: 0,
-                bytes: vec![0xc3; 64]
-            }]
+                offset: 8,
+                bytes: vec![0xc3; 8]
+            }],
+            "S wrote 8 bytes at offset 8, so 8 bytes at offset 8 cross — a run covering the whole \
+             64-byte blob would be carrying 56 bytes S never wrote"
         );
     }
 
-    /// The last page of a blob whose size is not a whole number of pages is likewise not padded.
+    /// A run that reaches the blob's **final byte** is closed by the blob's end, and still carries
+    /// only the bytes S wrote.
+    ///
+    /// This is the one range the loop cannot close by finding an unchanged byte after it, so it is
+    /// the branch a diff most easily drops on the floor: the write would simply never cross, and
+    /// the last thing S rendered would silently never reach the application.
     #[test]
-    fn a_trailing_partial_page_ships_only_the_bytes_that_exist() {
-        let mut blob = a_blob(SYNC_PAGE_BYTES as u64 + 10);
-        s_engine_writes(&blob, SYNC_PAGE_BYTES, 0x7f, 10);
+    fn a_run_reaching_the_blob_s_final_byte_is_closed_by_the_end() {
+        let mut blob = a_blob(A_PAGE as u64 + 10);
+        // Ends exactly at the blob's last byte, and starts partway into the trailing page so that
+        // a page-grain run would visibly differ (it would start at the page boundary, 4096).
+        s_engine_writes(&blob, A_PAGE + 4, 0x7f, 6);
 
-        let runs = blob.take_pages_s_wrote();
+        let runs = blob.take_bytes_s_wrote();
+
+        assert_eq!(
+            runs,
+            vec![WrittenRun {
+                offset: A_PAGE as u64 + 4,
+                bytes: vec![0x7f; 6]
+            }],
+            "the run must start where S's write started and stop at the blob's end; got {runs:?}"
+        );
+    }
+
+    /// **The byte grain's known cost, pinned with the live capture's real bytes rather than left as
+    /// a hunch.**
+    ///
+    /// A run breaks wherever a written byte coincides with the byte already there — from a
+    /// comparison's point of view nothing happened, which is true, and which is why not shipping it
+    /// is safe. But one logical write can then leave as many runs as it has coincidences.
+    ///
+    /// Ring-findings §6 caught the readback buffer (`res=6`, 16384 B = 64×64×4) holding
+    /// `00 00 ff ff` repeated — RGBA `(0, 0, 255, 255)`, the blue clear colour. Against a fresh
+    /// blob's zero baseline **only the `ff ff` pairs differ**, so the reference app's very first
+    /// readback fragments into 4096 two-byte runs rather than one 16 KiB run.
+    ///
+    /// This test exists to make that number a fact Task 9 can measure against, and to fail loudly if
+    /// someone "fixes" it by merging runs across unchanged bytes — those skipped bytes are exactly
+    /// the ones S did not write, and shipping them is the clobber §7.2 exists to prevent. The
+    /// correct trade, if this ever matters, is a wire change that carries many runs in one message,
+    /// not a diff that lies about what S wrote.
+    #[test]
+    fn a_flat_colour_readback_fragments_into_one_run_per_pixel_and_that_is_the_known_cost() {
+        let mut blob = a_blob(16384);
+        // The blue clear colour, written as the GPU writes it: RGBA (0, 0, 255, 255) per pixel.
+        for pixel in 0..4096 {
+            s_engine_writes(&blob, pixel * 4 + 2, 0xff, 2);
+        }
+
+        let runs = blob.take_bytes_s_wrote();
 
         assert_eq!(
             runs.len(),
-            1,
-            "only the trailing page changed; got {runs:?}"
+            4096,
+            "one run per pixel: the R and G bytes are zero over a zero baseline, so they are not \
+             bytes S wrote and must not ride along. Got {} runs",
+            runs.len()
         );
-        assert_eq!(runs[0].offset, SYNC_PAGE_BYTES as u64);
         assert_eq!(
-            runs[0].bytes,
-            vec![0x7f; 10],
-            "the run stops at the blob's end, not at the page's"
+            runs[0],
+            WrittenRun {
+                offset: 2,
+                bytes: vec![0xff; 2]
+            },
+            "each run is the pixel's B and A bytes alone"
+        );
+        let shipped: usize = runs.iter().map(|r| r.bytes.len()).sum();
+        assert_eq!(
+            shipped, 8192,
+            "half the blob's bytes cross, in 4096 messages — fewer bytes than the page rule shipped, \
+             in far more messages. That trade is v1's to measure (spec §8), not to pre-empt"
         );
     }
 
@@ -485,12 +571,12 @@ mod tests {
         s_engine_writes(&blob, 0, 0x11, 8192);
 
         assert_eq!(
-            blob.take_pages_s_wrote().len(),
+            blob.take_bytes_s_wrote().len(),
             1,
             "the first take ships it"
         );
         assert_eq!(
-            blob.take_pages_s_wrote(),
+            blob.take_bytes_s_wrote(),
             Vec::new(),
             "S has written nothing since, so it has nothing more to say"
         );
@@ -504,24 +590,24 @@ mod tests {
     /// blob — the arena's replies would vanish the moment C synced anything sharing it.
     #[test]
     fn copy_in_re_snapshots_only_the_range_it_wrote() {
-        let mut blob = a_blob(2 * SYNC_PAGE_BYTES as u64);
-        // S's engine writes the second page and has not yet shipped it.
-        s_engine_writes(&blob, SYNC_PAGE_BYTES, 0x5a, 16);
+        let mut blob = a_blob(2 * A_PAGE as u64);
+        // S's engine writes into the second page and has not yet shipped it.
+        s_engine_writes(&blob, A_PAGE, 0x5a, 16);
         // C's own bytes land in the first page.
         blob.copy_in(0, &[0x33; 8]).expect("an in-range write");
 
-        let runs = blob.take_pages_s_wrote();
+        let runs = blob.take_bytes_s_wrote();
 
         assert_eq!(
-            runs.len(),
-            1,
-            "C's write must not be shipped back, and S's must not be swallowed by it; got {runs:?}"
+            runs,
+            vec![WrittenRun {
+                offset: A_PAGE as u64,
+                bytes: vec![0x5a; 16]
+            }],
+            "C's write must not be shipped back, and S's must not be swallowed by it — and S's run \
+             is the 16 bytes S wrote, not the 4096-byte page containing them, of which 4080 bytes \
+             are S's stale copy of memory the application owns. Got {runs:?}"
         );
-        assert_eq!(
-            runs[0].offset, SYNC_PAGE_BYTES as u64,
-            "the run is S's page, not C's"
-        );
-        assert_eq!(&runs[0].bytes[..16], &[0x5a; 16]);
     }
 
     /// A refused `copy_in` must not move the baseline either — it wrote nothing, so C has nothing.
@@ -534,7 +620,7 @@ mod tests {
             .expect_err("a write past the end must be refused");
 
         assert_eq!(
-            blob.take_pages_s_wrote(),
+            blob.take_bytes_s_wrote(),
             vec![WrittenRun {
                 offset: 0,
                 bytes: vec![0x5a; 64]
