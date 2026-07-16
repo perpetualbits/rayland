@@ -28,6 +28,11 @@ pub mod exact_math;
 // The solid itself: its 60 vertices, their flat normals and their texture coordinates.
 pub mod geometry;
 
+// Where the solid points and how deep the fractal is zoomed, at each frame.
+pub mod schedule;
+// The zooming Mandelbrot image the faces are textured with.
+pub mod fractal;
+
 /// The number of frames a fixture run renders.
 ///
 /// Fixed, and not configurable. A fixture with a `--frames` option is a fixture with an opinion
