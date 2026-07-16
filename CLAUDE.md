@@ -69,7 +69,7 @@ Wayland/Vulkan/GPU-remoting — must painstakingly verify **every line** for cor
 
 ## Repository status and layout
 
-A Cargo workspace of eleven crates. Each declares its own license per the policy below
+A Cargo workspace of twelve crates. Each declares its own license per the policy below
 (library → LGPL, application/binary → GPL); all are `v0.0.x` and pre-stable.
 
 - **`crates/rayland`** — the published placeholder that reserves the crates.io name; the
@@ -109,6 +109,13 @@ A Cargo workspace of eleven crates. Each declares its own license per the policy
   `RenderEngine::submit` is used only for the inline vtest path, which carries the
   `vkCreateRingMESA` that creates the ring and essentially nothing else. Unlike `rayland-c`, this
   crate **may** depend on `rayland-engine`: it is the GPU machine. GPL, `publish = false`.
+- **`crates/rayland-present`** — **on-screen presentation ((c)1 Task 7), extracted from
+  `rayland-server`'s `window.rs`/`dmabuf.rs`.** Takes finished pixels and shows them in a real
+  `xdg_toplevel` window, via `wl_shm` or zero-copy `zwp_linux_dmabuf_v1`. Shared by both the SP-era
+  `rayland-server` and `rayland-s`, so it lives in its own crate rather than being duplicated.
+  **Note (c)1 uses only the `wl_shm` path** and is deliberately *not* zero-copy: S presents the
+  application's readback blob, because it cannot see the app's `DEVICE_LOCAL` render target (that
+  produces no blob at all). LGPL.
 - **`crates/rayland-engine`** — **the real engine (arc (c)).** FFI-embeds
   `libvirglrenderer` behind `rayland-vtest`'s `RenderEngine` trait, driving a Venus
   context on S's GPU. Since (c)1 Task 1 this crate is *only* the GPU: the `ffi`
