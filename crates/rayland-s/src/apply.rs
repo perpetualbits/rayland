@@ -440,8 +440,6 @@ impl Applier {
                         .insert(res_id, RingMirror::new(identity.buffer_size));
                 }
 
-
-
                 // **Ship whatever is already in the blob, right now.** (c)1 Task 6's finding, and the
                 // last thing standing between a working relay and a blank picture.
                 //

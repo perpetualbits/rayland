@@ -358,11 +358,10 @@ impl QuicListener {
         // Accept the connection and its first bi-stream on the runtime.
         let (send, recv) = self.rt.block_on(async {
             // Wait for an incoming connection and finish its handshake.
-            let incoming = self
-                .endpoint
-                .accept()
-                .await
-                .ok_or_else(|| anyhow::anyhow!("endpoint closed before a connection arrived"))?;
+            let incoming =
+                self.endpoint.accept().await.ok_or_else(|| {
+                    anyhow::anyhow!("endpoint closed before a connection arrived")
+                })?;
             let conn = incoming.await?;
             // Accept the peer's single bi-stream. Unlike `accept`, both halves go to the caller.
             //

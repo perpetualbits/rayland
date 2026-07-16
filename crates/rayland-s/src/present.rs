@@ -425,9 +425,9 @@ pub fn frame_size_from_env() -> anyhow::Result<(u32, u32)> {
     let (w, h) = raw.split_once('x').ok_or_else(|| {
         anyhow::anyhow!("{ENV_PRESENT_SIZE}={raw:?} is not WIDTHxHEIGHT (e.g. \"64x64\")")
     })?;
-    let width: u32 = w
-        .parse()
-        .map_err(|e| anyhow::anyhow!("{ENV_PRESENT_SIZE}={raw:?}: width {w:?} is not a number: {e}"))?;
+    let width: u32 = w.parse().map_err(|e| {
+        anyhow::anyhow!("{ENV_PRESENT_SIZE}={raw:?}: width {w:?} is not a number: {e}")
+    })?;
     let height: u32 = h.parse().map_err(|e| {
         anyhow::anyhow!("{ENV_PRESENT_SIZE}={raw:?}: height {h:?} is not a number: {e}")
     })?;

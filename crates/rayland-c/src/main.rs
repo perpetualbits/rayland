@@ -226,13 +226,20 @@ impl RingFlush for RingBarrier {
     fn flush_ring(&self) {
         // No ring, nothing to order against. This is the `vkCreateRingMESA` case: the command that
         // creates the ring cannot be overtaken by bytes in a ring that does not exist yet.
-        let Some(identity) = *self.ring.lock().expect("the ring slot lock is never poisoned") else {
+        let Some(identity) = *self
+            .ring
+            .lock()
+            .expect("the ring slot lock is never poisoned")
+        else {
             return;
         };
 
         // The frontier Mesa had reached when it sent the command that brought us here.
         let target = {
-            let table = self.blobs.lock().expect("the blob table lock is never poisoned");
+            let table = self
+                .blobs
+                .lock()
+                .expect("the blob table lock is never poisoned");
             let Some(blob) = table.get(&identity.res_id) else {
                 // The ring's shadow is gone: the session is being torn down. Nothing to order.
                 return;
@@ -900,8 +907,9 @@ fn main() -> Result<()> {
     let s_socket = s_addr
         .parse()
         .with_context(|| format!("{ENV_S_ADDR}={s_addr:?} is not a valid host:port address"))?;
-    let (tx, rx) = rayland_c::link::connect(s_socket)
-        .map_err(|e| anyhow::anyhow!("connecting to S at {s_addr} (set {ENV_S_ADDR} to change it): {e}"))?;
+    let (tx, rx) = rayland_c::link::connect(s_socket).map_err(|e| {
+        anyhow::anyhow!("connecting to S at {s_addr} (set {ENV_S_ADDR} to change it): {e}")
+    })?;
     let tx = Arc::new(Mutex::new(tx));
 
     // The session handshake belongs to whoever owns the connection, not to the engine.

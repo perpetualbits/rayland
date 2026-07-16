@@ -750,7 +750,11 @@ mod tests {
              vkWaitRingSeqnoMESA overtake the ring delta that satisfies it, which virglrenderer \
              treats as a broken driver and answers by destroying the context"
         );
-        assert_eq!(sent.lock().unwrap().len(), 1, "and the command still crosses");
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            1,
+            "and the command still crosses"
+        );
     }
 
     /// A malformed command is still refused, and the barrier still runs.
@@ -791,7 +795,10 @@ mod tests {
     /// and C's reader has already dropped it for want of a shadow. See [`PendingBlob`].
     #[test]
     fn creating_a_blob_stages_a_local_shadow_and_adopts_s_s_resource_id() {
-        let link = MockLink::with_replies([S2C::BlobCreated { res_id: 7, initial: Vec::new() }]);
+        let link = MockLink::with_replies([S2C::BlobCreated {
+            res_id: 7,
+            initial: Vec::new(),
+        }]);
         let mut engine = RelayEngine::new(link);
         let pending = engine.pending();
         let blobs = engine.blobs();
@@ -811,7 +818,12 @@ mod tests {
         // Staged, not yet registered: in the daemon the reader thread has already committed it by
         // now, but nothing here plays that role, so this is the honest intermediate state.
         assert_eq!(
-            pending.lock().unwrap().as_ref().expect("a staged shadow").size(),
+            pending
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("a staged shadow")
+                .size(),
             131268
         );
         assert!(
@@ -824,7 +836,12 @@ mod tests {
         commit_pending_blob(&pending, &blobs, blob.resource_id, &[]);
 
         assert_eq!(
-            blobs.lock().unwrap().get(&7).expect("a shadow under S's id").size(),
+            blobs
+                .lock()
+                .unwrap()
+                .get(&7)
+                .expect("a shadow under S's id")
+                .size(),
             131268
         );
         assert!(
@@ -855,7 +872,10 @@ mod tests {
     /// published under must be **S's**, since that is what every `RingDelta` will be addressed to.
     #[test]
     fn allocating_the_ring_publishes_its_identity_for_the_watcher() {
-        let link = MockLink::with_replies([S2C::BlobCreated { res_id: 4, initial: Vec::new() }]);
+        let link = MockLink::with_replies([S2C::BlobCreated {
+            res_id: 4,
+            initial: Vec::new(),
+        }]);
         let mut engine = RelayEngine::new(link);
         let ring = engine.ring();
         assert_eq!(
@@ -884,7 +904,10 @@ mod tests {
     #[test]
     fn allocating_a_non_ring_blob_does_not_publish_a_ring() {
         // The 1 MiB reply arena from the live capture.
-        let link = MockLink::with_replies([S2C::BlobCreated { res_id: 2, initial: Vec::new() }]);
+        let link = MockLink::with_replies([S2C::BlobCreated {
+            res_id: 2,
+            initial: Vec::new(),
+        }]);
         let mut engine = RelayEngine::new(link);
         let ring = engine.ring();
 
@@ -900,7 +923,10 @@ mod tests {
     /// (ring-findings §6), so corrupting it would destroy information S cannot recover.
     #[test]
     fn a_blob_request_reaches_s_with_its_fields_intact() {
-        let link = MockLink::with_replies([S2C::BlobCreated { res_id: 3, initial: Vec::new() }]);
+        let link = MockLink::with_replies([S2C::BlobCreated {
+            res_id: 3,
+            initial: Vec::new(),
+        }]);
         let mut engine = RelayEngine::new(link);
 
         // The app's 64-byte vertex buffer from the live capture: blob_id 16, i.e. non-zero, i.e.
@@ -984,7 +1010,10 @@ mod tests {
     #[test]
     fn a_reply_that_does_not_answer_the_request_is_refused() {
         // A blob id where a capset was due.
-        let link = MockLink::with_replies([S2C::BlobCreated { res_id: 1, initial: Vec::new() }]);
+        let link = MockLink::with_replies([S2C::BlobCreated {
+            res_id: 1,
+            initial: Vec::new(),
+        }]);
         let mut engine = RelayEngine::new(link);
 
         let err = engine.venus_capset(0).expect_err("a refusal");
@@ -1040,7 +1069,10 @@ mod tests {
     /// sit in S's resource table for the whole session.
     #[test]
     fn unref_drops_the_local_shadow_and_tells_s() {
-        let link = MockLink::with_replies([S2C::BlobCreated { res_id: 9, initial: Vec::new() }]);
+        let link = MockLink::with_replies([S2C::BlobCreated {
+            res_id: 9,
+            initial: Vec::new(),
+        }]);
         let mut engine = RelayEngine::new(link);
         let blobs = engine.blobs();
         let pending = engine.pending();

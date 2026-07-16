@@ -64,10 +64,9 @@ use std::net::SocketAddr;
 /// two-machine bring-up can produce.
 pub fn connect(s_addr: SocketAddr) -> Result<(QuicSendLink, QuicRecvLink), EngineError> {
     // SP2 owns the endpoint, the TLS config and the runtime; this is the whole of (c)1's QUIC code.
-    let stream =
-        rayland_transport::connect(s_addr).map_err(|e| EngineError::RelayLinkFailed {
-            detail: format!("connecting to S at {s_addr} over QUIC: {e:#}"),
-        })?;
+    let stream = rayland_transport::connect(s_addr).map_err(|e| EngineError::RelayLinkFailed {
+        detail: format!("connecting to S at {s_addr} over QUIC: {e:#}"),
+    })?;
     // Two threads, two halves, no lock between the reader and the writers.
     let (send, recv) = stream.split();
     Ok((QuicSendLink { send }, QuicRecvLink { recv }))

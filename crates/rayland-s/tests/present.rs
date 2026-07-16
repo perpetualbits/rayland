@@ -132,7 +132,8 @@ impl RenderEngine for PrefillEngine {
         if n > 0 {
             // SAFETY-free path: `write_all_at` is the safe positional-write API on any file.
             use std::os::unix::fs::FileExt;
-            let file = std::fs::File::from(fd.try_clone().expect("duplicating the blob descriptor"));
+            let file =
+                std::fs::File::from(fd.try_clone().expect("duplicating the blob descriptor"));
             file.write_all_at(&self.prefill[..n], 0)
                 .expect("pre-filling the blob's pages");
             // `file` drops here, closing only its own duplicate; `fd` still refers to the memory.
@@ -213,7 +214,10 @@ fn capture_sees_a_blob_born_with_the_frame_already_in_it() {
     let frame = capture
         .into_frame()
         .expect("exactly one frame-sized blob was created");
-    assert_eq!(frame.width, FRAME_W, "the frame's width is the configured one");
+    assert_eq!(
+        frame.width, FRAME_W,
+        "the frame's width is the configured one"
+    );
     assert_eq!(
         frame.height, FRAME_H,
         "the frame's height is the configured one"
