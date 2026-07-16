@@ -1,0 +1,43 @@
+# `rayland-icosa-cpu` — fixture A: an ordinary offscreen Vulkan program that draws a spinning
+# icosahedron textured with a Mandelbrot fractal it computes on **its own CPU**, every frame,
+# writing it through a persistently-mapped `HOST_COHERENT` staging buffer with no flush and no
+# interceptable Vulkan call, then uploads and draws it.
+#
+# This is the task the whole icosahedron sub-project exists for. Everything before it —
+# `rayland-icosa-core`'s geometry/schedule/fractal math, `rayland-icosa-vk`'s shared Vulkan
+# scaffolding — was built so that this crate could be small: a manifest, the texture upload path
+# (`texture.rs`), and the frame loop (`main.rs`).
+#
+# Depends on exactly two `rayland-*` crates — `rayland-icosa-vk` and `rayland-icosa-core` — and
+# neither of those depends on anything Rayland-specific either. This crate never mentions Venus,
+# vtest, virglrenderer, sockets, or remoting, and never probes its environment beyond what
+# `ash::Entry::load()` itself does to find a Vulkan driver. That ignorance is the fixture's whole
+# value: a program that knew it might be remoted would prove nothing about the ordinary Vulkan
+# programs it stands in for, because the interception has to be invisible to exactly the kind of
+# program that would otherwise notice it.
+#
+# A BINARY crate (it has a main), so per the repository license policy it is GPL-3.0-or-later
+# rather than the LGPL used by this workspace's library crates.
+[package]
+name = "rayland-icosa-cpu"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+description = "Fixture A: a spinning icosahedron textured with a CPU-computed, per-frame-uploaded Mandelbrot fractal."
+license = "GPL-3.0-or-later"
+repository = "https://github.com/perpetualbits/rayland"
+publish = false
+
+[[bin]]
+name = "rayland-icosa-cpu"     # binary target name, the executable the native test launches
+path = "src/main.rs"           # binary entry point
+
+[dependencies]
+rayland-icosa-vk = { path = "../rayland-icosa-vk" }      # shared Vulkan scaffolding: context, Scene, MappedBuffer
+rayland-icosa-core = { path = "../rayland-icosa-core" }  # geometry, schedule, fractal — no GPU, no remoting
+ash = { workspace = true }                               # thin Vulkan bindings; the texture path's own barriers/copies
+anyhow = { workspace = true }                            # top-level error handling, per the repo's binary-crate convention
+
+[dev-dependencies]
+# The native test decodes the PNGs the binary wrote and inspects individual pixels.
+image = { workspace = true }
