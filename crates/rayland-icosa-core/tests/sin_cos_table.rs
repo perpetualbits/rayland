@@ -19,7 +19,17 @@ use rayland_icosa_core::exact_math::sin_cos;
 /// pins reproducibility to the last bit; this tolerance checks that the reproducible answer is also
 /// the *right* answer to within the truncated series' error. Both matter: a function could be
 /// perfectly reproducible and perfectly wrong.
-const ACCURACY_TOLERANCE: f64 = 1e-9;
+///
+/// Set to `1e-10`. The kernels' true worst-case error, scanned over the full reduced range
+/// `[-π/4, π/4]` in exact arithmetic, is 6.93e-12 (sine kernel, at `|r| = π/4`; the cosine kernel's
+/// is smaller, 3.9e-13) — see `exact_math.rs`'s `sin_cos` doc comment. `1e-10` leaves roughly 14x
+/// slack over that true error: enough that the check is not brittle against, say, a future term
+/// count change, but tight enough to still be *binding*. A materially looser value is not merely
+/// generous — dropping the cosine kernel's `+1/12!` term entirely still passes both this check and
+/// the Pythagorean-identity check below at the old `1e-9` tolerance; only the frozen table below
+/// catches that regression. The oracle itself stays sound at this tightness: libm's own error is
+/// ~1e-16, far below `1e-10`.
+const ACCURACY_TOLERANCE: f64 = 1e-10;
 
 /// Inputs spanning every quadrant, plus the reduction's tie points and edges.
 ///
@@ -70,6 +80,13 @@ const ACCURACY_TOLERANCE: f64 = 1e-9;
 /// ordinary boundary near π/2 does not, and it still keeps the large-argument, negative and
 /// cancellation-heavy cases from the original list.
 ///
+/// - `-0.0`: `k = -0.0`, quadrant 0, `r = 0.0`. Included not for the quadrant model above (it is
+///   arithmetically identical to `0.0`) but because `sin_cos` has a documented, deliberate
+///   divergence from libm at exactly this input — `sin_cos(-0.0)` returns `+0.0` for the sine
+///   component, where libm returns `-0.0` (see `exact_math.rs`'s `sin_cos` doc comment for why).
+///   Adding it here pins that divergence in the frozen table below, rather than leaving it as an
+///   assertion in a comment that nothing actually checks.
+///
 /// The four values that coincide with a named `std::f64::consts` constant (π/2, π, 2π, π/4) are
 /// written using that constant rather than as hand-typed decimals — clippy's `approx_constant`
 /// lint flags a literal that merely approximates a well-known constant, since a transcription slip
@@ -95,6 +112,7 @@ const INPUTS: &[f64] = &[
     std::f64::consts::FRAC_PI_4,
     -std::f64::consts::FRAC_PI_4,
     2.356194490192345,
+    -0.0,
 ];
 
 /// Every input must reproduce its committed bit patterns exactly.
@@ -107,8 +125,9 @@ fn sin_cos_matches_the_committed_bit_patterns() {
     // exact implementation, sanity-checked (sin(0) = 0.0 exactly, cos(0) = 1.0 exactly, sin(π/2) ≈
     // 1.0, and the π/4 / 3π/4 pair cross-checked against the identities sin(3π/4) = sin(π/4) and
     // cos(3π/4) = -cos(π/4) — both hold bit-for-bit, the sign flip on cos being the only
-    // difference), then frozen here. The temporary test has been deleted; see the module doc
-    // comment in `exact_math.rs` for what regenerating this table would require.
+    // difference), then frozen here. The temporary test has been deleted; see this file's own
+    // "# Regenerating the table" section (top of file) for what regenerating this table would
+    // require.
     const CASES: &[(f64, u64, u64)] = &[
         (0.0, 0x0000000000000000, 0x3ff0000000000000),
         (0.5, 0x3fdeaee8744b048f, 0x3fec1528065b7d56),
@@ -144,7 +163,15 @@ fn sin_cos_matches_the_committed_bit_patterns() {
             0x3fe6a09e667e480b,
         ),
         (2.356194490192345, 0x3fe6a09e667e480b, 0xbfe6a09e667f497a),
+        // Pins the documented libm divergence at -0.0: sin comes out +0.0 (bits identical to
+        // sin_cos(0.0)'s), not the -0.0 libm's sin(-0.0) would give. See exact_math.rs's sin_cos
+        // doc comment.
+        (-0.0, 0x0000000000000000, 0x3ff0000000000000),
     ];
+    // If the table is ever emptied (e.g. by a bad merge or an over-eager refactor), the loop below
+    // would iterate zero times and this test would report success without checking anything — the
+    // exact silent-pass failure mode this file exists to prevent. Guard against that explicitly.
+    assert!(!CASES.is_empty(), "the bit-pattern table must not be empty");
     for &(input, want_sin, want_cos) in CASES {
         let (got_sin, got_cos) = sin_cos(input);
         assert_eq!(
@@ -181,8 +208,23 @@ fn sin_cos_is_accurate_enough() {
     }
 }
 
-/// The Pythagorean identity must hold, which catches a broken quadrant selection that the accuracy
-/// check could miss if both kernels drifted together.
+/// The Pythagorean identity must hold, which catches a wrong-magnitude kernel term that the
+/// accuracy check alone could miss.
+///
+/// This is **not** a quadrant-selection check, and must not be described as one: every quadrant arm
+/// in `sin_cos` is a signed permutation of `(sin_r, cos_r)` — a swap, a sign flip, or both — and
+/// `s² + c²` is invariant under all four of them (squaring erases both the swap and every sign).
+/// So no quadrant bug, however wrong, can move this sum away from 1. Verified directly: mutating the
+/// quadrant `match` (swapping arms 1 and 3, and separately corrupting arm 2) is caught by both the
+/// bit-pattern table above and `sin_cos_is_accurate_enough`, but this test passes unchanged against
+/// both mutations. `tests/sin_cos_table.rs`'s frozen table is what actually covers the quadrants;
+/// see `exact_math.rs`'s `sin_cos` doc comment for why.
+///
+/// What this test *does* catch, and was verified to catch: a term dropped from a Taylor kernel —
+/// specifically, the review confirmed it catches a dropped sine-kernel term. Because the two
+/// kernels are evaluated independently, a magnitude error in one is not cancelled by the other the
+/// way a quadrant permutation would be, so `s² + c²` moves measurably away from 1. That makes this
+/// a kernel-magnitude check, cheap to run and complementary to the per-value accuracy check above.
 #[test]
 fn sin_cos_satisfies_the_pythagorean_identity() {
     for &x in INPUTS {

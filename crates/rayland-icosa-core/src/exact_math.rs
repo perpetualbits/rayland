@@ -20,11 +20,12 @@
 //! that way evaluates bit-identically everywhere.
 //!
 //! # These are less accurate than the standard library, on purpose
-//! Each is a truncated series good to roughly 1e-9, against a standard library that is
-//! correctly-rounded to the last bit. That trade is correct here: the results drive an 8-bit colour
-//! channel and a rotation matrix, where 1e-9 is invisible, while reproducibility is load-bearing.
-//! **A visually fine approximation that is bit-exact everywhere is strictly better here than a
-//! perfect one that is not.**
+//! Each is a truncated series, against a standard library that is correctly-rounded to the last
+//! bit: `log2` to roughly 1e-9 and `sin_cos` to roughly 1e-11 (see each function's own doc comment
+//! for the measured worst case). That trade is correct here: the results drive an 8-bit colour
+//! channel and a rotation matrix, where errors of this size are invisible, while reproducibility is
+//! load-bearing. **A visually fine approximation that is bit-exact everywhere is strictly better
+//! here than a perfect one that is not.**
 //!
 //! # Pitfall
 //! Do not "improve" anything here by reaching for a standard-library transcendental, and do not
@@ -134,7 +135,11 @@ const PI_OVER_2_LO: f64 = 6.077100506506192e-11;
 /// roughly `[-π/4, π/4]`, and remember `k mod 4` — the quadrant. Sine and cosine of the original
 /// argument are then sine and cosine of `r`, possibly swapped and possibly negated, according to
 /// the quadrant. Over `[-π/4, π/4]` the Taylor series for both converge fast enough that
-/// truncating leaves an error near 1e-9.
+/// truncating leaves a maximum error — scanned over the full reduced range in exact arithmetic —
+/// of **6.93e-12** for the sine kernel (attained at the domain's edge, `|r| = π/4`) and a smaller
+/// **3.9e-13** for the cosine kernel. Both are many orders below the resolution of anything
+/// downstream (an 8-bit colour channel, a rotation matrix), which is the basis for calling the
+/// term counts above adequate.
 ///
 /// The subtraction is done in two steps against a split `π/2` (Cody-Waite) rather than one, because
 /// a single-constant subtraction would lose most of its significant bits to cancellation for larger
@@ -149,6 +154,17 @@ const PI_OVER_2_LO: f64 = 6.077100506506192e-11;
 /// any frame produces is well under 100). For very large arguments the two-constant reduction is
 /// insufficient and the result degrades; it does not signal this. NaN and infinite inputs produce
 /// NaN.
+///
+/// `sin_cos(-0.0)` returns `(+0.0, 1.0)` for the sine component, where libm returns `-0.0` —
+/// libm preserves the sign of zero through sine (an odd function) as an IEEE-754 convention, but
+/// the reduction here does not: `k` rounds to `-0.0`, and the two Cody-Waite subtractions that
+/// follow (`-0.0 - (-0.0)`) land on positive zero before the kernel ever runs, so `sin_r` comes out
+/// `0.0 * positive = +0.0`. This is a **deliberate non-issue, not a bug**: the divergence is itself
+/// bit-exact and deterministic across every host, so it cannot reintroduce the cross-machine drift
+/// this module exists to prevent, and `|(+0.0) - (-0.0)| = 0.0` keeps it well inside any accuracy
+/// tolerance the tests enforce. It is documented here, and pinned in `tests/sin_cos_table.rs`'s
+/// frozen table, purely so a future reader comparing this function's output to libm's does not
+/// mistake the sign-bit difference at this one input for a real defect.
 pub fn sin_cos(x: f64) -> (f64, f64) {
     // A non-finite angle has no meaningful sine, and the reduction below would produce nonsense
     // rather than propagate the NaN cleanly.
