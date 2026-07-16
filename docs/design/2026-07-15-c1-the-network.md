@@ -1,7 +1,21 @@
 # (c)1 — The Network (rescoped after C0)
 
 **Date:** 2026-07-15
-**Status:** Sub-project design spec (awaiting owner review)
+**Status:** Sub-project design spec — **RATIFIED 2026-07-16 by the repository owner**, including the
+rewrites Task 6's live run forced on it (§4.5 retracted; §4.6, §4.7, §7.3 added; §5 gains row 6).
+
+> **On that ratification.** A spec rewritten by its own implementation task is not a failure of the
+> spec; it is the only evidence that the task was worth running. Four of (c)1's six shared-memory
+> channels were found by **running** the thing and none by reading it — which is why Task 6 was
+> written as a gate rather than a demo. The retracted §4.5 is kept in place, because its facts are
+> right and only its conclusion was wrong, and that distinction is the useful part.
+>
+> Two findings generalise beyond (c)1 and should be read before any later slice adds a channel:
+> **§5's inventory is of *pages*, and that is why it kept missing things** — an ordering requirement
+> (§4.7) and a lifecycle fact (§7.3) are real, load-bearing, and cannot be expressed as a row in a
+> table of memory. And **`VN_DEBUG=no_abort` (§6) stays unlicensed**: Mesa's 3.5 s abort is the only
+> reason §4.6's fault was visible at all, and the crutch this spec once listed as a convenience would
+> have turned every one of Task 6's four findings into a silent hang.
 **Parent design:** [`2026-07-13-native-remote-wayland-gpu.md`](2026-07-13-native-remote-wayland-gpu.md)
 **Predecessor:** C0 — Venus First Light (substance complete)
 **Required reading:** [`2026-07-15-venus-ring-findings.md`](2026-07-15-venus-ring-findings.md) — this spec is
@@ -21,7 +35,7 @@ actually tested: **that an application's rendering can cross a network as *langu
 commands — rather than as pixels.**
 
 **Success criterion (measurable):** the `rayland-refapp` — unmodified, unaware of Rayland — runs on
-**C** (`appollo.localdomain`, x86_64). Its Vulkan commands cross a real network over QUIC to **S**
+**C** (`apollo.localdomain`, x86_64). Its Vulkan commands cross a real network over QUIC to **S**
 (`dop561`), where they are replayed on S's real Intel GPU and the resulting frame is **presented in
 a window on S's display**. Correctness is asserted twice, by two independent paths:
 
@@ -93,7 +107,7 @@ contents; on-screen presentation on S; and a measurement of what all of that cos
 
 ### 4.1 Topology
 
-- **C = `appollo.localdomain`** — x86_64, has an AMD GPU that is **entirely unused**. Runs the
+- **C = `apollo.localdomain`** — x86_64, has an AMD GPU that is **entirely unused**. Runs the
   refapp and the `rayland-c` daemon. **Needs no GPU and no Wayland**: Venus is a *serializing*
   driver; it never touches local hardware. This is the thesis in physical form.
 - **S = `dop561`** — Intel Iris Xe, the display the user is looking at, the Wayland compositor.
@@ -127,7 +141,7 @@ we swap in is not another renderer, it is **a network**.
 ### 4.4 Data flow
 
 ```
-  C = appollo (no GPU, no Wayland)          |          S = dop561 (Intel GPU, display)
+  C = apollo (no GPU, no Wayland)          |          S = dop561 (Intel GPU, display)
                                             |
   rayland-refapp (unmodified)               |
     │  Vulkan calls                         |
@@ -154,6 +168,12 @@ the delta between them. Likewise every blob has a local shadow on C and its real
 
 ### 4.5 Waking up: the ring `status` bit
 
+> **RETRACTED 2026-07-16 by Task 6's live run — see §4.6.** The section below is kept because its
+> *facts* are right and still load-bearing; its **conclusion is wrong**, and the error is instructive.
+> It reads the IDLE bit as a seam between Mesa and `rayland-c`. It is not: it is a seam between Mesa
+> and **the ring's consumer**, and `rayland-c` is not the consumer. Read §4.6 before relying on any
+> of this.
+
 C0's findings doc records the corrected polarity: **bit 0 of `status` set means the host's ring
 thread is IDLE (parked); `status == 0` means it is actively polling.** Mesa sends
 `vkNotifyRingMESA` **only when the IDLE bit is set** *and* ≥1ms has passed since the last kick
@@ -170,6 +190,81 @@ unchanged. A naive "set IDLE then sleep" will miss work and stall. This is exact
 the inverted-polarity documentation would have caused, and it is called out here because the
 polarity error was live in this repository until 2026-07-15.
 
+### 4.6 The doorbell does not survive the split — and the `status` word is a channel
+
+**Added 2026-07-16, after Task 6 ran C against S for the first time. This was the first thing that
+broke, and the fault is mine: §4.5 is a design error, not an implementation slip.**
+
+§4.5 says *"`rayland-c` sets IDLE before sleeping and Mesa will kick it"*. That sentence quietly
+assumes `rayland-c` is the thing Mesa's kick wakes. **It is not.** The IDLE bit means *"the ring's
+**consumer** is parked"*, and (c)1's consumer is **virglrenderer's ring thread, on S**. `rayland-c`
+is a relay standing between them. So C publishing its own watcher's park state into C's `status`
+word answers a question nobody asked, and the question that matters goes unanswered.
+
+The chain, every link of it in the source:
+
+1. virglrenderer's ring thread parks after `idleTimeout` with no new commands, setting IDLE in **its
+   own** `status` word and blocking on a condvar (`vkr_ring_thread`, `vkr_ring.c:265-285`).
+2. Mesa sets that timeout to **1 ms** (`VN_RING_IDLE_TIMEOUT_NS`, `vn_ring.c:18`) — *shorter than a
+   relay hop*. So on a networked setup the thread is parked **most of the time**, not rarely.
+3. Only `vkNotifyRingMESA` wakes it (`vkr_ring_notify`, `vkr_ring.c:368-378`).
+4. Mesa sends that doorbell only when it reads the IDLE bit — **from C's `status` word**, a different
+   word in a different machine's memory, which nothing in (c)1 connects to S's.
+
+Observed: the application ran ~15 ring round-trips (init worked, because C's watcher happened to be
+parked often enough that Mesa doorbelled anyway), then stalled and Mesa aborted at ~3.5 s on
+`aborting on expired ring alive status`.
+
+**Shipping S's `status` back to C does not fix it.** Mesa decides on the doorbell *at submit time*
+and never revisits it (`vn_ring_submit_command`); by the time C learns S parked, Mesa has already
+made — and throttled — its decision and is blocked in `vn_ring_wait_seqno`. The information arrives
+strictly too late, at any link speed. Forcing IDLE permanently on C does not fix it either: Mesa's
+≥1 ms notify throttle then suppresses exactly the doorbell that is needed. **Both were tried; both
+failed identically.**
+
+**The fix: S rings its own ring's doorbell after every applied delta.** S is the only party that
+knows both that new bytes arrived and what its own consumer is doing. It costs no network bytes.
+`rayland-vtest`'s `venus_ring::doorbell` carries the ordering argument that makes an *unconditional*
+doorbell correct and a *conditional* one (checking S's live `status` first) a hang.
+
+**The general lesson, which is the finding rather than the fix:** §5's inventory lists the four
+shared pages we knew about and missed a fifth — **the ring's `status` word**, which is neither
+command nor reply but *control*, written by the host and read by the client on a path with no API
+call anywhere near it. It is the same shape of surprise as C0's: the interesting state is not in the
+protocol, it is in the memory. That is now four channels found by running the thing and none found by
+reading it, and it is the reason Task 6 is the gate for (c)1 rather than a demo.
+
+### 4.7 The two-producer ordering hazard
+
+**Added 2026-07-16, after Task 6. Also a design error rather than an implementation slip.**
+
+§4.4's diagram shows `rayland-c`'s vtest server and its ring watcher both feeding one link, and says
+nothing about ordering between them. **Venus requires one, and it is invisible because on one machine
+it cannot be broken:** Mesa stores the ring's `tail` into shared memory and *only then* sends
+`vkWaitRingSeqnoMESA` / `vkNotifyRingMESA` on the socket, so a host cannot observe the command without
+also observing the bytes.
+
+(c)1 breaks it. The inline command takes a short, direct path (the vtest thread relays it
+immediately); the ring bytes take a longer one (the watcher must *notice* them by polling, then relay
+them). So the socket command routinely **overtakes** the bytes it depends on. virglrenderer does not
+treat this as "early" — it treats it as a **broken driver** and destroys the context:
+
+```text
+vkr: vkr_ring_thread: ring seqno(7072) unable to reach wait seqno(7144)
+vkr: vkWaitRingSeqnoMESA resulted in CS error
+vkr: destroying context 1 (rayland-venus) with a valid instance
+```
+
+**This is not a timing bug to be tuned away.** No poll interval makes "notice, then relay" beat
+"relay". The fix restores the invariant where it was broken: on receiving an inline command, C waits
+until the watcher has shipped the ring as far as Mesa had written it at that moment — which, because
+Mesa stored `tail` first, necessarily covers everything the command can refer to. See
+`rayland-c`'s `RingFlush`.
+
+**`vkWaitRingSeqnoMESA` (opcode 253) also belongs in §5's inventory** and is not there: it is a
+*blocking* ring wait that arrives on the inline path, and neither this spec nor the ring-findings
+document mentions it.
+
 ---
 
 ## 5. The channel inventory — everything that must cross
@@ -184,6 +279,19 @@ carry, and (c)1's strategy for each:
 | 3 | **Feedback slots** | S→C | Fence/semaphore/event/query status, written by the host so the client can poll without a round-trip (`vn_feedback.h`) | **Disable** (§6) |
 | 4 | **Mapped blobs** | C→S and S→C | The app's `vkMapMemory` memory: vertices out, pixels back | Conservative full sync (§7) |
 | 5 | **Out-of-line streams** | C→S | Submissions >8192 B are replaced in-ring by `vkExecuteCommandStreamsMESA` (opcode 180) pointing at *other* shmems | **Detect and fail loudly** (§5.1) |
+| 6 | **Ring `status` word** | S→C | **Missed until Task 6 ran.** The host's ring thread publishes its own IDLE state here, and Mesa reads it to decide whether to ring the doorbell. Neither command nor reply: *control*, with no API call near it | **Do not relay it — it cannot arrive in time.** S rings its own doorbell instead (§4.6) |
+
+**Row 6 is the entry this table exists to have.** It was missed because the other five are all *data*
+and it is not, and because §4.5 mistook it for a seam between Mesa and `rayland-c` when it is a seam
+between Mesa and **the ring's consumer on S**. Its absence did not present as a missing feature; it
+presented as an application that initialised correctly and then hung. See §4.6.
+
+**And the inventory is of *pages*, which is why it kept missing things.** Task 6 also found an
+ordering requirement between two channels that no row can express (§4.7), and a *lifecycle* fact that
+no row can express either: a blob can be **born with its contents already in it**, because Mesa
+creates a blob resource lazily at `vkMapMemory` — so a readback buffer's blob comes into existence
+after the GPU has already filled it (§7.3). Enumerating the shared memory was necessary and was never
+sufficient.
 
 ### 5.1 The out-of-line path: not implemented, but never silent
 
@@ -260,8 +368,10 @@ and v1 relays the ring as opaque bytes without parsing them. The only boundary v
 observe is **its own relay event** — i.e. "we are about to ship ring bytes to S". So:
 
 - **C→S:** before shipping a ring delta, ship every mapped blob whose shadow is dirty.
-- **S→C:** after S reports the replayed batch retired, ship back every mapped blob the GPU may have
-  written.
+- **S→C:** ~~after S reports the replayed batch retired, ship back every mapped blob the GPU may have
+  written.~~ **RETRACTED 2026-07-15 — see §7.2. The S→C half was both incomplete (it never carried
+  the reply arena at all) and unsound (it is a last-writer-wins race). The corrected rule: S ships
+  back exactly the pages S actually wrote.**
 
 This is deliberately over-eager: it syncs blobs that may not have changed, and it syncs on relays
 that contain no submit at all. That is the intended cost. **The precision upgrade is already in
@@ -273,6 +383,109 @@ than debug that.
 **Why this is honest rather than lazy:** it is *correct* for any app, and its cost is *visible*.
 The alternative — guessing at an optimization before we have numbers — is how projects acquire
 subtle corruption bugs.
+
+### 7.2 The S→C rule, corrected: ship what S wrote, not what S owns
+
+**Added 2026-07-15, after Task 5.** The original S→C rule above was wrong twice over, and both
+faults were mine rather than an implementer's.
+
+**It never carried the reply arena.** §5's channel 2 lists the arena as S→C traffic, but no task
+owned it, so nothing shipped it. The symptom is not the hang one might expect: `head` *does* advance
+from `S2C::RingProgress`, so `vn_ring_wait_seqno` returns and the application is **released onto an
+arena that is still zeros**. `vn_instance_init_renderer_versions` reads `instance_version = 0`,
+fails the `VN_MIN_RENDERER_VERSION` check, and `vkCreateInstance` fails. **Silent garbage, not a
+stall** — worth knowing before debugging it.
+
+**And "every blob the GPU *may* have written" is a last-writer-wins race.** S ships back app blobs
+its GPU never touched — vertex and uniform buffers, the common case. Concretely: the app memcpys
+frame N+1's vertices into `res=3`; S's poll fires on head movement from frame N and ships S's
+**stale** `res=3`; C's reader overwrites the app's fresh vertices; C then relays the stale bytes
+back. Invisible in the refapp, which writes its vertices exactly once — which is precisely why every
+test passed.
+
+**A rejected fix, recorded because it is the attractive one.** Identify the arena by decoding
+`vkSetReplyCommandStreamMESA` (opcode 178) out of the ring. It is **silently unsound**: 178 is
+emitted before *every* reply-bearing command (`vn_ring_submit_command` → `vn_ring_set_reply_shmem_locked`,
+`vn_ring.c:711-715`), so all but the first sit behind the decoder's stop point at the unsizeable
+`vkCreateInstance`; and when the 1 MiB reply pool fills, `vn_renderer_shmem_pool_grow_locked`
+(`vn_renderer_util.c:70-96`) mints a **new `res_id`**. C0 measured 48820 bytes of reply traffic, so
+the refapp never grows the pool — this would have passed every test we have and corrupted the first
+longer session, with S shipping a dead arena while the app read a live one. **Not a decoding bug: a
+correct decode of an incomplete picture, which is worse, because there is no bug to find.**
+
+**THE RULE: S ships back exactly the bytes S wrote.** Stop asking *"whose memory is this?"* and ask
+*"did I write it?"* — on one machine every byte S writes is instantly visible to C, so ownership
+predicates are a *guess* at that relationship while observed writes **are** it. Mechanically: S
+snapshots each blob after applying an inbound `C2S::BlobData` (so C's own writes never count as S's),
+diffs **byte-granular** at retirement, and ships the changed runs via `BlobData`'s existing `offset`
+field. Rings are excluded by `res_id` — S already holds them, and `RingDelta`/`RingProgress` own
+those bytes. That exclusion is **structural, not heuristic**.
+
+> **Amended 2026-07-15, during Task 5b: this said *page*-granular, and that was an unexamined habit
+> of mine rather than a decision.** Dirty-*page* tracking is the usual idiom because page tables are
+> the usual mechanism — but S is not using page tables, it is using `memcmp`, **and a `memcmp` is
+> byte-granular for free.**
+>
+> Page granularity leaves a live hole. If S writes one region of a 4096-byte page while the
+> application writes another region of *the same page* — entirely legal, and requiring no Vulkan
+> synchronization between them — then S's run carries its **stale** copy of the app's bytes and
+> clobbers the app's fresh ones. `VkDeviceMemory` is page-aligned and applications suballocate, so
+> this is realistic rather than theoretical. **It is the same shape as the whole-blob race this very
+> section exists to remove: invisible in the refapp, live for the first real application.**
+>
+> The compare cost is identical and the shipped volume is smaller, so byte granularity is strictly
+> better and the earlier wording bought nothing. Task 5b implemented the page-granular rule as
+> specified and flagged the hole rather than deviating from a binding spec unasked — the right call,
+> which is why this is an amendment and not a bug report.
+
+This is the same epistemological move as §5.1's out-of-line dword scan: **a predicate over bytes,
+not a reading of them.** §7's "no decoding the ring to make a correctness decision" survives intact.
+
+### 7.3 The rule was right; its implementation had two holes, and both were silent
+
+**Added 2026-07-16, after Task 6. Neither is a criticism of Task 5b: the rule §7.2 states is
+correct and survives unchanged. What Task 6 found is that "S ships back exactly the bytes S wrote"
+had been implemented as two subtly different questions, and both differences cost the whole frame.**
+
+**Hole 1 — *"bytes S wrote"* had become *"bytes that changed since S mapped the blob"*.** The baseline
+was taken from the blob's live pages at map time. That looks more careful than assuming zeros and is
+in fact strictly weaker: the two differ by **every write that happened before the mapping existed**.
+That is not a corner case, it is the readback buffer's normal life — **Mesa creates a blob resource
+lazily, at `vkMapMemory`**, so a readback buffer's blob is created *after* `vkCmdCopyImageToBuffer`
+has already run, and S's first sight of those pages is of the finished frame. The frame was therefore
+baked into the baseline, the diff found nothing, and the application read its own zeros.
+
+The correct baseline is **zeros**, and the reason is what the baseline *means*: it is *"the bytes C
+already has"*, and C's blob is a brand-new zero-filled memfd. The rejected worry — that a zero
+baseline would ship an engine's leftovers to C as though S had rendered them — is backwards: **on one
+machine the application maps those very pages and reads whatever is in them**, leftovers included, so
+shipping them is what makes C see what a local client sees. Withholding them was the deviation.
+
+**Hole 2 — blob bytes were shipped only when a *ring* retired.** A sound gate for a running
+application, and a deliberate one (diffing every blob on every 200 µs poll would make the poll loop a
+bandwidth source). But it never fires for the blob that matters: the readback's contents are already
+present when the blob is born, and the application then reads them and exits without touching the ring
+again. **Blob creation is itself an event on the return path**, and the same predicate answers it.
+
+**And a third fact, which is neither a channel nor a rule but an ordering:** a blob's **id and its
+contents must arrive in the same message**. `S2C::BlobCreated` is what unblocks C's vtest thread,
+which hands Mesa the descriptor, which Mesa `mmap`s and the application reads — all while C's reader
+is still getting to the next message. No separate `BlobData`, however promptly sent, can win that
+race, because the gap is not between the two messages but between the reply and Mesa's `mmap`. So
+`BlobCreated` now carries the blob's initial contents, making *"you have an id"* and *"your pages are
+correct"* one event, exactly as they are on one machine.
+
+**What all three have in common is worth more than the fixes.** Each was invisible to a unit test for
+the same reason: **a memfd is zero-filled, and a test never renders into a blob before mapping it.**
+The tests were not weak; they were testing a world in which blobs are born empty. Venus's are not.
+
+What falls out, with no knowledge of what any blob *is*: the arena ships (blocker gone); the staging
+pool never does (no wiped recording); app buffers never do (race gone); the readback ships, because
+the GPU genuinely wrote it. It is immune to the reply pool growing, to the shmem cache recycling ids,
+and to Venus adding a fourth internal shmem tomorrow. The cost — roughly 8 MiB of **byte** compares
+per retirement, worst case (the same volume the retracted page-granular rule would have compared,
+now compared one byte at a time rather than one page at a time — see the amendment below) — is
+exactly the kind of honest, measurable slowness §6 and §8 ask v1 for.
 
 ### 7.1 Where the presented pixels come from — and why it is not zero-copy
 
@@ -325,7 +538,7 @@ question is *"is remote Wayland feasible?"* A demo cannot answer it; a table can
 - **Bytes each way, split by channel** (ring / replies / blob sync). This tells us what to compress
   and what to cache, and it is cheap to measure once the split exists.
 - **Frame latency** — native on S, vs local socket, vs LAN.
-- **Breaking point under simulated WAN** — inject 20/50/100 ms RTT with `tc netem` on appollo and
+- **Breaking point under simulated WAN** — inject 20/50/100 ms RTT with `tc netem` on apollo and
   find where it becomes unusable. This is the cheapest possible way to answer "would this work over
   the internet" without an internet.
 
@@ -408,7 +621,7 @@ paths, both must be right.
 **Bit-identity is a legitimate assertion here, but only against the right baseline.** venus-from-C
 renders on S's **Intel** GPU, so it must be compared against `rayland-refapp` run natively **on S**
 (also Intel) — C0 established that same-GPU/same-stack replay is bit-identical (0/16384 bytes).
-Comparing against appollo-native would be an **AMD** render and is meaningless. Assert bit-identity
+Comparing against apollo-native would be an **AMD** render and is meaningless. Assert bit-identity
 against the S-native baseline; **report** rather than assert any divergence, so a legitimate change
 surfaces to a human instead of turning CI red.
 
@@ -436,10 +649,25 @@ exactly the "C may be weak, or a different CPU architecture" case the parent des
 **Its Xorg-vs-Wayland situation is irrelevant to the C role**, and this is worth stating plainly
 because it looked like a blocker: **C needs no compositor and no GPU.** Venus never touches local
 hardware, the refapp is headless, and even a future Wayland app on C gets its socket from our proxy
-rather than a local compositor. The only real question for milkv is whether **Mesa 26 with the
-Venus ICD builds for riscv64** there — a build problem, not a distro problem.
+rather than a local compositor. The only real question for milkv was whether **Mesa's Venus ICD
+builds for riscv64** — a build problem, not a distro problem.
 
-Deferred purely to keep one unknown at a time: x86→x86 must work first.
+> **Answered 2026-07-16 (research spike, no hardware needed): SHIPPED ALREADY.** Debian sid
+> `mesa-vulkan-drivers` **26.1.4-1** for **riscv64** already contains
+> `/usr/lib/riscv64-linux-gnu/libvulkan_virtio.so` (the Venus ICD, compiled for riscv64 by Debian's
+> buildd) plus `/usr/share/vulkan/icd.d/virtio_icd.json`
+> ([filelist](https://packages.debian.org/sid/riscv64/mesa-vulkan-drivers/filelist)). A build
+> artifact existing *is* proof the driver compiles for the arch; the `VN_DEBUG=vtest` path is a
+> runtime switch inside that same `.so`, and vtest — a plain Unix-socket client — needs *less* than
+> the virtgpu backend, so it is if anything more portable. **Two carry-forwards:** (1) the manifest
+> is named generically `virtio_icd.json` with **no arch suffix** (unlike `radeon_icd.riscv64.json` in
+> the same package) — do not hard-code `virtio_icd.riscv64.json`; point `VK_DRIVER_FILES`/`VK_ICD_FILENAMES`
+> at whatever is installed. (2) This verifies *builds / packages / loads*, not a completed vtest
+> handshake on a physical U74 — first-run bring-up on the board is the only unretired risk, and it is
+> low. Full spike: `.superpowers/sdd/spike-venus-riscv64.md`.
+
+Deferred purely to keep one unknown at a time: x86→x86 must work first. But the milkv demo is now a
+**shorter hop than it looked** — no Mesa fork, no source build, a stock distro package.
 
 ---
 
@@ -453,9 +681,22 @@ Deferred purely to keep one unknown at a time: x86→x86 must work first.
    assumed.
 3. **Does disabling all four feedback types actually work?** Each `VN_PERF` switch exists, but the
    combination is untested, and Venus may have paths that assume feedback is present.
-4. **What is the 1 MiB blob?** C0 identified it by *behaviour* as the reply arena
-   (`vkSetReplyCommandStreamMESA` names `resourceId=2`), but three independent 1 MiB allocations
-   exist in the Venus source and *which* one it is remains `[UNKNOWN]`.
+4. **What is the 1 MiB blob? Resolved, by source, during (c)1 Task 5's review.** C0 identified it
+   by *behaviour* as the reply arena (`vkSetReplyCommandStreamMESA` names `resourceId=2`), but left
+   open which of Venus's independent 1 MiB allocations that is. Tracing the emitter settles it:
+   `vn_instance.c:328-332` shows `instance->cs_shmem_pool` is sized `8u << 20` (8 MiB) and
+   `instance->reply_shmem_pool` is sized `1u << 20` (1 MiB) — the only 1 MiB pool the instance owns.
+   The only place a `vkSetReplyCommandStreamMESA` is ever emitted is
+   `vn_ring_set_reply_shmem_locked` (`vn_ring.c:672-687`), and its `shmem` argument always comes from
+   `vn_ring_submit_command`'s call to `vn_instance_reply_shmem_alloc` (`vn_ring.c:701`), which is a
+   thin wrapper (`vn_instance.h:92-98`) over `vn_renderer_shmem_pool_alloc(..., &instance->
+   reply_shmem_pool, ...)`. So C0's captured `resourceId=2` **is** `instance->reply_shmem_pool`, by
+   construction of the code rather than by having observed it behave one way. The third 1 MiB
+   candidate, `ring->upload` (`vn_ring.c:322`), is excluded on the same evidence C0 already had: the
+   refapp emits zero opcode-180s (ring-findings §5.3), and `ring->upload` backs exactly that
+   out-of-line path (`vn_ring.c:605`), so it is never allocated in the captured session. This entry
+   is kept, rather than deleted now that it is answered, because how it was resolved — reasoning from
+   the source rather than from another capture — is itself worth having on record.
 5. **Does the fence path's 5s `FENCE_WAIT_TIMEOUT` survive a real networked workload?** It has
    never been exercised — C0's path never reached it.
 6. **Residual on presentation (the decision itself is made — see §7.1):** the host presents from

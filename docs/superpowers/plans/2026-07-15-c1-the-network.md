@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Split C0's single-machine host into a C-side relay daemon and an S-side engine host joined by QUIC, so the unmodified `rayland-refapp` runs on `appollo` while its frame is rendered on `dop561`'s GPU and presented on `dop561`'s screen — and measure what that costs.
+**Goal:** Split C0's single-machine host into a C-side relay daemon and an S-side engine host joined by QUIC, so the unmodified `rayland-refapp` runs on `apollo` while its frame is rendered on `dop561`'s GPU and presented on `dop561`'s screen — and measure what that costs.
 
 **Architecture:** `rayland-c` *is* a vtest server, so stock Mesa talks to it over a local Unix socket and cannot tell it is not an ordinary vtest host. It allocates the Venus command ring and every blob as **local memfds**, watches the ring's `tail`, and relays ring deltas + mapped-blob contents over QUIC to `rayland-s`, which re-materializes them into a real virglrenderer context, replays on the GPU, and presents. No Mesa fork, no app changes.
 
@@ -28,7 +28,7 @@
   - `VN_PERF=no_fence_feedback,no_semaphore_feedback,no_event_feedback,no_query_feedback` — removes the S→C shared status pages.
   - `VN_DEBUG=no_abort` — **only after Task 3's progress-aware timeout exists** (spec §6.2).
 - **Socket paths must be short** — `sun_path` is 108 bytes. Use `/tmp/rl-c1.sock`, never a scratchpad path.
-- **Machines:** C = `appollo.localdomain` (x86_64, AMD GPU **unused**, key-based ssh, passwordless sudo, do not break it). S = `dop561` (Intel Iris Xe, the display). Loopback on `dop561` is the CI/dev path.
+- **Machines:** C = `apollo.localdomain` (x86_64, AMD GPU **unused**, key-based ssh, passwordless sudo, do not break it). S = `dop561` (Intel Iris Xe, the display). Loopback on `dop561` is the CI/dev path.
 
 ---
 
@@ -356,7 +356,15 @@ The heart of (c)1's client half: be a vtest server, allocate blobs locally, watc
 - Consumes: `rayland_vtest::{serve_vtest, RenderEngine, EngineError, VtestTransport}`, `rayland_vtest::venus_ring::{RING_HEAD_OFFSET, RING_TAIL_OFFSET, RING_STATUS_OFFSET, RING_BUFFER_OFFSET}`, `rayland_relay::{C2S, S2C, write_msg, read_msg}`.
 - Produces: `pub struct RelayEngine<T: RelayLink>` implementing `RenderEngine`; `pub trait RelayLink { fn send(&mut self, m: &C2S) -> Result<(), EngineError>; fn recv(&mut self) -> Result<S2C, EngineError>; }` (so Task 3 is testable with a mock and Task 6 plugs QUIC in); `pub struct RingWatcher`.
 
-**DECISION — local `head` advance (not in the spec; recorded here):** `head` is host-written and the app reads it to know how much ring space is free. `rayland-c` advances the local `head` **as soon as it has relayed the bytes**, not when S reports consuming them. This makes C's ring a pure staging buffer and removes a round-trip per wrap. **The consequence must be understood:** backpressure then comes from QUIC's flow control, not from S's ring occupancy, so a slow S causes C's relay to block rather than the app to stall on a full ring. That is the intended behaviour, but it means **`S2C::RingProgress` is a liveness signal, not a flow-control one.**
+**DECISION — local `head` advance. ~~As originally written~~ — WRONG. RETRACTED 2026-07-15, before implementation, by Task 3's source read. Kept visible rather than deleted, because the reasoning error is instructive.**
+
+> ~~`head` is host-written and the app reads it to know how much ring space is free. `rayland-c` advances the local `head` **as soon as it has relayed the bytes**, not when S reports consuming them. This makes C's ring a pure staging buffer and removes a round-trip per wrap. **The consequence must be understood:** backpressure then comes from QUIC's flow control, not from S's ring occupancy, so a slow S causes C's relay to block rather than the app to stall on a full ring. That is the intended behaviour, but it means **`S2C::RingProgress` is a liveness signal, not a flow-control one.**~~
+
+**Why it was wrong.** `head` is not only a space counter — **it is the reply-ready signal for every synchronous Vulkan call.** Mesa's `vn_ring_get_seqno_status` is literally `vn_ring_ge_seqno(ring, vn_ring_load_head(ring), seqno)` (`vn_ring.c:176-179`), and `vn_ring_wait_seqno` polls exactly that (`:182-197`) **before** the caller reads the reply arena (`:722-727`). Advancing `head` on *relay* therefore tells the application "your reply has arrived" while S has not yet answered — the app then decodes an unwritten arena. This is a **correctness** bug, not the performance trade-off the retracted text framed it as, and it is not a rare path: it fires on `vkEnumerateInstanceVersion`, command #2 of every capture C0 took.
+
+The error was one of scope, and worth naming: the note reasoned carefully about backpressure — a real consequence — and concluded from that alone, without checking what else `head` gates. `docs/design/2026-07-15-venus-ring-findings.md` §7 already said `head` gates *"every seqno wait"*. The evidence was on disk and simply was not consulted.
+
+**THE ACTUAL DECISION:** `head` is advanced **only** from `S2C::RingProgress`, i.e. only once S has genuinely consumed and answered. **`S2C::RingProgress` is therefore a *correctness* signal, not a liveness one** — the exact inverse of the retracted claim. Backpressure comes from S's real ring occupancy, as Venus designed it. The round-trip the retraction reintroduces is not overhead to be optimized away later: it *is* the synchronous call's semantics.
 
 - [ ] **Step 1: Create the crate**
 
@@ -598,13 +606,13 @@ git commit -m "(c)1 Task 7: extract rayland-present; present the readback blob v
 
 ---
 
-## Task 8: Two-machine bring-up (appollo → dop561)
+## Task 8: Two-machine bring-up (apollo → dop561)
 
 **Files:** Create `scripts/c1-two-machine.sh`
 
-- [ ] **Step 1: Install the client stack on appollo.** `ssh appollo.localdomain` (key-based, passwordless sudo; **do not break it**). It needs Mesa 26 with the Venus ICD (`/usr/share/vulkan/icd.d/virtio_icd.json`) and the `rayland-c` binary. **It needs no GPU and no Wayland.** Record exactly what you installed.
+- [ ] **Step 1: Install the client stack on apollo.** `ssh apollo.localdomain` (key-based, passwordless sudo; **do not break it**). It needs Mesa 26 with the Venus ICD (`/usr/share/vulkan/icd.d/virtio_icd.json`) and the `rayland-c` binary. **It needs no GPU and no Wayland.** Record exactly what you installed.
 
-- [ ] **Step 2: Run it.** `rayland-s` on dop561, `rayland-c` + refapp on appollo, with:
+- [ ] **Step 2: Run it.** `rayland-s` on dop561, `rayland-c` + refapp on apollo, with:
 ```bash
 VN_DEBUG=vtest,no_abort \
 VN_PERF=no_multi_ring,no_fence_feedback,no_semaphore_feedback,no_event_feedback,no_query_feedback \
@@ -614,7 +622,7 @@ env -u VK_LOADER_DRIVERS_SELECT ./rayland-refapp /tmp/out.png
 ```
 **Only set `no_abort` if Task 3's progress timeout is in place.**
 
-- [ ] **Step 3: The correctness assertion (spec §10.2).** Compare venus-from-appollo against `rayland-refapp` run natively **on dop561** — both are the **same Intel GPU**, so assert **bit-identity**. Do **not** compare against appollo-native: that is an AMD render and means nothing.
+- [ ] **Step 3: The correctness assertion (spec §10.2).** Compare venus-from-apollo against `rayland-refapp` run natively **on dop561** — both are the **same Intel GPU**, so assert **bit-identity**. Do **not** compare against apollo-native: that is an AMD render and means nothing.
 
 - [ ] **Step 4: Write `scripts/c1-two-machine.sh`** with the verified commands, and **run the script** — a documented command that does not work is the exact bug C0 shipped and a reviewer caught.
 
@@ -622,7 +630,7 @@ env -u VK_LOADER_DRIVERS_SELECT ./rayland-refapp /tmp/out.png
 
 ```bash
 git add scripts/c1-two-machine.sh
-git commit -m "(c)1 Task 8: two-machine bring-up (appollo -> dop561)"
+git commit -m "(c)1 Task 8: two-machine bring-up (apollo -> dop561)"
 ```
 
 ---
@@ -637,10 +645,10 @@ git commit -m "(c)1 Task 8: two-machine bring-up (appollo -> dop561)"
 
 - [ ] **Step 1: Count things.** In `metrics.rs`: round-trips (any send that blocks for a reply), bytes each way **split by channel** (ring / replies / blob sync), and wall-clock to first frame. Print a summary at exit behind `RAYLAND_C1_METRICS=1`.
 
-- [ ] **Step 2: Sweep simulated WAN.** On appollo:
+- [ ] **Step 2: Sweep simulated WAN.** On apollo:
 ```bash
 sudo tc qdisc add dev <iface> root netem delay 20ms    # then 50ms, then 100ms
-sudo tc qdisc del dev <iface> root                     # ALWAYS clean up — do not leave appollo crippled
+sudo tc qdisc del dev <iface> root                     # ALWAYS clean up — do not leave apollo crippled
 ```
 Record round-trips, bytes, and time-to-frame at 0/20/50/100 ms RTT. Find where it becomes unusable.
 

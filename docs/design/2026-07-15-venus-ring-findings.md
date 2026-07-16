@@ -65,7 +65,8 @@ GPU*. Rayland FFI-embeds it as `libvirglrenderer` (C0 Task 1).
 (`virtgpu`). Outside a VM there is no such device, so Mesa has a second, developer-oriented backend
 that talks over a plain Unix socket instead. That backend is called **vtest**, and it is the reason
 Rayland can use Venus *with no VM at all*. C0's host implements the vtest protocol
-(`crates/rayland-engine/src/vtest.rs`).
+(`crates/rayland-vtest/src/vtest.rs` — it lived in `rayland-engine` when this document was written;
+(c)1 Task 1 moved it into its own crate, which by construction links no GPU code).
 
 **The ring** is the thing this document is about. It is a fixed-size block of memory that *both*
 the client and the host can read and write, with a producer writing commands into one end and a
@@ -99,8 +100,8 @@ That is all. Measured on this host, across three independent live captures of an
 **~4 KiB of ring traffic is a *complete* Vulkan initialization** (4024 bytes, identical in all three
 runs). Against that, the socket carried **140–236 bytes**, all of it bookkeeping.
 
-The consequence is stated bluntly in the engine's own module docs
-(`crates/rayland-engine/src/venus_ring/mod.rs`): **`RenderEngine::submit` — the path C0 built, and
+The consequence is stated bluntly in the ring module's own docs
+(`crates/rayland-vtest/src/venus_ring/mod.rs`): **`RenderEngine::submit` — the path C0 built, and
 the only path the socket feeds — never sees a single application Vulkan command.** It sees the
 ring's *address*, and then a series of pokes. The real work is done by virglrenderer's `vkr_ring`
 thread reading shared memory that our process never routes.
@@ -248,7 +249,7 @@ corroborating §2 from evidence gathered for a different purpose.
 
 ### 3.3 This finding is now in the repository, not just in this document
 
-The captured bytes are a **CI fixture test** (`crates/rayland-engine/src/venus_ring/captured.rs`),
+The captured bytes are a **CI fixture test** (`crates/rayland-vtest/src/venus_ring/captured.rs`),
 running with no GPU and no Mesa install. It is **mutation-verified, not decorative**: changing
 `encoded_size(178)` from 36 to 40 independently fails **5 of the 6** fixture tests.
 

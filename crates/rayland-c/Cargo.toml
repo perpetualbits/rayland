@@ -1,0 +1,32 @@
+# Rayland's **C-side daemon**: the local vtest server that Mesa's Venus ICD talks to, and the
+# relay that carries what Mesa writes into shared memory across the network to S.
+#
+# C is by design the *weak* machine: the application runs here, but the GPU does not. This crate
+# therefore must never link a GPU stack — see `tests/no_gpu_linkage.rs`, which asserts that
+# `rayland-engine` (the one crate in this workspace that FFI-links `libvirglrenderer`) is absent
+# from this binary's dependency tree. Guarding the *binary* covers `rayland-relay`,
+# `rayland-vtest` and everything they pull in transitively, which is strictly stronger than a
+# guard on any single library.
+#
+# This crate produces a BINARY (`src/main.rs`), so per the repository license policy it is
+# GPL-3.0-or-later (library crates in the workspace are LGPL-3.0-or-later). It also exposes a
+# library target (`src/lib.rs`) so that the ring watcher — the piece most likely to hang, and the
+# piece worth testing hardest — can be exercised from `tests/` against a synthetic ring with no
+# GPU, no Mesa and no network.
+[package]
+name = "rayland-c"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+# Binary → GPL per CLAUDE.md's licensing policy.
+license = "GPL-3.0-or-later"
+publish = false
+description = "Rayland's C-side daemon: a local vtest server that relays Venus's command ring to S."
+repository = "https://github.com/perpetualbits/rayland"
+
+[dependencies]
+rayland-vtest = { path = "../rayland-vtest" }   # protocol only — NEVER rayland-engine (see Task 1)
+rayland-relay = { path = "../rayland-relay" }   # the (c)1 C<->S message set and its framing
+rayland-transport = { path = "../rayland-transport" } # SP2's QUIC: the network C's commands cross
+anyhow = { workspace = true }                   # ergonomic top-level errors for the daemon binary
+libc = { workspace = true }                     # mmap-adjacent POSIX bits the daemon needs directly

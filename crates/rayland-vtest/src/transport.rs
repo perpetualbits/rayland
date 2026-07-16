@@ -114,10 +114,18 @@ fn send_fd_over_socket(socket: BorrowedFd<'_>, fd: BorrowedFd<'_>) -> Result<(),
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
-    // Taking the address of the union's byte arm (a raw-pointer expression, so no `unsafe` and no
-    // read of a union field actually happens). The union is live for the whole call; we only ever
-    // hand the kernel this pointer plus its length.
-    msg.msg_control = (&raw mut cmsg_buffer.bytes) as *mut c_void;
+    // Take the address of the union's byte arm. Nothing is *read* here — `&raw mut` only computes
+    // an address — but Rust 1.85, the MSRV this crate declares, still classes any access to a union
+    // field as unsafe and rejects the bare expression (E0133). Rust 1.87 later relaxed exactly this
+    // case, which is why the `unsafe` looks redundant on a modern toolchain and is not optional on
+    // the floor we promise; `unused_unsafe` is allowed below rather than the MSRV being bumped,
+    // because CLAUDE.md names RISC-V as a target for machine C and that floor is a deliberate claim.
+    // SAFETY: no union field is read. `&raw mut` yields an address without loading the (zeroed, and
+    // therefore anyway fully initialized) bytes, `cmsg_buffer` is live for the whole call, and the
+    // kernel receives only this pointer plus the matching `CMSG_BUF_LEN` length.
+    #[allow(unused_unsafe)]
+    let control = unsafe { (&raw mut cmsg_buffer.bytes) as *mut c_void };
+    msg.msg_control = control;
     msg.msg_controllen = CMSG_BUF_LEN as _;
 
     // Fill in the single SCM_RIGHTS control message.
@@ -204,7 +212,7 @@ impl VtestTransport for UnixStream {
 /// # Failure modes
 /// - [`EngineError::ShmCreateFailed`] if `memfd_create` or `ftruncate` fails (typically
 ///   `ENOMEM`, or an `RLIMIT_NOFILE`/memlock limit).
-pub(crate) fn create_memfd(size: u64) -> Result<OwnedFd, EngineError> {
+pub fn create_memfd(size: u64) -> Result<OwnedFd, EngineError> {
     // A debug name; the kernel shows it as `/memfd:rayland-blob (deleted)` in `/proc/*/maps`,
     // which is worth having when diagnosing a live client's mappings. It is not an identifier —
     // memfd names need not be unique.
@@ -254,13 +262,21 @@ pub(crate) fn create_memfd(size: u64) -> Result<OwnedFd, EngineError> {
 /// mapping's lifetime to a Rust value the engine stores alongside the resource — and unrefing the
 /// resource *before* this drops — is what makes that ordering structural rather than a comment
 /// someone must remember.
-pub(crate) struct ShmMapping {
+pub struct ShmMapping {
     /// Start of the mapping. Never null (`mmap` failure is turned into an error at construction).
     ptr: *mut c_void,
     /// Mapping length in bytes, needed verbatim by `munmap`.
     len: usize,
 }
 
+// `len` below reports a fixed mapping size, not a collection's element count, so clippy's usual
+// "a public `len` wants an `is_empty`" pairing does not apply: `map` rejects a zero-sized mapping
+// outright (`mmap` itself returns EINVAL for one), so an `is_empty` here could only ever return a
+// constant `false` — a method that answers a question no caller has, and implies this type might
+// sometimes be empty when by construction it never is. Silencing the lint is the honest option.
+// The lint only began firing at all when (c)1 Task 1 widened these methods from `pub(crate)` to
+// `pub` for the crate split; nothing about the type itself changed.
+#[allow(clippy::len_without_is_empty)]
 impl ShmMapping {
     /// Maps all `size` bytes of `fd` shared and read/write, for handing to virglrenderer as an
     /// iovec.
@@ -278,7 +294,7 @@ impl ShmMapping {
     /// # Failure modes
     /// - [`EngineError::ShmMapFailed`] if `mmap` fails, or if `size` is 0 (which `mmap` rejects
     ///   with `EINVAL` anyway; reported honestly rather than papered over with a 1-page mapping).
-    pub(crate) fn map(fd: BorrowedFd<'_>, size: u64) -> Result<Self, EngineError> {
+    pub fn map(fd: BorrowedFd<'_>, size: u64) -> Result<Self, EngineError> {
         // `size` originates from an untrusted client's wire message; it must fit this platform's
         // address space before we ask the kernel for a mapping of it.
         let len = usize::try_from(size).map_err(|_| EngineError::ShmMapFailed {
@@ -312,12 +328,12 @@ impl ShmMapping {
     /// The mapping's base address, for filling in the `iov_base` of the iovec handed to
     /// virglrenderer. The pointer is valid for exactly as long as this `ShmMapping` lives — which
     /// is the invariant [`ShmMapping`]'s doc comment explains the resource lifecycle around.
-    pub(crate) fn as_ptr(&self) -> *mut c_void {
+    pub fn as_ptr(&self) -> *mut c_void {
         self.ptr
     }
 
     /// The mapping's length in bytes, for the iovec's `iov_len`.
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.len
     }
 }
@@ -439,8 +455,14 @@ mod tests {
         let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
         msg.msg_iov = &mut iov;
         msg.msg_iovlen = 1;
-        // Address of the live union's byte arm; see `send_fd_over_socket` for why it is aligned.
-        msg.msg_control = (&raw mut cmsg_buffer.bytes) as *mut c_void;
+        // Address of the live union's byte arm; see `send_fd_over_socket` for why it is aligned, and
+        // for why the `unsafe` that reads as redundant on a modern toolchain is what the declared
+        // 1.85 MSRV requires.
+        // SAFETY: no union field is read — `&raw mut` only computes an address into the live,
+        // zeroed `cmsg_buffer` above.
+        #[allow(unused_unsafe)]
+        let control = unsafe { (&raw mut cmsg_buffer.bytes) as *mut c_void };
+        msg.msg_control = control;
         msg.msg_controllen = CMSG_BUF_LEN as _;
 
         // SAFETY: `socket` is live; `msg` and its buffers are live for the call.

@@ -1,0 +1,37 @@
+# Rayland's **presentation library**: put a finished frame in a window on S's display.
+#
+# Extracted from `rayland-server`'s `window.rs` by (c)1 Task 7, because two different S-side
+# binaries now need the identical code and duplicating it would rot:
+#
+# - `rayland-server` — the SP-era (arc (s)) server, which renders a triangle from Rayland's own
+#   hand-rolled `postcard` stream and presents it (SP1's `wl_shm` path, SP3's zero-copy dmabuf path).
+# - `rayland-s` — (c)1's S-side daemon, which presents the readback blob of a *real, unmodified*
+#   Vulkan application whose commands crossed a network (spec §7.1).
+#
+# A LIBRARY crate, so per the repository license policy it is LGPL-3.0-or-later (binaries are GPL).
+#
+# # What is deliberately NOT here: any GPU dependency
+# This crate does **not** depend on `ash`, and that is a design constraint rather than an accident.
+# Presentation is "here are some pixels (or here is a dmabuf fd + its layout); show them" — it has
+# no business knowing how they were produced. The Vulkan code that *creates* a dmabuf export
+# (`vkGetMemoryFdKHR`, `VK_EXT_image_drm_format_modifier`, the OPTIMAL→LINEAR blit) stays in
+# `rayland-server`'s `dmabuf.rs`, next to the renderer it belongs to. Only the *description* of an
+# exported dmabuf ([`DmabufFrame`]) lives here, because that is what the Wayland protocol consumes.
+#
+# See `src/lib.rs` for the full account of the split and where the seam was cut.
+[package]
+name = "rayland-present"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"                                  # minimum toolchain that supports edition 2024
+# Library → LGPL per CLAUDE.md's licensing policy.
+license = "LGPL-3.0-or-later"
+publish = false
+description = "Rayland presentation: show a finished frame in a Wayland window, via dmabuf or wl_shm."
+repository = "https://github.com/perpetualbits/rayland"
+
+[dependencies]
+anyhow = { workspace = true }                    # the error type `present` already spoke; kept so the move is behaviour-preserving
+smithay-client-toolkit = { workspace = true }    # the Wayland window + wl_shm + calloop event loop
+wayland-client = { workspace = true }            # enables the dlopen backend for the whole tree
+wayland-protocols = { workspace = true }         # zwp_linux_dmabuf_v1 (the zero-copy path)

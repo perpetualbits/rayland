@@ -55,7 +55,8 @@ of why borrowing this engine is a better idea than writing one.
 **vtest** is how they talk without a VM. Inside a VM, Venus reaches the host through a kernel device
 (`virtgpu`). Outside, no such device exists — so Mesa has a second backend that speaks a simple
 protocol over a **Unix socket** instead. That backend is why Venus works with no VM at all, and
-C0's host implements it (`crates/rayland-engine/src/vtest.rs`).
+C0's host implements it (`crates/rayland-vtest/src/vtest.rs` — it lived in `rayland-engine` during
+C0; (c)1 Task 1 moved it into its own GPU-free crate).
 
 ### The architecture
 

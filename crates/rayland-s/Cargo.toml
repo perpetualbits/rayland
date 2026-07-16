@@ -1,0 +1,40 @@
+# Rayland's **S-side daemon**: the machine with the real GPU and the display.
+#
+# S is the strong half of (c)1. It owns a live `libvirglrenderer` (via `rayland-engine`) and
+# replays the Venus command stream `rayland-c` relays to it. Unlike `rayland-c` — which must never
+# link a GPU stack, and has a test asserting so — this crate *is* the GPU machine, so depending on
+# `rayland-engine` is the whole point rather than a violation.
+#
+# This crate produces a BINARY (`src/main.rs`), so per the repository license policy it is
+# GPL-3.0-or-later (library crates in the workspace are LGPL-3.0-or-later). It also exposes a
+# library target (`src/lib.rs`) so the piece with all the real logic — applying relay messages to
+# S's ring memory — can be exercised from `tests/` against a real shared-memory mapping with no
+# GPU, no Mesa and no network.
+[package]
+name = "rayland-s"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+# Binary → GPL per CLAUDE.md's licensing policy.
+license = "GPL-3.0-or-later"
+publish = false
+description = "Rayland's S-side daemon: replays C's relayed Venus command ring on a real GPU."
+repository = "https://github.com/perpetualbits/rayland"
+
+[dependencies]
+rayland-engine = { path = "../rayland-engine" }  # the real GPU: FFI-embedded libvirglrenderer
+rayland-vtest = { path = "../rayland-vtest" }    # RenderEngine, EngineError, the ring layout, ShmMapping
+rayland-relay = { path = "../rayland-relay" }    # the (c)1 C<->S message set and its framing
+rayland-transport = { path = "../rayland-transport" } # SP2's QUIC: the network C's commands cross
+# The Wayland window S puts the frame in ((c)1 Task 7). Extracted from `rayland-server`'s
+# `window.rs`, whose SP1 `wl_shm` path this crate uses — and whose SP3 dmabuf path it structurally
+# cannot, because S never sees the application's render target (spec §7.1). See `src/present.rs`.
+rayland-present = { path = "../rayland-present" }
+anyhow = { workspace = true }                    # ergonomic top-level errors for the daemon binary
+thiserror = { workspace = true }                 # typed, precise refusals of remote input
+
+[dev-dependencies]
+# `tests/loopback_e2e.rs` decodes the two PNGs the reference app writes (native, and rendered across
+# the network) and compares them pixel by pixel. A dev-dependency only: nothing in `rayland-s` itself
+# touches images — S moves command streams and blob bytes, not pictures.
+image = { workspace = true }

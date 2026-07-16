@@ -9,12 +9,14 @@
 // The off-screen Vulkan renderer (Task 4).
 pub mod render;
 
-// The S-side presentation path: convert a rendered frame to a wl_shm buffer and
-// show it in a live Wayland window (SP1).
+// The S-side presentation path (SP1/SP3). Since (c)1 Task 7 the window itself lives in the
+// `rayland-present` crate — which `rayland-s` also uses — and what is left here is the adapter that
+// lets this crate's Vulkan `Renderer` drive it. See the module's own docs for where the seam is.
 pub mod window;
 
 // The GPU dmabuf export path (SP3): render on the GPU, hand the compositor the image by
-// dmabuf handle instead of copying it through CPU memory.
+// dmabuf handle instead of copying it through CPU memory. The `ash` code that *creates* the export
+// is here; its *description* (`DmabufFrame`) lives in `rayland-present` and is re-exported.
 pub mod dmabuf;
 
 // The wire messages and framed reader.
