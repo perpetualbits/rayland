@@ -649,10 +649,25 @@ exactly the "C may be weak, or a different CPU architecture" case the parent des
 **Its Xorg-vs-Wayland situation is irrelevant to the C role**, and this is worth stating plainly
 because it looked like a blocker: **C needs no compositor and no GPU.** Venus never touches local
 hardware, the refapp is headless, and even a future Wayland app on C gets its socket from our proxy
-rather than a local compositor. The only real question for milkv is whether **Mesa 26 with the
-Venus ICD builds for riscv64** there — a build problem, not a distro problem.
+rather than a local compositor. The only real question for milkv was whether **Mesa's Venus ICD
+builds for riscv64** — a build problem, not a distro problem.
 
-Deferred purely to keep one unknown at a time: x86→x86 must work first.
+> **Answered 2026-07-16 (research spike, no hardware needed): SHIPPED ALREADY.** Debian sid
+> `mesa-vulkan-drivers` **26.1.4-1** for **riscv64** already contains
+> `/usr/lib/riscv64-linux-gnu/libvulkan_virtio.so` (the Venus ICD, compiled for riscv64 by Debian's
+> buildd) plus `/usr/share/vulkan/icd.d/virtio_icd.json`
+> ([filelist](https://packages.debian.org/sid/riscv64/mesa-vulkan-drivers/filelist)). A build
+> artifact existing *is* proof the driver compiles for the arch; the `VN_DEBUG=vtest` path is a
+> runtime switch inside that same `.so`, and vtest — a plain Unix-socket client — needs *less* than
+> the virtgpu backend, so it is if anything more portable. **Two carry-forwards:** (1) the manifest
+> is named generically `virtio_icd.json` with **no arch suffix** (unlike `radeon_icd.riscv64.json` in
+> the same package) — do not hard-code `virtio_icd.riscv64.json`; point `VK_DRIVER_FILES`/`VK_ICD_FILENAMES`
+> at whatever is installed. (2) This verifies *builds / packages / loads*, not a completed vtest
+> handshake on a physical U74 — first-run bring-up on the board is the only unretired risk, and it is
+> low. Full spike: `.superpowers/sdd/spike-venus-riscv64.md`.
+
+Deferred purely to keep one unknown at a time: x86→x86 must work first. But the milkv demo is now a
+**shorter hop than it looked** — no Mesa fork, no source build, a stock distro package.
 
 ---
 
