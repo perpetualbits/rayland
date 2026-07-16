@@ -121,6 +121,14 @@ Fixture A minus fixture B approximates the cost attributable to **mapped-write v
 texture upload**, because everything else — vertex count, draw calls, resolution, frame
 count, lighting, the arithmetic itself — is held identical by construction.
 
+"Held identical by construction" takes real care, and is easy to lose. §4's rule that
+fixture A iterates only the sampled triangle exists entirely for this reason: B's
+rasteriser restricts its fractal work to the visible region automatically, so an A that did
+not restrict its own would be doing three times the arithmetic for a reason unrelated to
+the experiment. Any future change to one fixture must be checked against this paragraph
+before it is made. The pair is an instrument, and an instrument with an uncontrolled
+variable in it is just two programs.
+
 **Be precise about what the control controls.** Both fixtures write to mapped memory with
 no interceptable API call; both are `HOST_COHERENT`; neither ever calls
 `vkFlushMappedMemoryRanges`. They differ only in **volume**: roughly 1 MiB per frame
@@ -168,6 +176,25 @@ fractal texture. Every face therefore shows the same image, and the zoom is visi
 of them simultaneously. The alternative — atlasing 20 distinct sub-regions — buys nothing
 diagnostic and adds a per-face layout that can be subtly wrong in ways a test would
 struggle to catch.
+
+**Only the sampled triangle is iterated.** An equilateral triangle inscribed in a square
+covers 32.5% of it, so a naive full-texture fractal would spend roughly two thirds of its
+arithmetic on texels no face ever samples. Fixture A therefore runs the Mandelbrot
+iteration **only for texels inside the UV triangle**, and fills the rest with black.
+
+This is not merely an efficiency point, and it is not optional. Fixture B evaluates the
+fractal **per fragment**, so it only ever computes the visible region — it gets the
+triangular restriction for free, from the rasteriser. A fixture A that iterated the whole
+square would do about three times B's fractal arithmetic for reasons that have nothing to
+do with where the fractal is computed, which is the single property §3.4 claims the pair
+isolates. The comparison would be contaminated by a factor of three, silently.
+
+**The full megabyte is still written and still uploaded.** Only the *iteration* is
+restricted; the black padding is written into mapped memory every frame like everything
+else. This is deliberate. The expensive thing (up to `MAX_ITER` iterations per texel) is
+what must not be wasted; the byte traffic is what the fixture exists to create, and
+shrinking it to fit the triangle would quietly reduce the headline number in §5.3 that the
+whole workload is built around.
 
 ### 4.1 Unit tests (no GPU)
 
@@ -305,7 +332,9 @@ that could be learned.
 
 1. Compute the 512×512 fractal **directly into persistently-mapped host-visible memory**.
    `vkMapMemory` is called **once**, at startup; every frame thereafter writes through the
-   raw pointer.
+   raw pointer. Texels outside the sampled UV triangle are written black without being
+   iterated (§4): the full megabyte crosses mapped memory, but none of the Mandelbrot
+   arithmetic is spent where no face can see it.
 2. Write the model-view-projection matrix into mapped uniform memory the same way.
 3. `vkCmdCopyBufferToImage` from the staging buffer to a device-local texture.
 4. Draw 20 triangles with depth testing.
