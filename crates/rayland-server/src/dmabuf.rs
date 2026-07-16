@@ -28,11 +28,17 @@ use ash::vk;
 // Wrap the exported raw fd in an owning handle so it is closed exactly once, on drop.
 use std::os::fd::{FromRawFd, OwnedFd};
 
-/// DRM fourcc for `XRGB8888` ('XR24'): a little-endian 0x00RRGGBB word (memory B,G,R,X). The
-/// matching Vulkan format is `B8G8R8A8_UNORM`; the compositor must advertise this fourcc.
-pub const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
-/// The trivial "linear, row-major, no vendor tiling" DRM modifier — universally importable.
-pub const DRM_FORMAT_MOD_LINEAR: u64 = 0;
+// The *description* of an exported dmabuf, and the two DRM constants that describe it, moved to
+// `rayland-present` by (c)1 Task 7 and re-exported here so every SP-era caller (`render.rs`, this
+// module's own tests, `window.rs`) still names them at `crate::dmabuf::...` exactly as before.
+//
+// Why the split runs here and not somewhere tidier: `DmabufFrame` is what the *compositor*
+// consumes, so it has to live on the presentation side, which must not link `ash`. Everything
+// below — creating an exportable LINEAR image, `vkGetMemoryFdKHR`, the OPTIMAL→LINEAR blit and its
+// channel-order reasoning (see the module docs) — is what the *GPU* is told, and stays here with
+// the renderer it serves. `EXPORT_VK_FORMAT` is the hinge between the two halves and is
+// deliberately on this side, next to the code that hands it to Vulkan.
+pub use rayland_present::{DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_XRGB8888, DmabufFrame};
 
 /// The Vulkan format whose in-memory byte order (`B,G,R,A`) matches DRM `XRGB8888`.
 ///
@@ -40,26 +46,6 @@ pub const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 /// the DRM fourcc, and the GPU is told this Vulkan format, and they must describe the same
 /// bytes. See the module docs for why this is `BGRA` and not `RGBA`.
 const EXPORT_VK_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
-
-/// A rendered frame exported as a dmabuf: the fd plus everything the compositor needs to
-/// interpret the memory. The fd owns a dup of the exported handle; the *backing GPU memory* is
-/// owned separately (by the `Renderer`) and outlives this struct's fd.
-pub struct DmabufFrame {
-    /// The exported dmabuf file descriptor.
-    pub fd: OwnedFd,
-    /// Image width in pixels.
-    pub width: u32,
-    /// Image height in pixels.
-    pub height: u32,
-    /// DRM fourcc describing the pixel format (`DRM_FORMAT_XRGB8888`).
-    pub drm_format: u32,
-    /// DRM format modifier describing the tiling (`DRM_FORMAT_MOD_LINEAR`).
-    pub modifier: u64,
-    /// Byte offset of plane 0 within the buffer (from `vkGetImageSubresourceLayout`).
-    pub offset: u32,
-    /// Row stride in bytes of plane 0 (from `vkGetImageSubresourceLayout`; may exceed width*4).
-    pub stride: u32,
-}
 
 /// The device extensions the dmabuf export path requires.
 ///

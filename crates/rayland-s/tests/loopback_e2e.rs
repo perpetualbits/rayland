@@ -380,7 +380,17 @@ fn refapp_renders_across_the_network_the_same_triangle_it_renders_natively() {
         let mut command = Command::new(&rayland_s);
         command
             .env("RAYLAND_C1_S_LISTEN", &s_addr)
-            .env("RAYLAND_C1_RENDER_NODE", RENDER_NODE);
+            .env("RAYLAND_C1_RENDER_NODE", RENDER_NODE)
+            // (c)1 Task 7: S now ends a session by opening a **window** and waiting for a human to
+            // close it (spec §1's second verification path). That is exactly right for the manual
+            // bring-up and impossible here: nothing in an automated test can click a close button,
+            // so `rayland-s` would never exit and this suite would pop a window on the developer's
+            // desktop on every run. Disabling it costs this test nothing — it asserts the
+            // application's PNG on C, which is §1's *other*, independent path and does not go near
+            // presentation. The presentation path has its own coverage:
+            // `rayland-s/tests/present.rs` for the frame identification, `rayland-present`'s
+            // `tests/live_window.rs` for a real compositor, and a human for the actual triangle.
+            .env("RAYLAND_C1_NO_PRESENT", "1");
         Daemon::spawn("rayland-s", command)
     };
     // Wait for S to be listening before starting C. C connects to S at startup and exits if it

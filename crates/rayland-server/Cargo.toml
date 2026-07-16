@@ -20,12 +20,13 @@ path = "src/main.rs"           # binary entry point
 [dependencies]
 rayland-wire = { path = "../rayland-wire" }   # the shared command/protocol types
 rayland-transport = { path = "../rayland-transport" } # QUIC listen()/accept() (SP2)
+# SP1's wl_shm window and SP3's zero-copy dmabuf window, which used to be this crate's `window.rs`
+# until (c)1 Task 7 extracted them so `rayland-s` could present too. This crate keeps the Vulkan
+# half (`render.rs`, and `dmabuf.rs`'s `ash` export code); `rayland-present` owns the Wayland half.
+rayland-present = { path = "../rayland-present" }
 ash = { workspace = true }                    # Vulkan bindings for the off-screen renderer
 image = { workspace = true }                  # PNG encoding for the binary
 anyhow = { workspace = true }                 # top-level error handling
-smithay-client-toolkit = { workspace = true }   # the Wayland window + wl_shm + calloop event loop
-wayland-client = { workspace = true }            # enables the dlopen backend for the whole tree
-wayland-protocols = { workspace = true }         # zwp_linux_dmabuf_v1 (SP3 Task 4 dmabuf presenter)
 
 [dev-dependencies]
 # rayland-wire is already a normal dependency (above), so tests see it without re-listing.

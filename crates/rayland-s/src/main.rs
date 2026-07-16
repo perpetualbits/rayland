@@ -62,6 +62,9 @@ use rayland_engine::{VirglEngine, virgl_available};
 use rayland_relay::{C2S, S2C, read_msg, write_msg};
 // The message applier: everything this daemon actually knows how to do.
 use rayland_s::apply::Applier;
+// Presentation: finding the application's readback buffer among S's blobs, and putting it on S's
+// screen. See that module's docs for why finding it is the one guess (c)1 has to make.
+use rayland_s::present::{ENV_NO_PRESENT, FrameCapture, frame_size_from_env, present_frame};
 
 // SP2's QUIC transport: the network C's commands cross.
 use rayland_transport::{QuicRecv, QuicSend};
@@ -121,6 +124,61 @@ fn env_or(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
 }
 
+/// The environment variable a Wayland client finds its compositor through.
+///
+/// Consulted directly, rather than just letting `rayland_present::present` fail, so that "this
+/// machine has no display" and "this machine has a display and presentation broke" are two different
+/// outcomes — see [`present_the_frame`].
+const ENV_WAYLAND_DISPLAY: &str = "WAYLAND_DISPLAY";
+
+/// The second half of spec §1's success criterion: put the frame on S's screen.
+///
+/// §1 asks for correctness to be asserted **twice, by two independent paths** — the application's
+/// own readback PNG on C, and *the frame the host presents on S*. (c)1 Task 6 delivered the first
+/// and only the first; this is the other one.
+///
+/// # The three ways this declines, and why each is a decline rather than a failure
+/// 1. **[`ENV_NO_PRESENT`] is set.** Something automated is driving this daemon and cannot click a
+///    close button. `tests/loopback_e2e.rs` is the only such caller today, and it says so.
+/// 2. **No compositor.** `rayland-s` on a headless box is still a perfectly good relay — the
+///    application on C renders correctly and gets its pixels back either way. Presentation is the
+///    part that needs a screen, and a machine without one has not failed at anything. This mirrors
+///    how every GPU/Wayland-dependent test in this repository skips rather than reddens.
+///
+/// A **failure to identify the frame is not on that list**: it is an error, and it exits non-zero.
+/// The session may well have succeeded — the application's PNG on C is untouched by any of this — but
+/// §1's second path did not happen, and this branch's recurring failure is things that quietly did
+/// not happen. See [`FrameCapture::into_frame`](rayland_s::present::FrameCapture::into_frame).
+///
+/// # Inputs / outputs
+/// - `capture`: what the session collected. Consumed — the decision is final.
+/// - Returns when the window is closed, or immediately if presentation is declined.
+///
+/// # Errors
+/// Returns an error if the frame could not be identified (no candidate, or an ambiguity S refuses to
+/// guess through), or if presentation itself failed on a machine that does have a compositor.
+fn present_the_frame(capture: FrameCapture) -> Result<()> {
+    if std::env::var_os(ENV_NO_PRESENT).is_some() {
+        eprintln!(
+            "rayland-s: not presenting ({ENV_NO_PRESENT} is set). The relay itself is unaffected; \
+             the application on C has its pixels either way."
+        );
+        return Ok(());
+    }
+    if std::env::var_os(ENV_WAYLAND_DISPLAY).is_none() {
+        eprintln!(
+            "rayland-s: not presenting (no {ENV_WAYLAND_DISPLAY}, so there is no compositor to \
+             present to). S relayed the session correctly regardless — but note that on a machine \
+             with no display, S is not the machine (c)1 §1 describes."
+        );
+        return Ok(());
+    }
+    // Refuse loudly here rather than show something wrong. `into_frame`'s two errors both explain
+    // themselves at length, so there is nothing to add with a `context`.
+    let frame = capture.into_frame()?;
+    present_frame(frame)
+}
+
 /// Frame and write one message to C, flushing it.
 ///
 /// Flushing is not politeness: an unflushed `Capset` is an answer C never sees, and C is blocked in
@@ -175,12 +233,15 @@ fn progress_thread(applier: Arc<Mutex<Applier>>, tx: Arc<Mutex<QuicSend>>) {
 /// - `applier`: the session state, shared with the progress thread.
 /// - `engine`: S's real GPU. Owned by this thread rather than shared, so the progress thread can
 ///   never be blocked behind GPU work.
+/// - `capture`: collects the application's readback buffer as it goes past, for presentation after
+///   the session. Owned by this thread — the progress thread never touches it.
 /// - Returns when C closes the link or a read fails.
 fn serve(
     mut rx: QuicRecv,
     tx: Arc<Mutex<QuicSend>>,
     applier: Arc<Mutex<Applier>>,
     engine: &mut VirglEngine,
+    capture: &mut FrameCapture,
 ) -> Result<()> {
     loop {
         let msg: C2S = match read_msg(&mut rx) {
@@ -217,6 +278,20 @@ fn serve(
         // so it never holds both, and this is the only path that holds them together.
         let mut session = applier.lock().expect("the applier lock is never poisoned");
         let out = session.apply(engine, msg);
+
+        // **Look for the frame here, before the lock is released and before the replies go out.**
+        // Spec §7.3: Mesa creates a blob resource lazily, at `vkMapMemory`, so the readback buffer's
+        // blob is born *after* `vkCmdCopyImageToBuffer` has already run — with the finished frame
+        // already in it. This is the moment S has the pixels, and there is no later one: the
+        // application reads them and exits without touching the ring again, which is exactly why
+        // Task 6's retirement-gated return path never shipped them. Presentation must not repeat
+        // that mistake, so it hangs off the same event the fix does.
+        //
+        // Reading S's *own* mapping rather than the runs `poll_progress` ships is what makes §1's
+        // two verification paths independent: the window shows what S's GPU wrote, the app's PNG on
+        // C shows what the relay delivered, and a divergence between them is a finding rather than
+        // two views of one diff agreeing with each other. See `Applier::blob`.
+        capture.observe_replies(&session, &out);
 
         for reply in &out {
             // Worth a human's attention either way, and S's log is the more reliable of the two
@@ -312,7 +387,18 @@ fn main() -> Result<()> {
         })
         .context("spawning the progress thread")?;
 
-    serve(rx, tx, applier, &mut engine)?;
+    // What to look for. Read before the session rather than after it, so a malformed
+    // `RAYLAND_C1_PRESENT_SIZE` is a startup refusal naming the setting — not a surprise at the end
+    // of a run that has already done all its work and cannot be repeated for free.
+    let (present_width, present_height) = frame_size_from_env()?;
+    let mut capture = FrameCapture::new(present_width, present_height);
+
+    serve(rx, tx, applier, &mut engine, &mut capture)?;
     eprintln!("rayland-s: session ended");
-    Ok(())
+
+    // Now that the session is over, put the frame on screen — and keep it there until a human closes
+    // it. Presentation deliberately runs *after* the session rather than alongside it; the reasons
+    // (one static frame, and a window that must outlive an application that exits the instant it has
+    // its pixels) are on `rayland_s::present::present_frame`.
+    present_the_frame(capture)
 }

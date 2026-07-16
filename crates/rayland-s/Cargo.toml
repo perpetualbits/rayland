@@ -26,6 +26,10 @@ rayland-engine = { path = "../rayland-engine" }  # the real GPU: FFI-embedded li
 rayland-vtest = { path = "../rayland-vtest" }    # RenderEngine, EngineError, the ring layout, ShmMapping
 rayland-relay = { path = "../rayland-relay" }    # the (c)1 C<->S message set and its framing
 rayland-transport = { path = "../rayland-transport" } # SP2's QUIC: the network C's commands cross
+# The Wayland window S puts the frame in ((c)1 Task 7). Extracted from `rayland-server`'s
+# `window.rs`, whose SP1 `wl_shm` path this crate uses — and whose SP3 dmabuf path it structurally
+# cannot, because S never sees the application's render target (spec §7.1). See `src/present.rs`.
+rayland-present = { path = "../rayland-present" }
 anyhow = { workspace = true }                    # ergonomic top-level errors for the daemon binary
 thiserror = { workspace = true }                 # typed, precise refusals of remote input
 

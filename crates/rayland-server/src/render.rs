@@ -48,15 +48,14 @@ pub struct FrameRequest {
     pub vertices: Vec<Vertex>,
 }
 
-/// The rendered result: a tightly-packed RGBA8 image.
-pub struct RenderedFrame {
-    /// Image width in pixels.
-    pub width: u32,
-    /// Image height in pixels.
-    pub height: u32,
-    /// `width * height * 4` bytes of RGBA8, row-major, no padding.
-    pub pixels: Vec<u8>,
-}
+// The rendered result: a tightly-packed RGBA8 image.
+//
+// Moved to `rayland-present` by (c)1 Task 7 and re-exported here, so every caller still names it at
+// `crate::render::RenderedFrame` exactly as before. It moved because it is the *input to
+// presentation* — `pack_xrgb8888` and the whole `wl_shm` path consume it — and presentation is now
+// a separate crate that two binaries share. Nothing about it is Vulkan-specific: it is a width, a
+// height, and RGBA8 bytes, which is why it could cross the split unchanged.
+pub use rayland_present::RenderedFrame;
 
 // The compiled shaders, embedded so the build needs no shader compiler (see Task 3).
 // SPIR-V is a stream of 32-bit words, so we align the bytes to 4 for `read_spv`.

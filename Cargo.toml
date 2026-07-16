@@ -10,6 +10,7 @@ members = [
     "crates/rayland-server",         # off-screen Vulkan renderer (this task)
     "crates/rayland-client",         # client: builds and sends the triangle stream (this task)
     "crates/rayland-transport",      # QUIC transport foundation + loopback spike (SP2 Task 1)
+    "crates/rayland-present",        # S-side presentation: a finished frame in a Wayland window, dmabuf or wl_shm ((c)1 Task 7)
     "crates/rayland-vtest",          # the Venus vtest wire protocol + command-ring knowledge; no GPU deps ((c)1 Task 1)
     "crates/rayland-relay",          # (c)1 relay wire protocol: ring deltas, blob syncs, replies over a network ((c)1 Task 2)
     "crates/rayland-c",              # (c)1 C-side daemon: local vtest server + memfd blobs + ring watcher ((c)1 Task 3)

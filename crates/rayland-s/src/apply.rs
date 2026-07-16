@@ -248,6 +248,30 @@ impl Applier {
         Self::default()
     }
 
+    /// A blob S currently holds, by resource id — a **read-only** view of its live pages.
+    ///
+    /// # Why this exists, and why it is deliberately this narrow
+    /// (c)1 Task 7 needs it: presentation must read the application's readback buffer out of S's own
+    /// mapping, because spec §1 asks for the frame on S's screen and the frame the app's PNG shows
+    /// on C to be **two independent paths**. Reading it here — from the pages S's GPU actually wrote
+    /// — is what makes them independent; reconstructing it from what `poll_progress` shipped back
+    /// would make the window and the PNG two views of the same diff, agreeing even when that diff is
+    /// wrong. Task 6 found exactly such a bug, so the distinction is not academic.
+    ///
+    /// It is a plain lookup rather than an iterator over the table because the caller has the
+    /// resource id already — it came out of the [`S2C::BlobCreated`] it is reacting to — and
+    /// exposing the whole map would invite a scan, which is how a presentation concern would end up
+    /// making decisions about resources it has no business naming.
+    ///
+    /// # Inputs / outputs
+    /// - `res_id`: the engine's resource id, as it appears on the wire.
+    /// - Returns `None` if S has no blob by that id. A shared reference, so nothing outside can
+    ///   write these pages; [`HostBlob::bytes`] documents the (inherent, pre-existing) raciness of
+    ///   *reading* memory a cross-process writer also touches.
+    pub fn blob(&self, res_id: u32) -> Option<&HostBlob> {
+        self.blobs.get(&res_id)
+    }
+
     /// Record the ring's handle if `cmd` is the `vkCreateRingMESA` that declares it.
     ///
     /// Called for every inline batch. Most are not ring creations and this does nothing; the one
