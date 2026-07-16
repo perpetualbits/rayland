@@ -354,10 +354,13 @@ The algorithm, unchanged in substance:
 
 **512**, fixed as a constant in `icosa-core`, not an option. `mandelsmooth.c` uses 2000;
 that was tuned for an interactive GPU shader and is far too expensive for a per-frame CPU
-loop over 512×512 pixels on a machine that may be a RISC-V single-board computer. 512
-keeps fixture A's worst-case inner loop at ~134 million iterations per frame — heavy
-enough to be honest about C being weak, light enough not to dominate the measurement — and
-is ample detail at the zoom depth §5.2 reaches.
+loop on a machine that may be a RISC-V single-board computer.
+
+The worst case is **~44.9 million iterations per frame**, not the 512×512×512 ≈ 134 million
+a full-texture fractal would cost: §4's restriction means only the dilated triangle is
+iterated, about 33.5% of the texture. That is heavy enough to be honest about C being weak,
+light enough not to dominate the measurement, and ample detail at the zoom depth §5.2
+reaches.
 
 Both fixtures use this same constant. B must not get a different iteration count, or the
 pair stops being a controlled comparison.
