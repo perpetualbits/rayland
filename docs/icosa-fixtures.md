@@ -560,4 +560,17 @@ They are deliberately option-free (design spec §2): no `--frames`, no `--no-tex
 because a fixture with opinions about how it is run stops being evidence about how real applications
 behave. **"The sweep needs it" is a real reason** to revisit that. A shorter run, a different texture
 size, or a fixed subset of frames can be added properly — as constants, or as a second binary — in
-preference to patching around the fixture or, worse, weakening it until it passes.
+preference to patching around the fixture.
+
+**The failure mode this is guarding against is not laziness; it is a bad night.** The danger is not
+that someone adds a knob for a good reason. It is that once `--frames 10` exists, someone will
+eventually be tempted to pass it for a *bad* reason, at 2 a.m., to make a red run go green — and
+then **weaken it until it passes, which would quietly destroy the only thing it is for.** The value
+of "no knob" is that it removes that temptation from the person under pressure, who may well be
+right about everything else that night and wrong about this.
+
+That is the sentence this section exists to deliver, and it is aimed at whoever picks these fixtures
+up when the people who built them are no longer here to object. A fixture that has been softened to
+pass does not announce itself: it still runs, still prints numbers, still goes green. It has simply
+stopped being evidence. The rest of this document is about instruments that reported results they
+were not in a position to produce (§9); a weakened fixture is that same failure, chosen on purpose.
