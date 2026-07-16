@@ -50,11 +50,27 @@
 //! fixture fails *differently* from fixture A (a different frame, a different symptom), that
 //! difference is itself the finding. See `docs/c0-venus-first-light.md`.
 //!
-//! # This is expected to fail, and that is the point
-//! This pair of fixtures exists to make (c)2 ("mapped-memory coherence") executable. (c)2 has not
-//! been built yet. **A failing test here is this task's actual deliverable, not a defect in the
-//! test.** Do not loosen this test's assertions to make it pass; see
-//! `.superpowers/sdd/task-8-brief.md`.
+//! # This test was expected to fail. It passes, and that is a finding.
+//! This pair of fixtures exists to make (c)2 ("mapped-memory coherence") executable, and (c)2 has
+//! not been built — so the design spec predicted this test would fail. **It does not: all 120
+//! frames are bit-identical.**
+//!
+//! The prediction conflated "through Venus" with "across a network". This path is C0's: one
+//! machine, a local Unix socket, and a Venus ICD that hands the ring and blobs to the engine as
+//! **memfds passed over `SCM_RIGHTS`**. Nothing is transported, so nothing can be lost — mapped
+//! writes work perfectly here not because Rayland solved anything but because on one machine there
+//! is nothing to solve.
+//!
+//! For **this** fixture the point is sharper still: it barely writes mapped memory at all (80 bytes
+//! of uniforms per frame against fixture A's megabyte), so it was never the one (c)2 threatened.
+//! Its job is to be the volume control — and its passing says the shared scaffolding, the geometry,
+//! the depth attachment and the fragment path all survive the C0 round trip intact. That is the
+//! baseline against which fixture A's behaviour across the real relay must be read.
+//!
+//! Still do not loosen these assertions. If this test ever *starts* failing, something on the C0
+//! path regressed, and the bit-exact comparison is what will say so. See `docs/icosa-fixtures.md`
+//! for the full findings and `docs/design/2026-07-16-icosa-fixtures.md` §9 for the corrected
+//! expectation.
 //!
 //! # The one place this test crosses the fixtures' isolation rule, and why it does not violate it
 //! `rayland-engine` depends on the fixture binary (via [`build_icosa_gpu`], which shells out to

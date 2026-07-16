@@ -32,12 +32,28 @@
 //! stale texture, a delta applied out of order. A tolerance is precisely where those would live, so
 //! this test does not have one — the comparison is `assert_eq!` on raw bytes.
 //!
-//! # This is expected to fail, and that is the point
+//! # This test was expected to fail. It passes, and that is a finding.
 //! Fixture A exists to make (c)2 ("mapped-memory coherence") executable: it writes a whole texture
 //! into mapped memory every frame with no Vulkan call anywhere between the write and the copy that
-//! reads it. (c)2 has not been built yet. **A failing test here is this task's actual deliverable,
-//! not a defect in the test.** Do not loosen this test's assertions to make it pass; see
-//! `docs/c0-venus-first-light.md` and this repository's `.superpowers/sdd/task-8-brief.md`.
+//! reads it. (c)2 has not been built, so the design spec predicted this test would fail.
+//!
+//! **It does not. All 120 frames are bit-identical.** The prediction conflated "through Venus" with
+//! "across a network". This path is C0's: one machine, a local Unix socket, and a Venus ICD that
+//! hands the ring and blobs to the engine as **memfds passed over `SCM_RIGHTS`**. The fixture's
+//! mapped memory *is* the pages virglrenderer reads. Nothing is transported, so nothing can be
+//! dropped, torn, or applied out of order — per-frame mapped writes work perfectly here, not
+//! because Rayland solved anything but because on one machine there is nothing to solve.
+//!
+//! **So this test is the control, not the proof.** It establishes that the fixture renders
+//! bit-identically when the memory really is shared, which is exactly what must be true before the
+//! same binary is run across `rayland-c` → `rayland-s` — because it makes any divergence *there*
+//! provably the relay's fault rather than the fixture's. That relay run is where (c)2 actually
+//! bites, and nothing has yet pointed a fixture at it.
+//!
+//! Still do not loosen these assertions. If this test ever *starts* failing, something on the C0
+//! path regressed, and the bit-exact comparison is what will say so. See
+//! `docs/icosa-fixtures.md` for the full findings and `docs/design/2026-07-16-icosa-fixtures.md` §9
+//! for the corrected expectation.
 //!
 //! # The one place this test crosses the fixtures' isolation rule, and why it does not violate it
 //! `rayland-engine` depends on the fixture binary (via [`build_icosa_cpu`], which shells out to
