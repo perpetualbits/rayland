@@ -244,8 +244,10 @@ fn serve(
     capture: &mut FrameCapture,
 ) -> Result<()> {
     loop {
+        // The framed byte count `read_msg` now returns is C's measurement seam (Task 9); S keeps its
+        // own accounting out of this path, so it is discarded here rather than plumbed through.
         let msg: C2S = match read_msg(&mut rx) {
-            Ok(m) => m,
+            Ok((m, _framed_bytes)) => m,
             Err(e) => {
                 // Not necessarily an error: a clean shutdown ends here too.
                 eprintln!("rayland-s: link from C ended: {e}");

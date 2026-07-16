@@ -457,13 +457,25 @@ impl RelayLink for ChannelLink {
     }
 
     fn recv(&mut self) -> Result<S2C, EngineError> {
+        // This is the *only* place in `rayland-c` where a thread blocks waiting for S, which makes
+        // it the only honest place to measure a round trip. Ring deltas are fire-and-forget and cost
+        // bandwidth, not latency; the requests that land here — the capset, blob creation — are the
+        // ones the application genuinely waits on, and spec §8.1 predicts they cluster at startup
+        // and go quiet afterwards. Timing the wait here is what tests that.
+        let waited = std::time::Instant::now();
         // A closed channel means the reader thread is gone, i.e. S dropped the connection. That is
         // a link failure, not an end of stream: whoever is waiting here will never get its answer.
-        self.replies
+        let r = self
+            .replies
             .recv()
             .map_err(|_| EngineError::RelayLinkFailed {
                 detail: "the reader thread ended before S answered this request".into(),
-            })
+            });
+        // Record the stall even when the wait ended in failure: time spent blocked on an answer that
+        // never came is still time the application lost, and dropping it would flatter a failing
+        // link by making its worst stalls invisible.
+        rayland_c::metrics::metrics().round_trip(waited.elapsed());
+        r
     }
 }
 
@@ -907,6 +919,14 @@ fn main() -> Result<()> {
     let s_socket = s_addr
         .parse()
         .with_context(|| format!("{ENV_S_ADDR}={s_addr:?} is not a valid host:port address"))?;
+    // Start Task 9's clock *before* the QUIC handshake, not after: spec §8.1 predicts startup is
+    // round-trip-bound but one-off, and a time-to-first-frame that excluded the handshake could not
+    // test that claim. `metrics()` fixes the start instant on first call, so this call is the
+    // measurement's zero. It is a no-op unless RAYLAND_C1_METRICS is set.
+    rayland_c::metrics::metrics();
+    // The reporter prints running totals every 100 ms, so the sweep harness always holds a last-good
+    // sample even when it kills the daemon rather than letting it exit.
+    rayland_c::metrics::start_reporter();
     let (tx, rx) = rayland_c::link::connect(s_socket).map_err(|e| {
         anyhow::anyhow!("connecting to S at {s_addr} (set {ENV_S_ADDR} to change it): {e}")
     })?;

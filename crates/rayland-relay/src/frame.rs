@@ -82,7 +82,18 @@ pub enum RelayError {
 /// `postcard`-encoded message. Returns an error if serialization or the underlying write
 /// fails. Generic over `M` so the same function frames both [`crate::C2S`] (written by
 /// `rayland-c`) and [`crate::S2C`] (written by `rayland-s`).
-pub fn write_msg<W: Write, M: Serialize>(w: &mut W, m: &M) -> Result<(), RelayError> {
+///
+/// # Returns the number of framed bytes written — body **plus** the 4-byte prefix
+/// That count exists for (c)1 Task 9's measurement (`rayland-c`'s `metrics` module), and it is
+/// returned from here rather than recomputed by the caller for one blunt reason: **this is the
+/// only place the true size is known without paying for it twice.** A caller wanting the size
+/// would have to serialize the message a second time — and blob-sync messages carry a megabyte of
+/// mapped memory, so a second `postcard::to_stdvec` would allocate and copy 1 MiB per frame purely
+/// to count it, corrupting the very timings being measured.
+///
+/// Callers that do not care may ignore it; `write_msg(w, m)?;` in statement position discards it
+/// exactly as it discarded the previous `()`.
+pub fn write_msg<W: Write, M: Serialize>(w: &mut W, m: &M) -> Result<usize, RelayError> {
     // Encode the message into an owned byte vector using postcard's compact, deterministic format.
     let bytes = postcard::to_stdvec(m)?;
     // The length prefix must fit in a u32; converted explicitly (never silently truncated) so an
@@ -98,7 +109,10 @@ pub fn write_msg<W: Write, M: Serialize>(w: &mut W, m: &M) -> Result<(), RelayEr
     w.write_all(&len.to_le_bytes())?;
     // Write the message body itself.
     w.write_all(&bytes)?;
-    Ok(())
+    // Report what actually crossed: the body plus the 4-byte length prefix. Counting only the body
+    // would under-report every message by 4 bytes, which on a chatty channel is a real distortion of
+    // a measurement whose whole purpose is to be trusted.
+    Ok(bytes.len() + 4)
 }
 
 /// Read one length-prefixed frame from `r` and decode it into an `M`.
@@ -116,7 +130,17 @@ pub fn write_msg<W: Write, M: Serialize>(w: &mut W, m: &M) -> Result<(), RelayEr
 /// a denial-of-service / crash vector, not merely a slow path. To close it, `len` is
 /// checked against [`MAX_FRAME_BYTES`] and rejected with [`RelayError::FrameTooLarge`]
 /// **before** the body buffer is allocated.
-pub fn read_msg<R: Read, M: DeserializeOwned>(r: &mut R) -> Result<M, RelayError> {
+///
+/// # Returns the decoded message **and** the number of framed bytes read
+/// The byte count is the body plus the 4-byte prefix, and it is returned for the same reason
+/// [`write_msg`] returns its count: (c)1 Task 9 measures the return path, ring-findings §7 predicts
+/// that path is ~12x the command path, and only this function knows the true framed size without
+/// re-encoding a message that may hold a megabyte of blob data.
+///
+/// The tuple is deliberately not an out-parameter or a separate `read_msg_counted`: a second entry
+/// point would let a future caller read frames that the measurement never sees, and a metric with a
+/// silent blind spot is worse than no metric, because it still looks like a total.
+pub fn read_msg<R: Read, M: DeserializeOwned>(r: &mut R) -> Result<(M, usize), RelayError> {
     // Read the 4-byte length prefix; a short read here means the stream ended (or never had a
     // full frame to begin with).
     let mut len_bytes = [0u8; 4];
@@ -133,7 +157,9 @@ pub fn read_msg<R: Read, M: DeserializeOwned>(r: &mut R) -> Result<M, RelayError
     r.read_exact(&mut body)?;
     // Decode the body bytes into the caller's requested message type.
     let message = postcard::from_bytes(&body)?;
-    Ok(message)
+    // Report the framed size alongside the message: `len` body bytes plus the 4-byte prefix that
+    // was consumed before them.
+    Ok((message, len as usize + 4))
 }
 
 #[cfg(test)]
@@ -152,8 +178,17 @@ mod tests {
         };
         let mut buf = Vec::new();
         write_msg(&mut buf, &msg).expect("write");
-        let got: C2S = read_msg(&mut buf.as_slice()).expect("read");
+        // read_msg reports the framed size alongside the message; assert it matches what
+        // write_msg said it wrote, so the two halves of the byte accounting Task 9 rests on are
+        // pinned against each other rather than merely believed.
+        let written = write_msg(&mut Vec::new(), &msg).expect("write");
+        let (got, framed): (C2S, usize) = read_msg(&mut buf.as_slice()).expect("read");
         assert_eq!(got, msg);
+        assert_eq!(
+            framed, written,
+            "read and write must agree on the framed size"
+        );
+        assert_eq!(framed, buf.len(), "the framed size must be the whole frame");
     }
 
     #[test]
@@ -181,7 +216,7 @@ mod tests {
         let truncated = &buffer[..truncated_len];
         let mut cursor = std::io::Cursor::new(truncated);
 
-        let result: Result<C2S, RelayError> = read_msg(&mut cursor);
+        let result: Result<(C2S, usize), RelayError> = read_msg(&mut cursor);
         assert!(
             matches!(result, Err(RelayError::Io(_))),
             "expected RelayError::Io from a truncated stream, got {result:?}"

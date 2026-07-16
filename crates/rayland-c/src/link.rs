@@ -99,9 +99,14 @@ impl crate::relay_engine::RelayLink for QuicSendLink {
     /// flush is a no-op today because it does not buffer above quinn; it is called anyway, because
     /// this code's correctness must not rest on a detail of the transport's current internals.)
     fn send(&mut self, m: &C2S) -> Result<(), EngineError> {
-        write_msg(&mut self.send, m).map_err(|e| EngineError::RelayLinkFailed {
+        // `write_msg` reports the framed size — body plus the 4-byte prefix — because it is the only
+        // place that knows it without serializing a possibly-megabyte message twice (Task 9).
+        let framed = write_msg(&mut self.send, m).map_err(|e| EngineError::RelayLinkFailed {
             detail: format!("writing {m:?} to S failed: {e}"),
         })?;
+        // Classify and count *after* a successful write: a message that failed to go out is not
+        // traffic, and counting it would inflate the byte totals with bytes the network never saw.
+        crate::metrics::metrics().record_send(m, framed);
         self.send.flush().map_err(|e| EngineError::RelayLinkFailed {
             detail: format!("flushing the link to S failed: {e}"),
         })
@@ -144,8 +149,16 @@ impl crate::relay_engine::RelayLink for QuicRecvLink {
     /// lost connection to EOF (`Ok(0)`), which `read_msg` then surfaces as a short read — so a
     /// vanished S arrives here as an I/O error, which is what it is.
     fn recv(&mut self) -> Result<S2C, EngineError> {
-        read_msg(&mut self.recv).map_err(|e| EngineError::RelayLinkFailed {
+        // The framed size comes back with the message for the same reason it does on the send side:
+        // only the framing layer knows what actually crossed (Task 9).
+        let (m, framed) = read_msg(&mut self.recv).map_err(|e| EngineError::RelayLinkFailed {
             detail: format!("reading from S failed: {e}"),
-        })
+        })?;
+        // Every S->C message passes through this one function — the reader thread owns `recv`
+        // exclusively — so counting here cannot miss a message, and that exclusivity is what makes
+        // the return-path total (ring-findings §7's ~12x prediction) trustworthy rather than a
+        // sample.
+        crate::metrics::metrics().record_recv(&m, framed);
+        Ok(m)
     }
 }
