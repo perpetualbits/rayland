@@ -18,11 +18,27 @@ use rayland_icosa_core::exact_math::log2;
 
 /// Inputs and their required exact results, as raw `f64` bit patterns.
 ///
-/// The inputs are chosen to cover the shape of the function rather than to be pretty: exact powers
-/// of two (where the mantissa polynomial contributes nothing and only the exponent path runs),
-/// values just above and just below them (where the exponent decomposition switches over), and a
-/// spread of ordinary values across the range the fractal actually feeds it — `log2(|z|)` for `|z|`
-/// just past the escape radius of 2, up to very large escapees.
+/// The inputs are chosen to cover the *shape* of the function, not to be pretty. Recall how `log2`
+/// works internally: it splits `x` into a mantissa `m` in `[1, 2)` and an integer exponent `e`, then
+/// approximates only `log2(m)` via `t = (m - 1) / (m + 1)`, which maps `m`'s range onto `t` in
+/// `[0, 1/3)` before running the truncated polynomial. So the property that actually needs covering
+/// is where each case lands on that `t` axis, not how the inputs look in decimal:
+///
+/// - `1.0`, `2.0`, `4.0`, `0.5` are exact powers of two: `m` is exactly `1.0`, so `t` is exactly `0`
+///   and the polynomial contributes nothing — only the exponent path is exercised.
+/// - `1.5` and `3.0` share the identical mantissa (`1.5`, so `t = 0.2` for both) but different
+///   exponents (`0` and `1`). Pinning the same polynomial output against two different exponents is
+///   what isolates the `exponent +` term from the series term — a real bug in the exponent bias or
+///   the mantissa bit-mask would show up here even if the polynomial itself were flawless.
+/// - `2.0001` is just above a power of two: `m ≈ 1.00005`, so `t ≈ 2.5e-5`, pinning the `t → 0` edge
+///   where the exponent decomposition switches over and where the polynomial is evaluated nearest
+///   its most common real input. It also doubles as a realistic value of `|z|` just past the
+///   fractal's escape radius of 2, which is what this function is actually fed in production.
+/// - `1.999` is just below a power of two: `m ≈ 1.999`, so `t ≈ 0.333`, pinning the `t → 1/3` edge —
+///   the far end of the polynomial's domain, where the series' truncation error is largest (~1e-9,
+///   versus ~1.5e-13 at `t = 0.2`) and its shape is most distinctive.
+/// - `10.0` (`t ≈ 0.111`) and `1e300` (`t ≈ 0.198`) round out the middle of the domain and exercise
+///   large positive exponents.
 const CASES: &[(f64, u64)] = &[
     (1.0, 0x0000000000000000),
     (2.0, 0x3ff0000000000000),
@@ -35,6 +51,13 @@ const CASES: &[(f64, u64)] = &[
     (1.5, 0x3fe2b803473f72b3),
     (10.0, 0x400a934f0979a371),
     (1e300, 0x408f24a09f1a8b87),
+    // Added in a review follow-up to Task 1: the original eight inputs pinned the polynomial at
+    // only three distinct t values (0, 0.2, 0.111/0.198), all in the lower 60% of its domain,
+    // leaving the t -> 0 and t -> 1/3 edges — and the doc comment's claims about covering them —
+    // untested. Generated the same way as the block above and sanity-checked against
+    // log2(1.999) ≈ 0.99928 and log2(2.0001) ≈ 1.0000721 before being committed.
+    (1.999, 0x3feffa16d7dfcfd3),
+    (2.0001, 0x3ff0004ba30a7e18),
 ];
 
 /// Every case must reproduce its committed bit pattern exactly.
