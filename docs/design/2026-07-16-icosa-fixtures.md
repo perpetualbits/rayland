@@ -215,16 +215,21 @@ depth image allocation, and depth attachment setup through the remoted path. Exp
 to be where breakage appears first, and treat a depth-related failure as a finding about
 Rayland rather than a bug in the fixture.
 
-**UV mapping.** All 20 faces sample the *same* equilateral triangle inscribed in the
-fractal texture. Every face therefore shows the same image, and the zoom is visible on all
-of them simultaneously. The alternative — atlasing 20 distinct sub-regions — buys nothing
-diagnostic and adds a per-face layout that can be subtly wrong in ways a test would
-struggle to catch.
+**UV mapping.** All 20 faces sample the *same* equilateral triangle, centred in the fractal
+texture with a margin around it. Every face therefore shows the same image, and the zoom is
+visible on all of them simultaneously. The alternative — atlasing 20 distinct sub-regions —
+buys nothing diagnostic and adds a per-face layout that can be subtly wrong in ways a test
+would struggle to catch.
 
-**Only the sampled triangle is iterated.** An equilateral triangle inscribed in a square
-covers 32.5% of it, so a naive full-texture fractal would spend roughly two thirds of its
-arithmetic on texels no face ever samples. Fixture A therefore runs the Mandelbrot
-iteration **only for texels inside the UV triangle**, and fills the rest with black.
+Note it is **not** *inscribed*, and the distinction matters to the arithmetic below: a
+genuinely inscribed (maximal) equilateral triangle in a square has side ≈1.035 and covers
+≈46% of it. This one has side 0.866, covers 32.5%, and touches none of the texture's edges.
+The margin is not slack — it is what leaves room for the one-texel dilation §7.2 requires.
+
+**Only the sampled triangle is iterated.** The triangle covers 32.5% of the square texture,
+so a naive full-texture fractal would spend roughly two thirds of its arithmetic on texels
+no face ever samples. Fixture A therefore runs the Mandelbrot iteration **only for texels in
+and immediately around the UV triangle**, and fills the rest with black.
 
 This is not merely an efficiency point, and it is not optional. Fixture B evaluates the
 fractal **per fragment**, so it only ever computes the visible region — it gets the
@@ -379,6 +384,16 @@ that could be learned.
    raw pointer. Texels outside the sampled UV triangle are written black without being
    iterated (§4): the full megabyte crosses mapped memory, but none of the Mandelbrot
    arithmetic is spent where no face can see it.
+
+   **The iterated region is the triangle dilated outward by two texels, not the bare
+   triangle.** The texture is sampled with `LINEAR` filtering, so a bilinear fetch at a UV
+   just *inside* the triangle reads a 2×2 neighbourhood reaching up to one texel *outside*
+   it. Leaving those black bleeds a dark fringe into every face's edge — and only fixture A
+   has a texture, so only fixture A would have the fringe, making it a visible divergence in
+   exactly the place §3.5 requires the pair to be identical. Two texels rather than one: one
+   is the strict bilinear footprint, the second is margin against UV-to-texel rounding at the
+   boundary. The dilation must stay this small; it is filter correctness, not licence to
+   iterate the square.
 2. Write the model-view-projection matrix into mapped uniform memory the same way.
 3. `vkCmdCopyBufferToImage` from the staging buffer to a device-local texture.
 4. Draw 20 triangles with depth testing.
