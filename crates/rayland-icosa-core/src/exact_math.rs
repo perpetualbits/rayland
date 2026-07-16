@@ -104,3 +104,98 @@ pub fn log2(x: f64) -> f64 {
     // which is why `log2(2^n)` comes out exactly `n`.
     exponent + TWO_OVER_LN2 * t * poly
 }
+
+/// `2 / π`, used to find how many quarter-turns to subtract during range reduction.
+///
+/// Taken from `std::f64::consts` rather than written as a literal, because clippy's
+/// `approx_constant` lint (correctly) flags a hand-typed decimal that happens to approximate a
+/// named constant — the risk is a transcription slip nobody would notice. Verified bit-identical
+/// to the literal `0.6366197723675814` this was originally written as (`to_bits()` on both sides
+/// gives `0x3fe45f306dc9c883`), so using the named constant changes nothing about the arithmetic
+/// below, only where the bit pattern comes from.
+const TWO_OVER_PI: f64 = std::f64::consts::FRAC_2_PI;
+
+/// The high half of `π / 2`, exact in `f64` with its low mantissa bits deliberately zeroed.
+///
+/// Splitting `π/2` across two constants is the classical Cody-Waite trick: `k * PI_OVER_2_HI` is
+/// then computed *exactly* (no rounding, because `HI` has enough trailing zero bits to absorb the
+/// multiplication for the small `k` this crate ever uses), so the subtraction below loses no
+/// precision to cancellation. `PI_OVER_2_LO` then supplies the bits `HI` omitted.
+const PI_OVER_2_HI: f64 = 1.5707963267341256;
+
+/// The low half of `π / 2` — the part [`PI_OVER_2_HI`] left out.
+const PI_OVER_2_LO: f64 = 6.077100506506192e-11;
+
+/// Sine and cosine together, reproducible bit-for-bit on any IEEE-754 host.
+///
+/// # How it works
+/// Both functions are only cheaply approximable near zero, so the argument is first *range
+/// reduced*: find the nearest multiple `k` of `π/2`, subtract it to leave a remainder `r` in
+/// roughly `[-π/4, π/4]`, and remember `k mod 4` — the quadrant. Sine and cosine of the original
+/// argument are then sine and cosine of `r`, possibly swapped and possibly negated, according to
+/// the quadrant. Over `[-π/4, π/4]` the Taylor series for both converge fast enough that
+/// truncating leaves an error near 1e-9.
+///
+/// The subtraction is done in two steps against a split `π/2` (Cody-Waite) rather than one, because
+/// a single-constant subtraction would lose most of its significant bits to cancellation for larger
+/// arguments and the resulting angle error would be plainly visible as a wobble in the animation.
+///
+/// # Inputs and outputs
+/// `x` in radians. Returns `(sin(x), cos(x))`. Both are returned together because the caller always
+/// wants both and the expensive part — the range reduction — is shared.
+///
+/// # Failure modes
+/// Accurate for `|x|` up to a few hundred radians, which is all this crate needs (the largest angle
+/// any frame produces is well under 100). For very large arguments the two-constant reduction is
+/// insufficient and the result degrades; it does not signal this. NaN and infinite inputs produce
+/// NaN.
+pub fn sin_cos(x: f64) -> (f64, f64) {
+    // A non-finite angle has no meaningful sine, and the reduction below would produce nonsense
+    // rather than propagate the NaN cleanly.
+    if !x.is_finite() {
+        return (f64::NAN, f64::NAN);
+    }
+
+    // How many quarter-turns away from zero the argument is. `round` is `roundToIntegralTiesAway`,
+    // which IEEE-754 *does* exactly specify — unlike the transcendentals — so this is reproducible.
+    let k = (x * TWO_OVER_PI).round();
+    // The two-step Cody-Waite subtraction. Written as two separate subtractions on purpose: fusing
+    // them into one expression would let the intermediate be rounded once instead of twice and
+    // change the result.
+    let r = (x - k * PI_OVER_2_HI) - k * PI_OVER_2_LO;
+
+    // Which quadrant the original angle fell in. `rem_euclid` gives a non-negative result for
+    // negative `k`, unlike `%`, so the match below needs no sign special-casing.
+    let quadrant = (k as i64).rem_euclid(4);
+
+    let r2 = r * r;
+
+    // sin(r) = r - r³/3! + r⁵/5! - r⁷/7! + r⁹/9! - r¹¹/11!, in Horner form over r².
+    let mut sin_poly = -1.0 / 39916800.0; // -1/11!
+    sin_poly = sin_poly * r2 + 1.0 / 362880.0; // +1/9!
+    sin_poly = sin_poly * r2 - 1.0 / 5040.0; // -1/7!
+    sin_poly = sin_poly * r2 + 1.0 / 120.0; // +1/5!
+    sin_poly = sin_poly * r2 - 1.0 / 6.0; // -1/3!
+    sin_poly = sin_poly * r2 + 1.0; // +1
+    let sin_r = r * sin_poly;
+
+    // cos(r) = 1 - r²/2! + r⁴/4! - r⁶/6! + r⁸/8! - r¹⁰/10! + r¹²/12!, in Horner form over r².
+    let mut cos_r = 1.0 / 479001600.0; // +1/12!
+    cos_r = cos_r * r2 - 1.0 / 3628800.0; // -1/10!
+    cos_r = cos_r * r2 + 1.0 / 40320.0; // +1/8!
+    cos_r = cos_r * r2 - 1.0 / 720.0; // -1/6!
+    cos_r = cos_r * r2 + 1.0 / 24.0; // +1/4!
+    cos_r = cos_r * r2 - 1.0 / 2.0; // -1/2!
+    cos_r = cos_r * r2 + 1.0; // +1
+
+    // Rotate the (sin, cos) pair into the quadrant the reduction took us out of. Each arm is the
+    // standard identity for adding a multiple of π/2; getting one wrong swaps or flips the
+    // animation in a way the identity test alone would not catch, which is why the table test
+    // covers every quadrant explicitly.
+    match quadrant {
+        0 => (sin_r, cos_r),
+        1 => (cos_r, -sin_r),
+        2 => (-sin_r, -cos_r),
+        _ => (-cos_r, sin_r),
+    }
+}
