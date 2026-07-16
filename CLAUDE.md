@@ -142,7 +142,7 @@ A Cargo workspace of sixteen crates. Each declares its own license per the polic
   only on the two icosa libraries and knows nothing about remoting. GPL, `publish = false`.
 - **`crates/rayland-icosa-gpu`** — fixture B: the same spinning icosahedron, same geometry, same
   schedule, same fractal arithmetic, and — via `rayland-icosa-vk` — literally the same render loop.
-  Only the fractal moves: it is evaluated in a fragment shader, so roughly 128 bytes per frame cross
+  Only the fractal moves: it is evaluated in a fragment shader, so 80 bytes per frame cross
   mapped memory instead of a megabyte. It is the **volume control** for `rayland-icosa-cpu`, not an
   alternative to it: it still writes its uniforms through a persistent mapping with no interceptable
   call, so the pair isolates how cost scales with mapped-write volume, not the presence of mapped

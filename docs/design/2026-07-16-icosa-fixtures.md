@@ -176,7 +176,7 @@ variable in it is just two programs.
 **Be precise about what the control controls.** Both fixtures write to mapped memory with
 no interceptable API call; both are `HOST_COHERENT`; neither ever calls
 `vkFlushMappedMemoryRanges`. They differ only in **volume**: roughly 1 MiB per frame
-versus roughly 128 bytes per frame. So the pair does *not* isolate "mapped writes versus
+versus exactly 80 bytes per frame. So the pair does *not* isolate "mapped writes versus
 no mapped writes" — that experiment does not exist here, and could not, since a moving
 picture needs at least a matrix to change. What the pair isolates is **how the cost scales
 with mapped-write volume**, across four orders of magnitude of it. That is the more useful
@@ -425,7 +425,8 @@ and the fixture's job is to state it in executable form rather than in prose.
 ### 7.3 `rayland-icosa-gpu`, per frame
 
 1. Write the MVP matrix, zoom half-width, and centre into mapped uniform memory
-   (~128 bytes).
+   (80 bytes: a 64-byte MVP matrix, a 4-byte half-width, 4 bytes of std140 padding, and an
+   8-byte centre).
 2. Draw 20 triangles with depth testing; the fragment shader evaluates the fractal
    per-pixel from the interpolated UVs.
 3. Read back, write the PNG.
