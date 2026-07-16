@@ -19,6 +19,7 @@ members = [
     "crates/rayland-refapp",         # C0's unmodified reference app: a plain offscreen Vulkan triangle (C0 Task 4b)
     "crates/rayland-icosa-core",     # shared geometry/schedule/fractal math for the icosahedron fixtures (icosa Task 1)
     "crates/rayland-icosa-vk",       # shared Vulkan scaffolding for the icosahedron fixtures (icosa Task 5)
+    "crates/rayland-icosa-cpu",      # fixture A: fractal on the CPU, uploaded per frame (icosa Task 6)
 ]
 
 # Dependency versions shared across member crates, so every crate agrees on one version.

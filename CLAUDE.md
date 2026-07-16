@@ -69,7 +69,7 @@ Wayland/Vulkan/GPU-remoting — must painstakingly verify **every line** for cor
 
 ## Repository status and layout
 
-A Cargo workspace of fourteen crates. Each declares its own license per the policy below
+A Cargo workspace of fifteen crates. Each declares its own license per the policy below
 (library → LGPL, application/binary → GPL); all are `v0.0.x` and pre-stable.
 
 - **`crates/rayland`** — the published placeholder that reserves the crates.io name; the
@@ -134,6 +134,12 @@ A Cargo workspace of fourteen crates. Each declares its own license per the poli
   readback. It exists so the two fixtures **cannot** drift in the parts that must be identical for
   their comparison to mean anything — the same argument `rayland-icosa-core` rests on, applied to
   the render loop. Knows nothing about remoting. LGPL, `publish = false`.
+- **`crates/rayland-icosa-cpu`** — fixture A: an ordinary offscreen Vulkan program drawing a
+  spinning icosahedron textured with a fractal it computes on **its own CPU** and writes into
+  persistently-mapped `HOST_COHERENT` memory every frame — with no flush, and so no call on the wire
+  saying a megabyte changed. That is both what an ordinary Vulkan program does and exactly the case
+  with nothing to intercept, which is the problem this fixture states in executable form. Depends
+  only on the two icosa libraries and knows nothing about remoting. GPL, `publish = false`.
 
 The work is decomposed into sub-projects, each getting its own design spec →
 implementation plan → build cycle, sequenced as a "walking skeleton" (get something
