@@ -21,6 +21,9 @@
 // Reproducible replacements for the libm functions the rest of the crate would otherwise need.
 pub mod exact_math;
 
+// The solid itself: its 60 vertices, their flat normals and their texture coordinates.
+pub mod geometry;
+
 /// The number of frames a fixture run renders.
 ///
 /// Fixed, and not configurable. A fixture with a `--frames` option is a fixture with an opinion
