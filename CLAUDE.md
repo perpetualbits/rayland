@@ -69,7 +69,7 @@ Wayland/Vulkan/GPU-remoting — must painstakingly verify **every line** for cor
 
 ## Repository status and layout
 
-A Cargo workspace of twelve crates. Each declares its own license per the policy below
+A Cargo workspace of thirteen crates. Each declares its own license per the policy below
 (library → LGPL, application/binary → GPL); all are `v0.0.x` and pre-stable.
 
 - **`crates/rayland`** — the published placeholder that reserves the crates.io name; the
@@ -124,6 +124,11 @@ A Cargo workspace of twelve crates. Each declares its own license per the policy
 - **`crates/rayland-refapp`** — C0's captured workload: an **ordinary** offscreen Vulkan
   triangle program with **zero `rayland-*` dependencies** and no knowledge of remoting.
   Its value is that it is boring and typical; keep it that way. GPL, `publish = false`.
+- **`crates/rayland-icosa-core`** — shared foundations for the icosahedron fixtures: the geometry,
+  the frame-indexed animation schedule, the Mandelbrot math, and the bit-exact `log2`/`sin`/`cos`
+  those rest on. **No dependencies at all, and never touches a GPU** — its correctness is
+  arithmetic. Its reason for existing is that the two fixtures must be identical in everything but
+  the property under study, and two copies of this code would drift. LGPL, `publish = false`.
 
 The work is decomposed into sub-projects, each getting its own design spec →
 implementation plan → build cycle, sequenced as a "walking skeleton" (get something
