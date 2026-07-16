@@ -22,13 +22,14 @@
 //!
 //! # Why bit-identical is a fair demand and not a harsh one
 //! Both runs draw on the same GPU with the same driver — the native baseline via the local ICD, the
-//! remoted run through the engine — and the fractal's arithmetic is bit-exact regardless of which
-//! fixture evaluates it: this fixture's fragment shader is a hand-transcription of
-//! `rayland-icosa-core::exact_math`'s `log2`/HSV ramp (see `shaders/icosa_fractal.frag`'s own
-//! header), built precisely so it needs no floating-point leniency to agree with the CPU reference.
-//! The **only** thing that differs between the two runs, for this fixture, is how the 80-byte
-//! per-frame uniform write and the draw commands reached the GPU. Any pixel difference is therefore
-//! a defect in that path.
+//! remoted run through the engine — so it is the same fragment shader doing the same arithmetic on
+//! the same hardware in both legs of this comparison. That argument has nothing to do with fixture
+//! A: this test never compares fixture B's pixels against fixture A's, only against fixture B's own
+//! native run (the two fixtures are never bit-compared to each other — `f32` shader arithmetic
+//! against `f64` CPU arithmetic, plus the CPU path's extra bilinear resample through its 512×512
+//! texture, guarantee they would not match even natively). The **only** thing that differs between
+//! the two runs compared here, for this fixture, is how the 80-byte per-frame uniform write and the
+//! draw commands reached the GPU. Any pixel difference is therefore a defect in that path.
 //!
 //! # Why every frame is compared, not just the last
 //! A defect that corrupts one intermediate frame and then self-corrects — a stale uniform, a delta

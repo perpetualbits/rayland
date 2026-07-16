@@ -28,8 +28,11 @@ const int MAX_ITER = 512;
 //
 // The reproducibility argument that forces this on the CPU side does not, strictly, apply here:
 // this shader runs on one GPU and produces the same answer every time it does. It is transcribed
-// anyway so that the two fixtures compute the same function of the same inputs, which is what lets
-// their outputs be compared to each other as well as each to its own baseline.
+// anyway so that the two fixtures compute the same function of the same inputs, which is what makes
+// this a controlled experiment about the cost of moving that function's inputs across mapped memory.
+// It does not make the two fixtures' pixels match: this shader is f32 where the CPU reference is
+// f64, and the CPU path additionally resamples through a 512x512 texture with LINEAR filtering. Each
+// fixture is compared only against its own native baseline, never against the other.
 float exact_log2(float x) {
     // frexp splits x into a mantissa in [0.5, 1) and an exponent, exactly — the same field
     // extraction the Rust version does by hand, which GLSL exposes directly.
@@ -60,7 +63,7 @@ vec3 hsv2rgb(vec3 c) {
 }
 
 void main() {
-    // The face's UV, which spans an equilateral triangle inscribed in the unit square, is mapped
+    // The face's UV, which spans an equilateral triangle centred in the unit square with a margin, is mapped
     // onto the complex plane exactly as the CPU fixture maps its texture's pixel grid — so the two
     // fixtures show the same region of the fractal on the same face.
     vec2 offset = frag_uv - vec2(0.5);

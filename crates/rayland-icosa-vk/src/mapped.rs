@@ -5,7 +5,7 @@
 //! `rayland-refapp`'s `HostBuffer` maps, writes, and unmaps once, because refapp renders a single
 //! frame and exits. Every fixture built on this crate renders `rayland_icosa_core::FRAME_COUNT`
 //! frames, writing new data into the *same* buffer every time — the CPU fixture rewrites ~1 MiB of
-//! fractal texels each frame, the GPU fixture rewrites a few dozen bytes of uniforms, and this
+//! fractal texels each frame, the GPU fixture rewrites 80 bytes of uniforms, and this
 //! crate's own [`crate::scene::Scene`] rewrites uniforms and reads back pixels every frame too.
 //! Mapping and unmapping around every one of those writes would add `vkMapMemory`/`vkUnmapMemory`
 //! call overhead to a loop whose entire point, for the CPU fixture, is to measure the cost of
@@ -14,7 +14,7 @@
 //!
 //! That both fixtures reach for this same type is itself part of what this crate's existence
 //! proves: the GPU fixture is not somehow "avoiding" mapped memory by computing the fractal in a
-//! shader — it uses the identical mapping mechanism, just for ~128 bytes of uniforms a frame
+//! shader — it uses the identical mapping mechanism, just for 80 bytes of uniforms a frame
 //! instead of ~1 MiB of texture. The difference the pair exists to measure is *how much* goes
 //! through the mapping, not *whether* one of them uses one at all.
 //!

@@ -114,7 +114,7 @@ Vulkan program has no reason to, and these fixtures must stay ordinary per the d
 spec's §2). Without a messenger, and without a settings file telling the layer where to
 send what it finds, every check still runs, and the results simply go nowhere. **A run
 without the settings file below reports success whether the code is right or wrong** —
-this exact mistake was made once already in this project (see §7), and the run that made
+this exact mistake was made once already in this project (see §9), and the run that made
 it looked, from the outside, identical to a clean pass.
 
 The recipe that actually reports something: write a settings file —
@@ -246,7 +246,7 @@ against Rayland — first on the depth attachment, then on per-frame mapped text
 prediction held.** Run through Rayland's C0 path — `cargo test -p rayland-engine --test
 icosa_cpu_venus_e2e` and `--test icosa_gpu_venus_e2e` — both fixtures produced **120 of 120
 frames bit-identical** to their native runs. The depth prediction was independently wrong
-too, for an unrelated reason (§8 below).
+too, for an unrelated reason (§7 below).
 
 **These tests are not vacuous.** Each requires the fixture to genuinely connect to the
 vtest socket — a fixture that fails to connect (the classic missing-`VN_DEBUG=vtest`

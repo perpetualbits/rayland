@@ -1,6 +1,10 @@
 # The icosahedron fixtures — a workload that makes `vkMapMemory` bite
 
-**Status:** design, ratified 2026-07-16. Not yet implemented.
+**Status:** design, ratified 2026-07-16. **Implemented** on the `icosa-fixtures` branch; this
+spec is maintained as a living document, and §4 and §9 have been amended in place, each
+carrying the correction the implementation forced (§4: the depth attachment's original
+justification was disproved by direct experiment; §9: the sequencing section's failure
+prediction was wrong, and the wrong prediction is left standing above its own refutation).
 **Serves:** (c)2 (mapped-memory coherence) primarily; (c)3 (content-addressed assets) and
 on-screen work secondarily.
 **Required reading first:**
@@ -94,7 +98,7 @@ constants, not a flag on this one.
 Contains everything both fixtures must agree on, and nothing that touches a GPU:
 
 - The icosahedron geometry table (§4).
-- The frame schedule: `frame_orientation(i)` and `frame_zoom(i)` (§5).
+- The frame schedule: `frame_mvp(i)` and `frame_zoom(i)` (§5).
 - The Mandelbrot smooth-iteration and HSV→RGB math, in scalar Rust (§6).
 - The bit-exact `log2` the smooth-iteration formula needs (§6.2).
 
@@ -275,8 +279,8 @@ whole workload is built around.
 Orientation and zoom are **pure functions of the frame index**:
 
 ```
-frame_orientation(i) -> rotation to apply at frame i
-frame_zoom(i)        -> complex-plane half-width at frame i
+frame_mvp(i)  -> model-view-projection matrix to apply at frame i
+frame_zoom(i) -> complex-plane half-width at frame i
 ```
 
 No `Instant::now()`, no delta-time, no frame skipping, no vsync coupling. This is what
@@ -335,7 +339,7 @@ refactor changes a single bit, the test fails, which is the intent.
 
 **Amendment, 2026-07-16 (Task 9).** This section originally named `log` as the *only*
 libm trap in this design, and that was incomplete. The frame schedule's rotation matrix
-(`frame_orientation`, §5) is built from `sin` and `cos` of the frame index, and those are
+(computed inside `frame_mvp`, §5) is built from `sin` and `cos` of the frame index, and those are
 libm functions subject to the identical argument made above: IEEE-754 does not specify
 transcendental functions bit-for-bit, C's target machines explicitly include RISC-V, and a
 `sin`/`cos` evaluated by whatever libm ships on the C machine would place the solid at a
@@ -348,8 +352,13 @@ kernels in Horner form, using only IEEE `+ - * /` and `round()`, no libm call an
 and it is pinned bit-for-bit against a frozen table
 (`crates/rayland-icosa-core/tests/sin_cos_table.rs`) covering all four quadrants and the
 three points (`π/4`, `-π/4`, `3π/4`) where the range reduction's ties-away rounding rule
-alone decides which quadrant is selected. The fragment shader in fixture B uses the same
-polynomial, transcribed, exactly as it does for `log2`.
+alone decides which quadrant is selected. Unlike `log2`, `sin_cos` is used **only** on the
+CPU side, by `frame_mvp` — no shader contains a `sin` or `cos` of any kind, transcribed or
+otherwise, because the rotation is computed once per frame on C and reaches both fixtures
+already-multiplied into the MVP matrix that crosses mapped memory as a uniform. Its
+bit-exactness matters for the same reason `log2`'s does: that matrix must come out
+identical on any host the application runs on, C's RISC-V machines included, not because a
+shader needs to reproduce it.
 
 ### 5.5 Why bit-identical is a fair demand
 
@@ -486,7 +495,7 @@ into what is drawn, determinism is gone and the fixtures are worthless.
 
 - Geometry invariants (§4.1).
 - `log2` bit-exactness against the committed table (§5.4).
-- Schedule purity: `frame_orientation(i)` and `frame_zoom(i)` return equal values for
+- Schedule purity: `frame_mvp(i)` and `frame_zoom(i)` return equal values for
   equal `i`, across repeated calls and in any order.
 
 ### 8.2 Per fixture — `tests/native_render.rs`
