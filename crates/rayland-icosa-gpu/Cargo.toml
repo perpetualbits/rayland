@@ -3,7 +3,7 @@
 # **volume control** for fixture A, not an alternative render path: it still writes its uniforms
 # through the same persistently-mapped `HOST_COHERENT` buffer, with no flush and no interceptable
 # Vulkan call, exactly as fixture A does. What differs is the *volume* of those writes — roughly
-# 128 bytes per frame here against roughly a megabyte for fixture A — which is the one thing the
+# 80 bytes per frame here against roughly a megabyte for fixture A — which is the one thing the
 # pair of fixtures exists to isolate.
 #
 # This crate is deliberately tiny: a manifest, `src/main.rs`'s frame loop, and nothing else. Every
@@ -14,8 +14,9 @@
 #
 # Depends on exactly two `rayland-*` crates, same as fixture A, and neither of those depends on
 # anything Rayland-specific either. This crate never mentions Venus, vtest, virglrenderer,
-# sockets, or remoting, and never probes its environment beyond what `ash::Entry::load()` itself
-# does to find a Vulkan driver.
+# sockets, or remoting, and — unlike fixture A — has no `ash` dependency of its own at all: it
+# reaches Vulkan only through `rayland-icosa-vk`, and whatever environment probing happens to find
+# a driver (`ash::Entry::load()`) is that crate's doing, not this one's.
 #
 # A BINARY crate (it has a main), so per the repository license policy it is GPL-3.0-or-later
 # rather than the LGPL used by this workspace's library crates.

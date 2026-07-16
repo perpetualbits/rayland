@@ -13,11 +13,12 @@
 //! at startup, exactly the same mechanism, exactly as invisible to anything watching the Vulkan API.
 //!
 //! What differs between the two fixtures is not *whether* a mapped write happens every frame, but
-//! *how much* crosses it: roughly 128 bytes here (one MVP matrix plus two small floats, std140
-//! padded) against roughly a megabyte for fixture A's whole fractal texture. That volume — not the
-//! presence of the write — is the one thing this pair of fixtures exists to isolate. A reader who
-//! concludes "the GPU one has no staging buffer, so it has no mapped-memory problem" has drawn
-//! exactly the wrong lesson from this program.
+//! *how much* crosses it: exactly 80 bytes here (the std140-padded uniform block: 64 bytes for the
+//! MVP matrix, 4 for `half_width`, 4 bytes of std140 padding, and 8 for `center` — already a
+//! multiple of 16, so there is no further tail padding) against roughly a megabyte for fixture A's
+//! whole fractal texture. That volume — not the presence of the write — is the one thing this pair
+//! of fixtures exists to isolate. A reader who concludes "the GPU one has no staging buffer, so it
+//! has no mapped-memory problem" has drawn exactly the wrong lesson from this program.
 //!
 //! # Why this crate is so small
 //! Every piece both fixtures must agree on for their comparison to mean anything — geometry, the
@@ -95,21 +96,51 @@ fn main() {
 /// aligned. `from_ne_bytes` (native-endian) matches what every target this repository builds for
 /// actually is (little-endian), and is the same assumption `ash::util::read_spv` makes internally.
 ///
+/// Dropping the `ash` dependency (see this crate's `Cargo.toml` doc for why) meant losing the two
+/// checks `ash::util::read_spv` performs for free on its way in: that the byte length is a whole
+/// number of words, and that the first word is SPIR-V's magic number. Both are reinstated below as
+/// explicit assertions, because without them this function does something worse than panic on bad
+/// input — see "Failure modes".
+///
 /// # Inputs and outputs
 /// `bytes` must be a whole number of 4-byte words — true for any file `glslangValidator -V`
 /// produces, since SPIR-V's own container format is defined in 32-bit words throughout. Returns
 /// those words as `u32`s.
 ///
 /// # Failure modes
-/// Panics (via the `try_into().unwrap()` below) if `bytes.len()` is not a multiple of 4. That
-/// can only happen if `shaders/icosa_fractal.frag.spv` were replaced with something that is not
-/// valid SPIR-V, which is a build-time packaging error, not a runtime condition this program
-/// should try to recover from.
+/// Asserts that `bytes.len()` is a multiple of 4, and that the first resulting word is SPIR-V's
+/// magic number `0x0723_0203`. Both assertions exist because of what silently happens without
+/// them: `chunks_exact(4)` never yields a short trailing slice — it *drops* a trailing partial
+/// chunk instead — so an unchecked mis-sized blob would be silently **truncated**, not rejected,
+/// and the `try_into().unwrap()` on each chunk could then never fail (every chunk `chunks_exact`
+/// yields is already exactly 4 bytes), so it documents no failure mode of its own — the length
+/// check belongs before the chunking, not folded into it. Likewise, with no magic-number check, a
+/// corrupt or byte-swapped `.spv` would sail through as `u32`s and only surface as an opaque
+/// driver-level failure inside `vkCreateShaderModule`. Both inputs reaching this function are
+/// `include_bytes!` of files committed to this repository, so in practice both assertions are
+/// defence against the embedded file being replaced with something that is not valid SPIR-V — a
+/// build-time packaging error — not a scenario expected to occur at runtime.
 fn spirv_words(bytes: &[u8]) -> Vec<u32> {
-    bytes
+    // Reject a mis-sized blob outright: chunks_exact(4) would otherwise silently truncate it to
+    // the largest whole number of 4-byte words instead of ever reporting the mismatch.
+    assert!(
+        bytes.len() % 4 == 0,
+        "SPIR-V blob is {} bytes, not a whole number of 4-byte words",
+        bytes.len()
+    );
+    let words: Vec<u32> = bytes
         .chunks_exact(4)
         .map(|word| u32::from_ne_bytes(word.try_into().unwrap()))
-        .collect()
+        .collect();
+    // SPIR-V's magic number is always the stream's first word; ash::util::read_spv checks the same
+    // thing internally. Catches a corrupt or byte-swapped blob here, with a clear message, instead
+    // of letting it reach vkCreateShaderModule as garbage.
+    assert_eq!(
+        words.first(),
+        Some(&0x0723_0203),
+        "SPIR-V magic number missing or wrong; expected the stream to start with 0x0723_0203"
+    );
+    words
 }
 
 /// The real body of [`main`]: bring up Vulkan, build the scene, then render and write every one of
@@ -130,9 +161,11 @@ fn run() -> anyhow::Result<()> {
     })?;
     let output_dir = std::path::PathBuf::from(output_dir);
 
-    // Bring Vulkan up. Which driver answers is entirely the environment's decision (see this
-    // program's module doc) — this is the only place that decision's outcome could be observed,
-    // and this program deliberately never looks.
+    // Bring Vulkan up. Which driver answers is entirely the environment's decision — this crate
+    // does no probing of its own and reaches Vulkan only through `rayland-icosa-vk` (see that
+    // crate's module doc, "This crate never mentions remoting", for what it does and does not
+    // probe) — this is the only place that decision's outcome could be observed, and this program
+    // deliberately never looks.
     let context = VulkanContext::new()?;
 
     // The compiled fragment shader, parsed into properly aligned 32-bit words. Fixture A's
@@ -182,7 +215,7 @@ fn run() -> anyhow::Result<()> {
 
         // 3. Draw and read back. `uniforms` (built above) goes into mapped uniform memory inside
         //    `draw` itself (`Scene` owns that buffer, not this frame loop) — the one mapped write
-        //    this fixture makes every frame, roughly 128 bytes against fixture A's roughly one
+        //    this fixture makes every frame, exactly 80 bytes against fixture A's roughly one
         //    megabyte. See this module's doc comment for why that volume difference, not the
         //    write's presence, is the whole point.
         let draw_start = Instant::now();
