@@ -56,11 +56,13 @@ pub const TEXTURE_SIZE: u32 = 512;
 
 /// The Mandelbrot escape-iteration ceiling.
 ///
-/// 512, not the 2000 a GPU-only interactive program can afford. The CPU fixture evaluates this
-/// loop for every one of 512×512 pixels every frame, on a machine that may be a modest
-/// single-board computer, and 512 keeps that worst case near 134 million iterations per frame:
-/// heavy enough to be honest about a weak CPU, light enough not to swamp the measurement. It is
-/// also ample detail at the zoom depth this run reaches.
+/// 512, not the 2000 a GPU-only interactive program can afford. The CPU fixture does *not* evaluate
+/// this loop for all 512×512 pixels: [`fractal`] restricts iteration to the sampled triangle plus a
+/// small filtering margin (see that module's doc comment), which together cover ~33.5% of the
+/// texture. So the true worst case is `262144 × 0.335 × 512 ≈ 44.9 million` iterations per frame, on
+/// a machine that may be a modest single-board computer — heavy enough to be honest about a weak
+/// CPU, light enough not to swamp the measurement. It is also ample detail at the zoom depth this run
+/// reaches.
 ///
 /// **Both fixtures use this same value.** Giving the GPU one a different ceiling because it can
 /// afford one would destroy the only thing the pair is for.

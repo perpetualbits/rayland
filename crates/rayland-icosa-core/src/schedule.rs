@@ -43,9 +43,14 @@ pub const CENTER: (f64, f64) = (-0.743_643_887_037_151, 0.131_825_904_205_33);
 
 /// How far the solid turns about the vertical axis each frame, in radians.
 ///
-/// Chosen with [`PITCH_PER_FRAME`] so that the two are incommensurate: the solid never returns to a
-/// previous orientation during a run, so all 120 frames are genuinely distinct and a defect that
-/// affects only some orientations cannot hide behind a repeat.
+/// The solid never returns to a previous orientation during a run, so all 120 frames are genuinely
+/// distinct and a defect that affects only some orientations cannot hide behind a repeat. The reason
+/// is simpler than it might look: at this rate, yaw's own period is `2π / 0.031 ≈ 202.7` frames, well
+/// past [`crate::FRAME_COUNT`] = 120, so across one run yaw itself never completes a full turn and is
+/// therefore injective over `0..120` — no repeat is possible regardless of what pitch does. (0.031
+/// and [`PITCH_PER_FRAME`] are *not* incommensurate, for what that is worth: `0.031 / 0.017 = 31/17`
+/// exactly, a rational ratio, which is the definition of commensurate — but that fact plays no role
+/// in the no-repeat argument above.)
 const YAW_PER_FRAME: f64 = 0.031;
 
 /// How far the solid tips about the horizontal axis each frame, in radians.
@@ -237,10 +242,22 @@ mod tests {
     /// problem; this test is what keeps that true if someone later tunes the constants.
     #[test]
     fn the_zoom_never_approaches_the_precision_floor() {
+        // The real cliff is where the *per-texel step* — `2 * half_width / TEXTURE_SIZE`, the gap
+        // in the complex plane between adjacent texel centres — approaches an f64 ulp at [`CENTER`]:
+        // once a step is that small, neighbouring texels round to the same `c` and the image
+        // pixelates into blocks. At `CENTER.0 ≈ -0.744`, the ulp is `2^-53 ≈ 1.1e-16` (f64's mantissa
+        // is 52 bits, and `0.5 <= |CENTER.0| < 1.0` puts the binade exponent at -1), so the cliff sits
+        // at `half_width ≈ ulp * TEXTURE_SIZE / 2 ≈ 2.8e-14` — about four orders of magnitude below
+        // this `1e-12` threshold. `1e-12` is deliberately not tightened to sit right at that cliff:
+        // it is a coarse guard comfortably above it, tuned to catch a schedule that got tuned into the
+        // danger zone without having to track the exact ulp math above every time. At frame 119 the
+        // half-width is ~0.04 and the per-texel step is ~1.56e-4 — about 1.4e12 ulps clear of
+        // degenerate, nowhere near this floor or the real one.
         let smallest = frame_zoom(crate::FRAME_COUNT - 1);
         assert!(
             smallest > 1e-12,
-            "a half-width near f64's resolution would pixelate into blocks; got {smallest}"
+            "a half-width within a few orders of magnitude of f64's per-texel resolution would \
+             pixelate into blocks; got {smallest}"
         );
     }
 

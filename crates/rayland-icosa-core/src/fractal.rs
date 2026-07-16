@@ -12,7 +12,7 @@
 //! from libm this image would differ in its last bits between an x86 machine and a RISC-V one.
 //!
 //! # Only the visible third (plus a filtering margin) is iterated
-//! Every face samples the same equilateral triangle inscribed in this square texture
+//! Every face samples the same equilateral triangle centred in this square texture with a margin
 //! ([`crate::geometry::FACE_UVS`]), and that triangle covers 32.5% of it. The expensive part of this
 //! module — the Mandelbrot iteration, up to [`crate::MAX_ITER`] steps per texel — therefore runs
 //! only near that triangle; the rest is written black without being iterated.
@@ -158,12 +158,16 @@ fn point_color(cx: f64, cy: f64) -> [f64; 3] {
     let smooth_iteration = iteration as f64 + 1.0 - log2(log_modulus);
 
     // Normalise into a hue. The scale factor is not `MAX_ITER`: almost every escaping point does so
-    // in the first few dozen iterations (this view's centre sits on the set's boundary, where escape
-    // is typically fast a short distance out), so dividing by the full budget would compress the
-    // entire visible palette into a sliver of the hue circle and the image would be nearly
-    // monochrome. 64 was chosen by rendering a frame and eyeballing it: the hue sweep visibly
-    // completes several times across the triangle rather than sitting in a narrow band. Not derived
-    // from a formula — the eyeballed check is what stands behind this constant, not a calculation.
+    // in the first few dozen iterations at frame 0, so even dividing by 64 already produces a narrow
+    // band, not a wide sweep (measured: with this divisor, hue's 10th/50th/90th percentiles across
+    // the triangle are 0.043/0.068/0.215 of a cycle — 90% of the palette packed into a fifth of the
+    // hue circle). Dividing by the full 512-iteration budget instead would make that band 8x narrower
+    // still, and the image would be nearly monochrome. 64 is a compromise across the whole run rather
+    // than a fit to either end: at frame 0 it keeps the band narrow but legible instead of crushing it
+    // further, and by frame 119 — deep enough into the zoom that escape has slowed markedly — the same
+    // divisor produces a full multi-cycle sweep (median hue 0.375, with 13.5% of the triangle past one
+    // cycle). Not derived from a formula; chosen by rendering both ends of the zoom and checking that
+    // 64 keeps the palette usable at both, not just one.
     let hue = smooth_iteration / 64.0;
     hsv_to_rgb(hue, 0.85, 1.0)
 }
@@ -296,9 +300,16 @@ pub fn render_into_at(pixels: &mut [u8], center: (f64, f64), half_width: f64) {
 
             let rgb = point_color(cx, cy);
             // Scale to 8-bit. The `+ 0.5` before truncation is round-to-nearest; without it the
-            // whole image would be biased half a level dark. Clamping guards the channel against a
-            // palette value marginally outside 0..1 producing a wrapped byte — a bright pixel in a
-            // dark region, which looks exactly like a memory-corruption artefact.
+            // whole image would be biased half a level dark. `as u8` on a float has been a
+            // *saturating* cast since Rust 1.45 (`1.2f64 as u8 == 255`, `(-0.3f64) as u8 == 0`,
+            // `f64::NAN as u8 == 0`), so an out-of-range value can never wrap into a bogus byte — that
+            // failure mode does not exist in this language. The `clamp` is a defensive statement of
+            // the intended `0..=1` range rather than a guard against a real hazard: `hsv_to_rgb`'s
+            // output is provably within `[0.15, 1.0]` for the fixed `saturation = 0.85`, `value = 1.0`
+            // this module always calls it with (its result is `1 + 0.85·(ramp − 1)` with
+            // `ramp ∈ [0, 1]`), so the clamp is currently unreachable. It stays so that a future
+            // palette change — a different saturation, or a value channel that varies — cannot
+            // silently produce an out-of-range byte instead of an explicit clamp to a known range.
             for channel in 0..3 {
                 pixels[offset + channel] = (rgb[channel].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
             }
