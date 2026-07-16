@@ -14,9 +14,13 @@
 //!
 //! # Determinism is the product
 //! Every function here that can affect a pixel is built exclusively from IEEE-754 basic operations
-//! (`+ - * /`, comparison, `round`) and bit manipulation. None of them calls a libm transcendental.
-//! See [`exact_math`] for why that constraint exists; it is the single most surprising thing about
-//! this crate and the easiest to accidentally undo.
+//! (`+ - * /`, comparison, square root, `round`) and bit manipulation. None of them calls a libm
+//! transcendental. Square root is in that list deliberately, not by oversight: IEEE-754 specifies it
+//! exactly, the same as the four arithmetic operators, so — unlike `log`, `sin` or `cos` — it needs
+//! no reproducible replacement from [`exact_math`] and does not weaken this guarantee.
+//! `geometry`'s private `normalize` function is the example: it calls `sqrt` directly to build
+//! vertex positions and normals. See [`exact_math`] for why the transcendental restriction exists;
+//! it is the single most surprising thing about this crate and the easiest to accidentally undo.
 
 // Reproducible replacements for the libm functions the rest of the crate would otherwise need.
 pub mod exact_math;

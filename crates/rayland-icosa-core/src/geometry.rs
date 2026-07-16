@@ -8,12 +8,14 @@
 //! That is deliberate. A vertex shared between faces can carry only one normal, so sharing forces
 //! the normal at each corner to be an average of the five faces meeting there, and the GPU then
 //! interpolates smoothly across every face — turning a Platonic solid into a faceted ball with soft
-//! edges. Giving each face its own three vertices lets each carry its own true face normal, so the
-//! faces shade flatly and the edges stay hard, which is what makes the shape read as an
-//! icosahedron. At 60 vertices (1,920 bytes) versus 12 shared vertices plus a 60-entry `u16` index
-//! buffer (504 bytes), an index buffer would save about 1.4 KB — trivial next to the 1 MiB fractal
-//! texture this solid is wrapped in — while adding Vulkan surface (an index buffer, its binding,
-//! and the smooth-normal-vs-flat-normal tradeoff above) for a saving nobody would notice.
+//! edges. That is the dealbreaker, not merely a cost: it rules out the 12-vertex indexed mesh
+//! outright, because smooth shading is not an option this solid can use and still read as an
+//! icosahedron. Giving each face its own three vertices lets each carry its own true face normal, so
+//! the faces shade flatly and the edges stay hard. Measured only against the byte cost that remains
+//! once flat shading is a given — an index buffer and its binding, with no smooth/flat choice left to
+//! make — 60 vertices (1,920 bytes) versus 12 shared vertices plus a 60-entry `u16` index buffer (504
+//! bytes) is a saving of about 1.4 KB: trivial next to the 1 MiB fractal texture this solid is
+//! wrapped in, and not worth the added Vulkan surface for a saving nobody would notice.
 //!
 //! # The construction
 //! The 12 corners of a regular icosahedron are the cyclic permutations of `(0, ±1, ±φ)`, where `φ`
@@ -23,9 +25,11 @@
 
 /// The golden ratio, `(1 + √5) / 2`.
 ///
-/// `sqrt` is one of the few operations IEEE-754 *does* specify exactly, so this is reproducible
-/// across hosts in the same way the rest of this crate is — unlike a transcendental, it needs no
-/// replacement from [`crate::exact_math`].
+/// Written as a decimal literal, not computed with `sqrt`: no square root executes here, at compile
+/// time or runtime. The literal is reproducible for the ordinary reason a literal always is — every
+/// conforming Rust compiler parses the same source text to the same bit pattern — and it has been
+/// checked to be the correctly-rounded nearest `f32` to the true golden ratio, so nothing is lost by
+/// writing it this way instead of calling `sqrt` at runtime.
 const PHI: f32 = 1.618_034;
 
 /// A single vertex, laid out exactly as the vertex shader expects to read it.
@@ -45,7 +49,11 @@ pub struct Vertex {
     pub uv: [f32; 2],
 }
 
-/// The UV triangle every face samples: an equilateral triangle inscribed in the texture.
+/// The UV triangle every face samples: an equilateral triangle centred in the texture, with a
+/// margin — it touches none of the square's four edges. It is not inscribed (a maximal equilateral
+/// triangle in a unit square has side ≈1.035 and covers ≈46% of it); this one has side 0.866 and
+/// covers ~32.5%. The gap between the triangle and the square's edges is deliberate: see
+/// [`uv_is_inside_face`]'s pitfall note for why a margin is needed at all.
 ///
 /// All 20 faces use these same three coordinates, so every face displays the same fractal image and
 /// the zoom is visible on all of them at once. Equilateral to match the equilateral faces, so the
@@ -75,8 +83,26 @@ pub const FACE_UVS: [[f32; 2]; 3] = [[0.5, 0.125], [0.067, 0.875], [0.933, 0.875
 /// The standard edge-sign test: for each of the triangle's three edges, compute the cross product
 /// of the edge with the vector from its start to the point. The point is inside exactly when all
 /// three have the same sign — that is, when it is on the same side of every edge. Points exactly on
-/// an edge produce a zero and are counted inside, which is the right choice at a texture boundary:
-/// a texel the sampler may read must not be black.
+/// an edge produce a zero and are counted inside; that choice is arbitrary, not load-bearing. In
+/// `f32` the set of sample points landing *exactly* on an edge is effectively empty (measure zero),
+/// so `>=`/`<=` versus `>`/`<` here changes nothing measurable in practice — it is included/excluded
+/// consistently and that is all that matters.
+///
+/// # Pitfall for a future caller that writes a texture from this predicate
+/// This function means exactly "inside the triangle", nothing more — it does *not* account for
+/// texture filtering, and a caller iterating it to fill a texture must handle that separately. The
+/// fractal texture this triangle bounds is sampled with **linear** (bilinear) filtering. A fetch at
+/// a UV just *inside* the triangle can read a 2×2 texel neighbourhood that reaches up to one texel
+/// *outside* it. A texture-writer that iterates exactly `uv_is_inside_face` — filling inside texels
+/// and leaving outside ones black — leaves those just-outside texels black, and the linear filter
+/// then blends that black into every sample near an edge: a dark fringe on every face, in whichever
+/// fixture samples a texture. (Only the CPU fixture is exposed to this: its sibling evaluates the
+/// fractal per fragment and has no texture, hence no filter, at all — so an unhandled version of this
+/// hazard is a visible divergence between the two fixtures in exactly the place they must match.) The
+/// fix is **not** to change this predicate — it must keep meaning "inside the triangle" and nothing
+/// fuzzier. The fix belongs to whoever writes the texture: iterate a region dilated by at least the
+/// filter's footprint (one texel, for bilinear) beyond this triangle. [`FACE_UVS`]'s margin from the
+/// texture's own edges exists to leave room for exactly that dilation.
 ///
 /// # Failure modes
 /// None in this crate: [`FACE_UVS`] is a compile-time constant forming a genuine, non-degenerate
@@ -148,9 +174,25 @@ const FACES: [[usize; 3]; 20] = [
 
 /// Scale a vector onto the unit sphere.
 ///
-/// The raw golden-ratio corners sit at radius `√(1 + φ²) ≈ 1.902`; normalising gives the solid a
-/// radius of exactly 1, so the camera distance in [`crate::schedule`] can be chosen once and stay
-/// meaningful.
+/// The raw golden-ratio corners sit at radius `√(1 + φ²) ≈ 1.902`; dividing by that length gives the
+/// solid a radius of 1 (to `f32` rounding — see below), so the camera distance in
+/// [`crate::schedule`] can be chosen once and stay meaningful. "1" is not used loosely here: "exact"
+/// is a term of art in this crate, reserved for a bit pattern pinned by [`exact_math`]'s tables, and
+/// `v / length` in `f32` does not generally land on exactly 1.0 — see the `all_positions_have_unit_length`
+/// test below, which checks it to a tolerance rather than asserting bit-exactness. (Not linked: it
+/// lives in the `#[cfg(test)]` module, invisible to a non-test doc build.)
+///
+/// # Inputs and outputs
+/// `v`, any vector. Returns `v` scaled to unit length, in the same direction.
+///
+/// # Failure modes
+/// A zero-length `v` divides by zero and returns `[NaN, NaN, NaN]` (`f32` division by `+0.0`
+/// produces `NaN` from a `0.0` numerator, not an error). Every call site in this file passes either
+/// a [`CORNERS`] entry (never zero — the corners are constructed at radius ≈1.902) or a face normal
+/// computed from two non-parallel edges of a genuine triangle (never zero for a non-degenerate
+/// face). A degenerate entry in [`FACES`] — the mis-wound-table scenario that table's own doc already
+/// warns about — could produce a zero-area face and a zero cross product here, which would surface as
+/// `NaN` positions or normals rather than a silently wrong picture.
 fn normalize(v: [f32; 3]) -> [f32; 3] {
     let length = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
     [v[0] / length, v[1] / length, v[2] / length]
@@ -215,12 +257,37 @@ mod tests {
 
     /// The solid must have exactly the 20 faces of an icosahedron, unshared.
     ///
-    /// 60 = 20 faces × 3 vertices. The vertices are deliberately *not* shared between faces even
-    /// though only 12 distinct positions exist, because each face needs its own flat normal — see
-    /// the module documentation.
+    /// `icosahedron().len()` is a compile-time constant (the return type is `[Vertex; 60]`), so
+    /// asserting it equals 60 would prove nothing — it cannot fail no matter what the function
+    /// computes. The real content of "20 faces, unshared" is geometric: five faces meet at every
+    /// corner of an icosahedron, so each of the 12 distinct positions must appear in exactly 5 of the
+    /// 60 vertices. That is what this test checks, and it fails if the construction ever collapsed
+    /// two corners together, dropped a face, or otherwise stopped being 20 genuinely distinct,
+    /// unshared triangles — the case a bare length check cannot see.
     #[test]
     fn has_twenty_faces_of_three_unshared_vertices() {
-        assert_eq!(icosahedron().len(), 60, "20 triangular faces × 3 vertices");
+        let verts = icosahedron();
+        assert_eq!(verts.len(), 60, "20 triangular faces × 3 vertices");
+
+        // Count how many of the 60 vertices carry each distinct position (compared by bit pattern,
+        // since these positions come from the identical `normalize` expression every time).
+        let mut counts: std::collections::HashMap<[u32; 3], u32> = std::collections::HashMap::new();
+        for v in &verts {
+            let key = [
+                v.position[0].to_bits(),
+                v.position[1].to_bits(),
+                v.position[2].to_bits(),
+            ];
+            *counts.entry(key).or_insert(0) += 1;
+        }
+        assert_eq!(counts.len(), 12, "an icosahedron has 12 corners");
+        for (position, count) in &counts {
+            assert_eq!(
+                *count, 5,
+                "corner {position:?} appears {count} times; every corner of an icosahedron is \
+                 shared by exactly 5 faces"
+            );
+        }
     }
 
     /// Those 60 vertices must collapse to exactly 12 distinct positions.
@@ -251,14 +318,28 @@ mod tests {
     ///
     /// A tolerance is used here, unlike elsewhere in this crate, because this test asserts a
     /// *geometric* property (that the solid is regular) rather than the bit-for-bit
-    /// *reproducibility* that `exact_math`'s frozen tables pin. Those are different kinds of claim:
-    /// a geometric property should still hold, and this test should still express "a regular
-    /// icosahedron", even if the construction below changed to one that reached equal edge lengths
-    /// by a different, less symmetric route. Measured against this exact construction the deviation
-    /// happens to be exactly zero — every edge here is computed from the same pair of magnitudes by
-    /// the solid's symmetry, and `sqrt` is one of the few operations IEEE-754 specifies exactly — but
-    /// the test does not rely on that; 1e-6 is loose enough to survive a construction that does not
-    /// share this coincidence while still being far tighter than any real regularity defect.
+    /// *reproducibility* that `exact_math`'s frozen tables pin. Those are two different kinds of
+    /// claim, and this one is intentionally the looser kind: this test should still express "a
+    /// regular icosahedron" even if the construction below changed to one that reached equal edge
+    /// lengths by a different, less symmetric arithmetic route, so it must not over-fit to this
+    /// particular table's bit patterns.
+    ///
+    /// `1e-6` is not an arbitrary-looking guess: it is roughly 8 ULP at the reference edge length of
+    /// ~1.05, i.e. about eight times the smallest representable `f32` step there — loose enough to
+    /// absorb ordinary floating-point rounding from a differently-ordered computation, tight enough
+    /// that it would catch any real regularity defect by many orders of magnitude.
+    ///
+    /// The measured deviation against *this* construction happens to be exactly zero, but that is a
+    /// coincidence, not a symmetry-forced identity, and the test does not rely on it. Checking all 60
+    /// edges shows the difference vectors take two structurally different forms — one nonzero
+    /// component (an edge like `(0, 0, 2a)`, i.e. `sqrt((2a)^2)`) and three nonzero components (an
+    /// edge like `(a, b-a, b)`, i.e. `sqrt(a^2 + (b-a)^2 + b^2)`) — computed from different
+    /// expressions. That two structurally different `sqrt` evaluations land on the identical bit
+    /// pattern is a coincidence of this specific table, not something the icosahedron's symmetry
+    /// guarantees. (It is also not an IEEE cross-host reproducibility claim: this test runs all of
+    /// its comparisons on one host in one process, where any deterministic `sqrt` of equal inputs
+    /// gives equal outputs regardless of whether the rounding is correct — that guarantee is orthogonal
+    /// to what this test checks.)
     #[test]
     fn all_edges_have_equal_length() {
         let verts = icosahedron();
@@ -310,7 +391,7 @@ mod tests {
         }
     }
 
-    /// Every face must carry the same inscribed-triangle UVs, so every face shows the same image.
+    /// Every face must carry the same centred-triangle UVs, so every face shows the same image.
     #[test]
     fn every_face_carries_the_same_uv_triangle() {
         for (index, face) in icosahedron().chunks_exact(3).enumerate() {
@@ -340,7 +421,7 @@ mod tests {
         for corner in [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]] {
             assert!(
                 !uv_is_inside_face(corner),
-                "{corner:?} is a corner of the texture, outside the inscribed triangle"
+                "{corner:?} is a corner of the texture, outside the centred triangle"
             );
         }
     }
@@ -349,8 +430,11 @@ mod tests {
     ///
     /// This pins the number the fractal's cost rests on. An equilateral triangle of side 0.866 and
     /// height 0.75 has area 0.325 — so about two thirds of the texture is padding that must never be
-    /// iterated. If a future edit to `FACE_UVS` changed this materially, the CPU fixture's timings
-    /// would shift for a reason nobody would think to look for; this test makes that loud.
+    /// iterated. That padding is not waste: it is the margin documented on [`FACE_UVS`], reserved for
+    /// the dilation a texture-writer must apply for linear-filter sampling (see
+    /// [`uv_is_inside_face`]'s pitfall note). If a future edit to `FACE_UVS` changed this coverage
+    /// materially, the CPU fixture's timings would shift for a reason nobody would think to look for;
+    /// this test makes that loud.
     #[test]
     fn the_triangle_covers_about_a_third_of_the_texture() {
         let steps = 200;
@@ -369,7 +453,33 @@ mod tests {
         let coverage = inside as f32 / (steps * steps) as f32;
         assert!(
             (0.31..0.34).contains(&coverage),
-            "the inscribed equilateral triangle must cover ~32.5% of the texture; got {coverage}"
+            "the centred equilateral triangle must cover ~32.5% of the texture; got {coverage}"
         );
+    }
+
+    /// Every position must sit on the unit sphere, to within a tight tolerance.
+    ///
+    /// Nothing about the other eight geometry tests pins the *scale* of the solid: the raw
+    /// [`CORNERS`] table (never normalised) would fail none of them — `all_edges_have_equal_length`
+    /// passes because every edge scales together, and the normal-direction tests are independent of
+    /// position scale. So a construction bug that emitted un-normalised or wrongly-normalised
+    /// positions (radius ≈1.902 instead of 1, from a `normalize` call that got dropped) would pass
+    /// the entire rest of this module's suite silently. But radius 1 is load-bearing outside this
+    /// module too — [`normalize`]'s doc explains that a fixed camera distance in
+    /// [`crate::schedule`] depends on it — so this test exists specifically to pin it.
+    ///
+    /// `1e-6` matches the tolerance used in `all_edges_have_equal_length`, for the same reason:
+    /// comfortably above `f32` rounding noise from the `sqrt` and division in [`normalize`], and
+    /// comfortably below any deviation a real construction bug would produce.
+    #[test]
+    fn all_positions_have_unit_length() {
+        for (index, vertex) in icosahedron().iter().enumerate() {
+            let p = vertex.position;
+            let radius = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+            assert!(
+                (radius - 1.0).abs() < 1e-6,
+                "vertex {index} has radius {radius}, not 1"
+            );
+        }
     }
 }
