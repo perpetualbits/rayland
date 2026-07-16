@@ -102,11 +102,24 @@ struct GpuUniforms {
 /// `Scene` cannot use that pattern as-is, because this crate's documented public interface gives a
 /// caller no explicit teardown method to call — `Scene::new` and `Scene::draw` are the whole public
 /// surface, and this crate's own tests (and, later, the fixtures) simply let a `Scene` go out of
-/// scope. So `Scene` implements `Drop`, and the in-flight-work hazard above is closed a different
-/// way: **every [`Scene::draw`] call already waits on its fence before returning** (see that
-/// method's doc), so by the time control ever reaches `Scene`'s `Drop` — after the last `draw` call
-/// has already returned — no work from this `Scene` can still be in flight. `Drop` therefore needs
-/// no error-path/success-path distinction here the way `render_triangle_inner` does.
+/// scope. So `Scene` implements `Drop`.
+///
+/// # Why `Drop` cannot rely on "every `draw` waits its fence" alone
+/// On the ordinary path this is true and would be enough on its own: every [`Scene::draw`] call
+/// already waits on its fence before returning (see that method's doc), so by the time control
+/// reaches `Drop` after a normal return, no work from this `Scene` can still be in flight. But that
+/// argument only covers `draw` calls that return `Ok`. [`Scene::draw`]'s fence wait can time out
+/// (`FENCE_TIMEOUT_NS` exists precisely because a wedged GPU is a reachable failure, not a
+/// hypothetical one) — and when it does, `?` propagates the error out of `draw` with the
+/// submission possibly still executing. A caller that turns that error into a panic (an `.expect()`
+/// at a call site, say) unwinds straight into this `Drop` impl while GPU work may still be reading
+/// or writing the very images, buffers and command pool `Drop` is about to destroy — the same
+/// use-after-free hazard `rayland-refapp`'s `render.rs` module docs describe at length, just
+/// reached through a panic instead of an explicit destroy call on the error path.
+///
+/// Rather than accept that as a residual, documented hazard, `Drop` closes it directly: it calls
+/// `device_wait_idle` unconditionally, before destroying anything (see the impl below), so
+/// destruction is sound whether the last `draw` returned `Ok` or unwound through a timeout.
 ///
 /// A second hazard `rayland-refapp`'s `TrianglePipeline` avoids by *not* storing a device handle
 /// ("the ordinary Vulkan-in-Rust trade-off... the alternative is storing a device clone in every
@@ -371,13 +384,14 @@ impl Scene {
     /// makes that safe anyway: **by the time `draw` returns, the fence has already been waited on,
     /// so every read this frame's GPU work performed of any buffer is complete.** A fixture that
     /// writes its next frame's data only after `draw` returns therefore never races the GPU,
-    /// without ever touching a fence itself. This is verified, not merely asserted: this crate's
-    /// `drawing_twice_gives_the_same_pixels` test draws frame 0, draws a *different* frame in
-    /// between, then draws frame 0 again and asserts bit-identical pixels — a result that a queued
-    /// but not-yet-complete previous submission could not produce reliably, and that a version of
-    /// this method returning before the wait would make flaky rather than reliably wrong (the race
-    /// would sometimes win), which is precisely why this contract is load-bearing rather than
-    /// cosmetic.
+    /// without ever touching a fence itself. This crate's `drawing_twice_gives_the_same_pixels`
+    /// test exercises this contract — it draws frame 0, draws a *different* frame in between, then
+    /// draws frame 0 again and asserts bit-identical pixels, a result a queued but
+    /// not-yet-complete previous submission could not produce reliably — but it does not *verify*
+    /// the contract: a version of this method that returned before the wait would make that test
+    /// flaky rather than reliably wrong (the race would sometimes still win), so one clean test run
+    /// is not proof a future run is guaranteed to also catch a regression here. The contract is
+    /// load-bearing regardless of what any single run shows.
     ///
     /// # Errors
     /// Returns an error if any Vulkan call fails, or if the GPU does not finish within
@@ -617,19 +631,29 @@ impl Scene {
 }
 
 impl Drop for Scene {
-    /// Destroy every Vulkan object this `Scene` owns, in reverse creation order.
+    /// Wait for the device to go idle, then destroy every Vulkan object this `Scene` owns, in
+    /// reverse creation order.
     ///
-    /// Sound without an in-flight-work check because every [`Scene::draw`] call already waited on
-    /// `self.fence` before returning — see the struct doc's "Destruction order" section for the
-    /// full argument, and the caller obligation (`Scene` must drop before its `VulkanContext`) that
-    /// comes with it.
+    /// The `device_wait_idle` call is what makes this sound on *every* path, not just the one where
+    /// the last `draw` returned `Ok` — see the struct doc's "Why `Drop` cannot rely on..." section
+    /// for the error-path hazard this closes (a timed-out fence wait unwinding into `Drop` with
+    /// work still in flight). Its result is deliberately ignored: `Drop` cannot return a `Result`,
+    /// there is no caller left to hand an error to, and if the device is lost there is nothing more
+    /// sensible to do than proceed and let the destroy calls below fail or no-op as the driver
+    /// sees fit. The caller obligation this still relies on (`Scene` must drop before its
+    /// `VulkanContext`) is unchanged — see the struct doc.
     fn drop(&mut self) {
-        // SAFETY: per the struct doc: no work from this `Scene` can be in flight by the time this
-        // runs, and the caller is relied upon to drop this `Scene` before its `VulkanContext`, so
-        // `self.device` is still a live device handle. Reverse creation order throughout; freeing
-        // `command_pool` frees `command_buffer`, and freeing `descriptor_pool` frees
+        // SAFETY: the caller is relied upon to drop this `Scene` before its `VulkanContext`, so
+        // `self.device` is still a live device handle here. Reverse creation order throughout;
+        // freeing `command_pool` frees `command_buffer`, and freeing `descriptor_pool` frees
         // `descriptor_set`, so neither needs a separate call.
         unsafe {
+            // Block until every submission this `Scene` ever made has finished, closing the
+            // fence-timeout error path described in the struct doc. The error case (device lost)
+            // is not actionable here, so it is discarded rather than propagated (`Drop` has no
+            // `Result` to propagate it through) or panicked on (panicking in `Drop` during an
+            // existing unwind would abort the process instead of finishing cleanup).
+            let _ = self.device.device_wait_idle();
             self.device.destroy_fence(self.fence, None);
             self.device.destroy_command_pool(self.command_pool, None);
             self.device

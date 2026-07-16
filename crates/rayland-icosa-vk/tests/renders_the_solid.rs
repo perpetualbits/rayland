@@ -1,5 +1,14 @@
-//! The scaffolding's **baseline**: it draws a correct, depth-tested, shaded solid on this host's
-//! own GPU, with this host's own Vulkan driver, and neither fixture involved.
+//! The scaffolding's **baseline**: it draws a correct, shaded solid on this host's own GPU, with
+//! this host's own Vulkan driver, and neither fixture involved.
+//!
+//! # This does not test depth testing
+//! Nothing in this file exercises the depth buffer's *effect* on the picture. The render pass and
+//! pipeline this crate builds (see `rayland-icosa-vk`'s internal `pipeline` module) do configure
+//! and enable depth testing, but for a convex solid with back-face culling on, culling already
+//! removes every triangle depth testing would otherwise need to arbitrate between — confirmed by
+//! disabling `depth_test_enable` and finding this crate's whole test suite, including this file's,
+//! still passes unchanged. So no assertion here, or anywhere else in this crate, can currently tell
+//! whether depth testing is on or off.
 //!
 //! # Why this is tested here rather than only through the fixtures
 //! Everything in this crate is shared by both fixtures, which means a defect here shows up as
@@ -92,7 +101,7 @@ fn the_scaffolding_renders_a_shaded_solid() {
         );
     }
 
-    eprintln!("OK: the scaffolding renders a shaded, depth-tested solid");
+    eprintln!("OK: the scaffolding renders a shaded solid");
 }
 
 /// Two draws of the same uniforms must produce the same pixels.

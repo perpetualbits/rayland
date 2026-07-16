@@ -22,6 +22,33 @@
 //! [`DEPTH_FORMAT`] for why `D32_SFLOAT` needs no format-support negotiation, and
 //! `create_render_pass`/`create_pipeline` below for the render-pass attachment and the
 //! depth-stencil pipeline state that make the depth buffer actually take effect.
+//!
+//! # Depth testing is configured but not exercised by any test in this crate
+//! `create_pipeline` enables depth testing (`depth_test_enable(true)`, `CompareOp::LESS`), and the
+//! render pass clears and binds a real depth attachment every frame — this is genuinely wired up,
+//! not a placeholder. But for *this* scene, no test here or in `tests/renders_the_solid.rs` can
+//! tell whether it is working, because it has nothing to do: the rasterizer's back-face culling
+//! (`cull_mode(vk::CullModeFlags::BACK)`, below) already discards every triangle facing away from
+//! the camera before it ever reaches the depth test, and for a convex solid like the icosahedron
+//! that is exactly the set of triangles the depth test would otherwise need to arbitrate against
+//! the front-facing ones. A convex solid's front-facing surface covers each screen pixel with at
+//! most one triangle, so once culling has run there is never more than one fragment competing for
+//! any given pixel — nothing for `CompareOp::LESS` to ever reject.
+//!
+//! This was checked experimentally, not assumed: setting `depth_test_enable(false)` here while
+//! leaving culling untouched leaves this crate's entire test suite passing, and produces
+//! byte-for-byte identical rendered images (checked across several different frame rotations) to
+//! the depth-tested pipeline. Disabling culling instead (with depth testing back on) makes the two
+//! configurations diverge, which confirms the mechanism above rather than some other, coincidental
+//! explanation: culling is what is currently doing all the work depth testing was written to do.
+//!
+//! None of this makes the depth attachment dead weight worth removing. The two icosahedron
+//! fixtures' *later* geometry — anything concave, or anything that draws more than one convex
+//! solid — can produce screen pixels genuinely covered by more than one front-facing triangle, and
+//! depth testing is what will resolve those correctly once that geometry exists. This crate keeps
+//! the depth attachment and the depth-tested pipeline state for that reason; a future fixture that
+//! actually needs it will be the first thing in this repository to exercise it, and should add a
+//! test that can tell the two configurations apart the way this crate's own tests currently cannot.
 
 // The Vulkan API surface and its handle/struct types.
 use ash::vk;
@@ -449,11 +476,13 @@ unsafe fn create_pipeline(
     let multisample = vk::PipelineMultisampleStateCreateInfo::default()
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
 
-    // Without this, the pipeline defaults to no depth testing and the 20 faces paint over each
-    // other in submission order — the back of the solid drawn on top of the front, which looks
-    // like a scrambled mess rather than an obviously wrong picture. `LESS` with
-    // `depth_write_enable` is the ordinary opaque-geometry configuration: a fragment survives only
-    // if it is nearer than what is already there, and if it survives it becomes the new nearest.
+    // `LESS` with `depth_write_enable` is the ordinary opaque-geometry configuration: a fragment
+    // survives only if it is nearer than what is already there, and if it survives it becomes the
+    // new nearest. Note what disabling this would NOT currently do: it would not make the 20 faces
+    // paint over each other in submission order, because `cull_mode(BACK)` above already discards
+    // every back face before it reaches this stage, and for this convex solid that leaves at most
+    // one front face per pixel — nothing left for depth testing to arbitrate. See the module docs
+    // for the experiment that confirmed this and why the depth state stays enabled regardless.
     let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
         .depth_test_enable(true)
         .depth_write_enable(true)
