@@ -36,7 +36,6 @@ path = "src/main.rs"           # binary entry point
 rayland-icosa-vk = { path = "../rayland-icosa-vk" }      # shared Vulkan scaffolding: context, Scene, MappedBuffer
 rayland-icosa-core = { path = "../rayland-icosa-core" }  # geometry, schedule, fractal — no GPU, no remoting
 ash = { workspace = true }                               # thin Vulkan bindings; the texture path's own barriers/copies
-image = { workspace = true }                             # PNG encoding of each frame's readback
 anyhow = { workspace = true }                            # top-level error handling, per the repo's binary-crate convention
 
 [dev-dependencies]

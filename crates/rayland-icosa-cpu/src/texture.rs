@@ -59,12 +59,27 @@
 //! to wait on: the layout was `UNDEFINED`, so there is no prior write in this image to be visible
 //! yet) to `dstAccessMask = TRANSFER_WRITE` at the `TRANSFER` stage — exactly what the copy needs.
 //! Barrier 2 is `srcAccessMask = TRANSFER_WRITE` at `TRANSFER` to `dstAccessMask = SHADER_READ` at
-//! `FRAGMENT_SHADER` — exactly what the sampling draw call needs. Because `upload` waits its own
-//! fence before returning (see above), the *draw* that samples this image is a wholly separate,
-//! later submission that only ever begins after the host has observed the upload's completion —
-//! so by the time `Scene::draw` records its command buffer, this second barrier's writes are
-//! already visible to any subsequent read, with no further synchronisation required between the two
-//! submissions.
+//! `FRAGMENT_SHADER` — exactly what the sampling draw call needs.
+//!
+//! It is tempting, but wrong, to read `upload`'s fence wait (see above) as the reason the draw's
+//! sample is safe and conclude barrier 2 is therefore redundant. The fence wait's job is narrower
+//! and different: it covers the *host* write into the staging buffer (so the next frame's CPU write
+//! cannot race the copy's read), not the *draw's* read of the image. What makes the draw's sample
+//! sound is two separate things, neither of which is the fence: (1) the layout must actually be
+//! `SHADER_READ_ONLY_OPTIMAL` when `Scene`'s descriptor set — written once, at `Scene::new`, against
+//! that exact layout — is consumed by the draw; without barrier 2 the layout is still
+//! `TRANSFER_DST_OPTIMAL`, and `vkCmdDraw` rejects that outright (confirmed directly: Khronos
+//! Validation reports `VUID-vkCmdDraw-None-09600`, "all image subresources identified by that
+//! descriptor must be in the image layout identified when the descriptor was written", at every
+//! draw once barrier 2 is removed — see `tests/native_render.rs`'s validation-layer test). (2)
+//! barrier 2's *second* synchronisation scope (`dstAccessMask = SHADER_READ` at `FRAGMENT_SHADER`)
+//! reaches the draw's read through the Vulkan queue-submission-order guarantee — commands recorded
+//! into a later submission on the same queue see the effects of an earlier submission's barriers —
+//! which holds regardless of whether anything ever calls `vkWaitForFences`. Deleting barrier 2 would
+//! be a real defect, not a redundancy: `tests/native_render.rs`'s validation-layer test pins exactly
+//! this, and an earlier report's claim that removing this barrier was "not caught" turned out to be
+//! a false negative caused by validation having no reporting sink configured, not by the barrier
+//! being unneeded — see that test's doc comment for the full account.
 //!
 //! # Why the sampler is `LINEAR`, and why that is load-bearing
 //! `rayland_icosa_core::fractal::render_into` iterates the sampled UV triangle dilated by two

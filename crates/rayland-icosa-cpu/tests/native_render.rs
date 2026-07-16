@@ -59,6 +59,20 @@ const IMAGE_SIZE: u32 = 256;
 /// (measured directly from a real run); a `10%` floor is comfortably below that measured value and
 /// still far above what a broken draw (0%, an all-background frame) or a badly mis-sized solid could
 /// produce.
+///
+/// # Why this also counts distinct colours
+/// The checks above pin the solid's *silhouette* — its size and position — but say nothing about
+/// its *content*. A fragment shader that sampled a constant colour instead of the fractal texture,
+/// or an upload that never actually ran (leaving the image's `UNDEFINED`-layout garbage, or whatever
+/// was in device memory before), would still light up the correct fraction of the frame with the
+/// correct silhouette and pass every check above — per-face Lambert shading alone still varies
+/// brightness across faces. What only the *fractal itself* produces is fine-grained colour variation
+/// *within* a face, from its escape-time gradient. Measured directly on a real render: frame 0 shows
+/// 2,860 distinct non-background RGBA colours; a build mutated to sample a constant colour instead
+/// (verified the same way, see this crate's task report) shows 7 — the few flat shades one per
+/// visible face, no more. A `100`-colour floor sits nowhere near either boundary: two orders of
+/// magnitude below a real render and well over an order of magnitude above what flat shading alone
+/// can produce.
 #[test]
 fn icosa_cpu_natively_renders_a_textured_solid() {
     if !Path::new(RENDER_NODE).exists() {
@@ -104,6 +118,23 @@ fn icosa_cpu_natively_renders_a_textured_solid() {
         "at least 10% of the frame must be covered by lit, textured surface, not background; got \
          {:.1}% ({non_background_pixels}/{total_pixels} pixels)",
         non_background_fraction * 100.0
+    );
+
+    // Distinct-colour content check (see this test's doc comment, "Why this also counts distinct
+    // colours"). A solid-coloured or unuploaded texture would still pass every check above — the
+    // silhouette's size and position say nothing about what is painted on it — so this counts how
+    // many different colours appear on the lit solid and requires far more than flat shading alone
+    // could ever produce.
+    let distinct_colors: std::collections::HashSet<image::Rgba<u8>> = frame
+        .pixels()
+        .filter(|(_, _, pixel)| *pixel != background)
+        .map(|(_, _, pixel)| pixel)
+        .collect();
+    assert!(
+        distinct_colors.len() > 100,
+        "the lit solid must show substantial colour variation from the sampled fractal, not a flat \
+         or near-flat shade per face; got {} distinct non-background colours",
+        distinct_colors.len()
     );
 
     let last = IMAGE_SIZE - 1;
@@ -199,4 +230,161 @@ fn icosa_cpu_prints_a_timing_report() {
     let fields: Vec<&str> = lines[1].split(',').collect();
     assert_eq!(fields.len(), 4, "each data line must have four fields");
     assert_eq!(fields[0], "0", "the first data line must be frame 0");
+}
+
+/// A `khronos_validation` settings file, written by this test into a temporary directory and
+/// pointed to via `VK_LAYER_SETTINGS_PATH`.
+///
+/// `debug_action = VK_DBG_LAYER_ACTION_LOG_MSG` plus `log_filename = stdout` is what actually gives
+/// the layer somewhere to report to (see [`validation_layer_reports_no_errors_across_a_full_run`]'s
+/// doc comment for why this is not optional). `validate_sync = true` is requested for completeness;
+/// see this crate's task report (`.superpowers/sdd/task-6-report.md`) for why sync validation is
+/// specifically the wrong tool for this fixture's staging-buffer hazard, and is expected to stay
+/// silent regardless of that hazard's presence.
+const VALIDATION_LAYER_SETTINGS: &str = "\
+khronos_validation.debug_action = VK_DBG_LAYER_ACTION_LOG_MSG\n\
+khronos_validation.log_filename = stdout\n\
+khronos_validation.validate_core = true\n\
+khronos_validation.validate_sync = true\n\
+";
+
+/// True if the Khronos Validation Layer's Vulkan-loader manifest is present in any location the
+/// loader itself would search.
+///
+/// This is a filesystem probe, not a Vulkan call — matching this file's [`RENDER_NODE`] convention
+/// of skipping (not failing) a GPU-dependent test by checking for the resource's presence up front,
+/// rather than by launching Vulkan and interpreting an error. `$VK_LAYER_PATH`, when set, replaces
+/// the loader's default search path, so it is checked first and exclusively-first among the
+/// directories tried; the remaining paths are the standard Linux locations for explicit layer
+/// manifests (system-wide, then a local-to-root install, then per-user).
+fn khronos_validation_layer_installed() -> bool {
+    let mut directories: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(layer_path) = std::env::var_os("VK_LAYER_PATH") {
+        directories.extend(std::env::split_paths(&layer_path));
+    }
+    directories.push(std::path::PathBuf::from(
+        "/usr/share/vulkan/explicit_layer.d",
+    ));
+    directories.push(std::path::PathBuf::from(
+        "/usr/local/share/vulkan/explicit_layer.d",
+    ));
+    if let Some(home) = std::env::var_os("HOME") {
+        directories
+            .push(std::path::PathBuf::from(home).join(".local/share/vulkan/explicit_layer.d"));
+    }
+    directories.iter().any(|directory| {
+        std::fs::read_dir(directory)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("VkLayer_khronos_validation")
+            })
+    })
+}
+
+/// Running under Khronos Validation, with sync validation on, the app must report zero
+/// `Validation Error`s across a full 120-frame run.
+///
+/// # Why this test exists: a predecessor's validation run was vacuous
+/// An earlier report concluded that removing `texture.rs`'s second `cmd_pipeline_barrier` — the
+/// `TRANSFER_DST_OPTIMAL -> SHADER_READ_ONLY_OPTIMAL` transition the draw's sampled read depends on
+/// — was "not caught" by the validation layer, and treated that as evidence the mutation was benign.
+/// It is not benign, and the negative result was an artefact of how the layer was invoked, not a
+/// fact about the code: this app creates no `VK_EXT_debug_utils` messenger (an ordinary Vulkan
+/// program has no reason to), so once the layer is force-loaded (`VK_LOADER_LAYERS_ENABLE` or
+/// `VK_INSTANCE_LAYERS`) it still has **no reporting sink** — it runs every check exactly as
+/// configured and prints nothing, on a correct build and a broken one alike. Only a
+/// `VK_LAYER_SETTINGS_PATH` settings file that requests `debug_action = VK_DBG_LAYER_ACTION_LOG_MSG`
+/// (a legacy, sink-agnostic reporting path the layer still honours without any messenger) makes the
+/// layer's findings observable at all — see [`VALIDATION_LAYER_SETTINGS`].
+///
+/// Confirmed directly, not just argued, while writing this test: with this exact settings file, a
+/// correct build produces zero `Validation Error` lines over a full 120-frame run (121 lines of
+/// plain CSV, matching [`icosa_cpu_prints_a_timing_report`]'s expectation, and nothing else).
+/// Commenting out `texture.rs`'s second barrier and rerunning the same command produces ten
+/// `Validation Error: [ VUID-vkCmdDraw-None-09600 ]` lines — one per draw call whose descriptor set
+/// was written against `SHADER_READ_ONLY_OPTIMAL` while the image was actually left in
+/// `TRANSFER_DST_OPTIMAL` — confirming both that the barrier is load-bearing and that this test
+/// catches its removal. That mutation was reverted immediately after being observed; see this
+/// crate's task report for the full transcript of both runs.
+///
+/// # Why this does not also catch the staging-buffer fence-wait removal
+/// It doesn't, and shouldn't be expected to: sync validation (`validate_sync = true`, requested
+/// above) cannot observe a host write through a persistently-mapped `HOST_COHERENT` buffer with no
+/// flush, because there is no Vulkan API call for it to hook — the write is a bare memory store
+/// through a pointer `vkMapMemory` handed back once, entirely outside anything the loader or a layer
+/// ever sees. That is not a gap in this test; it is verbatim the thing this whole fixture exists to
+/// demonstrate (see this crate's own module doc, and `.superpowers/sdd/task-6-report.md`'s corrected
+/// account of that mutation).
+///
+/// # Skip, don't fail, without the render node or the layer
+/// Following this repository's convention for GPU tests, either missing dependency is reported as a
+/// SKIP rather than a failure, so CI without a GPU or without the validation layer installed stays
+/// green.
+#[test]
+fn validation_layer_reports_no_errors_across_a_full_run() {
+    if !Path::new(RENDER_NODE).exists() {
+        eprintln!(
+            "SKIP validation_layer_reports_no_errors_across_a_full_run: no render node at \
+             {RENDER_NODE}"
+        );
+        return;
+    }
+    if !khronos_validation_layer_installed() {
+        eprintln!(
+            "SKIP validation_layer_reports_no_errors_across_a_full_run: \
+             VK_LAYER_KHRONOS_validation not installed"
+        );
+        return;
+    }
+
+    let work_dir = std::env::temp_dir().join("rayland-icosa-cpu-validation");
+    let _ = std::fs::remove_dir_all(&work_dir);
+    std::fs::create_dir_all(&work_dir).expect("the work directory must be creatable");
+
+    // Written fresh every run rather than checked in: the settings' content is this test's own
+    // contract with the layer, and keeping it inline keeps that contract visible in one place.
+    let settings_path = work_dir.join("vk_layer_settings.txt");
+    std::fs::write(&settings_path, VALIDATION_LAYER_SETTINGS)
+        .expect("the layer settings file must be writable");
+
+    let output_dir = work_dir.join("frames");
+    std::fs::create_dir_all(&output_dir).expect("the frame output directory must be creatable");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rayland-icosa-cpu"))
+        .arg(&output_dir)
+        // Forces the loader to insert the layer even though this app itself requests no layers —
+        // an ordinary Vulkan program, by design, never asks for validation (see this crate's module
+        // doc on why this fixture is deliberately ignorant of its environment).
+        .env("VK_LOADER_LAYERS_ENABLE", "*validation")
+        .env("VK_LAYER_SETTINGS_PATH", &settings_path)
+        .output()
+        .expect("the fixture binary must be launchable under the validation layer");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "the fixture must exit successfully under validation; got {}\nstdout:\n{stdout}\nstderr:\n\
+         {stderr}",
+        output.status
+    );
+
+    // `log_filename = stdout` above sends every message here; both streams are checked anyway in
+    // case a different loader/layer version ever redirects logging to stderr instead.
+    let error_lines: Vec<&str> = stdout
+        .lines()
+        .chain(stderr.lines())
+        .filter(|line| line.contains("Validation Error"))
+        .collect();
+    assert!(
+        error_lines.is_empty(),
+        "the validation layer reported {} error(s) across the run:\n{}",
+        error_lines.len(),
+        error_lines.join("\n")
+    );
 }
