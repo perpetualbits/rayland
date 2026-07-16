@@ -1,0 +1,30 @@
+# The Vulkan scaffolding the two icosahedron fixtures share: bring-up, the depth-tested render pass
+# and pipeline, the render targets, the persistent host mapping, and the readback.
+#
+# Everything the two fixtures must hold *identical* lives here, so that they cannot drift in it. The
+# pair exists to be compared, and a comparison is only meaningful if everything except the property
+# under study is held constant; two hand-maintained copies of a render loop would not stay constant,
+# they would stay *approximately* constant, which is not the same thing and is much harder to notice.
+#
+# This crate knows nothing about remoting, exactly as the fixtures do not. It depends only on
+# `rayland-icosa-core` (pure mathematics) and on ordinary third-party crates. That a fixture's Vulkan
+# scaffolding lives in a library does not make it unusual — real Vulkan applications lean on helper
+# libraries (VMA, vk-bootstrap) constantly; a program with 1200 lines of hand-rolled bring-up inline
+# would be the less typical one.
+#
+# A LIBRARY crate, so per the repository license policy it is LGPL-3.0-or-later.
+[package]
+name = "rayland-icosa-vk"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+description = "Shared Vulkan scaffolding for the icosahedron fixtures: bring-up, depth-tested pipeline, targets, mapping, readback."
+license = "LGPL-3.0-or-later"
+repository = "https://github.com/perpetualbits/rayland"
+publish = false
+
+[dependencies]
+rayland-icosa-core = { path = "../rayland-icosa-core" }  # geometry and schedule — no GPU, no remoting
+ash = { workspace = true }                               # thin Vulkan bindings; the only way this code talks to a GPU
+image = { workspace = true }                             # PNG encoding of the pixels read back from the GPU
+anyhow = { workspace = true }                            # error handling

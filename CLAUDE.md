@@ -69,7 +69,7 @@ Wayland/Vulkan/GPU-remoting — must painstakingly verify **every line** for cor
 
 ## Repository status and layout
 
-A Cargo workspace of twelve crates. Each declares its own license per the policy below
+A Cargo workspace of sixteen crates. Each declares its own license per the policy below
 (library → LGPL, application/binary → GPL); all are `v0.0.x` and pre-stable.
 
 - **`crates/rayland`** — the published placeholder that reserves the crates.io name; the
@@ -124,6 +124,29 @@ A Cargo workspace of twelve crates. Each declares its own license per the policy
 - **`crates/rayland-refapp`** — C0's captured workload: an **ordinary** offscreen Vulkan
   triangle program with **zero `rayland-*` dependencies** and no knowledge of remoting.
   Its value is that it is boring and typical; keep it that way. GPL, `publish = false`.
+- **`crates/rayland-icosa-core`** — shared foundations for the icosahedron fixtures: the geometry,
+  the frame-indexed animation schedule, the Mandelbrot math, and the bit-exact `log2`/`sin`/`cos`
+  those rest on. **No dependencies at all, and never touches a GPU** — its correctness is
+  arithmetic. Its reason for existing is that the two fixtures must be identical in everything but
+  the property under study, and two copies of this code would drift. LGPL, `publish = false`.
+- **`crates/rayland-icosa-vk`** — the Vulkan scaffolding both icosahedron fixtures share: bring-up,
+  the depth-tested render pass and pipeline, the targets, the persistent host mapping, and the
+  readback. It exists so the two fixtures **cannot** drift in the parts that must be identical for
+  their comparison to mean anything — the same argument `rayland-icosa-core` rests on, applied to
+  the render loop. Knows nothing about remoting. LGPL, `publish = false`.
+- **`crates/rayland-icosa-cpu`** — fixture A: an ordinary offscreen Vulkan program drawing a
+  spinning icosahedron textured with a fractal it computes on **its own CPU** and writes into
+  persistently-mapped `HOST_COHERENT` memory every frame — with no flush, and so no call on the wire
+  saying a megabyte changed. That is both what an ordinary Vulkan program does and exactly the case
+  with nothing to intercept, which is the problem this fixture states in executable form. Depends
+  only on the two icosa libraries and knows nothing about remoting. GPL, `publish = false`.
+- **`crates/rayland-icosa-gpu`** — fixture B: the same spinning icosahedron, same geometry, same
+  schedule, same fractal arithmetic, and — via `rayland-icosa-vk` — literally the same render loop.
+  Only the fractal moves: it is evaluated in a fragment shader, so 80 bytes per frame cross
+  mapped memory instead of a megabyte. It is the **volume control** for `rayland-icosa-cpu`, not an
+  alternative to it: it still writes its uniforms through a persistent mapping with no interceptable
+  call, so the pair isolates how cost scales with mapped-write volume, not the presence of mapped
+  writes. GPL, `publish = false`.
 
 The work is decomposed into sub-projects, each getting its own design spec →
 implementation plan → build cycle, sequenced as a "walking skeleton" (get something
@@ -157,7 +180,10 @@ Venus/virglrenderer capture/replay engine, so *unmodified* applications run.**
   for on-screen presentation. **Required reading:**
   [`docs/design/2026-07-15-venus-ring-findings.md`](docs/design/2026-07-15-venus-ring-findings.md).
 - **(c)2 — mapped-memory coherence:** the `vkMapMemory` problem (apps write vertices and
-  textures straight into mapped memory with **no API call to intercept**).
+  textures straight into mapped memory with **no API call to intercept**). The icosahedron
+  fixtures (`rayland-icosa-cpu`/`rayland-icosa-gpu`) were built to make this bite and, run
+  through C0's path, did not — see [`docs/icosa-fixtures.md`](docs/icosa-fixtures.md) for
+  why not and where the real failure is still waiting.
 - **(c)3 — content-addressed assets.**
 - **(c)4 — real/complex applications; GL via Zink.**
 

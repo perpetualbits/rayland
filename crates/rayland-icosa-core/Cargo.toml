@@ -1,0 +1,24 @@
+# Everything the two icosahedron fixtures must agree on, and nothing that touches a GPU.
+#
+# The two fixtures exist to be compared against each other, and that comparison is only meaningful
+# if they are identical in every respect except the one under study. Two copies of this code would
+# drift — someone would fix a rounding detail in one and not the other — and the moment they drift
+# the comparison stops measuring what it claims to. Sharing the code is what makes the pair an
+# instrument rather than two programs.
+#
+# This crate has NO dependencies, deliberately. Its correctness is mathematical, and it should be
+# testable on a machine with no GPU, no driver and no display.
+#
+# A LIBRARY crate, so per the repository license policy it is LGPL-3.0-or-later.
+[package]
+name = "rayland-icosa-core"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+description = "Shared geometry, animation schedule and reproducible fractal math for the icosahedron fixtures."
+license = "LGPL-3.0-or-later"
+repository = "https://github.com/perpetualbits/rayland"
+publish = false                # a test fixture's support library; nothing here belongs on crates.io
+
+[dependencies]
+# None, and none may be added without a very good reason. See the crate note above.

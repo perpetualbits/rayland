@@ -17,6 +17,10 @@ members = [
     "crates/rayland-s",              # (c)1 S-side daemon: applies C's relayed ring deltas to a real virglrenderer ((c)1 Task 4)
     "crates/rayland-engine",         # S-side render engine: FFI-embedded libvirglrenderer + Venus context (C0 Task 1)
     "crates/rayland-refapp",         # C0's unmodified reference app: a plain offscreen Vulkan triangle (C0 Task 4b)
+    "crates/rayland-icosa-core",     # shared geometry/schedule/fractal math for the icosahedron fixtures (icosa Task 1)
+    "crates/rayland-icosa-vk",       # shared Vulkan scaffolding for the icosahedron fixtures (icosa Task 5)
+    "crates/rayland-icosa-cpu",      # fixture A: fractal on the CPU, uploaded per frame (icosa Task 6)
+    "crates/rayland-icosa-gpu",      # fixture B: fractal in a fragment shader; the volume control (icosa Task 7)
 ]
 
 # Dependency versions shared across member crates, so every crate agrees on one version.
