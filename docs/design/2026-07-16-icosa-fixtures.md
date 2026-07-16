@@ -207,13 +207,27 @@ vertices would force normals to be averaged at the corners and smooth the edges 
 There is no index buffer; at 60 vertices it would save nothing worth the extra Vulkan
 surface.
 
-**A depth buffer is required.** A solid seen from outside has faces behind other faces,
-and without depth testing the back ones paint over the front ones depending on submission
-order. This is the first thing in Rayland that needs a depth attachment — refapp's single
-triangle never did — so it will be the first exercise of depth-stencil format selection,
-depth image allocation, and depth attachment setup through the remoted path. Expect this
-to be where breakage appears first, and treat a depth-related failure as a finding about
-Rayland rather than a bug in the fixture.
+**A depth attachment is carried, but depth *testing* does not change this picture.**
+This paragraph originally claimed a depth buffer was required — that "without depth testing
+the back faces paint over the front ones depending on submission order". **That is false,
+and Task 5 disproved it by experiment:** with back-face culling enabled, disabling depth
+testing produces byte-for-byte identical output across every rotation tested; only with
+culling *also* disabled do the two diverge. The reason is a property of the shape. The solid
+is **convex**, so a ray from the camera enters through exactly one front face and leaves
+through exactly one back face; culling removes the exit face, so precisely one fragment
+reaches each pixel and `LESS` never has anything to reject.
+
+The attachment is kept anyway, and the reason is Rayland's, not the picture's: it is the
+first depth attachment in this repository — refapp's single triangle never had one — so it
+is the first exercise of depth-stencil **format selection, depth image allocation, and
+attachment setup** through the remoted path. Those are the parts that must survive the
+relay, and they run whether or not any fragment is ever rejected. Expect this to be where
+breakage appears first, and treat a depth-related failure as a finding about Rayland rather
+than a bug in the fixture.
+
+Do not "simplify" the attachment away on the strength of the paragraph above. A later,
+non-convex workload would need it, and removing it would silently retire the only coverage
+this project has of the depth path.
 
 **UV mapping.** All 20 faces sample the *same* equilateral triangle, centred in the fractal
 texture with a margin around it. Every face therefore shows the same image, and the zoom is
