@@ -18,8 +18,11 @@
 //! Neither crate needs the other's.
 //!
 //! Behaviour is unchanged from SP3: same two paths, same auto-detection, same `--force-shm`
-//! override, same log lines, same teardown contract. The extraction is deliberately
-//! behaviour-preserving, and `tests/e2e.rs`, `tests/quic_e2e.rs`, `tests/render.rs` and
+//! override, same teardown contract. The one cosmetic change is the log reason printed when a
+//! frame source cannot export a dmabuf: `rayland-present` is now abstract over frame sources, so it
+//! says "this frame source cannot export a dmabuf" rather than SP3's GPU-specific wording — same
+//! path taken, only the string differs, and only when the GPU lacks the export extensions. The
+//! extraction is otherwise behaviour-preserving, and `tests/e2e.rs`, `tests/quic_e2e.rs`, `tests/render.rs` and
 //! `tests/handle.rs` are the regression net that says so.
 
 // The rendered frame we present on the wl_shm path; its pixels are tightly-packed RGBA8.

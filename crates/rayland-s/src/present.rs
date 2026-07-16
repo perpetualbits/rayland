@@ -489,7 +489,7 @@ pub fn present_frame(frame: RenderedFrame) -> anyhow::Result<()> {
         force_shm: false,
     };
     // A socket pair whose other end this function holds until it returns: `present` watches `theirs`
-    // for EOF, and `_ours` cannot EOF while it is alive, so only the close button ends the loop.
+    // for EOF, and `ours` cannot EOF while it is alive, so only the close button ends the loop.
     let (ours, theirs) = std::os::unix::net::UnixStream::pair()
         .map_err(|e| anyhow::anyhow!("creating the window's liveness socket pair: {e}"))?;
     // `present` requires a non-blocking source: its calloop callback reads until `WouldBlock`, and a
@@ -500,7 +500,7 @@ pub fn present_frame(frame: RenderedFrame) -> anyhow::Result<()> {
 
     println!("presenting the frame in a window; close it to exit");
     let result = rayland_present::present(&mut source, &config, theirs);
-    // Explicit rather than implicit: `_ours` staying alive across the `present` call above is the
+    // Explicit rather than implicit: `ours` staying alive across the `present` call above is the
     // entire mechanism keeping the window open, so dropping it is worth a line a reader can see.
     drop(ours);
     result
