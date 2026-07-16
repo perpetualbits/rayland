@@ -224,7 +224,7 @@ would struggle to catch.
 Note it is **not** *inscribed*, and the distinction matters to the arithmetic below: a
 genuinely inscribed (maximal) equilateral triangle in a square has side ≈1.035 and covers
 ≈46% of it. This one has side 0.866, covers 32.5%, and touches none of the texture's edges.
-The margin is not slack — it is what leaves room for the one-texel dilation §7.2 requires.
+The margin is not slack — it is what leaves room for the two-texel dilation §7.2 requires.
 
 **Only the sampled triangle is iterated.** The triangle covers 32.5% of the square texture,
 so a naive full-texture fractal would spend roughly two thirds of its arithmetic on texels
@@ -356,7 +356,7 @@ The algorithm, unchanged in substance:
 that was tuned for an interactive GPU shader and is far too expensive for a per-frame CPU
 loop on a machine that may be a RISC-V single-board computer.
 
-The worst case is **~44.9 million iterations per frame**, not the 512×512×512 ≈ 134 million
+The worst case is **~45.0 million iterations per frame**, not the 512×512×512 ≈ 134 million
 a full-texture fractal would cost: §4's restriction means only the dilated triangle is
 iterated, about 33.5% of the texture. That is heavy enough to be honest about C being weak,
 light enough not to dominate the measurement, and ample detail at the zoom depth §5.2
