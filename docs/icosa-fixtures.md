@@ -479,3 +479,85 @@ not do, and could not have done without (c)1's relay existing to run them over, 
 failure the original spec predicted. That failure is still out there, unrefuted, waiting at
 the far end of `rayland-c` → `rayland-s` — and per §6, it will not announce itself through
 any Vulkan API call, which is the one fact about it that is not in question.
+
+---
+
+## 11. For (c)1's Task 9: how to point these at the relay
+
+§10 says the failure is waiting at the far end of `rayland-c` → `rayland-s`. This section says
+concretely what to do about it, because (c)1's Task 9 — the netem sweep — is the run that can.
+
+### Why the sweep wants fixture A
+
+Task 9's workload today is `rayland-refapp`: one static triangle, one vertex buffer written once at
+startup. That is the right thing for Task 8's bring-up and it is **silent** on the questions Task 9
+asks, because it never touches mapped memory again and never sends a meaningful byte.
+
+| | `rayland-refapp` | `rayland-icosa-cpu` |
+|---|---|---|
+| mapped writes after startup | none | **1 MiB every frame** |
+| frames | 1 | 120 |
+| per-frame CPU work | none | ~49 ms of Mandelbrot |
+
+**Keep refapp in the sweep.** It is the trivial baseline that says whether a failure is
+workload-specific or general. Fixture A is the stress case, not a replacement.
+
+### What the control buys you
+
+Both fixtures render **bit-identically through Venus on the C0 path** (§5). That is not a proof about
+mapped memory — it is a *control*, and its value is entirely for this run: it means **any divergence
+across the relay is provably the relay's, not the fixture's.** Without it, a failure over the network
+would leave you asking whether the workload was ever sound. That question is now closed.
+
+### The comparison rule (do not get this backwards)
+
+Compare the remoted run against the fixture run **natively on S**, never on C. `c1-two-machine.sh`
+already states why: C's GPU is a different rasteriser, so a C-side baseline compares renderers
+instead of transports. `crates/rayland-engine/tests/icosa_{cpu,gpu}_venus_e2e.rs` already obeys this
+rule (they remove `VK_ICD_FILENAMES`/`VN_DEBUG`/`VTEST_SOCKET_NAME` for the native leg) and are a
+working model.
+
+One thing in the run's favour: with C and S both x86_64, the CPU-computed fractal is bit-exact across
+them for free. `rayland-icosa-core` rebuilds `log2`/`sin_cos` from IEEE basic operations so this
+survives a RISC-V C as well — but **that has never been tested** (§8). If a RISC-V C ever joins,
+fixture A is ready and that is where the bit-exactness earns its keep.
+
+### The open question these fixtures exist to ask
+
+**Does (c)1's blob sync actually ship the megabyte every frame, and what does it cost?**
+
+Task 5's conservative blob sync must move it somehow: 1 MiB × 120 frames = **120 MiB** of texture
+for a three-second animation. The fractal changes **every texel of every frame** — it is a zooming
+view, not a static image with a moving overlay — so the byte-granular diff of Task 5b should find
+**nothing to elide**. That makes this close to the worst case the design can be handed, which is
+exactly what a feasibility verdict should be tested against.
+
+If the diff *does* help here, that is a surprising result and worth understanding before trusting it
+elsewhere.
+
+For scale, measured locally (dop561, Intel Iris Xe / Mesa ANV, release, means over 120 frames): the
+megabyte costs **628 µs** to move on-machine — **1.2% of fixture A's frame**. Projected on bandwidth
+alone: **8.4 ms at 1 GbE**, **84 ms at 100 Mbit** — the latter *more than the fractal itself*. Those
+projections are what the sweep replaces with fact.
+
+### Practicalities that cost real time here
+
+- **The output directory must already exist.** Both fixtures exit 1 with
+  `No such file or directory (os error 2)` otherwise. This made 120 frames appear to take 0.48 s
+  once — a failed run read as a measurement.
+- **Budget the wall-clock and distinguish a timeout from a rendering failure** — they are different
+  findings. Native: fixture A ≈ 13.4 s for 120 frames, fixture B ≈ 2 s. Through Venus locally: 24 s
+  and 6 s.
+- **The validation layer prints nothing without a settings file** (§2). The fixtures register no
+  `VK_EXT_debug_utils` messenger, so a run without `VK_LAYER_SETTINGS_PATH` reports success whether
+  the code is right or wrong. `crates/rayland-icosa-cpu/tests/native_render.rs` has a working example.
+- **Do not add `VN_DEBUG=no_abort`** — `c1-two-machine.sh` explains why at length, and fixture A's
+  120-frame run gives a ring stall far more chances to occur than refapp's single frame ever did.
+
+### If the fixtures need to change for the sweep
+
+They are deliberately option-free (design spec §2): no `--frames`, no `--no-texture`, no size knob,
+because a fixture with opinions about how it is run stops being evidence about how real applications
+behave. **"The sweep needs it" is a real reason** to revisit that. A shorter run, a different texture
+size, or a fixed subset of frames can be added properly — as constants, or as a second binary — in
+preference to patching around the fixture or, worse, weakening it until it passes.
