@@ -1,7 +1,21 @@
 # (c)1 — The Network (rescoped after C0)
 
 **Date:** 2026-07-15
-**Status:** Sub-project design spec (awaiting owner review)
+**Status:** Sub-project design spec — **RATIFIED 2026-07-16 by the repository owner**, including the
+rewrites Task 6's live run forced on it (§4.5 retracted; §4.6, §4.7, §7.3 added; §5 gains row 6).
+
+> **On that ratification.** A spec rewritten by its own implementation task is not a failure of the
+> spec; it is the only evidence that the task was worth running. Four of (c)1's six shared-memory
+> channels were found by **running** the thing and none by reading it — which is why Task 6 was
+> written as a gate rather than a demo. The retracted §4.5 is kept in place, because its facts are
+> right and only its conclusion was wrong, and that distinction is the useful part.
+>
+> Two findings generalise beyond (c)1 and should be read before any later slice adds a channel:
+> **§5's inventory is of *pages*, and that is why it kept missing things** — an ordering requirement
+> (§4.7) and a lifecycle fact (§7.3) are real, load-bearing, and cannot be expressed as a row in a
+> table of memory. And **`VN_DEBUG=no_abort` (§6) stays unlicensed**: Mesa's 3.5 s abort is the only
+> reason §4.6's fault was visible at all, and the crutch this spec once listed as a convenience would
+> have turned every one of Task 6's four findings into a silent hang.
 **Parent design:** [`2026-07-13-native-remote-wayland-gpu.md`](2026-07-13-native-remote-wayland-gpu.md)
 **Predecessor:** C0 — Venus First Light (substance complete)
 **Required reading:** [`2026-07-15-venus-ring-findings.md`](2026-07-15-venus-ring-findings.md) — this spec is
