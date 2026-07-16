@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Split C0's single-machine host into a C-side relay daemon and an S-side engine host joined by QUIC, so the unmodified `rayland-refapp` runs on `appollo` while its frame is rendered on `dop561`'s GPU and presented on `dop561`'s screen — and measure what that costs.
+**Goal:** Split C0's single-machine host into a C-side relay daemon and an S-side engine host joined by QUIC, so the unmodified `rayland-refapp` runs on `apollo` while its frame is rendered on `dop561`'s GPU and presented on `dop561`'s screen — and measure what that costs.
 
 **Architecture:** `rayland-c` *is* a vtest server, so stock Mesa talks to it over a local Unix socket and cannot tell it is not an ordinary vtest host. It allocates the Venus command ring and every blob as **local memfds**, watches the ring's `tail`, and relays ring deltas + mapped-blob contents over QUIC to `rayland-s`, which re-materializes them into a real virglrenderer context, replays on the GPU, and presents. No Mesa fork, no app changes.
 
@@ -28,7 +28,7 @@
   - `VN_PERF=no_fence_feedback,no_semaphore_feedback,no_event_feedback,no_query_feedback` — removes the S→C shared status pages.
   - `VN_DEBUG=no_abort` — **only after Task 3's progress-aware timeout exists** (spec §6.2).
 - **Socket paths must be short** — `sun_path` is 108 bytes. Use `/tmp/rl-c1.sock`, never a scratchpad path.
-- **Machines:** C = `appollo.localdomain` (x86_64, AMD GPU **unused**, key-based ssh, passwordless sudo, do not break it). S = `dop561` (Intel Iris Xe, the display). Loopback on `dop561` is the CI/dev path.
+- **Machines:** C = `apollo.localdomain` (x86_64, AMD GPU **unused**, key-based ssh, passwordless sudo, do not break it). S = `dop561` (Intel Iris Xe, the display). Loopback on `dop561` is the CI/dev path.
 
 ---
 
@@ -606,13 +606,13 @@ git commit -m "(c)1 Task 7: extract rayland-present; present the readback blob v
 
 ---
 
-## Task 8: Two-machine bring-up (appollo → dop561)
+## Task 8: Two-machine bring-up (apollo → dop561)
 
 **Files:** Create `scripts/c1-two-machine.sh`
 
-- [ ] **Step 1: Install the client stack on appollo.** `ssh appollo.localdomain` (key-based, passwordless sudo; **do not break it**). It needs Mesa 26 with the Venus ICD (`/usr/share/vulkan/icd.d/virtio_icd.json`) and the `rayland-c` binary. **It needs no GPU and no Wayland.** Record exactly what you installed.
+- [ ] **Step 1: Install the client stack on apollo.** `ssh apollo.localdomain` (key-based, passwordless sudo; **do not break it**). It needs Mesa 26 with the Venus ICD (`/usr/share/vulkan/icd.d/virtio_icd.json`) and the `rayland-c` binary. **It needs no GPU and no Wayland.** Record exactly what you installed.
 
-- [ ] **Step 2: Run it.** `rayland-s` on dop561, `rayland-c` + refapp on appollo, with:
+- [ ] **Step 2: Run it.** `rayland-s` on dop561, `rayland-c` + refapp on apollo, with:
 ```bash
 VN_DEBUG=vtest,no_abort \
 VN_PERF=no_multi_ring,no_fence_feedback,no_semaphore_feedback,no_event_feedback,no_query_feedback \
@@ -622,7 +622,7 @@ env -u VK_LOADER_DRIVERS_SELECT ./rayland-refapp /tmp/out.png
 ```
 **Only set `no_abort` if Task 3's progress timeout is in place.**
 
-- [ ] **Step 3: The correctness assertion (spec §10.2).** Compare venus-from-appollo against `rayland-refapp` run natively **on dop561** — both are the **same Intel GPU**, so assert **bit-identity**. Do **not** compare against appollo-native: that is an AMD render and means nothing.
+- [ ] **Step 3: The correctness assertion (spec §10.2).** Compare venus-from-apollo against `rayland-refapp` run natively **on dop561** — both are the **same Intel GPU**, so assert **bit-identity**. Do **not** compare against apollo-native: that is an AMD render and means nothing.
 
 - [ ] **Step 4: Write `scripts/c1-two-machine.sh`** with the verified commands, and **run the script** — a documented command that does not work is the exact bug C0 shipped and a reviewer caught.
 
@@ -630,7 +630,7 @@ env -u VK_LOADER_DRIVERS_SELECT ./rayland-refapp /tmp/out.png
 
 ```bash
 git add scripts/c1-two-machine.sh
-git commit -m "(c)1 Task 8: two-machine bring-up (appollo -> dop561)"
+git commit -m "(c)1 Task 8: two-machine bring-up (apollo -> dop561)"
 ```
 
 ---
@@ -645,10 +645,10 @@ git commit -m "(c)1 Task 8: two-machine bring-up (appollo -> dop561)"
 
 - [ ] **Step 1: Count things.** In `metrics.rs`: round-trips (any send that blocks for a reply), bytes each way **split by channel** (ring / replies / blob sync), and wall-clock to first frame. Print a summary at exit behind `RAYLAND_C1_METRICS=1`.
 
-- [ ] **Step 2: Sweep simulated WAN.** On appollo:
+- [ ] **Step 2: Sweep simulated WAN.** On apollo:
 ```bash
 sudo tc qdisc add dev <iface> root netem delay 20ms    # then 50ms, then 100ms
-sudo tc qdisc del dev <iface> root                     # ALWAYS clean up — do not leave appollo crippled
+sudo tc qdisc del dev <iface> root                     # ALWAYS clean up — do not leave apollo crippled
 ```
 Record round-trips, bytes, and time-to-frame at 0/20/50/100 ms RTT. Find where it becomes unusable.
 

@@ -35,7 +35,7 @@ actually tested: **that an application's rendering can cross a network as *langu
 commands — rather than as pixels.**
 
 **Success criterion (measurable):** the `rayland-refapp` — unmodified, unaware of Rayland — runs on
-**C** (`appollo.localdomain`, x86_64). Its Vulkan commands cross a real network over QUIC to **S**
+**C** (`apollo.localdomain`, x86_64). Its Vulkan commands cross a real network over QUIC to **S**
 (`dop561`), where they are replayed on S's real Intel GPU and the resulting frame is **presented in
 a window on S's display**. Correctness is asserted twice, by two independent paths:
 
@@ -107,7 +107,7 @@ contents; on-screen presentation on S; and a measurement of what all of that cos
 
 ### 4.1 Topology
 
-- **C = `appollo.localdomain`** — x86_64, has an AMD GPU that is **entirely unused**. Runs the
+- **C = `apollo.localdomain`** — x86_64, has an AMD GPU that is **entirely unused**. Runs the
   refapp and the `rayland-c` daemon. **Needs no GPU and no Wayland**: Venus is a *serializing*
   driver; it never touches local hardware. This is the thesis in physical form.
 - **S = `dop561`** — Intel Iris Xe, the display the user is looking at, the Wayland compositor.
@@ -141,7 +141,7 @@ we swap in is not another renderer, it is **a network**.
 ### 4.4 Data flow
 
 ```
-  C = appollo (no GPU, no Wayland)          |          S = dop561 (Intel GPU, display)
+  C = apollo (no GPU, no Wayland)          |          S = dop561 (Intel GPU, display)
                                             |
   rayland-refapp (unmodified)               |
     │  Vulkan calls                         |
@@ -538,7 +538,7 @@ question is *"is remote Wayland feasible?"* A demo cannot answer it; a table can
 - **Bytes each way, split by channel** (ring / replies / blob sync). This tells us what to compress
   and what to cache, and it is cheap to measure once the split exists.
 - **Frame latency** — native on S, vs local socket, vs LAN.
-- **Breaking point under simulated WAN** — inject 20/50/100 ms RTT with `tc netem` on appollo and
+- **Breaking point under simulated WAN** — inject 20/50/100 ms RTT with `tc netem` on apollo and
   find where it becomes unusable. This is the cheapest possible way to answer "would this work over
   the internet" without an internet.
 
@@ -621,7 +621,7 @@ paths, both must be right.
 **Bit-identity is a legitimate assertion here, but only against the right baseline.** venus-from-C
 renders on S's **Intel** GPU, so it must be compared against `rayland-refapp` run natively **on S**
 (also Intel) — C0 established that same-GPU/same-stack replay is bit-identical (0/16384 bytes).
-Comparing against appollo-native would be an **AMD** render and is meaningless. Assert bit-identity
+Comparing against apollo-native would be an **AMD** render and is meaningless. Assert bit-identity
 against the S-native baseline; **report** rather than assert any divergence, so a legitimate change
 surfaces to a human instead of turning CI red.
 
