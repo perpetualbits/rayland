@@ -53,7 +53,17 @@ something harder does not.
 
 Therefore, for every crate specified here:
 
-- **Zero `rayland-*` dependencies.** Not for logging, not for utilities, not for tests.
+- **No dependency on any `rayland-*` crate except `rayland-icosa-core` and
+  `rayland-icosa-vk`** — the two libraries specified in §3, which are themselves bound by
+  every rule in this section and know nothing about remoting either. Not for logging, not
+  for utilities, not for tests.
+
+  The `rayland-` prefix on those two is a workspace naming convention, not a statement that
+  they are part of Rayland's remoting machinery; they are the fixtures' own support code
+  and nothing else depends on them. What the rule actually protects is that no code a
+  fixture links can *see* the remoting — and none can. The test to apply when adding any
+  dependency is not "is it in this workspace" but **"could this let the program tell it is
+  being remoted?"**
 - **No mention** of Venus, vtest, virglrenderer, sockets, rings, blobs, or remoting —
   in code, comments, documentation, or crate metadata.
 - **No environment probing**, no conditional rendering paths, no command-line rendering
@@ -77,7 +87,7 @@ constants, not a flag on this one.
 
 ---
 
-## 3. Structure: three crates
+## 3. Structure: four crates
 
 ### 3.1 `rayland-icosa-core` — the shared, GPU-free library
 
@@ -96,26 +106,60 @@ License LGPL-3.0-or-later (a library), `publish = false` (a test fixture; nothin
 belongs on crates.io).
 
 **Why a shared crate rather than duplicating the math.** The entire diagnostic value of
-having two fixtures (§3.4) rests on them being identical in every respect except the one
+having two fixtures (§3.5) rests on them being identical in every respect except the one
 under study. Two copies of the fractal math would drift — someone would fix a rounding
 detail in one and not the other — and the moment they drift, the comparison between the
 two fixtures stops measuring what it claims to measure and starts measuring the drift.
 Sharing the code is what makes the pair an instrument instead of two programs.
 
-### 3.2 `rayland-icosa-cpu` — fixture A, the torture test
+### 3.2 `rayland-icosa-vk` — the shared Vulkan scaffolding
+
+Contains everything both fixtures must agree on *graphically*, exactly as §3.1 holds
+everything they must agree on arithmetically:
+
+- Vulkan bring-up: instance, physical device, queue, logical device, command pool, and
+  memory-type selection.
+- The depth-tested render pass and graphics pipeline (§4), parameterised only by which
+  fragment shader it uses and whether a sampler is bound.
+- The colour target, the depth target, and the readback buffer.
+- `MappedBuffer`: the persistent `HOST_VISIBLE | HOST_COHERENT` mapping **both** fixtures
+  write through (§7.2).
+- The draw-and-read-back, and the PNG write.
+
+License LGPL-3.0-or-later (a library), `publish = false`.
+
+**Why this is shared and not copied into each fixture.** The argument is §3.1's, applied
+to the render loop rather than the arithmetic. If each fixture carried its own copy of
+roughly 1200 lines of Vulkan, the two would drift — someone would fix a barrier or a
+format in one and not the other — and the moment they drift, the comparison stops measuring
+where the fractal is computed and starts measuring the drift. Sharing the code makes the
+control a **fact** rather than a promise: the fixtures *cannot* differ in what this crate
+holds.
+
+**It does not make the fixtures less ordinary.** Real Vulkan applications lean on helper
+libraries — VMA, vk-bootstrap, whole engines — constantly. A program with 1200 lines of
+hand-rolled bring-up inline is the *less* typical one. What matters for §2's rule is that
+nothing in this crate knows about remoting either, and nothing does.
+
+**What deliberately stays out of it.** The frame loop, the timing report, and the texture
+path. Those are where the fixtures differ, and a shared frame loop with an `if texture`
+inside it would bury the experiment's independent variable in a library — the one place
+nobody thinks to look for it.
+
+### 3.3 `rayland-icosa-cpu` — fixture A, the torture test
 
 Computes the fractal on **C's CPU** every frame, writes it into persistently-mapped
 host-visible memory, uploads it, draws the spinning solid, reads back, writes PNGs, prints
 timings. This is the (c)2 workload proper. Binary crate → GPL-3.0-or-later per repository
 policy, `publish = false`.
 
-### 3.3 `rayland-icosa-gpu` — fixture B, the control
+### 3.4 `rayland-icosa-gpu` — fixture B, the control
 
 Same geometry, same lighting, same schedule, same math — but the fractal is evaluated in a
 fragment shader on S's GPU, so only a handful of scalars cross per frame instead of a
 megabyte. Binary crate → GPL-3.0-or-later, `publish = false`.
 
-### 3.4 What the pair measures, and what it does not
+### 3.5 What the pair measures, and what it does not
 
 Fixture A minus fixture B approximates the cost attributable to **mapped-write volume and
 texture upload**, because everything else — vertex count, draw calls, resolution, frame
@@ -138,12 +182,12 @@ picture needs at least a matrix to change. What the pair isolates is **how the c
 with mapped-write volume**, across four orders of magnitude of it. That is the more useful
 question, and it is the one (c)3's content-addressed assets exist to answer.
 
-### 3.5 Workspace registration
+### 3.6 Workspace registration
 
-Three entries are added to the workspace `members` list in the root `Cargo.toml`. This
-takes the workspace from twelve crates to fifteen, which makes the sentence "A Cargo
+Four entries are added to the workspace `members` list in the root `Cargo.toml`. This
+takes the workspace from twelve crates to sixteen, which makes the sentence "A Cargo
 workspace of twelve crates" in `CLAUDE.md` false — so `CLAUDE.md`'s crate count and crate
-list are updated **in the same change** that adds the crates, per its own self-update rule.
+list are updated **in the same change** that adds each crate, per its own self-update rule.
 This spec does not itself trigger that update, since a document adds no crates.
 
 ---
@@ -186,7 +230,7 @@ This is not merely an efficiency point, and it is not optional. Fixture B evalua
 fractal **per fragment**, so it only ever computes the visible region — it gets the
 triangular restriction for free, from the rasteriser. A fixture A that iterated the whole
 square would do about three times B's fractal arithmetic for reasons that have nothing to
-do with where the fractal is computed, which is the single property §3.4 claims the pair
+do with where the fractal is computed, which is the single property §3.5 claims the pair
 isolates. The comparison would be contaminated by a factor of three, silently.
 
 **The full megabyte is still written and still uploaded.** Only the *iteration* is
@@ -389,9 +433,14 @@ into what is drawn, determinism is gone and the fixtures are worthless.
 
 Mirrors `rayland-refapp/tests/native_render.rs`: run the binary on the host's own driver
 and assert known pixels on frame 0 and frame 119. Establishes that the picture is right
-when nothing else is involved. Like refapp's, these tests depend on no `rayland-*` crate —
-"renders correctly on its own" is exactly the baseline they exist to establish, and a
-baseline that linked Rayland would not be one.
+when nothing else is involved.
+
+These two test files are near-identical, and are deliberately **not** factored into a
+shared helper — the one place this design accepts duplication. A shared helper would have
+to live in a crate both fixtures depend on, and a baseline test's entire job is to
+establish "this program renders correctly with nothing else involved". A baseline that
+imported shared machinery would be testing that machinery too, which is exactly what it
+must not do.
 
 ### 8.3 Per fixture — e2e in `rayland-engine`
 

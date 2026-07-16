@@ -4,7 +4,9 @@
 
 **Goal:** Build two unmodified Vulkan applications — one computing a zooming Mandelbrot on the CPU into persistently-mapped memory, one computing it in a fragment shader — that texture a spinning icosahedron, so that Rayland finally has a workload which exercises the `vkMapMemory` problem (c)2 exists to solve.
 
-**Architecture:** Three crates. `rayland-icosa-core` is a GPU-free library holding everything the two fixtures must agree on: the icosahedron geometry, the frame-indexed animation schedule, the Mandelbrot math, and bit-exact `log2`/`sin`/`cos`. `rayland-icosa-cpu` and `rayland-icosa-gpu` are ordinary offscreen Vulkan binaries built on it, differing *only* in where the fractal is evaluated and therefore in how many bytes per frame cross mapped memory (~1 MiB versus ~128 B).
+**Architecture:** Four crates. `rayland-icosa-core` is a GPU-free library holding everything the two fixtures must agree on mathematically: the icosahedron geometry, the frame-indexed animation schedule, the Mandelbrot math, and bit-exact `log2`/`sin`/`cos`. `rayland-icosa-vk` holds everything they must agree on *graphically*: the Vulkan bring-up, the depth-tested render pass and pipeline, the render targets, the persistent-mapping helper, and the readback. `rayland-icosa-cpu` and `rayland-icosa-gpu` are then thin binaries over both, differing *only* in where the fractal is evaluated and therefore in how many bytes per frame cross mapped memory (~1 MiB versus ~128 B).
+
+**Why the scaffolding is shared and not copied:** the pair is an instrument, and an instrument's whole value is that everything except the property under study is held constant. The spec's §3.4 makes this argument for the math — "two copies would drift, and the moment they drift the comparison stops measuring what it claims" — and the argument is not weaker for the render loop. Sharing the code means the fixtures *cannot* drift in the parts that must be identical, rather than merely being expected not to. It also does not compromise their ordinariness: real Vulkan applications lean on helper libraries (VMA, vk-bootstrap) constantly, so a fixture with its Vulkan scaffolding in a library is more typical than one with 1200 lines of hand-rolled bring-up inline, not less.
 
 **Tech Stack:** Rust 2024, `ash` 0.38 (Vulkan), `image` 0.25 (PNG), `anyhow` 1. GLSL compiled to SPIR-V with `glslangValidator` and committed, per `shaders/README.md`.
 
@@ -14,10 +16,10 @@
 
 Every task's requirements implicitly include this section.
 
-- **The fixtures must not know they are being remoted.** Zero `rayland-*` dependencies in any of the three crates, including their tests. No mention of Venus, vtest, virglrenderer, sockets, rings, blobs, or remoting in code, comments, docs, or metadata. No environment probing, no conditional rendering paths, no command-line rendering options. (Spec §2.)
+- **The fixtures must not know they are being remoted.** Zero `rayland-*` dependencies in any of the four crates beyond `rayland-icosa-core` and `rayland-icosa-vk` (which are themselves Rayland-unaware), including in their tests. No mention of Venus, vtest, virglrenderer, sockets, rings, blobs, or remoting in code, comments, docs, or metadata. No environment probing, no conditional rendering paths, no command-line rendering options. (Spec §2.)
 - **No new flags, ever.** If a variant is needed it is a new binary with its own constants, not an option on an existing one. (Spec §2.)
 - **Rust edition 2024, `rust-version = "1.85"`**, matching the workspace.
-- **Licensing:** libraries LGPL-3.0-or-later, binaries GPL-3.0-or-later. All three crates `publish = false`, `version = "0.0.1"`.
+- **Licensing:** libraries LGPL-3.0-or-later, binaries GPL-3.0-or-later. All four crates `publish = false`, `version = "0.0.1"`.
 - **`repository = "https://github.com/perpetualbits/rayland"`** in every manifest.
 - **Comment discipline (`CLAUDE.md`):** a doc-comment block on every function, type, trait and module describing what it does, its inputs, outputs, failure modes and domain pitfalls; an intent comment on every non-trivial line explaining *why*, never restating syntax. Code and comments must always agree.
 - **No Claude/AI attribution** anywhere in code, comments, docs, or commit messages.
@@ -46,14 +48,22 @@ Tasks 1–4 give complete code: the math is exactly specifiable and its exactnes
 | `crates/rayland-icosa-core/src/fractal.rs` | Mandelbrot smooth-iteration + HSV→RGB; `render_fractal_into`. |
 | `crates/rayland-icosa-core/tests/log2_table.rs` | The committed bit-exactness contract for `log2`. |
 | `crates/rayland-icosa-core/tests/sin_cos_table.rs` | The committed bit-exactness contract for `sin_cos`. |
+| `crates/rayland-icosa-vk/Cargo.toml` | Manifest. `ash` + `image` + `anyhow` + `icosa-core`. |
+| `crates/rayland-icosa-vk/src/lib.rs` | Crate docs; re-exports. |
+| `crates/rayland-icosa-vk/src/context.rs` | Vulkan bring-up + memory allocation (adapted from refapp). |
+| `crates/rayland-icosa-vk/src/pipeline.rs` | Depth-tested render pass, graphics pipeline, descriptor layout. |
+| `crates/rayland-icosa-vk/src/targets.rs` | Colour target, depth target, readback buffer. |
+| `crates/rayland-icosa-vk/src/mapped.rs` | `MappedBuffer` — the persistent `HOST_COHERENT` mapping both fixtures write through. |
+| `crates/rayland-icosa-vk/src/scene.rs` | Vertex buffer, uniform block, draw-and-read-back, PNG write. |
+| `crates/rayland-icosa-vk/tests/renders_the_solid.rs` | The scaffolding draws a flat-shaded solid — proven without either fixture. |
 | `crates/rayland-icosa-cpu/Cargo.toml` | Fixture A manifest. |
-| `crates/rayland-icosa-cpu/src/main.rs` | Fixture A: constants, arg parsing, the frame loop, CSV. |
-| `crates/rayland-icosa-cpu/src/context.rs` | Vulkan bring-up + memory allocation (adapted from refapp). |
-| `crates/rayland-icosa-cpu/src/pipeline.rs` | Render pass with depth, graphics pipeline, descriptor layout. |
-| `crates/rayland-icosa-cpu/src/render.rs` | Targets, host buffers, the persistent map, texture upload, draw. |
+| `crates/rayland-icosa-cpu/src/main.rs` | Fixture A: the frame loop, the fractal, the CSV. |
+| `crates/rayland-icosa-cpu/src/texture.rs` | Fixture A's only unique code: the staging buffer, the texture, the upload. |
 | `crates/rayland-icosa-cpu/tests/native_render.rs` | Fixture A's baseline on the host's own driver. |
-| `crates/rayland-icosa-gpu/…` | Fixture B, same shape as A. |
-| `shaders/icosa.vert`, `icosa_textured.frag`, `icosa_fractal.frag` (+ `.spv`) | GLSL sources and committed SPIR-V. |
+| `crates/rayland-icosa-gpu/Cargo.toml` | Fixture B manifest. |
+| `crates/rayland-icosa-gpu/src/main.rs` | Fixture B: the frame loop and the CSV. No texture path at all. |
+| `crates/rayland-icosa-gpu/tests/native_render.rs` | Fixture B's baseline. |
+| `shaders/icosa.vert`, `icosa_flat.frag`, `icosa_textured.frag`, `icosa_fractal.frag` (+ `.spv`) | GLSL sources and committed SPIR-V. |
 | `crates/rayland-engine/tests/icosa_cpu_venus_e2e.rs` | Fixture A's end-to-end proof. |
 | `crates/rayland-engine/tests/icosa_gpu_venus_e2e.rs` | Fixture B's end-to-end proof. |
 
@@ -410,7 +420,7 @@ Expected: PASS — `log2_matches_the_committed_bit_patterns`, `log2_of_exact_pow
   the property under study, and two copies of this code would drift. LGPL, `publish = false`.
 ```
 
-(Later tasks bring the count to fourteen and fifteen; each fixes it in its own change.)
+(Later tasks bring the count to fourteen, fifteen and sixteen; each fixes it in its own change.)
 
 - [ ] **Step 7: Commit**
 
@@ -1776,91 +1786,95 @@ a sliver of the hue circle."
 
 ---
 
-### Task 5: `rayland-icosa-cpu` — the solid, shaded, one frame
+### Task 5: `rayland-icosa-vk` — the shared scaffolding draws the solid
 
 **Files:**
-- Create: `crates/rayland-icosa-cpu/Cargo.toml`
-- Create: `crates/rayland-icosa-cpu/src/main.rs`
-- Create: `crates/rayland-icosa-cpu/src/context.rs`
-- Create: `crates/rayland-icosa-cpu/src/pipeline.rs`
-- Create: `crates/rayland-icosa-cpu/src/render.rs`
-- Create: `shaders/icosa.vert`, `shaders/icosa_textured.frag` (+ committed `.spv`)
-- Test: `crates/rayland-icosa-cpu/tests/native_render.rs`
-- Modify: `Cargo.toml`, `CLAUDE.md`
+- Create: `crates/rayland-icosa-vk/Cargo.toml`, `src/lib.rs`, `src/context.rs`, `src/pipeline.rs`, `src/targets.rs`, `src/mapped.rs`, `src/scene.rs`
+- Create: `shaders/icosa.vert`, `shaders/icosa_flat.frag`, `shaders/icosa_textured.frag` (+ committed `.spv`)
+- Test: `crates/rayland-icosa-vk/tests/renders_the_solid.rs`
+- Modify: `Cargo.toml`, `CLAUDE.md`, `shaders/README.md`
 
 **Interfaces:**
 - Consumes: `rayland_icosa_core::{IMAGE_SIZE, geometry::{Vertex, icosahedron}, schedule::frame_mvp}`.
-- Produces: a binary `rayland-icosa-cpu <output-directory>` which, at this task's end, writes `frame_0000.png` — the solid, flat-shaded in a solid colour, no texture yet.
+- Produces:
+  - `VulkanContext::new() -> anyhow::Result<VulkanContext>`, with a public `device: ash::Device` and an `unsafe fn allocate(&self, requirements, properties) -> anyhow::Result<vk::DeviceMemory>`.
+  - `MappedBuffer::new(context, size, usage) -> anyhow::Result<MappedBuffer>`, with `.buffer -> vk::Buffer` and `.bytes(&mut self) -> &mut [u8]`.
+  - `Uniforms { mvp: [[f32; 4]; 4], half_width: f32, center: [f32; 2] }` — `#[repr(C)]`.
+  - `Scene::new(context: &VulkanContext, fragment_spirv: &[u32], sampler: Option<SamplerBinding>) -> anyhow::Result<Scene>`.
+  - `Scene::draw(&mut self, context, uniforms: &Uniforms) -> anyhow::Result<Vec<u8>>` — records, submits, waits, reads back `IMAGE_SIZE²` RGBA8 bytes.
+  - `write_png(path: &Path, pixels: &[u8]) -> anyhow::Result<()>`.
 
-**Why this task stops short of the texture:** the texture is the entire point of the fixture, and it is also the part most likely to fail against Rayland. Getting a shaded, depth-tested solid onto a PNG *first* means that when the textured version breaks, the depth buffer and the geometry are already known-good and the search space is one thing wide. This is the same reason `native_render.rs` exists at all.
+**Why this task exists, and why the fixtures come after it:** everything both fixtures must hold identical lives here, so that they *cannot* drift in it. It is also the riskiest code — this is the repository's first depth attachment — and proving it draws a correct, depth-tested solid *before* either fixture exists means that when a fixture later breaks, the scaffolding is already known-good and the search space is one thing wide.
+
+Note what is deliberately *not* shared: the frame loop, the CSV, and the texture path. Those are where the fixtures differ or where each states its own story, and a shared frame loop with an `if texture` in it would put the experiment's independent variable inside a library — exactly the place nobody looks.
 
 - [ ] **Step 1: Write the failing test**
 
-Create `crates/rayland-icosa-cpu/tests/native_render.rs`:
+Create `crates/rayland-icosa-vk/tests/renders_the_solid.rs`:
 
 ```rust
-//! The CPU fixture's **baseline**: it draws the right picture on this host's own GPU, with this
-//! host's own Vulkan driver, and nothing else involved.
+//! The scaffolding's **baseline**: it draws a correct, depth-tested, shaded solid on this host's
+//! own GPU, with this host's own Vulkan driver, and neither fixture involved.
 //!
-//! # Why this must pass before the end-to-end test is even attempted
-//! The end-to-end test spans an enormous amount of machinery. When something that long fails, the
-//! expensive question is *which link broke*. This test removes every link but the first: the app
-//! against the host's ordinary driver. If this passes and the end-to-end test fails, the app is
-//! provably not the problem. That localisation is the whole reason it is written and run first.
+//! # Why this is tested here rather than only through the fixtures
+//! Everything in this crate is shared by both fixtures, which means a defect here shows up as
+//! *both* of them being wrong — and two fixtures failing together is a far more confusing signal
+//! than one library failing alone. Proving the scaffolding independently means that when a fixture
+//! misbehaves later, this code is already excluded.
 //!
 //! # Skip, don't fail, without a GPU
 //! Following this repository's convention for GPU tests, absence of a render node is reported as a
 //! SKIP rather than a failure, so CI without one stays green and stays light.
 
-use image::GenericImageView;
+use rayland_icosa_core::{IMAGE_SIZE, schedule::frame_mvp};
+use rayland_icosa_vk::{Scene, Uniforms, VulkanContext};
 use std::path::Path;
-use std::process::Command;
 
 /// The DRM render node this repository's GPU tests gate on.
 const RENDER_NODE: &str = "/dev/dri/renderD128";
 
-/// The image edge length the app renders at. Asserted against the decoded PNG rather than assumed.
-const IMAGE_SIZE: u32 = 256;
+/// The flat-shading fragment shader, which needs no texture — so this test exercises the
+/// scaffolding without depending on either fixture's fractal.
+const FLAT_FRAGMENT_SPIRV: &[u8] = include_bytes!("../../../shaders/icosa_flat.frag.spv");
 
-/// The app must render a shaded solid: lit centre, empty corners.
+/// Read a pixel out of a readback buffer as RGBA.
+fn pixel(pixels: &[u8], x: u32, y: u32) -> [u8; 4] {
+    let offset = ((y * IMAGE_SIZE + x) * 4) as usize;
+    [pixels[offset], pixels[offset + 1], pixels[offset + 2], pixels[offset + 3]]
+}
+
+/// The scaffolding must draw a shaded solid: lit centre, cleared corners.
 ///
 /// The checks are chosen to distinguish the failures that actually happen. A centre that matches the
 /// background means the draw did not land — no geometry, wrong viewport, or every face culled. A
 /// corner that is *not* background means the solid is the wrong size or the projection is wrong.
 /// Together they pin "a solid of roughly the right size in the right place" without asserting a full
-/// hash, which is what the end-to-end test is for.
+/// hash, which is what the end-to-end tests are for.
 #[test]
-fn icosa_cpu_natively_renders_a_shaded_solid() {
+fn the_scaffolding_renders_a_shaded_solid() {
     if !Path::new(RENDER_NODE).exists() {
-        eprintln!("SKIP icosa_cpu_natively_renders_a_shaded_solid: no render node at {RENDER_NODE}");
+        eprintln!("SKIP the_scaffolding_renders_a_shaded_solid: no render node at {RENDER_NODE}");
         return;
     }
 
-    let output_dir = std::env::temp_dir().join("rayland-icosa-cpu-native");
-    // A stale directory from an earlier run would let a silently-failing binary "pass" on last
-    // run's artefacts. Removing it makes the files' existence real evidence of this run.
-    let _ = std::fs::remove_dir_all(&output_dir);
-    std::fs::create_dir_all(&output_dir).expect("the output directory must be creatable");
+    let context = VulkanContext::new().expect("a host with a render node must give a Vulkan device");
+    let spirv = ash::util::read_spv(&mut std::io::Cursor::new(FLAT_FRAGMENT_SPIRV))
+        .expect("the committed SPIR-V must be readable");
+    let mut scene = Scene::new(&context, &spirv, None).expect("the scene must build");
 
-    let status = Command::new(env!("CARGO_BIN_EXE_rayland-icosa-cpu"))
-        .arg(&output_dir)
-        .status()
-        .expect("the fixture binary must be launchable");
-    assert!(status.success(), "the fixture must exit successfully on a host with a GPU; got {status}");
-
-    let frame = image::open(output_dir.join("frame_0000.png"))
-        .expect("the app must have written a decodable PNG for frame 0");
+    let pixels = scene
+        .draw(&context, &Uniforms { mvp: frame_mvp(0), half_width: 1.5, center: [0.0, 0.0] })
+        .expect("the draw must succeed");
     assert_eq!(
-        frame.dimensions(),
-        (IMAGE_SIZE, IMAGE_SIZE),
-        "the app must render at its documented size"
+        pixels.len(),
+        (IMAGE_SIZE * IMAGE_SIZE * 4) as usize,
+        "the readback must be the documented size"
     );
 
     // The camera looks straight at the solid, so the image centre is always covered by a face.
-    let centre = frame.get_pixel(IMAGE_SIZE / 2, IMAGE_SIZE / 2);
     assert_ne!(
-        centre,
-        image::Rgba([0, 0, 0, 255]),
+        pixel(&pixels, IMAGE_SIZE / 2, IMAGE_SIZE / 2),
+        [0, 0, 0, 255],
         "the centre must be covered by a lit face, not the cleared background"
     );
 
@@ -1874,19 +1888,72 @@ fn icosa_cpu_natively_renders_a_shaded_solid() {
         (last, last, "bottom-right"),
     ] {
         assert_eq!(
-            frame.get_pixel(x, y),
-            image::Rgba([0, 0, 0, 255]),
+            pixel(&pixels, x, y),
+            [0, 0, 0, 255],
             "the {label} corner must still show the cleared background"
         );
     }
 
-    eprintln!("OK: the CPU fixture renders a shaded solid natively, with no remoting involved");
+    eprintln!("OK: the scaffolding renders a shaded, depth-tested solid");
+}
+
+/// Two draws of the same uniforms must produce the same pixels.
+///
+/// The scaffolding reuses one command buffer and one set of targets across frames, and the obvious
+/// bug there is state left behind — an un-cleared depth buffer, a stale descriptor. That would show
+/// up as frame N depending on frame N-1, which is fatal to a fixture whose entire premise is that
+/// frame N is a pure function of N.
+#[test]
+fn drawing_twice_gives_the_same_pixels() {
+    if !Path::new(RENDER_NODE).exists() {
+        eprintln!("SKIP drawing_twice_gives_the_same_pixels: no render node at {RENDER_NODE}");
+        return;
+    }
+
+    let context = VulkanContext::new().expect("a host with a render node must give a Vulkan device");
+    let spirv = ash::util::read_spv(&mut std::io::Cursor::new(FLAT_FRAGMENT_SPIRV))
+        .expect("the committed SPIR-V must be readable");
+    let mut scene = Scene::new(&context, &spirv, None).expect("the scene must build");
+
+    let uniforms = Uniforms { mvp: frame_mvp(0), half_width: 1.5, center: [0.0, 0.0] };
+    let first = scene.draw(&context, &uniforms).expect("the first draw must succeed");
+    // A different frame in between, so the second draw of frame 0 has to actually reset state
+    // rather than passively still be showing it.
+    let _ = scene
+        .draw(&context, &Uniforms { mvp: frame_mvp(37), half_width: 1.5, center: [0.0, 0.0] })
+        .expect("the intervening draw must succeed");
+    let second = scene.draw(&context, &uniforms).expect("the second draw must succeed");
+
+    assert_eq!(first, second, "the same uniforms must always produce the same pixels");
+}
+
+/// A different orientation must produce a different picture.
+#[test]
+fn a_different_orientation_gives_a_different_picture() {
+    if !Path::new(RENDER_NODE).exists() {
+        eprintln!("SKIP a_different_orientation_gives_a_different_picture: no render node at {RENDER_NODE}");
+        return;
+    }
+
+    let context = VulkanContext::new().expect("a host with a render node must give a Vulkan device");
+    let spirv = ash::util::read_spv(&mut std::io::Cursor::new(FLAT_FRAGMENT_SPIRV))
+        .expect("the committed SPIR-V must be readable");
+    let mut scene = Scene::new(&context, &spirv, None).expect("the scene must build");
+
+    let first = scene
+        .draw(&context, &Uniforms { mvp: frame_mvp(0), half_width: 1.5, center: [0.0, 0.0] })
+        .expect("the draw must succeed");
+    let later = scene
+        .draw(&context, &Uniforms { mvp: frame_mvp(60), half_width: 1.5, center: [0.0, 0.0] })
+        .expect("the draw must succeed");
+
+    assert_ne!(first, later, "the mvp must actually reach the shader");
 }
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p rayland-icosa-cpu`
+Run: `cargo test -p rayland-icosa-vk`
 Expected: FAIL — the package does not exist yet.
 
 - [ ] **Step 3: Write the shaders**
@@ -1959,7 +2026,7 @@ void main() {
 }
 ```
 
-For this task, the texture does not exist yet. Create a temporary `shaders/icosa_flat.frag` — identical but with `out_color = vec4(vec3(0.9, 0.5, 0.2) * light, 1.0);` and no sampler — use it for this task, and **delete it in Task 6** when the real texture arrives. This is what lets the depth-and-geometry half be proven before the texture half is written.
+Create `shaders/icosa_flat.frag` — identical to `icosa_textured.frag` but with no sampler and `out_color = vec4(vec3(0.9, 0.5, 0.2) * light, 1.0);`. This one is **permanent**, not scaffolding to delete: it is what lets `rayland-icosa-vk`'s own test prove the geometry, the depth buffer and the lighting without depending on either fixture's fractal. Document that in its header, so nobody later removes it as unused — no *binary* references it, only the library's test.
 
 Compile all three, per `shaders/README.md`:
 
@@ -1974,60 +2041,55 @@ Update `shaders/README.md` to list the new sources and their regeneration comman
 
 - [ ] **Step 4: Write the manifest and the Vulkan bring-up**
 
-Create `crates/rayland-icosa-cpu/Cargo.toml`:
+Create `crates/rayland-icosa-vk/Cargo.toml`:
 
 ```toml
-# An ordinary off-screen Vulkan program that draws a spinning, fractal-textured icosahedron, with
-# the fractal computed on this machine's CPU and uploaded to the GPU every frame.
+# The Vulkan scaffolding the two icosahedron fixtures share: bring-up, the depth-tested render pass
+# and pipeline, the render targets, the persistent host mapping, and the readback.
 #
-# This crate is deliberately unaware of everything around it. It depends on no `rayland-*` crate
-# except `rayland-icosa-core`, which is pure mathematics and knows nothing either. It contains no
-# mention of remoting, and it cannot tell whether its rendering is happening locally. That ignorance
-# is the whole point: an application that knew it was being remoted would prove nothing, and the
-# only way to be sure the interception is invisible is for the program to have no way to see it.
+# Everything the two fixtures must hold *identical* lives here, so that they cannot drift in it. The
+# pair exists to be compared, and a comparison is only meaningful if everything except the property
+# under study is held constant; two hand-maintained copies of a render loop would not stay constant,
+# they would stay *approximately* constant, which is not the same thing and is much harder to notice.
 #
-# A BINARY crate, so per the repository license policy it is GPL-3.0-or-later.
+# This crate knows nothing about remoting, exactly as the fixtures do not. It depends only on
+# `rayland-icosa-core` (pure mathematics) and on ordinary third-party crates. That a fixture's Vulkan
+# scaffolding lives in a library does not make it unusual — real Vulkan applications lean on helper
+# libraries (VMA, vk-bootstrap) constantly; a program with 1200 lines of hand-rolled bring-up inline
+# would be the less typical one.
+#
+# A LIBRARY crate, so per the repository license policy it is LGPL-3.0-or-later.
 [package]
-name = "rayland-icosa-cpu"
+name = "rayland-icosa-vk"
 version = "0.0.1"
 edition = "2024"
 rust-version = "1.85"
-description = "An ordinary off-screen Vulkan program drawing a spinning icosahedron textured with a CPU-computed fractal."
-license = "GPL-3.0-or-later"
+description = "Shared Vulkan scaffolding for the icosahedron fixtures: bring-up, depth-tested pipeline, targets, mapping, readback."
+license = "LGPL-3.0-or-later"
 repository = "https://github.com/perpetualbits/rayland"
 publish = false
 
-[[bin]]
-name = "rayland-icosa-cpu"
-path = "src/main.rs"
-
 [dependencies]
-rayland-icosa-core = { path = "../rayland-icosa-core" }  # geometry, schedule, fractal — no GPU, no remoting
-ash = { workspace = true }                               # thin Vulkan bindings; the only way this program talks to a GPU
+rayland-icosa-core = { path = "../rayland-icosa-core" }  # geometry and schedule — no GPU, no remoting
+ash = { workspace = true }                               # thin Vulkan bindings; the only way this code talks to a GPU
 image = { workspace = true }                             # PNG encoding of the pixels read back from the GPU
-anyhow = { workspace = true }                            # top-level error handling, per the repo's binary-crate convention
-
-[dev-dependencies]
-# The native test re-reads the PNGs the binary wrote and inspects individual pixels. Deliberately
-# no `rayland-*` crate beyond the fixture's own: "renders correctly on its own" is exactly the
-# baseline these tests establish, and a baseline that linked the system under test would not be one.
-image = { workspace = true }
+anyhow = { workspace = true }                            # error handling
 ```
 
-Create `crates/rayland-icosa-cpu/src/context.rs` by copying `crates/rayland-refapp/src/context.rs` and adapting it. That file already does exactly what is needed — instance creation, physical-device selection, queue-family selection, logical device, command pool, and an `allocate` helper that finds a memory type by property flags — and it is already reviewed and working. Changes required:
+Create `crates/rayland-icosa-vk/src/context.rs` by copying `crates/rayland-refapp/src/context.rs` and adapting it. That file already does exactly what is needed — instance creation, physical-device selection, queue-family selection, logical device, command pool, and an `allocate` helper that finds a memory type by property flags — and it is already reviewed and working. Changes required:
 
-1. Rename the crate references in the module docs; keep the same structure and comment density.
-2. `VulkanContext::new` needs no new extensions; the fixture is offscreen, exactly as refapp is.
+1. Update the module docs to describe this crate rather than refapp; keep the same structure and comment density.
+2. `VulkanContext::new` needs no new extensions; this is offscreen rendering, exactly as refapp is.
 
 Add the crate to the workspace `members` in the root `Cargo.toml`:
 
 ```toml
-    "crates/rayland-icosa-cpu",      # fixture A: fractal on the CPU, uploaded per frame
+    "crates/rayland-icosa-vk",       # shared Vulkan scaffolding for the icosahedron fixtures
 ```
 
 - [ ] **Step 5: Write the pipeline, with depth**
 
-Create `crates/rayland-icosa-cpu/src/pipeline.rs`, modelled on `crates/rayland-refapp/src/pipeline.rs`. Everything there carries over except that this pipeline has a **depth attachment**, a **vertex layout with three attributes**, and a **descriptor set**. The novel parts, in full:
+Create `crates/rayland-icosa-vk/src/pipeline.rs`, modelled on `crates/rayland-refapp/src/pipeline.rs`. Everything there carries over except that this pipeline has a **depth attachment**, a **vertex layout with three attributes**, and a **descriptor set**. The novel parts, in full:
 
 ```rust
 /// The format of the colour attachment, and of the PNG written from it.
@@ -2117,60 +2179,63 @@ let attributes = [
 
 Back-face culling is enabled (`cull_mode(vk::CullModeFlags::BACK)`, `front_face(vk::FrontFace::COUNTER_CLOCKWISE)`), matching the winding the geometry table produces. Do not disable culling to "fix" a missing face — that would mask a mis-wound face in the table, which Task 3's `all_normals_point_outward` test is the right place to catch.
 
-The descriptor set layout has two bindings: binding 0 a `UNIFORM_BUFFER` visible to both stages, binding 1 a `COMBINED_IMAGE_SAMPLER` visible to the fragment stage. For this task the fragment shader is `icosa_flat.frag` and does not use binding 1, but declare both now so Task 6 changes only the shader.
-
-- [ ] **Step 6: Write the render module and main, for one frame**
-
-Create `crates/rayland-icosa-cpu/src/render.rs`, modelled on `crates/rayland-refapp/src/render.rs`'s `ColorTarget` and `HostBuffer`. Add a `DepthTarget` alongside `ColorTarget` — a `D32_SFLOAT` image with `DEVICE_LOCAL` memory and a `DEPTH` aspect image view, no readback path, since nothing reads it.
-
-Create `crates/rayland-icosa-cpu/src/main.rs`. For this task it renders frame 0 only:
+The descriptor set layout's binding 0 is always a `UNIFORM_BUFFER` visible to both stages. Binding 1 — a `COMBINED_IMAGE_SAMPLER` visible to the fragment stage — is present only when `Scene::new` is given a sampler:
 
 ```rust
-//! **An ordinary off-screen Vulkan program.** It draws a spinning icosahedron, textured with a
-//! zooming Mandelbrot fractal that it computes on this machine's CPU, and writes each frame to a
-//! PNG. That is all it does.
-//!
-//! # Usage
-//! ```text
-//! rayland-icosa-cpu <output-directory>
-//! ```
-//! Writes `frame_0000.png` … `frame_0119.png` into the directory, and prints per-frame timings to
-//! stdout as CSV.
-//!
-//! # Pitfall for anyone changing this
-//! Resist the temptation to make it "better" in ways that make it special. No command-line
-//! rendering options, no environment probing, no conditional paths. Its value is precisely that it
-//! is boring and typical.
+/// The texture a fragment shader samples, if it samples one.
+///
+/// `Scene` takes this as an `Option` rather than always declaring binding 1, because a descriptor
+/// set layout that declares a binding no shader reads is not free: validation layers warn about it,
+/// and every set written against it must still supply something. The GPU fixture has no texture at
+/// all — passing `None` is an honest statement of that, and a dummy 1×1 image would be a fiction
+/// that made the two fixtures look more alike than they are.
+pub struct SamplerBinding {
+    /// The view the shader samples through.
+    pub view: vk::ImageView,
+    /// The sampler's filtering and addressing rules.
+    pub sampler: vk::Sampler,
+}
 ```
 
-Parse exactly one argument, the output directory. Bring up the context, build the pipeline, allocate the targets, upload the vertex buffer once, write `frame_mvp(0)` into the uniform buffer, draw, read back, write `frame_0000.png`.
+- [ ] **Step 6: Write the targets, the mapping, and the scene**
 
-- [ ] **Step 7: Run the test to verify it passes**
+Create `crates/rayland-icosa-vk/src/targets.rs`, modelled on `crates/rayland-refapp/src/render.rs`'s `ColorTarget` and `HostBuffer`. Add a `DepthTarget` alongside `ColorTarget` — a `D32_SFLOAT` image with `DEVICE_LOCAL` memory and a `DEPTH` aspect image view, no readback path, since nothing reads it.
 
-Run: `cargo test -p rayland-icosa-cpu`
-Expected: PASS — `icosa_cpu_natively_renders_a_shaded_solid`. On a host with no render node: SKIP.
+Create `crates/rayland-icosa-vk/src/mapped.rs` holding `MappedBuffer` — the persistent `HOST_VISIBLE | HOST_COHERENT` mapping. **Its full implementation and documentation are given in Task 6 Step 3**; write it here, in this crate, because both fixtures use it: the CPU fixture for its megabyte of fractal, the GPU fixture for its uniforms. That both fixtures write through the same mapping helper is the point — it makes concrete that the GPU fixture does not "avoid" mapped memory, it merely writes less of it.
 
-Then look at `/tmp/rayland-icosa-cpu-native/frame_0000.png`. You should see a clearly faceted icosahedron, lit from the upper right, in orange, on black — with **hard edges between faces**. If the faces blend smoothly into one another, the normals are being shared or interpolated and Task 3's construction should be suspected. If the solid looks scrambled, with faces visibly punching through one another, depth testing is not enabled.
+Create `crates/rayland-icosa-vk/src/scene.rs` holding the vertex buffer (uploaded once from `icosahedron()`), the `Uniforms` block, the descriptor set, the command buffer, the fence, and `Scene::draw` — which writes the uniforms, records, submits, waits, and reads the colour target back. Plus `write_png`.
+
+`Scene::draw` must wait on its fence **before** returning the readback and **before** any caller could overwrite mapped memory the previous frame is still reading. Document that contract on `draw`: the fixtures rely on it, and neither of them can see the fence.
+
+- [ ] **Step 7: Run the tests to verify they pass**
+
+Run: `cargo test -p rayland-icosa-vk`
+Expected: PASS — `the_scaffolding_renders_a_shaded_solid`, `drawing_twice_gives_the_same_pixels`, `a_different_orientation_gives_a_different_picture`. On a host with no render node: SKIP.
+
+Then eyeball it. Add a temporary line to the first test writing the pixels out with `write_png`, run it, open the file, and **delete the temporary line**. You should see a clearly faceted icosahedron, lit from the upper right, in orange, on black — with **hard edges between faces**. If the faces blend smoothly into one another, the normals are being shared or interpolated and Task 3's construction should be suspected. If the solid looks scrambled, with faces visibly punching through one another, depth testing is not enabled.
 
 - [ ] **Step 8: Update `CLAUDE.md` and commit**
 
 Change the crate count from "thirteen" to "fourteen" and add the crate entry, after `rayland-icosa-core`:
 
 ```markdown
-- **`crates/rayland-icosa-cpu`** — fixture A: an ordinary offscreen Vulkan program drawing a
-  spinning icosahedron textured with a fractal it computes on **its own CPU** and writes into
-  persistently-mapped memory every frame. Depends only on `rayland-icosa-core` (pure mathematics)
-  and knows nothing about remoting. GPL, `publish = false`.
+- **`crates/rayland-icosa-vk`** — the Vulkan scaffolding both icosahedron fixtures share: bring-up,
+  the depth-tested render pass and pipeline, the targets, the persistent host mapping, and the
+  readback. It exists so the two fixtures **cannot** drift in the parts that must be identical for
+  their comparison to mean anything — the same argument `rayland-icosa-core` rests on, applied to
+  the render loop. Knows nothing about remoting. LGPL, `publish = false`.
 ```
 
 ```bash
-git add crates/rayland-icosa-cpu Cargo.toml CLAUDE.md shaders/
-git commit -m "icosa Task 5: the CPU fixture draws a shaded, depth-tested solid
+git add crates/rayland-icosa-vk Cargo.toml CLAUDE.md shaders/
+git commit -m "icosa Task 5: the shared Vulkan scaffolding draws the solid
 
-Frame 0 only, flat-shaded in a solid colour — the texture comes next. Stopping
-here is deliberate: the texture is the part most likely to break against the
-remoting path, and proving the geometry and the depth buffer first means that
-when it does break, the search space is one thing wide.
+Everything the two fixtures must hold identical lives here, so that they
+cannot drift in it — the same argument icosa-core rests on, applied to the
+render loop rather than the arithmetic. Proven on its own, with a flat shader
+and neither fixture in the picture, because a defect in shared code shows up
+as both fixtures being wrong at once, which is a far more confusing signal
+than one library failing alone.
 
 This is the repository's first depth attachment. D32_SFLOAT because the spec
 requires every implementation to support it, so no format negotiation is
@@ -2179,22 +2244,106 @@ needed on the very path being brought up."
 
 ---
 
-### Task 6: `rayland-icosa-cpu` — the mapped fractal, all 120 frames
+### Task 6: `rayland-icosa-cpu` — fixture A: the mapped fractal, 120 frames
 
 **Files:**
-- Modify: `crates/rayland-icosa-cpu/src/render.rs`, `src/main.rs`, `src/pipeline.rs`
-- Delete: `shaders/icosa_flat.frag`, `shaders/icosa_flat.frag.spv`
-- Modify: `crates/rayland-icosa-cpu/tests/native_render.rs`
+- Create: `crates/rayland-icosa-cpu/Cargo.toml`, `src/main.rs`, `src/texture.rs`
+- Test: `crates/rayland-icosa-cpu/tests/native_render.rs`
+- Modify: `Cargo.toml`, `CLAUDE.md`
 
 **Interfaces:**
-- Consumes: everything from Task 5, plus `rayland_icosa_core::{TEXTURE_SIZE, FRAME_COUNT, fractal::render_into, schedule::frame_zoom}`.
-- Produces: the finished fixture A — `frame_0000.png` … `frame_0119.png` plus a CSV timing report on stdout.
+- Consumes: `rayland_icosa_vk::{VulkanContext, MappedBuffer, Scene, SamplerBinding, Uniforms, write_png}` (Task 5); `rayland_icosa_core::{TEXTURE_SIZE, FRAME_COUNT, IMAGE_SIZE, fractal::render_into, schedule::{frame_mvp, frame_zoom, CENTER}}` (Tasks 1–4).
+- Produces: a binary `rayland-icosa-cpu <output-directory>` writing `frame_0000.png` … `frame_0119.png` plus a CSV timing report on stdout.
 
 **This is the task the whole fixture exists for.** Everything before it was scaffolding.
 
-- [ ] **Step 1: Extend the test**
+Because Task 5 owns the Vulkan, this crate is small: a manifest, the texture path (`texture.rs` — the staging buffer, the texture image, the sampler, the upload submission), and the frame loop (`main.rs`). That smallness is the point — what is left in this crate is exactly what makes it *the CPU fixture* rather than the other one.
 
-Add to `crates/rayland-icosa-cpu/tests/native_render.rs`:
+- [ ] **Step 1: Write the failing test**
+
+Create `crates/rayland-icosa-cpu/tests/native_render.rs`. It begins with the same preamble as `rayland-icosa-vk`'s test — the `RENDER_NODE` gate and the skip-don't-fail convention — but drives the **binary**, because what is under test here is the whole program including its frame loop, its file output and its CSV, none of which a library test can see:
+
+```rust
+//! The CPU fixture's **baseline**: the whole program draws the right pictures on this host's own
+//! GPU, with this host's own Vulkan driver, and no remoting involved.
+//!
+//! # Why this must pass before the end-to-end test is even attempted
+//! The end-to-end test spans an enormous amount of machinery. When something that long fails, the
+//! expensive question is *which link broke*. This test removes every link but the first. If this
+//! passes and the end-to-end test fails, the app is provably not the problem. That localisation is
+//! the whole reason it is written and run first.
+//!
+//! # Why this drives the binary rather than the library
+//! `rayland-icosa-vk`'s own test already proves the scaffolding renders. What is unproven here is
+//! everything this crate adds: the frame loop, the per-frame fractal, the upload, the file naming
+//! and the timing report. Only running the actual executable exercises those.
+
+use image::GenericImageView;
+use std::path::Path;
+use std::process::Command;
+
+/// The DRM render node this repository's GPU tests gate on.
+const RENDER_NODE: &str = "/dev/dri/renderD128";
+
+/// The image edge length the app renders at. Asserted against the decoded PNG rather than assumed.
+const IMAGE_SIZE: u32 = 256;
+
+/// The app must render a shaded, textured solid: lit centre, cleared corners.
+///
+/// A centre that matches the background means the draw did not land. A corner that is *not*
+/// background means the solid is the wrong size or the projection is wrong. Together they pin "a
+/// solid of roughly the right size in the right place" without asserting a full hash, which is what
+/// the end-to-end test is for.
+#[test]
+fn icosa_cpu_natively_renders_a_textured_solid() {
+    if !Path::new(RENDER_NODE).exists() {
+        eprintln!("SKIP icosa_cpu_natively_renders_a_textured_solid: no render node at {RENDER_NODE}");
+        return;
+    }
+
+    let output_dir = std::env::temp_dir().join("rayland-icosa-cpu-native");
+    // A stale directory from an earlier run would let a silently-failing binary "pass" on last
+    // run's artefacts. Removing it makes the files' existence real evidence of this run.
+    let _ = std::fs::remove_dir_all(&output_dir);
+    std::fs::create_dir_all(&output_dir).expect("the output directory must be creatable");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_rayland-icosa-cpu"))
+        .arg(&output_dir)
+        .status()
+        .expect("the fixture binary must be launchable");
+    assert!(status.success(), "the fixture must exit successfully on a host with a GPU; got {status}");
+
+    let frame = image::open(output_dir.join("frame_0000.png"))
+        .expect("the app must have written a decodable PNG for frame 0");
+    assert_eq!(
+        frame.dimensions(),
+        (IMAGE_SIZE, IMAGE_SIZE),
+        "the app must render at its documented size"
+    );
+
+    assert_ne!(
+        frame.get_pixel(IMAGE_SIZE / 2, IMAGE_SIZE / 2),
+        image::Rgba([0, 0, 0, 255]),
+        "the centre must be covered by a lit face, not the cleared background"
+    );
+
+    let last = IMAGE_SIZE - 1;
+    for (x, y, label) in [
+        (0, 0, "top-left"),
+        (last, 0, "top-right"),
+        (0, last, "bottom-left"),
+        (last, last, "bottom-right"),
+    ] {
+        assert_eq!(
+            frame.get_pixel(x, y),
+            image::Rgba([0, 0, 0, 255]),
+            "the {label} corner must still show the cleared background"
+        );
+    }
+}
+```
+
+and continues with:
 
 ```rust
 /// The app must render all 120 frames, and they must differ from one another.
@@ -2272,29 +2421,36 @@ fn icosa_cpu_prints_a_timing_report() {
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p rayland-icosa-cpu`
-Expected: FAIL — `icosa_cpu_renders_all_frames_and_they_differ` fails on the missing `frame_0001.png`; `icosa_cpu_prints_a_timing_report` fails on empty stdout.
+Expected: FAIL — the package does not exist yet.
 
-- [ ] **Step 3: Add the persistently-mapped staging buffer**
+- [ ] **Step 3: Write `MappedBuffer` (in `rayland-icosa-vk`) and the texture path**
 
-In `crates/rayland-icosa-cpu/src/render.rs`, add:
+`MappedBuffer` belongs to Task 5's crate — `crates/rayland-icosa-vk/src/mapped.rs` — because both fixtures write through it. It is specified here because this is where it first matters. Written against `MappedBuffer::new(context, size, usage)`, the CPU fixture's staging buffer is `MappedBuffer::new(&context, TEXTURE_SIZE² × 4, vk::BufferUsageFlags::TRANSFER_SRC)` and its uniform buffer is `MappedBuffer::new(&context, size_of::<Uniforms>(), vk::BufferUsageFlags::UNIFORM_BUFFER)`.
 
 ```rust
-/// The fractal's staging buffer: host-visible memory the CPU writes and the GPU copies from.
+/// Host-visible memory the CPU writes through and the GPU reads, mapped once and never unmapped.
 ///
 /// # The pointer is held for the program's whole life
-/// `vkMapMemory` is called **once**, in [`FractalStaging::new`], and the raw pointer it returns is
+/// `vkMapMemory` is called **once**, in [`MappedBuffer::new`], and the raw pointer it returns is
 /// kept and written through on every frame thereafter. This is not an optimisation; it is what
-/// ordinary Vulkan programs do, and doing anything else here would make this fixture unrepresentative
-/// of the applications it stands in for. Mapping and unmapping around each write would be slower and
-/// would also be a lie.
+/// ordinary Vulkan programs do, and doing anything else here would make the fixtures
+/// unrepresentative of the applications they stand in for. Mapping and unmapping around each write
+/// would be slower and would also be a lie.
 ///
 /// # The memory is HOST_COHERENT, so there is no flush
 /// Coherent memory needs no `vkFlushMappedMemoryRanges`: the specification guarantees the write is
-/// visible to the device without one. So this program makes **no Vulkan call whatsoever** between
-/// writing a megabyte of pixels and issuing the copy that reads them. That is the ordinary, correct,
-/// idiomatic thing to do, and it is chosen here deliberately rather than incidentally.
-pub struct FractalStaging {
-    /// The buffer the copy command reads from.
+/// visible to the device without one. So a program using this type makes **no Vulkan call
+/// whatsoever** between writing its bytes and issuing the command that reads them. That is the
+/// ordinary, correct, idiomatic thing to do, and it is chosen here deliberately rather than
+/// incidentally.
+///
+/// # Both fixtures use this, which is the point
+/// The CPU fixture writes a megabyte of fractal through it each frame; the GPU fixture writes
+/// roughly 128 bytes of uniforms. Neither flushes, and neither makes any interceptable call. The
+/// difference between the fixtures is the *volume* of these writes, not their presence — and having
+/// one type serve both is what keeps that honest.
+pub struct MappedBuffer {
+    /// The buffer the GPU reads from.
     pub buffer: vk::Buffer,
     /// The memory backing it. Freed on drop, after the mapping is torn down.
     memory: vk::DeviceMemory,
@@ -2304,57 +2460,67 @@ pub struct FractalStaging {
     size: usize,
 }
 
-impl FractalStaging {
-    /// Allocate the staging buffer and map it, once.
+impl MappedBuffer {
+    /// Allocate a host-visible buffer and map it, once.
+    ///
+    /// # Inputs and outputs
+    /// `size` in bytes; `usage` says what the GPU will do with it (`TRANSFER_SRC` for a staging
+    /// buffer, `UNIFORM_BUFFER` for uniforms).
     ///
     /// # Failure modes
     /// Returns an error if the allocation fails or if no memory type is both `HOST_VISIBLE` and
     /// `HOST_COHERENT`. The latter cannot happen on a conformant implementation — Vulkan requires at
     /// least one such type to exist — but is reported rather than assumed.
-    pub unsafe fn new(context: &VulkanContext, size: usize) -> anyhow::Result<FractalStaging> {
-        let buffer_info = vk::BufferCreateInfo::default()
-            .size(size as u64)
-            // TRANSFER_SRC: this buffer is only ever the source of a copy into the texture image.
-            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let buffer = context.device.create_buffer(&buffer_info, None)?;
+    pub fn new(
+        context: &VulkanContext,
+        size: usize,
+        usage: vk::BufferUsageFlags,
+    ) -> anyhow::Result<MappedBuffer> {
+        // Safe: every handle below is created from `context`'s own device and is owned by the
+        // returned value, which tears them down in the right order on drop.
+        unsafe {
+            let buffer_info = vk::BufferCreateInfo::default()
+                .size(size as u64)
+                .usage(usage)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let buffer = context.device.create_buffer(&buffer_info, None)?;
 
-        let requirements = context.device.get_buffer_memory_requirements(buffer);
-        // HOST_VISIBLE so the CPU can map it at all; HOST_COHERENT so no explicit flush is needed.
-        // See the type's documentation for why coherent is the deliberate choice and not a shortcut.
-        let memory = allocate(
-            context,
-            requirements,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )?;
-        context.device.bind_buffer_memory(buffer, memory, 0)?;
+            let requirements = context.device.get_buffer_memory_requirements(buffer);
+            // HOST_VISIBLE so the CPU can map it at all; HOST_COHERENT so no explicit flush is
+            // needed. See the type's documentation for why coherent is deliberate, not a shortcut.
+            let memory = context.allocate(
+                requirements,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )?;
+            context.device.bind_buffer_memory(buffer, memory, 0)?;
 
-        // The one and only map. From here until drop, the CPU writes through this pointer.
-        let mapped = context
-            .device
-            .map_memory(memory, 0, size as u64, vk::MemoryMapFlags::empty())?
-            as *mut u8;
+            // The one and only map. From here until drop, the CPU writes through this pointer.
+            let mapped = context
+                .device
+                .map_memory(memory, 0, size as u64, vk::MemoryMapFlags::empty())?
+                as *mut u8;
 
-        Ok(FractalStaging { buffer, memory, mapped, size })
+            Ok(MappedBuffer { buffer, memory, mapped, size })
+        }
     }
 
-    /// The mapped bytes, as a slice the fractal renderer can fill.
+    /// The mapped bytes, as a slice the caller can fill.
     ///
     /// # Failure modes
     /// None, but the returned slice aliases GPU-visible memory: writing to it while the device is
-    /// reading from it is a data race that Vulkan does not protect against. The frame loop's fence
-    /// wait is what makes this safe, and it is the caller's job to have done it.
-    pub fn pixels(&mut self) -> &mut [u8] {
-        // Safe because `mapped` is valid for `size` bytes from construction until drop, and `&mut
-        // self` guarantees no other Rust reference to it exists.
+    /// reading from it is a data race Vulkan does not protect against. `Scene::draw`'s fence wait
+    /// is what makes this safe, and it is the caller's job to have done it.
+    pub fn bytes(&mut self) -> &mut [u8] {
+        // Safe: `mapped` is valid for `size` bytes from construction until drop, and `&mut self`
+        // guarantees no other Rust reference to it exists.
         unsafe { std::slice::from_raw_parts_mut(self.mapped, self.size) }
     }
 }
 ```
 
-`Drop` must `unmap_memory` before `free_memory` and destroy the buffer, in that order.
+`Drop` must `unmap_memory`, then `free_memory`, then destroy the buffer, in that order.
 
-Add a `FractalTexture` beside it: a `DEVICE_LOCAL` `R8G8B8A8_UNORM` image of `TEXTURE_SIZE` square with `TRANSFER_DST | SAMPLED` usage, its image view, and a `vk::Sampler` with `LINEAR` filtering and `CLAMP_TO_EDGE` addressing.
+Then create `crates/rayland-icosa-cpu/src/texture.rs` — **this crate's only unique code besides its frame loop**. It holds `FractalTexture`: a `DEVICE_LOCAL` `R8G8B8A8_UNORM` image of `TEXTURE_SIZE` square with `TRANSFER_DST | SAMPLED` usage, its image view, a `vk::Sampler` with `LINEAR` filtering and `CLAMP_TO_EDGE` addressing, and an `upload(&self, context, staging: &MappedBuffer)` that records and submits the layout transitions and the `vkCmdCopyBufferToImage`. It exposes a `SamplerBinding` for `Scene::new`.
 
 - [ ] **Step 4: Write the frame loop**
 
@@ -2368,56 +2534,67 @@ Replace the single-frame body of `main.rs` with:
 println!("frame,fractal_us,upload_us,draw_readback_us");
 
 for frame in 0..rayland_icosa_core::FRAME_COUNT {
-    // Wait for the previous frame to finish before touching the mapped memory it was reading from.
-    // Without this the CPU would overwrite the staging buffer while the GPU's copy was still in
-    // flight, and the texture would be a torn mixture of two frames — which looks exactly like a
-    // corrupted transport and would be a miserable thing to debug.
-    wait_for_previous_frame(&context, fence)?;
-
     // 1. The fractal, straight into mapped host-visible memory. No Vulkan call is involved in this
     //    step at all: it is a plain memory write through a pointer obtained once at startup.
+    //
+    //    `Scene::draw` waited on its fence before returning last frame's pixels, so the GPU is
+    //    provably finished with this buffer. Without that guarantee the CPU would overwrite the
+    //    staging buffer while the GPU's copy was still in flight and the texture would be a torn
+    //    mixture of two frames — which looks exactly like a corrupted transport and would be a
+    //    miserable thing to debug.
     let fractal_start = Instant::now();
     rayland_icosa_core::fractal::render_into(
-        staging.pixels(),
+        staging.bytes(),
         rayland_icosa_core::schedule::frame_zoom(frame),
     );
     let fractal_us = fractal_start.elapsed().as_micros();
 
-    // 2. The matrix, likewise straight into mapped memory.
-    write_uniforms(&mut uniforms, rayland_icosa_core::schedule::frame_mvp(frame));
-
-    // 3. The upload: the copy command that reads what step 1 wrote.
+    // 2. The upload: the copy command that reads what step 1 wrote. This is the only Vulkan call
+    //    that touches the megabyte, and it says nothing about which bytes changed.
     let upload_start = Instant::now();
-    record_and_submit_upload(&context, &staging, &texture)?;
+    texture.upload(&context, &staging)?;
     let upload_us = upload_start.elapsed().as_micros();
 
-    // 4. Draw and read back.
+    // 3. Draw and read back. The matrix goes into mapped uniform memory inside `draw`.
     let draw_start = Instant::now();
-    record_and_submit_draw(&context, &pipeline, &targets, fence)?;
-    let pixels = read_back(&context, &targets)?;
+    let pixels = scene.draw(
+        &context,
+        &Uniforms {
+            mvp: rayland_icosa_core::schedule::frame_mvp(frame),
+            // Present but unread by this fixture's fragment shader: the uniform block's layout is
+            // shared with the GPU fixture, whose shader does read them. Keeping one layout is what
+            // lets `rayland-icosa-vk` serve both without a conditional.
+            half_width: rayland_icosa_core::schedule::frame_zoom(frame) as f32,
+            center: [
+                rayland_icosa_core::schedule::CENTER.0 as f32,
+                rayland_icosa_core::schedule::CENTER.1 as f32,
+            ],
+        },
+    )?;
     let draw_readback_us = draw_start.elapsed().as_micros();
 
-    // 5. The artefact. Written by the application itself, from pixels it read back — not by anything
+    // 4. The artefact. Written by the application itself, from pixels it read back — not by anything
     //    else on its behalf.
-    let path = output_dir.join(format!("frame_{frame:04}.png"));
-    image::save_buffer(
-        &path,
-        &pixels,
-        rayland_icosa_core::IMAGE_SIZE,
-        rayland_icosa_core::IMAGE_SIZE,
-        image::ColorType::Rgba8,
-    )?;
+    rayland_icosa_vk::write_png(&output_dir.join(format!("frame_{frame:04}.png")), &pixels)?;
 
     println!("{frame},{fractal_us},{upload_us},{draw_readback_us}");
 }
 ```
 
-Switch the pipeline to `icosa_textured.frag.spv`, write the descriptor set's binding 1 to the texture's view and sampler, and delete `shaders/icosa_flat.frag` and its `.spv`.
+The scene is built with `Scene::new(&context, &textured_frag_spirv, Some(texture.sampler_binding()))`.
 
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `cargo test -p rayland-icosa-cpu`
-Expected: PASS — all four native tests.
+Expected: PASS — `icosa_cpu_natively_renders_a_textured_solid`, `icosa_cpu_renders_all_frames_and_they_differ`, `icosa_cpu_prints_a_timing_report`.
+
+Write the manifest as `crates/rayland-icosa-cpu/Cargo.toml`, following `rayland-icosa-vk`'s (Task 5 Step 4) but as a **binary**: `license = "GPL-3.0-or-later"`, a `[[bin]]` section naming `rayland-icosa-cpu`, and dependencies `rayland-icosa-vk`, `rayland-icosa-core`, `ash`, `image`, `anyhow`, plus a dev-dependency on `image` for the test. State in its header that this crate depends on no `rayland-*` crate beyond the two icosa libraries, that neither knows about remoting, and that this program cannot tell whether its rendering is happening locally — that ignorance being the whole point.
+
+Add to the workspace `members`:
+
+```toml
+    "crates/rayland-icosa-cpu",      # fixture A: fractal on the CPU, uploaded per frame
+```
 
 - [ ] **Step 6: Look at the result**
 
@@ -2431,12 +2608,22 @@ Open `frame_0000.png`, `frame_0060.png`, `frame_0119.png`. Each face should carr
 
 Also check the timing report's shape: `fractal_us` should dominate `upload_us` and `draw_readback_us` by a wide margin on any normal desktop. That is the number Task 7's fixture exists to contrast with.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 7: Update `CLAUDE.md` and commit**
+
+Change the crate count from "fourteen" to "fifteen" and add the crate entry, after `rayland-icosa-vk`:
+
+```markdown
+- **`crates/rayland-icosa-cpu`** — fixture A: an ordinary offscreen Vulkan program drawing a
+  spinning icosahedron textured with a fractal it computes on **its own CPU** and writes into
+  persistently-mapped `HOST_COHERENT` memory every frame — with no flush, and so no call on the wire
+  saying a megabyte changed. That is both what an ordinary Vulkan program does and exactly the case
+  with nothing to intercept, which is the problem this fixture states in executable form. Depends
+  only on the two icosa libraries and knows nothing about remoting. GPL, `publish = false`.
+```
 
 ```bash
-git add crates/rayland-icosa-cpu shaders/
-git rm shaders/icosa_flat.frag shaders/icosa_flat.frag.spv
-git commit -m "icosa Task 6: the mapped fractal, all 120 frames
+git add crates/rayland-icosa-cpu Cargo.toml CLAUDE.md
+git commit -m "icosa Task 6: fixture A — the mapped fractal, all 120 frames
 
 This is the task the fixture exists for. vkMapMemory is called once at
 startup; every frame thereafter writes a megabyte of freshly computed
@@ -2457,19 +2644,23 @@ nothing about what is drawn depends on a timing value."
 ### Task 7: `rayland-icosa-gpu` — the control
 
 **Files:**
-- Create: `crates/rayland-icosa-gpu/` (manifest, `main.rs`, `context.rs`, `pipeline.rs`, `render.rs`, `tests/native_render.rs`)
+- Create: `crates/rayland-icosa-gpu/Cargo.toml`, `src/main.rs`, `tests/native_render.rs`
 - Create: `shaders/icosa_fractal.frag` (+ `.spv`)
 - Modify: `Cargo.toml`, `CLAUDE.md`, `shaders/README.md`
 
 **Interfaces:**
-- Consumes: `rayland_icosa_core::{IMAGE_SIZE, FRAME_COUNT, MAX_ITER, geometry::*, schedule::{frame_mvp, frame_zoom, CENTER}}`.
+- Consumes: `rayland_icosa_vk::{VulkanContext, Scene, Uniforms, write_png}` (Task 5); `rayland_icosa_core::{FRAME_COUNT, schedule::{frame_mvp, frame_zoom, CENTER}}` (Tasks 1–4).
 - Produces: a binary `rayland-icosa-gpu <output-directory>` writing 120 PNGs and the same CSV.
 
-Fixture B is fixture A with the texture path removed: no staging buffer, no texture image, no sampler, no copy. The fragment shader evaluates the fractal instead. Everything else — geometry, schedule, lighting, resolution, frame count, iteration ceiling — is identical, because that identity is the only reason the pair is worth having.
+Fixture B is fixture A with the texture path removed: no staging buffer, no texture image, no sampler, no copy — `Scene::new(&context, &fractal_frag_spirv, None)`. The fragment shader evaluates the fractal instead. Everything else — geometry, schedule, lighting, resolution, frame count, iteration ceiling, the render loop itself — is *literally the same code*, in `rayland-icosa-vk`, which is what makes the identity a fact rather than a promise.
+
+This crate should end up very small: a manifest, a frame loop, and nothing else. If it grows a second module, something that belongs in `rayland-icosa-vk` has leaked into it — or, worse, the two fixtures have started to differ somewhere they must not.
 
 - [ ] **Step 1: Write the failing test**
 
-Create `crates/rayland-icosa-gpu/tests/native_render.rs` as a copy of fixture A's, with `rayland-icosa-cpu` replaced by `rayland-icosa-gpu` throughout and the temp directories renamed to match. The assertions are deliberately identical: both fixtures draw the same scene, so both baselines check the same things. (Repeated rather than shared: a test helper crate would be a `rayland-*` dependency, and these tests must not have one.)
+Create `crates/rayland-icosa-gpu/tests/native_render.rs` as fixture A's test with `rayland-icosa-cpu` replaced by `rayland-icosa-gpu` throughout and the temp directories renamed to match. The assertions are deliberately identical: both fixtures draw the same scene, so both baselines check the same things.
+
+These two test files are the one place the plan accepts duplication, and it is worth saying why, since Task 7 otherwise exists to remove duplication. A shared test helper would have to live in a crate both fixtures depend on — and a fixture's baseline test is the thing that establishes "this program renders correctly with nothing else involved". A baseline that imported shared machinery would be testing that machinery too, which is precisely what it must not do. The cost is two ~90-line files that drift only if someone edits one and not the other, and the reviewer will see both.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -2584,7 +2775,11 @@ glslangValidator -V shaders/icosa_fractal.frag -o shaders/icosa_fractal.frag.spv
 
 - [ ] **Step 4: Write the crate**
 
-Copy `crates/rayland-icosa-cpu` to `crates/rayland-icosa-gpu` and remove the texture path: no `FractalStaging`, no `FractalTexture`, no sampler, no `COMBINED_IMAGE_SAMPLER` descriptor binding, no upload submission, no call to `fractal::render_into`. The uniform buffer gains the `half_width` and `center` fields the shader reads — and note these are still written through a persistent mapping, exactly as fixture A's are. The difference between the fixtures is the *volume* of mapped writes, not their presence; both write through a pointer with no interceptable call, and stating that clearly in the crate documentation is important, because a reader will otherwise assume the GPU fixture "avoids" mapped memory. It does not.
+Write `crates/rayland-icosa-gpu/Cargo.toml` following fixture A's, minus the `image` dependency if the frame loop uses only `rayland_icosa_vk::write_png` (keep the dev-dependency; the test decodes PNGs).
+
+Write `src/main.rs`: the same frame loop as fixture A with steps 1 and 2 gone. `Scene::new(&context, &fractal_frag_spirv, None)` — `None` because there is no texture to bind.
+
+State plainly in the crate's header documentation that **this fixture does not avoid mapped memory**. It still writes its uniforms through the same `MappedBuffer`, with no flush and no interceptable call, exactly as fixture A does. The difference between the fixtures is the *volume* of those writes — roughly 128 bytes against roughly a megabyte — not their presence. Say it explicitly, because a reader skimming "the GPU one has no staging buffer" will otherwise conclude the opposite, and that conclusion would make the pair look like an experiment it is not.
 
 The CSV keeps all four columns for comparability. `fractal_us` is measured around the (now trivial) uniform write, and `upload_us` around nothing at all — record it as `0`. Keeping the columns identical means the two runs' reports can be diffed directly, which is the point.
 
@@ -2597,7 +2792,7 @@ Add to the workspace `members`:
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `cargo test -p rayland-icosa-gpu`
-Expected: PASS — all four native tests.
+Expected: PASS — all three native tests.
 
 - [ ] **Step 6: Compare the two fixtures**
 
@@ -2616,15 +2811,16 @@ If the two look like different fractals rather than the same one at different qu
 
 - [ ] **Step 7: Update `CLAUDE.md` and commit**
 
-Change the crate count from "fourteen" to "fifteen" and add:
+Change the crate count from "fifteen" to "sixteen" and add:
 
 ```markdown
 - **`crates/rayland-icosa-gpu`** — fixture B: the same spinning icosahedron, same geometry, same
-  schedule, same fractal arithmetic — but evaluated in a fragment shader, so roughly 128 bytes per
-  frame cross mapped memory instead of a megabyte. It is the **volume control** for
-  `rayland-icosa-cpu`, not an alternative to it: note that it still writes its uniforms through a
-  persistent mapping with no interceptable call, so the pair isolates how cost scales with
-  mapped-write volume, not the presence of mapped writes. GPL, `publish = false`.
+  schedule, same fractal arithmetic, and — via `rayland-icosa-vk` — literally the same render loop.
+  Only the fractal moves: it is evaluated in a fragment shader, so roughly 128 bytes per frame cross
+  mapped memory instead of a megabyte. It is the **volume control** for `rayland-icosa-cpu`, not an
+  alternative to it: it still writes its uniforms through a persistent mapping with no interceptable
+  call, so the pair isolates how cost scales with mapped-write volume, not the presence of mapped
+  writes. GPL, `publish = false`.
 ```
 
 ```bash
