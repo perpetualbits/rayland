@@ -20,6 +20,7 @@ members = [
     "crates/rayland-icosa-core",     # shared geometry/schedule/fractal math for the icosahedron fixtures (icosa Task 1)
     "crates/rayland-icosa-vk",       # shared Vulkan scaffolding for the icosahedron fixtures (icosa Task 5)
     "crates/rayland-icosa-cpu",      # fixture A: fractal on the CPU, uploaded per frame (icosa Task 6)
+    "crates/rayland-icosa-gpu",      # fixture B: fractal in a fragment shader; the volume control (icosa Task 7)
 ]
 
 # Dependency versions shared across member crates, so every crate agrees on one version.

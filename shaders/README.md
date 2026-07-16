@@ -4,13 +4,17 @@
 their SPIR-V compilations, embedded into `rayland-server` at build time so the build
 needs no shader compiler.
 
-`icosa.vert` / `icosa_flat.frag` / `icosa_textured.frag` are `rayland-icosa-vk`'s shaders,
-shared by both icosahedron fixtures. `icosa.vert` and `icosa_flat.frag` are embedded into
-`rayland-icosa-vk` itself (the vertex shader by the library, the flat fragment shader only
-by the library's own test — see that shader's header for why it is permanent, not
-scaffolding). `icosa_textured.frag` is compiled and committed here for the same
-no-shader-compiler-required reason, but is embedded by the CPU fixture (a later task), not
-by `rayland-icosa-vk`.
+`icosa.vert` / `icosa_flat.frag` / `icosa_textured.frag` / `icosa_fractal.frag` are
+`rayland-icosa-vk`'s shaders, shared by both icosahedron fixtures. `icosa.vert` and
+`icosa_flat.frag` are embedded into `rayland-icosa-vk` itself (the vertex shader by the
+library, the flat fragment shader only by the library's own test — see that shader's
+header for why it is permanent, not scaffolding). `icosa_textured.frag` is compiled and
+committed here for the same no-shader-compiler-required reason, but is embedded by the CPU
+fixture (`rayland-icosa-cpu`), not by `rayland-icosa-vk`. `icosa_fractal.frag` is its
+counterpart, embedded by the GPU fixture (`rayland-icosa-gpu`): it evaluates the same
+Mandelbrot arithmetic per fragment instead of sampling a texture the CPU wrote — see that
+shader's own header, and `rayland-icosa-gpu`'s crate doc, for why "no texture" does not
+mean "no mapped memory write".
 
 Regenerate after editing the GLSL with:
 
@@ -19,3 +23,4 @@ Regenerate after editing the GLSL with:
     glslangValidator -V shaders/icosa.vert -o shaders/icosa.vert.spv
     glslangValidator -V shaders/icosa_flat.frag -o shaders/icosa_flat.frag.spv
     glslangValidator -V shaders/icosa_textured.frag -o shaders/icosa_textured.frag.spv
+    glslangValidator -V shaders/icosa_fractal.frag -o shaders/icosa_fractal.frag.spv

@@ -1,0 +1,46 @@
+# `rayland-icosa-gpu` — fixture B: the same spinning icosahedron as `rayland-icosa-cpu`, but with
+# the Mandelbrot fractal evaluated **in a fragment shader** instead of on the CPU. It is the
+# **volume control** for fixture A, not an alternative render path: it still writes its uniforms
+# through the same persistently-mapped `HOST_COHERENT` buffer, with no flush and no interceptable
+# Vulkan call, exactly as fixture A does. What differs is the *volume* of those writes — roughly
+# 128 bytes per frame here against roughly a megabyte for fixture A — which is the one thing the
+# pair of fixtures exists to isolate.
+#
+# This crate is deliberately tiny: a manifest, `src/main.rs`'s frame loop, and nothing else. Every
+# piece both fixtures must agree on — geometry, schedule, render pass, pipeline, persistent
+# mapping, readback — lives in `rayland-icosa-vk`/`rayland-icosa-core` instead, so the two fixtures
+# cannot silently drift apart in anything but the one property under study. See
+# `rayland-icosa-cpu`'s own manifest for the identical argument from the CPU fixture's side.
+#
+# Depends on exactly two `rayland-*` crates, same as fixture A, and neither of those depends on
+# anything Rayland-specific either. This crate never mentions Venus, vtest, virglrenderer,
+# sockets, or remoting, and never probes its environment beyond what `ash::Entry::load()` itself
+# does to find a Vulkan driver.
+#
+# A BINARY crate (it has a main), so per the repository license policy it is GPL-3.0-or-later
+# rather than the LGPL used by this workspace's library crates.
+[package]
+name = "rayland-icosa-gpu"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+description = "Fixture B: a spinning icosahedron textured with a fragment-shader-computed Mandelbrot fractal — the volume control for rayland-icosa-cpu."
+license = "GPL-3.0-or-later"
+repository = "https://github.com/perpetualbits/rayland"
+publish = false
+
+[[bin]]
+name = "rayland-icosa-gpu"     # binary target name, the executable the native test launches
+path = "src/main.rs"           # binary entry point
+
+[dependencies]
+rayland-icosa-vk = { path = "../rayland-icosa-vk" }      # shared Vulkan scaffolding: context, Scene, MappedBuffer
+rayland-icosa-core = { path = "../rayland-icosa-core" }  # geometry, schedule, fractal constants — no GPU, no remoting
+anyhow = { workspace = true }                            # top-level error handling, per the repo's binary-crate convention
+
+[dev-dependencies]
+# The native test decodes the PNGs the binary wrote and inspects individual pixels. Not a runtime
+# dependency: this crate has no texture and writes PNGs only via rayland_icosa_vk::write_png, so
+# `image` belongs here, in dev-dependencies, and nowhere else — fixture A carried it as an unused
+# runtime dependency and review caught it; this crate does not repeat that.
+image = { workspace = true }
