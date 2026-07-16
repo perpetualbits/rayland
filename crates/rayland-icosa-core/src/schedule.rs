@@ -247,8 +247,11 @@ mod tests {
         // once a step is that small, neighbouring texels round to the same `c` and the image
         // pixelates into blocks. At `CENTER.0 ≈ -0.744`, the ulp is `2^-53 ≈ 1.1e-16` (f64's mantissa
         // is 52 bits, and `0.5 <= |CENTER.0| < 1.0` puts the binade exponent at -1), so the cliff sits
-        // at `half_width ≈ ulp * TEXTURE_SIZE / 2 ≈ 2.8e-14` — about four orders of magnitude below
-        // this `1e-12` threshold. `1e-12` is deliberately not tightened to sit right at that cliff:
+        // at `half_width ≈ ulp * TEXTURE_SIZE / 2 ≈ 2.8e-14` — about 1.5 orders of magnitude (roughly
+        // 36×) below this `1e-12` threshold. (The raw ulp itself, 1.1e-16, is about four orders of
+        // magnitude below the threshold; the `* TEXTURE_SIZE / 2` factor above shrinks that margin by
+        // log10(256) ≈ 2.4 orders to reach the cliff's ~1.5.) `1e-12` is deliberately not tightened to
+        // sit right at that cliff:
         // it is a coarse guard comfortably above it, tuned to catch a schedule that got tuned into the
         // danger zone without having to track the exact ulp math above every time. At frame 119 the
         // half-width is ~0.04 and the per-texel step is ~1.56e-4 — about 1.4e12 ulps clear of

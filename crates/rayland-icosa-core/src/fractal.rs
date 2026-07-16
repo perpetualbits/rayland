@@ -301,10 +301,12 @@ pub fn render_into_at(pixels: &mut [u8], center: (f64, f64), half_width: f64) {
             let rgb = point_color(cx, cy);
             // Scale to 8-bit. The `+ 0.5` before truncation is round-to-nearest; without it the
             // whole image would be biased half a level dark. `as u8` on a float has been a
-            // *saturating* cast since Rust 1.45 (`1.2f64 as u8 == 255`, `(-0.3f64) as u8 == 0`,
-            // `f64::NAN as u8 == 0`), so an out-of-range value can never wrap into a bogus byte — that
-            // failure mode does not exist in this language. The `clamp` is a defensive statement of
-            // the intended `0..=1` range rather than a guard against a real hazard: `hsv_to_rgb`'s
+            // *saturating* cast since Rust 1.45 (`(1.2 * 255.0 + 0.5) as u8 == 255` — exactly the
+            // expression below, saturating because 306.5 is out of `u8`'s range; also
+            // `(-0.3f64) as u8 == 0`, `f64::NAN as u8 == 0`), so an out-of-range value can never wrap
+            // into a bogus byte — that failure mode does not exist in this language. The `clamp` is a
+            // defensive statement of the intended `0..=1` range rather than a guard against a real
+            // hazard: `hsv_to_rgb`'s
             // output is provably within `[0.15, 1.0]` for the fixed `saturation = 0.85`, `value = 1.0`
             // this module always calls it with (its result is `1 + 0.85·(ramp − 1)` with
             // `ramp ∈ [0, 1]`), so the clamp is currently unreachable. It stays so that a future
