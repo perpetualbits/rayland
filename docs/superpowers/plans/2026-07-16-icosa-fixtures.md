@@ -44,7 +44,7 @@ Tasks 1–4 give complete code: the math is exactly specifiable and its exactnes
 | `crates/rayland-icosa-core/src/lib.rs` | Crate docs; re-exports; the shared constants. |
 | `crates/rayland-icosa-core/src/exact_math.rs` | Bit-exact `log2`, `sin_cos`. Nothing else. |
 | `crates/rayland-icosa-core/src/geometry.rs` | The 60-vertex icosahedron table and its `Vertex` type. |
-| `crates/rayland-icosa-core/src/schedule.rs` | `frame_orientation`, `frame_zoom`, the MVP matrix. |
+| `crates/rayland-icosa-core/src/schedule.rs` | `frame_mvp`, `frame_zoom`, the MVP matrix. |
 | `crates/rayland-icosa-core/src/fractal.rs` | Mandelbrot smooth-iteration + HSV→RGB; `render_fractal_into`. |
 | `crates/rayland-icosa-core/tests/log2_table.rs` | The committed bit-exactness contract for `log2`. |
 | `crates/rayland-icosa-core/tests/sin_cos_table.rs` | The committed bit-exactness contract for `sin_cos`. |
