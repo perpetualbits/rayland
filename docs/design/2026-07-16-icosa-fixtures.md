@@ -491,16 +491,64 @@ can produce.
 
 ## 9. Sequencing and expectations
 
-These fixtures are expected to **fail** against Rayland when first run, and that is their
-purpose. Likely order of breakage, most to least likely:
+**This section predicted the wrong thing. The correction is the most useful result the
+fixtures have produced, so the error is left standing above its own refutation.**
 
-1. **Depth attachments** — the first ones in the project (§4).
-2. **Per-frame mapped texture writes** — the (c)2 problem, unsolved by construction as of
-   (c)1 (§7.2).
-3. **Texture upload bandwidth** — the (c)3 problem; expected to be slow rather than wrong.
+### What it originally said
 
-A failure in (1) is a gap in coverage. A failure in (2) is the design working as
-currently specified — (c)1 does not claim to solve mapped memory — and the fixture's job
-is to say so precisely and reproducibly rather than to pass.
+> These fixtures are expected to **fail** against Rayland when first run, and that is their
+> purpose. Likely order of breakage, most to least likely:
+>
+> 1. **Depth attachments** — the first ones in the project (§4).
+> 2. **Per-frame mapped texture writes** — the (c)2 problem, unsolved by construction as of
+>    (c)1 (§7.2).
+> 3. **Texture upload bandwidth** — the (c)3 problem; expected to be slow rather than wrong.
 
-Do not weaken the fixtures to make them pass. Their value is exactly that they do not.
+### What actually happened
+
+**Both fixtures pass. 120/120 frames bit-identical, through Venus, for both.** The tests are
+not vacuous: each requires the fixture to genuinely connect to the vtest socket before it
+will proceed, and the remoted runs take 24 s and 6 s against 13 s and 2 s natively.
+
+Prediction (1) was also wrong, and was disproved earlier and separately: depth testing is
+**unobservable** in this scene at all (§4) — the solid is convex and back-face culling
+leaves one fragment per pixel, so `LESS` never rejects anything.
+
+### Why the prediction was wrong
+
+It conflated **"through Venus"** with **"across a network"**. Those are not the same thing,
+and the difference between them is the whole of (c)2.
+
+§8.3's path is **C0's**: one machine, a local Unix socket, and a Venus ICD that hands the
+ring and the blobs to the engine as **memfds passed over `SCM_RIGHTS`**. The application's
+"mapped memory" *is* the very pages virglrenderer reads. Nothing is transported, so nothing
+can be dropped, torn, or applied out of order. Per-frame mapped writes therefore work
+**perfectly** — not because Rayland solved anything, but because on one machine there is
+nothing to solve.
+
+[`2026-07-15-venus-ring-findings.md`](2026-07-15-venus-ring-findings.md) already said the
+half of this that matters: *neither a shared page nor an fd survives a network*. The
+corollary went unstated, and is exactly what this section missed: **both survive a socket
+perfectly well.**
+
+### What Task 8 actually is
+
+Not the (c)2 proof — the **control** for it. It establishes that these fixtures render
+bit-identically when the memory really is shared. That is precisely what must be true
+before running them across the relay, because it makes any divergence there **provably the
+relay's fault rather than the fixture's**. As a baseline that is worth more than a failure
+would have been.
+
+### Where the fixtures will actually bite
+
+Through **`rayland-c` → `rayland-s`** (the (c)1 QUIC relay), where the pages genuinely
+cannot be shared and an fd genuinely cannot cross. That is the run that matters, and **this
+spec never commissioned it**: neither `rayland-c` nor `rayland-s` currently knows how to
+launch these fixtures. Wiring that up is the obvious next piece of work, and it is where
+§9's original expectations properly belong.
+
+### The rule that still stands
+
+Do not weaken the fixtures to make them pass. Their value is that they say something true
+about whichever path they are pointed at — including, as here, that a path everyone assumed
+was hard is not hard at all, for a reason worth writing down.
