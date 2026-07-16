@@ -180,7 +180,10 @@ Venus/virglrenderer capture/replay engine, so *unmodified* applications run.**
   for on-screen presentation. **Required reading:**
   [`docs/design/2026-07-15-venus-ring-findings.md`](docs/design/2026-07-15-venus-ring-findings.md).
 - **(c)2 — mapped-memory coherence:** the `vkMapMemory` problem (apps write vertices and
-  textures straight into mapped memory with **no API call to intercept**).
+  textures straight into mapped memory with **no API call to intercept**). The icosahedron
+  fixtures (`rayland-icosa-cpu`/`rayland-icosa-gpu`) were built to make this bite and, run
+  through C0's path, did not — see [`docs/icosa-fixtures.md`](docs/icosa-fixtures.md) for
+  why not and where the real failure is still waiting.
 - **(c)3 — content-addressed assets.**
 - **(c)4 — real/complex applications; GL via Zink.**
 

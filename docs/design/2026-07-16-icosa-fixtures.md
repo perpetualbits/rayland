@@ -303,7 +303,7 @@ fixed schedule for determinism.)
 | Render target | 256×256 | Big enough for a shaded solid to have unambiguous interior and silhouette for a test to check; small enough that 120 readbacks stay cheap. |
 | Fractal texture | 512×512 RGBA8 = 1 MiB | Real bandwidth: ~63 MiB/s at 60 fps. Sits well under the 8 MiB blob cap pinned by (c)1 Task 2, so it stresses the design without immediately hitting an unrelated ceiling. |
 
-### 5.4 The `log()` trap
+### 5.4 The `log()` trap — and, amended below, the identical `sin`/`cos` trap
 
 The smooth-iteration formula (inherited from `mandelsmooth.c`) is:
 
@@ -333,18 +333,45 @@ correctly-rounded one that is not.
 and expected bit patterns, generated once and committed. The table is the contract; if a
 refactor changes a single bit, the test fails, which is the intent.
 
+**Amendment, 2026-07-16 (Task 9).** This section originally named `log` as the *only*
+libm trap in this design, and that was incomplete. The frame schedule's rotation matrix
+(`frame_orientation`, §5) is built from `sin` and `cos` of the frame index, and those are
+libm functions subject to the identical argument made above: IEEE-754 does not specify
+transcendental functions bit-for-bit, C's target machines explicitly include RISC-V, and a
+`sin`/`cos` evaluated by whatever libm ships on the C machine would place the solid at a
+minutely different angle on an x86 C than on a RISC-V one — corrupting every pixel of the
+comparison for a reason that has nothing to do with Rayland, and that would look exactly
+like a Rayland defect while investigating it. Task 2 built and froze this before it could
+bite: `rayland_icosa_core::exact_math::sin_cos` is a bit-exact replacement built the same
+way `log2` is — Cody-Waite range reduction against a split `π/2`, then truncated Taylor
+kernels in Horner form, using only IEEE `+ - * /` and `round()`, no libm call anywhere —
+and it is pinned bit-for-bit against a frozen table
+(`crates/rayland-icosa-core/tests/sin_cos_table.rs`) covering all four quadrants and the
+three points (`π/4`, `-π/4`, `3π/4`) where the range reduction's ties-away rounding rule
+alone decides which quadrant is selected. The fragment shader in fixture B uses the same
+polynomial, transcribed, exactly as it does for `log2`.
+
 ### 5.5 Why bit-identical is a fair demand
 
 In the remoted case, the drawing happens on **S's GPU**. In the native baseline, the
 drawing also happens on S's GPU, via S's local driver. Same hardware, same driver, both
-paths. The CPU-side fractal is computed on C in both cases, bit-exactly per §5.4. The only
-thing that differs between the two runs is *how the commands reached the GPU*.
+paths. The CPU-side fractal, and the rotation matrix that orients the solid, are computed
+on C in both cases, bit-exactly per §5.4 — the fractal via `log2`, the orientation via
+`sin_cos`. The only thing that differs between the two runs is *how the commands reached
+the GPU*.
 
 Therefore any pixel difference at all is a Rayland defect, and the tests demand exact
 equality rather than a tolerance. Tolerances hide precisely the class of bug this project
 is most likely to produce — a dropped mapped write, a stale texture, a delta applied out
 of order — because those bugs are usually *small* before they are large. A tolerance is a
 place for them to live.
+
+**Amendment, 2026-07-16 (Task 9).** This claim ("any pixel difference at all is a Rayland
+defect") originally rested on `log2` alone being bit-exact. It is only true if `sin`/`cos`
+are equally exact, since a wrong rotation angle would produce a pixel difference with
+nothing to do with Rayland — exactly the false-positive §5.4 warns about, just arriving
+through the other transcendental. §5.4 above now covers both, and both are frozen by table
+tests, so the claim holds as stated.
 
 ---
 
