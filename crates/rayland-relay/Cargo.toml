@@ -3,6 +3,10 @@
 # GPU and the display). This crate is pure data plus length-prefixed framing — no GPU code, no
 # network I/O, no sockets. Both `rayland-c` and `rayland-s` depend on it, so it must stay free of
 # any dependency that links a GPU stack (that is `rayland-engine`'s job, not this crate's).
+# It also carries one diagnostic module, `trace` (the (c)1 Task 9 stage tracer): env-gated stderr
+# timestamps shared by both daemons, adding a `clock_gettime` syscall and stderr writes — none of
+# them a GPU stack, network I/O, or a socket — so the purity contract above still holds. See
+# `src/trace.rs`.
 #
 # This is a LIBRARY crate (no `main`), so per the repository license policy it is
 # LGPL-3.0-or-later (binaries in the workspace are GPL-3.0-or-later).
@@ -19,3 +23,6 @@ repository = "https://github.com/perpetualbits/rayland"
 serde = { workspace = true }          # derive Serialize/Deserialize on the message types
 postcard = { workspace = true }       # the concrete serialization format used on the wire
 thiserror = { workspace = true }      # precise, typed framing errors (RelayError)
+libc = { workspace = true }           # CLOCK_MONOTONIC for the (c)1 Task 9 stage tracer (a syscall,
+                                      # not a GPU call — same reasoning rayland-vtest records for
+                                      # depending on libc). See `src/trace.rs`.

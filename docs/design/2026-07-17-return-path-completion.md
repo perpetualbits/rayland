@@ -1,8 +1,9 @@
 # The return path needs a completion protocol, not a better guess
 
 **Status:** design note, written 2026-07-17 after (c)1 Task 9's stale-frame race defeated three
-attempted fixes. It records *why* they failed and what shape the real fix has. Nothing here is
-implemented.
+attempted fixes. It records *why* they failed and what shape the real fix has. The **instrumentation**
+§7 asks for is now implemented and has confirmed the `T2 < T4` prediction — see §8. The **fix** (§6's
+completion protocol) is not yet implemented.
 
 The analysis in §2–§6 is **Roland's**, and it is the first account of this defect that explains all
 the evidence rather than part of it. It is recorded here rather than left in a chat log because
@@ -162,3 +163,21 @@ T4 resource sync/readback completed   T9 application CPU read begins
 
 The bug is wherever the graph permits `T9 < T7`, or `T2 < T4` while the implementation assumes
 `T2 >= T4`. Today's code assumes the latter and Task 9's evidence says it is false.
+
+## 8. That instrumentation was done, and it is `T2 < T4` (2026-07-17)
+
+§7 has been carried out. `rayland_relay::trace` (env-gated by `RAYLAND_C1_TRACE`) stamps T0/T2/T5/T6
+on S and T7/T8 on C against the shared `CLOCK_MONOTONIC`, and **Probe A** re-fingerprints each
+readback blob after S ships it, catching the GPU still writing a frame already declared complete. The
+full evidence and method are in [`../c1-the-network.md`](../c1-the-network.md) §3.1, *The mechanism,
+established*. In one sentence, across three runs:
+
+> **`T2 < T4` is real and large.** S's GPU keeps writing a readback blob for **0.33 ms to ~20 ms
+> after** the return path shipped it — every observed late write beyond both the 200 µs poll and the
+> 1.1 ms fence barrier, which is why neither §4's nor §5's experiment reached zero. And the C side is
+> a faithful courier: no `T7` ever preceded its `T6`, so `T9 < T7` is **not** in play. The violation
+> is entirely S shipping bytes the GPU has not finished.
+
+That closes the "do not fix until the ordering graph is known" gate this section opened. The graph is
+known, it is the one §2–§6 predicted, and the next step is the completion protocol of §6 — not another
+guess at the return path's timing.

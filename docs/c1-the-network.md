@@ -289,6 +289,11 @@ worth resurrecting as written.
 
 #### The mechanism is NOT established
 
+> **Superseded 2026-07-17.** The `❓ suspected, unproven` hypothesis below is now **proven** — see the
+> next subsection, *The mechanism, established*. This section is kept intact because the reasoning that
+> narrowed the field (and the one hypothesis it correctly refuted) is what made the proof cheap to
+> reach.
+
 Stated plainly because a plausible mechanism is worse than none:
 
 - ❌ **Refuted: "the return path is polled, not fenced — `RingProgress` releases the application's
@@ -307,6 +312,57 @@ Stated plainly because a plausible mechanism is worse than none:
 If that hypothesis holds, the defect is that **v1 infers "S wrote" from memory contents rather than
 from the GPU saying so**, and a diff-based return path is structurally racy against an engine with
 no completion signal. That is a deeper problem than a mis-ordering and it is **(c)1's, not (c)2's**.
+
+#### The mechanism, established: `T2 < T4` by up to ~20 ms (Task 9, 2026-07-17)
+
+The hypothesis holds. It was proven by instrumenting the return path's stages **separately**, as the
+design note ([`design/2026-07-17-return-path-completion.md`](design/2026-07-17-return-path-completion.md)
+§7) asked, and reading the ordering graph off the timeline directly instead of inferring it from frame
+outcomes.
+
+**The instrument.** A shared, env-gated tracer (`rayland_relay::trace`, switched on with
+`RAYLAND_C1_TRACE=1`) stamps each stage against the one clock both daemons share on loopback —
+`CLOCK_MONOTONIC` is system-wide, so S's and C's timestamps are directly comparable. It records `T0`
+(delta applied) → `T2` (ring retired) → `T5` (first byte diffed) → `T6` (packet sent) on S, and `T7`
+(packet installed) → `T8` (`head` advanced, releasing the application) on C. On top of it, **Probe A**:
+after S ships a readback blob, it re-fingerprints that blob on every idle poll and records any change
+that lands *while the application is still blocked and no new ring delta has arrived* — i.e. S's GPU
+still writing a frame the return path already declared complete. The probe watches only blobs S is
+observed to write (so a change is the GPU's, not C's forward writes) and retires a blob's watch the
+instant a new delta arrives (so it can never mistake the *next* frame's arrival for a late write of
+*this* one). Analysis: [`scripts/c1-trace-analyze.py`](../scripts/c1-trace-analyze.py).
+
+**The result — three traced runs, and it fires every time:**
+
+| run | wrong frames | late GPU writes caught | `dt` median | `dt` max | all `> 200 µs`? |
+|---:|---:|---:|---:|---:|:---:|
+| 1 | 25 | 26 | 4.46 ms | 5.61 ms | 26 / 26 |
+| 2 | 26 | 15 | 2.38 ms | 16.75 ms | 15 / 15 |
+| 3 | 32 | 15 | 5.41 ms | 20.48 ms | 15 / 15 |
+
+`dt` is how long **after** S shipped the frame (T6) its GPU was still writing that frame's readback
+blob. (Wrong-frame counts are from the traced runs; the probe perturbs timing slightly, so they are
+context, not the canonical rate. The late-write `dt` is the finding.)
+
+**This settles three things at once:**
+
+1. **`T2 < T4`, directly and quantitatively.** Ring retirement (T2) is not GPU-readback completion
+   (T4): the GPU keeps writing for **hundreds of microseconds to ~20 ms** past the point the return
+   path treats as done. The defect is exactly the one suspected above — *v1 infers "S wrote" from
+   memory contents and ships before the GPU has finished*.
+2. **It explains the two dead ends this document already recorded.** Every late write observed landed
+   **`> 200 µs`** after ship, so a single 200 µs grace poll ("hold one poll") cannot cover it — which
+   is why that plateaued at ~2% wrong instead of zero. And the median late write (2.4–5.4 ms) lands
+   *after* the fence barrier's average **1.1 ms** wait has already returned — which is why the barrier
+   changed nothing. Neither was a tuning failure; both were the wrong quantity.
+3. **The C side is a faithful courier — `T9 < T7` is NOT the failure.** Across ~1.3 M packet pairs per
+   run, no `T7` (install) was ever seen before its matching `T6` (ship) on the shared clock, and
+   install latency ran ~28–280 µs. C installs exactly what S sends, in order, and only then releases
+   the application. The whole violation is on S: it ships bytes that are not yet written.
+
+So the fix is not anywhere on C, and it is not a better guess on S. It is a completion signal that
+dominates the GPU's readback — the network fence-completion protocol argued for in the design note's
+§6.
 
 ### 3.2 The commands are free. The memory is not.
 

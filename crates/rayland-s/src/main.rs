@@ -73,6 +73,7 @@ use anyhow::{Context, Result};
 // `flush` on the link to C: `write_msg` hands bytes to the stream, but an unflushed reply is a
 // reply C never sees.
 use std::io::Write;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -248,6 +249,13 @@ fn progress_thread(
     engine: Arc<Mutex<VirglEngine>>,
     tx: Arc<Mutex<QuicSend>>,
 ) {
+    // **(c)1 Task 9 Probe A state**, per S-written blob: the fingerprint and monotonic timestamp at
+    // which the return path last *shipped* this blob (T6), and the applied-ring-delta count at that
+    // instant. On subsequent idle polls the loop re-fingerprints and, if the content has moved while
+    // the delta count has not, that is S's GPU writing after we declared the frame complete — the
+    // `T2 < T4` the design note predicts. Empty and unused unless `RAYLAND_C1_TRACE` is set.
+    let mut probe_baseline: HashMap<u32, ProbeBaseline> = HashMap::new();
+
     loop {
         // --- Step 1: what retired? A handful of loads, so the message thread is never blocked
         // behind anything slow — and crucially never behind a network write or a fence.
@@ -297,18 +305,126 @@ fn progress_thread(
             // Blob bytes FIRST, progress LAST. Progress is what releases the application's wait, and
             // it must not cross the wire ahead of the pixels the application is about to read.
             for msg in blobs.iter().chain(progress.iter()) {
+                // **T6 — transfer packet emitted** (design note §7): the point a `BlobData` leaves S
+                // for C. Stamped per blob, with the `res`/`off` that the C-side T7 echoes, so the
+                // join can pair each packet's departure with its installation. Only `BlobData` is a
+                // pixel packet; the trailing `RingProgress` is the release, not the pixels.
+                if let S2C::BlobData { res_id, offset, bytes } = msg {
+                    rayland_relay::trace::emit(
+                        "T6",
+                        &format!("side=S res={res_id} off={offset} len={}", bytes.len()),
+                    );
+                }
                 let mut stream = tx.lock().expect("the link send lock is never poisoned");
                 if let Err(e) = send(&mut stream, msg) {
                     eprintln!("rayland-s: reporting ring progress to C failed: {e:#}");
                     return;
                 }
             }
+
+            // **Probe A baseline.** Record what we just shipped as the reference the idle resample
+            // compares against. Gated on tracing so a production run pays nothing. The fingerprints
+            // are read *after* the send, i.e. as late as possible, so a GPU write that lands between
+            // the diff and here is already folded into the baseline rather than counted as "late".
+            if rayland_relay::trace::enabled() {
+                let ship_ns = rayland_relay::trace::monotonic_ns();
+                let session = applier.lock().expect("the applier lock is never poisoned");
+                let deltas = session.applied_ring_deltas();
+                for (res_id, fp) in session.fingerprint_written_blobs() {
+                    probe_baseline.insert(res_id, ProbeBaseline { fp, ship_ns, deltas });
+                }
+            }
+        } else if rayland_relay::trace::enabled() && !probe_baseline.is_empty() {
+            // --- Probe A: the decisive `T2 < T4` test. The application is blocked (no retirement
+            // this poll); if a readback blob's content has moved since we shipped it, and no new ring
+            // delta has arrived to explain it as the *next* frame, then S's GPU is still writing the
+            // frame we already declared done. See `ProbeBaseline` and `Applier::applied_ring_deltas`.
+            probe_a_resample(&applier, &mut probe_baseline);
         }
 
         // Wait before looking again. Sleeping unconditionally — rather than only when nothing moved
         // — keeps this loop simple and its cost bounded; see `PROGRESS_POLL` for the trade and the
         // honest note that it has never been measured.
         std::thread::sleep(PROGRESS_POLL);
+    }
+}
+
+/// **(c)1 Task 9 Probe A state**: what the return path last shipped for one blob.
+///
+/// See [`progress_thread`]'s `probe_baseline` for how these fields are used. Diagnostic only.
+struct ProbeBaseline {
+    /// The blob's fingerprint at ship time (T6) — the reference the idle resample compares against.
+    fp: u64,
+    /// The monotonic timestamp (ns) at which it was shipped, so a later change reports how long
+    /// *after* completion-was-declared the GPU actually wrote.
+    ship_ns: u64,
+    /// The applied-ring-delta count at ship time. If it advances, a new frame is in flight and this
+    /// baseline is retired rather than risk mislabelling the next frame's arrival as a late write.
+    deltas: u64,
+}
+
+/// **(c)1 Task 9 Probe A**: one idle-poll re-fingerprint of the S-written blobs.
+///
+/// Locks the applier once, reads the applied-ring-delta count and every S-written blob's current
+/// fingerprint together (so they are consistent), and for each blob we are still watching:
+///
+/// - if the delta count has advanced since the baseline was set, a **new frame** is in flight and the
+///   content is about to legitimately change, so the baseline is retired (a fresh one is set on that
+///   frame's ship);
+/// - otherwise, if the fingerprint has moved, S's GPU wrote **after** the return path declared the
+///   frame complete — the `T2 < T4` defect — and this emits an `A_RESAMPLE` line carrying how long
+///   after the ship the change was seen, then advances the baseline so a multi-burst late write is
+///   reported once per burst rather than continuously.
+///
+/// # Inputs / outputs
+/// - `applier`: the shared session; locked briefly for a consistent (count, fingerprints) read.
+/// - `baseline`: the per-blob Probe A state, mutated in place (entries advanced or retired).
+/// - Emits `A_RESAMPLE` trace lines as a side effect; returns nothing.
+fn probe_a_resample(applier: &Arc<Mutex<Applier>>, baseline: &mut HashMap<u32, ProbeBaseline>) {
+    let now = rayland_relay::trace::monotonic_ns();
+    // One consistent snapshot: the delta count and the fingerprints must be read under the same lock,
+    // or a delta applied between the two reads could make a legitimate new-frame write look late.
+    let (deltas, current): (u64, HashMap<u32, u64>) = {
+        let session = applier.lock().expect("the applier lock is never poisoned");
+        (
+            session.applied_ring_deltas(),
+            session.fingerprint_written_blobs().into_iter().collect(),
+        )
+    };
+
+    // Blobs whose baseline is retired this poll because a new frame started or the blob is gone;
+    // removed after the scan so the map is not mutated while borrowed.
+    let mut retire: Vec<u32> = Vec::new();
+    for (res_id, base) in baseline.iter_mut() {
+        // A blob with no current fingerprint was unref'd; retire its baseline.
+        let Some(&cur_fp) = current.get(res_id) else {
+            retire.push(*res_id);
+            continue;
+        };
+        if deltas != base.deltas {
+            // A new ring delta landed since we shipped: the next frame is arriving, so any change now
+            // is ambiguous. Stop watching until that frame's ship re-baselines this blob.
+            retire.push(*res_id);
+            continue;
+        }
+        if cur_fp != base.fp {
+            // The smoking gun: content moved with no new work to explain it. `dt_ns` is how long
+            // after we told C "your frame is ready" the GPU was still writing it.
+            rayland_relay::trace::emit(
+                "A_RESAMPLE",
+                &format!(
+                    "side=S res={res_id} dt_ns={} old_fp={:#x} new_fp={cur_fp:#x} changed=1",
+                    now.saturating_sub(base.ship_ns),
+                    base.fp,
+                ),
+            );
+            // Advance so a write that lands in several bursts is reported per burst, each `dt_ns`
+            // still measured from the original ship.
+            base.fp = cur_fp;
+        }
+    }
+    for res_id in retire {
+        baseline.remove(&res_id);
     }
 }
 

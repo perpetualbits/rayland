@@ -93,7 +93,10 @@ A Cargo workspace of sixteen crates. Each declares its own license per the polic
 - **`crates/rayland-relay`** — the **(c)1 relay wire protocol**: the `C2S`/`S2C` messages that
   cross the network between C and S (ring deltas, blob syncs, replies) and their `postcard`
   framing. Pure data — no GPU, no sockets, no async runtime — because both `rayland-c` and the
-  future `rayland-s` depend on it and C must never link a GPU stack. LGPL.
+  future `rayland-s` depend on it and C must never link a GPU stack. It also carries one diagnostic
+  module, `trace` (the (c)1 Task 9 stage tracer): env-gated stderr timestamps on a shared
+  `CLOCK_MONOTONIC`, used by **both** daemons to record the return path's stages against one clock —
+  none of a GPU stack, network I/O, or a socket, so the purity above holds. LGPL.
 - **`crates/rayland-c`** — **C's daemon ((c)1).** A local vtest server that a stock, unmodified
   Mesa Venus ICD connects to: it hands the application plain local memfds for its ring and blobs,
   **watches the ring** (where 100% of the application's Vulkan commands actually live), and relays

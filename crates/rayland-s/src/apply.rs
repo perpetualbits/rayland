@@ -269,6 +269,31 @@ pub struct Applier {
     /// refuses a second rather than silently picking one, so the day that crutch is removed presents
     /// as a named refusal instead of a doorbell delivered to the wrong ring.
     venus_ring_handle: Option<u64>,
+    /// **(c)1 Task 9 diagnostic only.** The res_ids S has *ever* been observed to write — the set
+    /// [`Self::take_blob_writes`] (and the born-with-contents [`C2S::CreateBlob`] path) has produced a
+    /// run for at least once.
+    ///
+    /// This is the set Probe A (`rayland-s`'s progress loop) re-fingerprints on idle polls to catch
+    /// S's GPU still writing after the return path declared the work retired. Restricting the probe to
+    /// this set is what makes an idle-poll content change attributable to the **GPU** rather than to
+    /// the message thread: the blobs C writes forward (its vertex/uniform/fractal memory) are applied
+    /// via [`HostBlob::copy_in`], which re-baselines rather than counting as an S write, so they never
+    /// enter this set. A change here, with no new `RingDelta` applied, is therefore a GPU DMA landing
+    /// late — the `T2 < T4` the design note predicts. It decides nothing on the wire; it only tells
+    /// the probe which blobs are worth watching.
+    s_written: std::collections::HashSet<u32>,
+    /// **(c)1 Task 9 diagnostic only.** A monotonic count of `C2S::RingDelta` messages applied.
+    ///
+    /// Probe A reads this to disambiguate the one thing that would otherwise make it lie: a readback
+    /// blob whose contents change during an idle poll could be S's GPU finishing the *shipped* frame
+    /// late (the `T2 < T4` we are hunting) **or** the *next* frame's readback already landing before
+    /// its retirement. The application is synchronous, so between S releasing frame N and the
+    /// application submitting frame N+1 there is a long CPU-bound quiet window with no new delta — and
+    /// a content change in that window is unambiguously a late write of frame N. This counter is how
+    /// the progress loop knows the window is still quiet: if it has not advanced since the frame was
+    /// shipped, any change is attributable to the shipped frame. Once it advances, the probe stops
+    /// watching that blob until the next ship re-baselines it.
+    applied_ring_deltas: u64,
 }
 
 impl Applier {
@@ -511,8 +536,15 @@ impl Applier {
                     .blobs
                     .get_mut(&res_id)
                     .expect("the blob was just inserted");
-                let initial = created
-                    .take_bytes_s_wrote()
+                let initial_runs = created.take_bytes_s_wrote();
+                // **(c)1 Task 9 diagnostic.** A blob born with contents is one S has "written" (the
+                // GPU rendered into it before Mesa's lazy `vkMapMemory` made it a blob), so it joins
+                // the S-written set Probe A watches — this is the very first readback buffer, whose
+                // first frame the retirement gate would otherwise never re-examine.
+                if !initial_runs.is_empty() {
+                    self.s_written.insert(res_id);
+                }
+                let initial = initial_runs
                     .into_iter()
                     .map(|run| BlobRun {
                         offset: run.offset,
@@ -581,6 +613,18 @@ impl Applier {
                         res_id: ring_res_id,
                         source,
                     })?;
+
+                // **T0 — guest/API submission accepted** (design note §7). The application's Vulkan
+                // commands for this delta are now in the ring's memory where S's engine will find
+                // them; `tail` names the frontier. Stamped here so the offline join can measure
+                // T0→T2 (how long S's ring thread took to retire) and place this cycle on the shared
+                // clock. Diagnostic only — the `tail` is the natural correlation key, since the
+                // `RingProgress` that eventually releases the wait echoes it back as `consumed_tail`.
+                self.applied_ring_deltas = self.applied_ring_deltas.wrapping_add(1);
+                rayland_relay::trace::emit(
+                    "T0",
+                    &format!("side=S res={ring_res_id} tail={tail} bytes={}", bytes.len()),
+                );
 
                 // **Wake S's ring thread — and do it here, after `apply_delta`, never before.**
                 //
@@ -807,6 +851,16 @@ impl Applier {
                 continue;
             };
             if let Some(consumed_tail) = mirror.take_progress(blob) {
+                // **T2 — host Vulkan fence/timeline signal** (design note §7): S's ring retired up to
+                // `consumed_tail`, which today's code treats as license to diff and ship. The whole
+                // §7 question is whether the GPU's readback (T4) is really done by now; this stamp is
+                // the T2 the join compares T4-evidence against. Emitted before the barrier runs, so
+                // the trace shows the ordering the code *assumes* (T2 then wait then diff) against
+                // what Probe A observes.
+                rayland_relay::trace::emit(
+                    "T2",
+                    &format!("side=S res={res_id} tail={consumed_tail}"),
+                );
                 progress.push(S2C::RingProgress {
                     ring_res_id: res_id,
                     consumed_tail,
@@ -866,13 +920,11 @@ impl Applier {
         });
 
         let mut out = Vec::new();
+        // **(c)1 Task 9 diagnostic.** The res_ids that produced a run on *this* call, folded into
+        // `self.s_written` after the loop rather than during it — inserting mid-loop would need a
+        // second mutable borrow of `self` while `blob` still borrows `self.blobs`.
+        let mut wrote_this_call: Vec<u32> = Vec::new();
         for res_id in res_ids {
-            // `expect` is unreachable: `res_ids` was just built from this map's own keys, and
-            // nothing removes a blob between there and here — this method holds `&mut self`.
-            let blob = self
-                .blobs
-                .get_mut(&res_id)
-                .expect("res_ids came from self.blobs' keys");
             // **The ring is excluded structurally, by `res_id`.** S's engine genuinely writes a
             // ring's pages — `vkr_ring_store_head` (`vkr_ring.c:60-67`) stores `head` into them
             // after each dispatched command — so the observed-writes rule would rightly report them,
@@ -880,10 +932,42 @@ impl Applier {
             // and command bytes are C's. Shipping a ring back as blob data would overwrite the very
             // commands C is in the middle of relaying with S's copy of them. `self.rings` is S's own
             // record of which blobs it built a mirror for, so this is a fact rather than a guess.
+            // Checked before the `get_mut` below so the two field borrows never overlap.
             if self.rings.contains_key(&res_id) {
                 continue;
             }
-            for run in blob.take_bytes_s_wrote() {
+            // `expect` is unreachable: `res_ids` was just built from this map's own keys, and
+            // nothing removes a blob between there and here — this method holds `&mut self`.
+            let blob = self
+                .blobs
+                .get_mut(&res_id)
+                .expect("res_ids came from self.blobs' keys");
+            let runs = blob.take_bytes_s_wrote();
+            if runs.is_empty() {
+                continue;
+            }
+
+            // **T5 — first changed byte observed in mapped host memory** (design note §7). This is
+            // the moment the return path *first sees* S's write for this cycle; the whole §7 question
+            // is whether the GPU had actually finished (T4) by now. The fingerprint is of the blob's
+            // current contents, and becomes Probe A's baseline: if it later changes while the
+            // application is blocked and no new `RingDelta` has arrived, the GPU was still writing
+            // past this point — the `T2 < T4` the note predicts. Guarded on `enabled()` so the
+            // ~1 MiB strided hash is never paid when tracing is off.
+            if rayland_relay::trace::enabled() {
+                let fp = rayland_relay::trace::fingerprint(blob.bytes());
+                rayland_relay::trace::emit(
+                    "T5",
+                    &format!(
+                        "side=S res={res_id} off={} runs={} fp={fp:#x}",
+                        runs[0].offset,
+                        runs.len()
+                    ),
+                );
+            }
+            wrote_this_call.push(res_id);
+
+            for run in runs {
                 out.push(S2C::BlobData {
                     res_id,
                     // No longer always 0: `offset` has been on the wire since Task 4 and this is
@@ -893,6 +977,50 @@ impl Applier {
                 });
             }
         }
+        // Record the S-written set for Probe A. A blob only ever joins this set — once S has written
+        // a resource, it is a GPU-write target forever, and the probe wants to keep watching it.
+        for res_id in wrote_this_call {
+            self.s_written.insert(res_id);
+        }
         out
+    }
+
+    /// **(c)1 Task 9 Probe A support**: fingerprint every blob S has ever written, cheaply.
+    ///
+    /// # What this is for
+    /// The design note (`docs/design/2026-07-17-return-path-completion.md` §7) predicts the defect is
+    /// `T2 < T4`: S's return path treats a ring retirement as proof the GPU's readback is done, and it
+    /// is not. This method is how the progress loop *catches the GPU in the act* — it re-fingerprints
+    /// the readback blobs on idle polls (when no new `RingDelta` has arrived, so the application is
+    /// blocked and nothing on C's side is writing this memory), and a fingerprint that has moved since
+    /// the return path shipped the frame is a GPU DMA landing **after** we declared completion.
+    ///
+    /// It is restricted to [`Self::s_written`] precisely so a moved fingerprint is attributable to the
+    /// GPU and not to C's forward writes — see that field's docs.
+    ///
+    /// # Inputs / outputs
+    /// - Returns `(res_id, fingerprint)` for every blob S has ever written that still exists, using
+    ///   the same strided [`rayland_relay::trace::fingerprint`] as the T5 baseline so the two are
+    ///   directly comparable. Cheap enough (microseconds per blob) to call on every 200 µs poll.
+    pub fn fingerprint_written_blobs(&self) -> Vec<(u32, u64)> {
+        self.s_written
+            .iter()
+            // A blob can be unref'd out from under the set; skip a res_id whose blob is gone rather
+            // than carry a stale entry. The set is diagnostic, so a lingering id is harmless.
+            .filter_map(|&res_id| {
+                self.blobs
+                    .get(&res_id)
+                    .map(|blob| (res_id, rayland_relay::trace::fingerprint(blob.bytes())))
+            })
+            .collect()
+    }
+
+    /// **(c)1 Task 9 Probe A support**: how many `C2S::RingDelta` messages have been applied so far.
+    ///
+    /// Probe A samples this alongside [`Self::fingerprint_written_blobs`] to tell a late GPU write of
+    /// the shipped frame from the next frame's readback arriving early — see [`Self::applied_ring_deltas`]'s
+    /// field docs for the full argument. Monotonic (modulo a `u64` wrap that no real session reaches).
+    pub fn applied_ring_deltas(&self) -> u64 {
+        self.applied_ring_deltas
     }
 }

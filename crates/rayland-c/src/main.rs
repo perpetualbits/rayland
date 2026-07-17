@@ -628,6 +628,15 @@ fn apply_blob_data(blobs: &BlobTable, res_id: u32, offset: u64, bytes: &[u8]) ->
 
     let start = offset as usize;
     blob.bytes_mut()[start..end as usize].copy_from_slice(bytes);
+
+    // **T7 — packet installed on C** (design note §7): the moment S's bytes are in the pages Mesa
+    // mapped. The `res`/`off` match the S-side T6 so the join can pair departure with installation
+    // across the two processes' shared monotonic clock, and the whole point of the graph is whether
+    // this precedes T8 (the fence release) and T9 (the application's read), or trails them.
+    rayland_relay::trace::emit(
+        "T7",
+        &format!("side=C res={res_id} off={offset} len={}", bytes.len()),
+    );
     Ok(())
 }
 
@@ -831,6 +840,17 @@ fn ring_watcher_thread(
                 // S reporting a tail we never sent (`Progress::note_consumed` is the first line of
                 // that defence and makes this assert unreachable).
                 watcher.advance_head(blob.bytes_mut(), consumed);
+                // **T8 — application-visible fence signalled** (design note §7). Writing `head` here
+                // is precisely what releases the application: `vn_ring_wait_seqno` busy-polls this
+                // word, so the instant it reaches the awaited seqno the application's synchronous
+                // Vulkan call returns and it proceeds to read its pixels (T9). Stamped with the
+                // `consumed` tail so the join can line this release up against the T6/T7 that carried
+                // the pixels it is releasing the application onto — the ordering the whole graph is
+                // built to check.
+                rayland_relay::trace::emit(
+                    "T8",
+                    &format!("side=C res={} tail={consumed}", identity.res_id),
+                );
                 // Reaching here *is* the evidence of ring progress: `consumed` only ever advances
                 // (`note_consumed` clamps it) and it differs from what we last published, so S has
                 // demonstrably replayed more of the ring since the last heartbeat. That is exactly
