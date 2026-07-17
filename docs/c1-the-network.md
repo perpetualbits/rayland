@@ -254,6 +254,39 @@ is *still the wrong question*.
 That is the fourth time in this document's history that an instrument has answered a different
 question than the one being asked, and the first time it happened to a fix rather than a measurement.
 
+#### What DOES help, by a factor of ten — and still is not a fix
+
+Two further experiments, both measured over three runs of the 120-frame fixture on loopback:
+
+| what the progress loop does | frames wrong | torn |
+|---|---|---|
+| release immediately (today's code) | 25, 13, 26 | 7, 3, 8 |
+| **hold each release for one extra poll** | **4, 1, 1** | **0, 0, 0** |
+| hold until a diff comes back empty | 16, 8 | 1, 1 |
+
+**Holding the release for one poll — giving late-landing writes one more diff before the application
+is let go — removes tearing entirely and cuts staleness roughly tenfold.** It costs one
+`PROGRESS_POLL` (200 µs) per synchronisation. It is *not* in the tree: it does not reach zero, and a
+correctness fix that turns "wrong 20% of the time" into "wrong 2% of the time" is not a fix, it is a
+better-hidden bug.
+
+Two things about that table are worth more than the improvement:
+
+1. **It is not monotonic in delay.** Zero polls → ~21 wrong; one poll → ~2; wait-for-quiet (which is
+   *at least* one poll and usually more) → ~12. If the defect were simply "the write lands late",
+   more grace would be monotonically better. It is not, so "wait longer" is not the axis, and the
+   one-poll result is not evidence that the mechanism is understood.
+2. **Waiting for quiet is worse than waiting one poll**, and the likely reason is instructive: the
+   reply arena is written on *every* command, so the diff is almost never empty while the application
+   is running. "Wait for quiet" therefore fires only once the application is fully blocked — which is
+   *later*, and evidently in a way that hurts.
+
+An attempt to parameterise the deferral (hold for N polls, to see whether N=4 reached zero) aborted
+the application: gating the queue's advance on new work strands the final release, so `head` never
+moves and Mesa's stall abort fires. That is recorded because it is a real trap in this loop's shape —
+**the queue must advance with time, not with work** — and not because the parameterised version is
+worth resurrecting as written.
+
 #### The mechanism is NOT established
 
 Stated plainly because a plausible mechanism is worse than none:
