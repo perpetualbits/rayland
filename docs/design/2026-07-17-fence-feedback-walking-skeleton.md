@@ -1,0 +1,196 @@
+# The stale-frame fix, minimal-correct: buy back fence feedback and deliver it
+
+**Status:** design spec, written 2026-07-17. It specifies the **walking-skeleton** fix for (c)1 Task
+9's stale-frame race — the smallest change that is *genuinely correct* (120/120 every run), not the
+smallest change that hides the symptom. It is the concrete implementation of the direction argued in
+[`2026-07-17-return-path-completion.md`](2026-07-17-return-path-completion.md) §6, narrowed to what
+the walking skeleton needs and grounded in two spikes run on 2026-07-17 (recorded in §2).
+
+The full robustness machinery of that note's §6 — an explicit `FENCE_COMPLETE` message, immutable
+`buffer_id`/`generation` versions, damage regions, `GENERATION_COMMITTED` accounting — is
+**deliberately deferred** to a later hardening pass. This spec says why the smaller thing is correct,
+and exactly where it is not yet robust.
+
+---
+
+## 1. The problem, in one paragraph
+
+An unmodified Vulkan application on C renders offscreen on S's GPU and reads its pixels back
+(`vkCmdCopyImageToBuffer` into its own mapped buffer, then `vkWaitForFences`, then a CPU read). Across
+(c)1's relay, some frames arrive as the *previous* frame whole, others *torn*. The measured evidence
+and the proof that the cause is `T2 < T4` (S ships the readback bytes before its GPU has finished
+writing them) are in [`../c1-the-network.md`](../c1-the-network.md) §3.1. This spec assumes that
+evidence and does not re-argue it.
+
+## 2. What the mechanism actually is (proven, not assumed)
+
+Two throwaway spikes on 2026-07-17 settled the question the fix rests on: *what, on S, signals that
+the GPU's readback is complete (T4)?*
+
+**Spike 1 — under `no_fence_feedback` (today's config), S has no GPU-completion signal at all.** With
+S's own ring fences (`virgl_renderer_context_create_fence`, the "barrier" of the negative-result
+commit `c787b52`) disabled, S's `write_context_fence` callback fired **zero times** across a full
+120-frame run. The application's own queue fences never reach S through that callback. So today the
+application's `vkWaitForFences` is satisfied only by the **ring head** advancing (`S2C::RingProgress`),
+which S advances as soon as its ring thread *reaches* the work — before the GPU *finishes* it. That is
+the `T2 < T4` race, at its root.
+
+**Spike 2 — fence completion is a *buffer write*, and enabling feedback surfaces it (but nothing
+delivers it).** With `no_fence_feedback` removed from the application's `VN_PERF`, the application
+initialised, created its device and blobs, ran, and then **timed out** ("a wait operation has not
+completed in the specified time"). `write_context_fence` *still* fired zero times. The conclusion:
+Venus signals fence completion by having the host (vkr) **write the retired fence value into a
+feedback buffer** — a Venus-internal shmem the guest polls locally — at GPU completion. That write is
+the T4 signal we need. It exists only when feedback is enabled, and under (c)1 nothing carries it
+across the network, so the application polls a word that never changes and hangs.
+
+**Therefore:** enabling fence feedback is not an optimisation to buy back later; it is the *only* way
+a T4 signal exists on S at all. The fix must enable it **and** deliver the resulting completion write
+to C. Both spike edits were reverted; they live only in this document.
+
+## 3. The fix
+
+Three parts. The surprise is how little code each is — because the completion signal, once feedback is
+enabled, is *ordinary blob data* that S's existing return path already knows how to ship.
+
+### 3.1 Un-pin `no_fence_feedback` for the application
+
+The application must run with fence feedback **on**. Concretely, its `VN_PERF` drops
+`no_fence_feedback` and keeps the rest of (c)1's crutches
+(`no_multi_ring,no_semaphore_feedback,no_event_feedback,no_query_feedback`).
+
+This single change moves the readback wait off the ring head and onto a feedback word that vkr writes
+**at GPU completion**. It closes the stale-frame path at its source: the head advancing early can no
+longer release the readback wait, because the readback wait no longer watches the head.
+
+`no_fence_feedback` is set in two places today, both in the loopback e2e test
+(`crates/rayland-s/tests/loopback_e2e.rs`, the refapp and icosa launches). In the field the value is
+chosen by whoever launches the application; (c)1's crutch table (spec §6) documents the recommended
+set, and that documentation must drop `no_fence_feedback` in the same change. The refapp test renders
+a single frame with no readback wait to speak of and may keep its current env; only the icosa test's
+launch *must* change, and that is the test that gates this fix.
+
+### 3.2 S delivers the completion write, gated on a cheap fingerprint
+
+Today S ships a blob's changed bytes (`Applier::take_blob_writes`) **only when a ring retires**
+(`Applier::take_ring_progress` returns non-empty). That gate is wrong for the feedback write: a
+blocked application produces no ring traffic, so the write that would release it never ships — exactly
+the spike-2 hang.
+
+The change: in `progress_thread` (`crates/rayland-s/src/main.rs`), on **every** poll, fingerprint the
+non-ring blobs (the cheap strided `rayland_relay::trace::fingerprint`, the same one Probe A uses); if
+any fingerprint moved, run the full `take_blob_writes` and ship the changes. The full byte-diff — the
+expensive part — runs only when the fingerprint says something changed, so an idle inter-frame gap
+costs one strided hash per poll, not a 1 MiB `memcmp`.
+
+**The watched set must be *all* non-ring blobs, not the already-S-written set.** Probe A's
+`s_written` records only blobs S has *already shipped a run for*, and the feedback buffer enters it
+only *after* its first write is shipped — so gating on `s_written` would never detect that first write
+(a bootstrap deadlock: the buffer is not watched until it has been shipped, and it cannot be shipped
+until it is watched). Fingerprinting every non-ring blob avoids this; the ring blobs are excluded for
+the same reason `take_blob_writes` excludes them (their pages are C's command bytes and S's `head`,
+not S's writes to return). A fingerprint move on a blob C wrote forward (its vertex/fractal memory) is
+harmless: `take_bytes_s_wrote` re-baselines C's writes, so the full diff simply ships nothing for it —
+a wasted diff, never wrong bytes.
+
+The ordering that makes this correct is the one `take_blob_writes` already imposes: **application
+blobs first, Venus-internal blobs last** (`Applier::venus_internal`). The readback buffer is an
+application blob; the feedback buffer is Venus-internal. So the readback pixels are always shipped
+ahead of the feedback word that releases the application to read them.
+
+`S2C::RingProgress` on ring retirement stays exactly as it is — it still carries ring space and the
+reply arena, which the application needs to make forward progress through non-readback synchronous
+calls. The fingerprint-gated ship is *added alongside* it, not a replacement.
+
+### 3.3 C does not change
+
+The feedback buffer is an ordinary blob C already shadows (it arrives via the `C2S::CreateBlob` path
+like any other, which spike 2 confirmed happens). `apply_blob_data` already installs arbitrary
+`S2C::BlobData` into a shadow's mapped pages, and Mesa on C polls those pages locally. So the
+completion write reaches the application through machinery that already exists. **No `rayland-c`
+change is required.**
+
+## 4. Why it is race-free
+
+The correctness argument is one sentence: **the feedback word exists only after the GPU (including the
+readback copy) is complete, and it is shipped last, so C never releases the application onto unfinished
+pixels.**
+
+Spelling out the two failure modes this closes:
+
+- **Stale (whole previous frame).** Today the application is released by the head before its pixels
+  land. With the fix, the application is released by the feedback word, which vkr writes only at
+  completion and which S ships after the readback pixels. Released too early is impossible: the word
+  it waits on does not exist until the pixels do.
+- **Torn (partial).** A poll that samples the readback buffer mid-DMA ships torn bytes — but it does
+  **not** ship the feedback word, because vkr has not written it yet. Later polls ship the corrected
+  bytes, and the poll that finally ships the feedback word ships the final readback bytes with it (in
+  the same batch, readback first). The application reads only after the feedback word installs, by
+  which point every readback byte is the finished frame.
+
+The `happens-before` edge the polling return path could never manufacture (note §2) is now supplied by
+Mesa's own fence-feedback contract: `write(feedback word) happens-after GPU-complete`, and S preserves
+it across the wire by ordering the feedback word last.
+
+## 5. What is deferred, and the one place this is not yet robust
+
+This is a walking skeleton. Named honestly, the gaps:
+
+- **No buffer versions / generations.** If an application overlaps frames (submits frame N+1's work
+  before reading frame N's readback), a single readback buffer's bytes could be mid-rewrite when the
+  fingerprint moves. The icosa fixture is strictly synchronous (one fence per frame, read before the
+  next submit), so this cannot arise for the fixture that gates the fix. A general application needs
+  the immutable-generation machinery of note §6. **This spec's correctness claim is scoped to the
+  synchronous one-fence-per-frame case.**
+- **No explicit `FENCE_COMPLETE` message.** The completion signal rides the existing `BlobData` path.
+  That works because S can *observe* vkr's feedback write in its own mapping. If a future engine or
+  configuration wrote the feedback through a path S does not map, this would need the explicit message
+  (note §6). The fallback is designed but not built.
+- **Per-poll fingerprinting cost on S.** Bounded (a strided hash), but real, and additive to the
+  byte-grain fragmentation already measured (`../c1-the-network.md` §3.1). Both are volume concerns
+  for a hardening pass, not correctness.
+- **The reply arena still ships on every command.** Unchanged by this spec.
+
+## 6. Implementation, in order
+
+**Step 0 — de-risk the load-bearing assumption first.** Before any other change, confirm S's blob
+diff observes vkr's write to the feedback buffer. Concretely: un-pin `no_fence_feedback` in the icosa
+test only, add a temporary log where `take_blob_writes` reports a run for a Venus-internal blob, run
+the fixture, and confirm a Venus-internal blob's bytes change *after* the application blocks (i.e. with
+no ring traffic). If they do, the design holds. If they do not, stop and switch to the explicit
+`FENCE_COMPLETE` fallback before writing the rest. This step is throwaway and is reverted.
+
+**Step 1 — S ships on fingerprint change.** In `progress_thread`, add the every-poll fingerprint gate
+and the fingerprint-gated `take_blob_writes` ship, alongside the existing retirement-driven path. This
+needs a fingerprint over **all non-ring blobs** (not `fingerprint_written_blobs`, whose `s_written`
+scope has the bootstrap problem of §3.2) — add an `Applier` method that fingerprints every blob except
+the rings, and reuse `take_blob_writes` for the actual ship. Keep the app-first/venus-last ordering.
+
+**Step 2 — un-pin `no_fence_feedback`** in the icosa test launch, and update the crutch-table
+documentation (spec §6 / the design note) to drop it from the recommended set.
+
+**Step 3 — verify.** Run `icosa_cpu_renders...` at least **three** times (it is a race; one pass is
+not evidence). Every run must be 120/120. Run once more with `RAYLAND_C1_TRACE=1` and confirm via
+`scripts/c1-trace-analyze.py` that Probe A no longer fires (no readback blob changes after its final
+ship) and that the feedback word's install (T7 on C) precedes the application's read.
+
+**Step 4 — self-review and update the binding docs.** If any statement in `CLAUDE.md` or the design
+note is made false by the change, fix it in the same commit (the repository's standing rule).
+
+## 7. Success criteria
+
+- `icosa_cpu_renders_across_the_network_the_same_120_frames_it_renders_natively` passes **120/120 on
+  three consecutive runs**, with `no_fence_feedback` no longer set for that application.
+- The refapp single-frame test still passes.
+- `cargo clippy --workspace --all-targets` is clean; the unit and no-GPU-linkage tests pass.
+- No `rayland-c` source change was required (if one turns out to be, that is a finding worth recording,
+  because this spec predicts none).
+
+## 8. Fallback if step 0 fails
+
+If S cannot observe the feedback write in its own mapping, build the explicit signal instead:
+`S2C::FenceComplete { ctx_id, ring_idx, fence_value }`, emitted by S when it can determine the fence
+retired, and applied on C by writing `fence_value` into the feedback buffer at the offset Mesa polls.
+This pulls forward part of note §6 and needs C to identify the feedback buffer and its layout — which
+is why it is the fallback, not the plan. It is recorded here so the pivot, if forced, starts from a
+design rather than a blank page.
