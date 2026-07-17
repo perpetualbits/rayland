@@ -182,20 +182,34 @@ byte-for-byte the *previous* native frame.**
 | 0 ms | **3** | 13, 77, 100 | **3 of 3** |
 | 20 ms | **5** | 8, 48, 75, 106, 115 | **5 of 5** |
 
-**Eight out of eight are `N−1`. Never `N−2`. Never torn. Never novel pixels.**
+> ⚠️ **This section originally said "eight out of eight are `N−1`; never torn, never novel pixels",
+> and drew structural conclusions from it. That was wrong**, and it is corrected below rather than
+> quietly rewritten. It was inferred from a sample of **eight** frames across two runs. A later run
+> of the loopback reproducer produced **38** bad frames, and **16 of them (42%) match no native frame
+> at all** — i.e. **tearing is real and common**. The conclusion "it is not tearing" was a confident
+> generalisation from a small sample: true of those eight, false about the system.
 
-That set of facts is unusually constraining, and each one rules something out:
+**There are two distinct failure modes**, measured on one loopback run of 120 frames (38 bad):
 
-- **It is not tearing.** A half-updated megabyte would produce a fractal matching **no** frame that
-  ever existed. Every bad frame matches a real one exactly.
-- **It is not a stale texture with fresh geometry.** That would show frame 13's rotation wearing
-  frame 12's fractal — again matching nothing. We get the whole previous frame, geometry and texture
-  together, intact.
+| mode | count | what the application got |
+|---|---:|---|
+| **stale by exactly one** — byte-for-byte the previous native frame | **22** | it read before *any* of its pixels had arrived |
+| **torn** — matches no native frame that ever existed | **16** | it read while its pixels were *partially* applied |
+
+The torn frames arrive in runs (0069–0070, 0073–0076, 0101–0105), which is what falling behind and
+staying behind looks like.
+
+What the full set does still establish:
+
 - **It is not an off-by-one in the code.** The affected frames are **different in every run**. Code
   is not sporadic. This is a **race**.
-- **It gets worse with latency** (3 → 5 frames from 0 → 20 ms), so the window being lost widens with
-  RTT.
-- **It never slips by two**, so whatever loses the race recovers within a single frame.
+- **Both modes share one cause.** If nothing couples *"your pixels have arrived"* to *"you may
+  read"*, then reading early yields the previous frame **intact**, and reading mid-delivery yields a
+  **torn** mix. One missing dependency, two costumes. The existence of tearing is what rules out a
+  pure mis-ordering, which could only ever produce a clean `N−1`.
+- **The rate varies enormously run to run** — 3, 5, 8, 20, 29, 36, 38, 39 of 120 have all been
+  observed, on the same code and the same link. Any single run is a sample, not a measurement. This
+  document said "3 of 120" as though it characterised the defect; it characterised one run.
 
 **Why this matters more than any timing number in this document:** the application **exits 0**. It
 is not told. With an ordinary application, frame N−1 *is a plausible frame of animation* — nobody
