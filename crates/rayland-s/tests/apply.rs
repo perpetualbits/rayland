@@ -35,6 +35,35 @@ use rayland_vtest::{BlobResource, EngineError, EngineFrame, RenderEngine};
 use std::collections::HashMap;
 use std::os::fd::{AsFd, OwnedFd};
 
+/// The return path's three steps, composed — the shape [`Applier`] used to expose as one method.
+///
+/// # Why these tests may skip the barrier that production must not
+/// The real loop in `rayland-s` is: [`Applier::take_ring_progress`] →
+/// [`RenderEngine::wait_for_work_retired`] → [`Applier::take_blob_writes`], and **skipping the
+/// middle step is (c)1's stale-frame defect** (`docs/c1-the-network.md` §3.1): a diff answers "did
+/// these bytes change?", never "has the GPU finished?".
+///
+/// It is a genuine no-op here rather than a convenience. These tests drive `Applier` against mock
+/// engines and a plain memfd: nothing renders asynchronously, so no GPU work is ever in flight and
+/// there is nothing to retire. That is the same reasoning behind
+/// `RenderEngine::wait_for_work_retired`'s default implementation.
+///
+/// It also means **these tests cannot catch a missing barrier** — only the live e2e can
+/// (`tests/loopback_e2e.rs`'s icosa test). That is not a gap to be closed here: a mock engine has no
+/// GPU to be ahead of, so the defect is unrepresentable rather than merely absent.
+fn poll_progress(applier: &mut Applier) -> Vec<S2C> {
+    let progress = applier.take_ring_progress();
+    if progress.is_empty() {
+        // Nothing retired: no wait to release, and nothing S can honestly claim its GPU wrote.
+        return Vec::new();
+    }
+    let mut out = applier.take_blob_writes();
+    // Blob bytes first, progress last: progress releases the application's wait and must not precede
+    // the pixels it is about to read.
+    out.extend(progress);
+    out
+}
+
 /// The context id used throughout, mirroring the live capture's single-context session.
 const CTX_ID: u32 = 1;
 
@@ -434,7 +463,7 @@ fn progress_reports_the_head_the_engine_wrote_not_the_tail_that_was_relayed() {
     // intra-cs, after each command, so a partial head is entirely normal).
     engine.write_control(ring, RING_HEAD_OFFSET, 32);
 
-    let out = applier.poll_progress();
+    let out = poll_progress(&mut applier);
 
     assert!(
         matches!(
@@ -465,7 +494,7 @@ fn no_progress_is_reported_while_the_engine_has_consumed_nothing() {
 
     // `head` is untouched: the ring thread has not run.
     assert!(
-        applier.poll_progress().is_empty(),
+        poll_progress(&mut applier).is_empty(),
         "an unconsumed ring has no progress to report; reporting one would release the \
          application's wait on a reply that does not exist"
     );
@@ -490,12 +519,12 @@ fn progress_is_reported_once_per_movement_not_on_every_poll() {
     engine.write_control(ring, RING_HEAD_OFFSET, 16);
 
     assert_eq!(
-        applier.poll_progress().len(),
+        poll_progress(&mut applier).len(),
         1,
         "the first poll sees the move"
     );
     assert!(
-        applier.poll_progress().is_empty(),
+        poll_progress(&mut applier).is_empty(),
         "`head` has not moved since, so there is nothing new to say; a repeat would be a \
          keepalive that proves only that S's process is running"
     );
@@ -1166,7 +1195,7 @@ fn the_reply_arena_crosses_because_s_wrote_it_not_because_s_knows_what_it_is() {
     engine.write_blob_range(arena, 0, 0x5a, 128);
     engine.write_control(ring, RING_HEAD_OFFSET, 64);
 
-    let out = applier.poll_progress();
+    let out = poll_progress(&mut applier);
 
     let runs = blob_runs_for(&out, arena);
     assert_eq!(
@@ -1219,7 +1248,7 @@ fn a_blob_s_never_wrote_is_not_shipped_back_even_though_c_wrote_it() {
     // S wrote nothing into it.
     relay_and_retire(&mut applier, &mut engine, ring, 0, 64);
 
-    let out = applier.poll_progress();
+    let out = poll_progress(&mut applier);
 
     assert_eq!(
         blob_runs_for(&out, vertices),
@@ -1252,7 +1281,7 @@ fn the_ring_is_excluded_by_res_id_even_though_s_wrote_its_head() {
 
     relay_and_retire(&mut applier, &mut engine, ring, 0, 64);
 
-    let out = applier.poll_progress();
+    let out = poll_progress(&mut applier);
 
     assert_eq!(
         blob_runs_for(&out, ring),
@@ -1283,7 +1312,7 @@ fn an_inbound_blob_data_re_snapshots_so_c_s_own_write_is_never_shipped_back() {
     relay_and_retire(&mut applier, &mut engine, ring, 0, 64);
     engine.write_blob(app_blob, 0x5a);
     assert!(
-        !blob_runs_for(&applier.poll_progress(), app_blob).is_empty(),
+        !blob_runs_for(&poll_progress(&mut applier), app_blob).is_empty(),
         "S wrote this blob, so round 1 must ship it — otherwise round 2 proves nothing"
     );
 
@@ -1299,7 +1328,7 @@ fn an_inbound_blob_data_re_snapshots_so_c_s_own_write_is_never_shipped_back() {
     assert!(out.is_empty(), "a blob sync has no reply; got {out:?}");
     relay_and_retire(&mut applier, &mut engine, ring, 64, 128);
 
-    let out = applier.poll_progress();
+    let out = poll_progress(&mut applier);
 
     assert_eq!(
         blob_runs_for(&out, app_blob),
@@ -1325,7 +1354,7 @@ fn only_the_bytes_s_wrote_cross_not_the_whole_blob() {
     engine.write_blob_range(app_blob, 2 * A_PAGE as u64, 0xc3, 4);
     relay_and_retire(&mut applier, &mut engine, ring, 0, 64);
 
-    let out = applier.poll_progress();
+    let out = poll_progress(&mut applier);
 
     let runs = blob_runs_for(&out, app_blob);
     assert_eq!(
@@ -1352,7 +1381,7 @@ fn contiguous_changed_bytes_coalesce_and_a_gap_splits_them() {
     engine.write_blob_range(app_blob, 3 * A_PAGE as u64, 0xb2, 16);
     relay_and_retire(&mut applier, &mut engine, ring, 0, 64);
 
-    let out = applier.poll_progress();
+    let out = poll_progress(&mut applier);
 
     let runs = blob_runs_for(&out, app_blob);
     let shapes: Vec<(u64, usize)> = runs.iter().map(|(o, b)| (*o, b.len())).collect();
@@ -1403,7 +1432,7 @@ fn s_s_run_does_not_carry_the_application_s_bytes_from_the_same_page() {
     engine.write_blob_range(app_blob, 0, 0xc3, 4);
     relay_and_retire(&mut applier, &mut engine, ring, 0, 64);
 
-    let out = applier.poll_progress();
+    let out = poll_progress(&mut applier);
 
     let runs = blob_runs_for(&out, app_blob);
     assert_eq!(
@@ -1447,7 +1476,7 @@ fn the_command_buffer_staging_pool_never_crosses_because_s_never_writes_it() {
 
     relay_and_retire(&mut applier, &mut engine, ring, 0, 64);
 
-    let out = applier.poll_progress();
+    let out = poll_progress(&mut applier);
 
     assert_eq!(
         blob_runs_for(&out, pool),
@@ -1472,7 +1501,7 @@ fn the_command_buffer_staging_pool_never_crosses_because_s_never_writes_it() {
 fn the_gpu_s_pixels_are_shipped_before_the_progress_that_releases_the_app_s_wait() {
     let (mut applier, _engine, _ring, app_blob) = a_retired_batch_with_pixels(0x5a);
 
-    let out = applier.poll_progress();
+    let out = poll_progress(&mut applier);
 
     let blob_at = out
         .iter()
@@ -1497,7 +1526,7 @@ fn the_gpu_s_pixels_are_shipped_before_the_progress_that_releases_the_app_s_wait
 fn the_shipped_blob_carries_the_bytes_s_s_gpu_actually_wrote() {
     let (mut applier, _engine, _ring, app_blob) = a_retired_batch_with_pixels(0x5a);
 
-    let out = applier.poll_progress();
+    let out = poll_progress(&mut applier);
 
     let (offset, bytes) = out
         .iter()
@@ -1543,7 +1572,7 @@ fn a_poll_that_finds_no_movement_ships_nothing_at_all() {
     engine.write_blob(app_blob, 0x77);
 
     assert!(
-        applier.poll_progress().is_empty(),
+        poll_progress(&mut applier).is_empty(),
         "with `head` unmoved there is no retired batch, so no progress and therefore no reason to \
          ship a blob; a blob per poll would make this loop a bandwidth source"
     );
@@ -1560,13 +1589,13 @@ fn a_quiescent_ring_re_ships_nothing_on_subsequent_polls() {
 
     // First poll: the batch retired, so pixels and progress both go.
     assert!(
-        !applier.poll_progress().is_empty(),
+        !poll_progress(&mut applier).is_empty(),
         "the first poll after a retired batch owes C both"
     );
 
     // Nothing has moved since.
     assert!(
-        applier.poll_progress().is_empty(),
+        poll_progress(&mut applier).is_empty(),
         "an unmoved `head` is not progress and not a reason to re-ship a blob"
     );
 }

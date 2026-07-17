@@ -219,6 +219,41 @@ wall-clock anywhere in its math, to turn "looks fine" into "here are the three, 
 That property was designed into `rayland-icosa-core` for a different reason, and it is the only
 reason this bug is visible.
 
+#### An attempted fix, and why it failed (read before trying the obvious thing)
+
+**The obvious repair has been tried and does not work. It is left in the tree, wired up and
+documented, so the next attempt starts after it rather than at it.**
+
+The reasoning was: `poll_progress` infers "S's GPU wrote" from a `memcmp`, and a `memcmp` answers
+*"did these bytes change?"*, never *"has the GPU finished?"*. `rayland-engine` has always been able
+to answer the real question — `VirglEngine::wait_for_context_fence`, which `read_back` has used since
+C0 Task 3 — so it was exposed on the trait as `RenderEngine::wait_for_work_retired` and called by the
+progress loop *between* reading the ring frontier and diffing the blobs (with the applier lock
+dropped across it, since a 5 s fence timeout would otherwise starve the ring and trip Mesa's 3.5 s
+abort). A second change ordered the application's blobs ahead of Venus's internal ones, so the reply
+arena — whose bytes release the application's wait — cannot cross the wire before the pixels.
+
+**Measured, three runs: 25, 13, 26 of 120 frames wrong.** The unfixed range is 3–39. It is not an
+improvement; it is indistinguishable from doing nothing.
+
+**And the barrier is not idle while failing**, which is the useful part:
+
+```
+C1BARRIER calls=684 total_us=740621 mean_us=1082
+```
+
+684 fence waits per run, averaging **1.1 ms of real waiting**. It waits for something. That something
+is **not** "the application's readback copy has landed in the blob".
+
+**The conclusion, and the next investigator's starting point: a virglrenderer context fence does not
+order against the work Venus's own ring thread dispatches.** `read_back` gets a correct frame from
+the identical primitive because it fences resources created by `create_resource` — C0's offscreen
+path — never the application's Venus queue. So the engine answers a real question, truthfully, and it
+is *still the wrong question*.
+
+That is the fourth time in this document's history that an instrument has answered a different
+question than the one being asked, and the first time it happened to a fix rather than a measurement.
+
 #### The mechanism is NOT established
 
 Stated plainly because a plausible mechanism is worse than none:

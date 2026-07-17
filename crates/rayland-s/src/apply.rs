@@ -221,6 +221,35 @@ pub struct Applier {
     /// (see `RingIdentity`'s docs). S has no such ambiguity: every `C2S::RingDelta` names its own
     /// `ring_res_id`, so S can simply mirror whatever C tells it about and let the message choose.
     rings: HashMap<u32, RingMirror>,
+    /// The blobs C declared as **Venus's own internal shmems** — `blob_id == 0` per ring-findings
+    /// §6, which is the ring, the reply arena, and the staging pool. Everything else is an
+    /// application `VkDeviceMemory` allocation.
+    ///
+    /// # Why this exists, when spec §7.2 deliberately stopped recording `blob_id`
+    /// It was removed because it decided **what S publishes** — and it is "a number a remote peer
+    /// chose, unverified against anything" (see [`HostBlob::map`]). That rule is retired and stays
+    /// retired: [`Applier::take_blob_writes`] still ships *exactly the bytes S wrote*, for every
+    /// blob, deciding nothing from this set.
+    ///
+    /// This uses it only to **order** those bytes on the wire, and that is a different bargain:
+    ///
+    /// - **The need.** The reply arena is the blob whose contents *release the application's wait* —
+    ///   Mesa reads its fence reply and then reads its own mapped memory. If it crosses the wire
+    ///   ahead of the application's readback blob, C applies the release first and the application
+    ///   reads pixels that have not landed yet. That is (c)1's residual stale-frame defect, measured
+    ///   at 2 of 120 frames after the GPU barrier removed the other 36
+    ///   (`docs/c1-the-network.md` §3.1). The blobs live in a `HashMap`, so before this the order was
+    ///   whatever hashing chose — and it chose the reply arena first.
+    /// - **The exposure, in full.** A hostile or buggy C can lie about `blob_id`. The worst it
+    ///   achieves is a bad *order*: no byte is dropped, no byte is invented, and nothing S owns is
+    ///   published. A peer that lies here makes **its own application** read stale frames. That is
+    ///   self-harm, not a hole in S — which is exactly what the retired rule could not say, because
+    ///   there a lie silently suppressed data S was obliged to send.
+    ///
+    /// Identifying the arena precisely is not available: spec §7.2 records that decoding
+    /// `vkSetReplyCommandStreamMESA` to learn its `res_id` is **silently unsound**, because the reply
+    /// pool mints a new id when it grows. So the choice is this coarse split or no ordering at all.
+    venus_internal: std::collections::HashSet<u32>,
     /// The context C created, remembered because [`C2S::CreateBlob`] does not carry one and
     /// `RenderEngine::create_blob_resource` needs one. `None` until [`C2S::CreateContext`] arrives.
     ctx_id: Option<u32>,
@@ -432,6 +461,15 @@ impl Applier {
                     ApplyError::from(source)
                 })?;
                 self.blobs.insert(res_id, host_blob);
+                // Remember which side of the ordering split this blob falls on. `blob_id == 0` is
+                // ring-findings §6's marker for Venus's own shmems — the ring, the reply arena, the
+                // staging pool — and the reply arena is the one whose bytes release the
+                // application's wait, so it must not cross the wire ahead of the application's own
+                // memory. See `venus_internal`'s docs for why using this number for *ordering* is
+                // sound while using it for *routing* was not.
+                if blob_id == 0 {
+                    self.venus_internal.insert(res_id);
+                }
 
                 // A ring-shaped blob gets a mirror. Unlike C, S needs no "first match only" rule:
                 // every delta names its own ring, so a second ring is simply a second mirror.
@@ -607,6 +645,12 @@ impl Applier {
                 engine.unref_resource(res_id);
                 self.blobs.remove(&res_id);
                 self.rings.remove(&res_id);
+                // Forget the send-order classification too. virglrenderer is free to hand the same
+                // `res_id` to a later blob, and a leftover entry here would silently sort a fresh
+                // application buffer into Venus's group — putting the application's own pixels
+                // *after* the reply that releases it, which is the exact defect this classification
+                // exists to prevent. Cheap to drop; invisible and sporadic if not.
+                self.venus_internal.remove(&res_id);
                 Ok(Vec::new())
             }
         }
@@ -720,7 +764,36 @@ impl Applier {
     /// correctness one, and it is required to be fixed — with a wire change carrying many runs per
     /// message, never by merging runs across bytes S did not write — before this carries any
     /// non-toy workload; Task 9 measures the exact numbers.
-    pub fn poll_progress(&mut self) -> Vec<S2C> {
+    /// The context C created, if any. The progress loop needs it to name the context whose GPU work
+    /// must retire before pixels are shipped; see [`Applier::take_ring_progress`].
+    pub fn ctx_id(&self) -> Option<u32> {
+        self.ctx_id
+    }
+
+    /// **Step 1 of the return path**: which rings retired, and how far.
+    ///
+    /// # Why the return path is three steps rather than one function
+    /// This used to be the first half of a single `poll_progress`, and that shape carried (c)1's
+    /// worst defect. The caller must be able to do something *between* learning that the ring
+    /// retired and asking the blobs what changed — namely **wait for S's GPU to actually finish the
+    /// work that retirement covers** ([`RenderEngine::wait_for_work_retired`]). Inside one function
+    /// that barrier would run with the applier lock held, and a pathological fence wait (5 s) would
+    /// starve the message thread that feeds the ring, so Mesa's ~3.5 s stall abort would kill the
+    /// application. Splitting lets the caller drop the lock across the barrier.
+    ///
+    /// The order the three steps must run in, and why each is where it is:
+    /// 1. **this** — read the rings' frontiers. Cheap; a handful of loads.
+    /// 2. **barrier** — `wait_for_work_retired`, *without* this lock held.
+    /// 3. [`Applier::take_blob_writes`] — diff, now that the GPU's writes are guaranteed visible.
+    ///
+    /// Ship step 3's bytes **before** step 1's progress: progress is what releases the application's
+    /// wait, so it must not cross the wire ahead of the pixels the application is about to read.
+    ///
+    /// # Inputs / outputs
+    /// - Returns one [`S2C::RingProgress`] per ring that moved since the last call, empty if none.
+    ///   **Empty means the caller must do nothing else**: no retirement, so no wait to release and
+    ///   nothing S can honestly claim its GPU wrote.
+    pub fn take_ring_progress(&mut self) -> Vec<S2C> {
         // Ask the rings first, before copying anything: on the overwhelming majority of polls
         // nothing moved, and shipping a blob per poll regardless would make this loop a bandwidth
         // source rather than the latency mechanism it is meant to be.
@@ -740,18 +813,66 @@ impl Applier {
                 });
             }
         }
-        if progress.is_empty() {
-            // Nothing retired, so there is nothing S can honestly claim its GPU wrote — and no wait
-            // to release, so nothing that needs pixels shipped ahead of it.
-            return Vec::new();
-        }
+        progress
+    }
 
-        // Something retired, so S's engine has had the chance to write memory C cannot see. v1 does
-        // not know — and deliberately does not ask — *which* blobs those commands touched: that
-        // would mean decoding the ring, which spec §7 rules out. It asks each blob a question it can
-        // answer from bytes alone: which of your bytes did S write? See the rule above.
+    /// **Step 3 of the return path**: the bytes S is *observed* to have written.
+    ///
+    /// # The caller MUST have run the barrier first
+    /// This diffs each blob against its baseline, and a diff answers *"did these bytes change?"* —
+    /// never *"has the GPU finished?"*. Calling it without [`RenderEngine::wait_for_work_retired`]
+    /// in between is precisely (c)1's stale-frame defect: the predecessor of these two methods
+    /// reasoned that *"something retired, so S's engine has had the chance to write"*, and **"has
+    /// had the chance" is not "has"**. Task 9 measured the result — 22 of 120 frames delivered whole
+    /// and one frame old, 16 more torn, application exiting 0 throughout
+    /// (`docs/c1-the-network.md` §3.1). The ordering is a contract this type cannot enforce, so it
+    /// is stated here and obeyed in `rayland-s`'s progress loop.
+    ///
+    /// v1 does not know — and deliberately does not ask — *which* blobs the retired commands
+    /// touched: that would mean decoding the ring, which spec §7 rules out. It asks each blob a
+    /// question it can answer from bytes alone; the barrier is what makes that question's answer
+    /// mean what the caller needs it to mean.
+    ///
+    /// # Inputs / outputs
+    /// - Returns one [`S2C::BlobData`] per run of bytes S wrote, across every non-ring blob. Empty
+    ///   when S wrote nothing since the last call.
+    pub fn take_blob_writes(&mut self) -> Vec<S2C> {
+        // **The application's own memory ships before Venus's.**
+        //
+        // The reply arena is a Venus-internal blob, and its bytes are what release the application's
+        // wait: Mesa reads its fence reply and then reads its own mapped pages. Ship it first and C
+        // applies the release before the pixels, so the application reads a frame that has not
+        // arrived — which is not hypothetical, it is the 2-of-120 residue the GPU barrier alone left
+        // behind (`docs/c1-the-network.md` §3.1). Before this, the order was a `HashMap`'s, and
+        // hashing happened to put the arena first.
+        //
+        // Within each group the order is still arbitrary and that is fine: two application blobs
+        // have no ordering relationship to each other — neither one's arrival releases anything —
+        // and the same holds for two of Venus's. The only edge that matters is between the groups.
+        //
+        // This decides ORDER only, never whether a blob ships: every blob below is asked the same
+        // question and every answer is sent. See `venus_internal` for why that distinction is what
+        // makes leaning on a peer-supplied `blob_id` acceptable here and unacceptable in the rule
+        // spec §7.2 retired.
+        let mut res_ids: Vec<u32> = self.blobs.keys().copied().collect();
+        res_ids.sort_by_key(|res_id| {
+            (
+                // false (0) sorts first: application memory leads.
+                self.venus_internal.contains(res_id),
+                // Then by id, purely so a run is reproducible rather than hash-ordered. Nothing
+                // depends on this and it costs nothing to have.
+                *res_id,
+            )
+        });
+
         let mut out = Vec::new();
-        for (&res_id, blob) in self.blobs.iter_mut() {
+        for res_id in res_ids {
+            // `expect` is unreachable: `res_ids` was just built from this map's own keys, and
+            // nothing removes a blob between there and here — this method holds `&mut self`.
+            let blob = self
+                .blobs
+                .get_mut(&res_id)
+                .expect("res_ids came from self.blobs' keys");
             // **The ring is excluded structurally, by `res_id`.** S's engine genuinely writes a
             // ring's pages — `vkr_ring_store_head` (`vkr_ring.c:60-67`) stores `head` into them
             // after each dispatched command — so the observed-writes rule would rightly report them,
@@ -772,9 +893,6 @@ impl Applier {
                 });
             }
         }
-        // **Last, always.** See the ordering argument above: this is what releases the application's
-        // wait, and it must not do so before the bytes it is waiting for are on their way.
-        out.extend(progress);
         out
     }
 }

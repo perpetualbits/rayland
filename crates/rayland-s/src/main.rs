@@ -57,7 +57,7 @@
 //! This file is written to be read, and it says where it is guessing.
 
 // The real GPU, and the gate that tells us whether this host has one.
-use rayland_engine::{VirglEngine, virgl_available};
+use rayland_engine::{RenderEngine, VirglEngine, virgl_available};
 // The relay protocol and its framing.
 use rayland_relay::{C2S, S2C, read_msg, write_msg};
 // The message applier: everything this daemon actually knows how to do.
@@ -189,32 +189,119 @@ fn send(stream: &mut QuicSend, msg: &S2C) -> Result<()> {
     stream.flush().context("flushing the link to C")
 }
 
-/// The progress thread: notice what S's engine retired, and tell C.
+/// The progress thread: notice what S's GPU retired, ship what it wrote, then release C.
 ///
-/// **This is the only thing that ever releases the application's synchronous Vulkan calls.** See the
-/// module docs for why it cannot be folded into the message loop, and [`Applier::poll_progress`] for
-/// why it reports only genuine movement rather than a reassuring keepalive.
+/// **This is the only thing that ever releases the application's synchronous Vulkan calls**, which
+/// is why the order below is the whole correctness argument rather than a detail. See the module
+/// docs for why it cannot be folded into the message loop.
+///
+/// # The three steps, and the defect that made them three
+/// This loop used to be one call: read the rings, diff the blobs, ship. That reasoned *"something
+/// retired, so S's engine **has had the chance** to write"* — and "has had the chance" is not "has".
+/// A diff answers *"did these bytes change?"*, never *"has the GPU finished?"*, and (c)1 Task 9
+/// measured what that costs: of 120 frames, **22 arrived whole and one frame stale, and 16 arrived
+/// torn** — the application exiting 0 throughout, told nothing
+/// (`docs/c1-the-network.md` §3.1). The engine could always answer the real question
+/// ([`RenderEngine::wait_for_work_retired`]); nothing asked it.
+///
+/// So: **read the frontier, wait for the GPU, then diff.**
+///
+/// # ⚠️ This ordering is right and it DOES NOT FIX THE DEFECT
+/// Stated here rather than discovered again: with the barrier in place the same 120-frame run still
+/// delivers **24 frames wrong** (18 stale, 6 torn) — inside the unfixed range of 3–39. The barrier
+/// is not idle while failing: it is called 684 times per run and waits **1.1 ms on average**. It
+/// waits for something; that something is not "the application's readback copy has landed".
+/// See [`RenderEngine::wait_for_work_retired`] for the conclusion — a virglrenderer context fence
+/// does not order against the work Venus's own ring thread dispatches — and `docs/c1-the-network.md`
+/// §3.1 for the measurements. The structure below is kept because it is *necessary* (a diff can
+/// never answer "has the GPU finished?") and because the next attempt needs somewhere to put a
+/// completion signal that actually covers the Venus queue. It is not *sufficient*.
+///
+/// 1. [`Applier::take_ring_progress`] — what retired. Cheap.
+/// 2. [`RenderEngine::wait_for_work_retired`] — **the barrier.** Intended to make step 3's diff ask
+///    about a settled buffer. It demonstrably does not achieve that for the application's readback;
+///    see the warning below before trusting this line.
+/// 3. [`Applier::take_blob_writes`] — what S wrote, now knowable.
+///
+/// Then blob bytes go out **before** the progress that releases the wait, exactly as before.
+///
+/// # Why the applier lock is dropped across the barrier
+/// A fence wait is bounded by `FENCE_WAIT_TIMEOUT` (5 s in `rayland-engine`), and Mesa aborts the
+/// application ~3.5 s after its ring stalls. Holding the applier lock across the barrier would block
+/// the message thread — the only thing that writes C's ring deltas into the ring — so a pathological
+/// fence wait would starve the ring and **kill the application it was protecting**. The lock is
+/// therefore taken twice, briefly, and never held across the wait.
+///
+/// # Lock order
+/// This thread takes `applier`, releases it, takes `engine`, releases it, takes `applier` again,
+/// releases it, and only then takes `tx`. It never holds two at once, so it cannot invert any order
+/// the message thread uses (which takes `applier`, then `engine` inside `apply`).
 ///
 /// # Inputs / outputs
-/// - `applier`: shared with the message thread. The lock is held only for the poll itself.
+/// - `applier`: shared with the message thread. Locked only for steps 1 and 3, never across the wait.
+/// - `engine`: shared with the message thread. virglrenderer is process-global and **not
+///   thread-safe**, so every call into it — including the barrier — goes through this one lock.
 /// - `tx`: the link to C.
 /// - Returns when the link fails; the session is over either way.
-fn progress_thread(applier: Arc<Mutex<Applier>>, tx: Arc<Mutex<QuicSend>>) {
+fn progress_thread(
+    applier: Arc<Mutex<Applier>>,
+    engine: Arc<Mutex<VirglEngine>>,
+    tx: Arc<Mutex<QuicSend>>,
+) {
     loop {
-        // Poll with the lock held, send without it. The poll is a handful of atomic loads, so the
-        // message thread is never blocked behind anything slow — and crucially never behind a
-        // network write, which is the mistake that would make this thread the bottleneck it exists
-        // to remove.
-        let progress = applier
-            .lock()
-            .expect("the applier lock is never poisoned")
-            .poll_progress();
+        // --- Step 1: what retired? A handful of loads, so the message thread is never blocked
+        // behind anything slow — and crucially never behind a network write or a fence.
+        let (progress, ctx_id) = {
+            let mut session = applier.lock().expect("the applier lock is never poisoned");
+            (session.take_ring_progress(), session.ctx_id())
+        };
 
-        for msg in &progress {
-            let mut stream = tx.lock().expect("the link send lock is never poisoned");
-            if let Err(e) = send(&mut stream, msg) {
-                eprintln!("rayland-s: reporting ring progress to C failed: {e:#}");
-                return;
+        if !progress.is_empty() {
+            // --- Step 2: THE BARRIER. Nothing retired means no wait to release and nothing to ship,
+            // so this is skipped entirely on the overwhelming majority of polls — the fence is paid
+            // only when there is something to be right about.
+            //
+            // `ring_idx` is 0, which is legitimate rather than lucky only because spec §6's crutch
+            // table sets `VN_PERF=no_multi_ring`. If that crutch is ever bought back, this must
+            // carry a real ring index — see `RenderEngine::wait_for_work_retired`.
+            //
+            // A context is required to fence against. `None` means C has not created one yet, so no
+            // application work exists to have retired, and there is nothing to wait for.
+            if let Some(ctx_id) = ctx_id {
+                let barrier = {
+                    let mut engine = engine.lock().expect("the engine lock is never poisoned");
+                    engine.wait_for_work_retired(ctx_id, 0)
+                };
+                if let Err(e) = barrier {
+                    // Refuse to ship rather than ship blind. Reaching here means S cannot prove its
+                    // GPU finished — so any bytes read now are exactly the stale or torn pixels this
+                    // barrier exists to prevent, and releasing C's wait would hand them to the
+                    // application as though they were the frame it asked for.
+                    eprintln!(
+                        "rayland-s: refusing to report ring progress: S cannot confirm its GPU \
+                         retired the work being acknowledged ({e}). Releasing C's wait now would \
+                         hand the application whatever bytes happen to be in memory — the stale/torn \
+                         frame defect of docs/c1-the-network.md §3.1. Ending the session instead."
+                    );
+                    return;
+                }
+            }
+
+            // --- Step 3: what did S write? Now a settled question: the barrier above guarantees the
+            // GPU's writes have landed, so this diff cannot miss the frame it is being asked about.
+            let blobs = {
+                let mut session = applier.lock().expect("the applier lock is never poisoned");
+                session.take_blob_writes()
+            };
+
+            // Blob bytes FIRST, progress LAST. Progress is what releases the application's wait, and
+            // it must not cross the wire ahead of the pixels the application is about to read.
+            for msg in blobs.iter().chain(progress.iter()) {
+                let mut stream = tx.lock().expect("the link send lock is never poisoned");
+                if let Err(e) = send(&mut stream, msg) {
+                    eprintln!("rayland-s: reporting ring progress to C failed: {e:#}");
+                    return;
+                }
             }
         }
 
@@ -240,7 +327,7 @@ fn serve(
     mut rx: QuicRecv,
     tx: Arc<Mutex<QuicSend>>,
     applier: Arc<Mutex<Applier>>,
-    engine: &mut VirglEngine,
+    engine: &Arc<Mutex<VirglEngine>>,
     capture: &mut FrameCapture,
 ) -> Result<()> {
     loop {
@@ -279,7 +366,14 @@ fn serve(
         // No deadlock: the progress thread takes `applier` and releases it **before** taking `tx`,
         // so it never holds both, and this is the only path that holds them together.
         let mut session = applier.lock().expect("the applier lock is never poisoned");
-        let out = session.apply(engine, msg);
+        // The engine is shared with the progress thread, which needs it for the GPU barrier (see
+        // `progress_thread`). virglrenderer is process-global and not thread-safe, so this lock is
+        // the one gate every call into it passes. Taken INSIDE the applier lock, which is the same
+        // order the progress thread would use if it ever held both — it never does.
+        let out = {
+            let mut engine = engine.lock().expect("the engine lock is never poisoned");
+            session.apply(&mut *engine, msg)
+        };
 
         // **Look for the frame here, before the lock is released and before the replies go out.**
         // Spec §7.3: Mesa creates a blob resource lazily, at `vkMapMemory`, so the readback buffer's
@@ -334,12 +428,21 @@ fn main() -> Result<()> {
          with the GPU; without one there is nothing for it to be.",
         render_node.display()
     );
-    let mut engine = VirglEngine::new(&render_node).map_err(|e| {
+    // Shared with the progress thread, which needs it for the GPU barrier that keeps stale frames
+    // off the wire (see `progress_thread`). virglrenderer is process-global and NOT thread-safe, so
+    // this mutex is the single gate every call into it passes through — the message thread's
+    // `apply` and the progress thread's fence alike.
+    //
+    // Contention is low by construction rather than by luck: after setup the message thread barely
+    // touches the engine at all. Ring deltas are written into the ring blob's *memory* and never
+    // enter the engine, and `submit` carries essentially only the `vkCreateRingMESA` that creates
+    // the ring (see CLAUDE.md). virglrenderer's own ring thread does the work, holding nothing here.
+    let engine = Arc::new(Mutex::new(VirglEngine::new(&render_node).map_err(|e| {
         anyhow::anyhow!(
             "creating the render engine on {}: {e}",
             render_node.display()
         )
-    })?;
+    })?));
 
     let bind_addr = listen
         .parse()
@@ -384,8 +487,9 @@ fn main() -> Result<()> {
         .name("rayland-s-progress".into())
         .spawn({
             let applier = Arc::clone(&applier);
+            let engine = Arc::clone(&engine);
             let tx = Arc::clone(&tx);
-            move || progress_thread(applier, tx)
+            move || progress_thread(applier, engine, tx)
         })
         .context("spawning the progress thread")?;
 
@@ -395,7 +499,7 @@ fn main() -> Result<()> {
     let (present_width, present_height) = frame_size_from_env()?;
     let mut capture = FrameCapture::new(present_width, present_height);
 
-    serve(rx, tx, applier, &mut engine, &mut capture)?;
+    serve(rx, tx, applier, &engine, &mut capture)?;
     eprintln!("rayland-s: session ended");
 
     // Now that the session is over, put the frame on screen — and keep it there until a human closes

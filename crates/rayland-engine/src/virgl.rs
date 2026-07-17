@@ -978,6 +978,30 @@ impl RenderEngine for VirglEngine {
             format: image.format,
         })
     }
+
+    /// Block until every command already submitted on `(ctx_id, ring_idx)` has retired on the GPU.
+    ///
+    /// The whole implementation is [`VirglEngine::wait_for_context_fence`], which [`Self::read_back`]
+    /// has used since C0 Task 3 to avoid reading a half-drawn frame. This exposes it on the trait so
+    /// that `rayland-s`'s return path can ask the same question before it ships pixels to C — see
+    /// [`RenderEngine::wait_for_work_retired`] for the defect that made it necessary and
+    /// `docs/c1-the-network.md` §3.1 for the measurement.
+    ///
+    /// # Thread-safety: the caller must serialize this against every other engine call
+    /// virglrenderer is **process-global and not thread-safe** (`ffi.rs`'s SAFETY note), and this
+    /// method reaches it via `virgl_renderer_context_create_fence` and `virgl_renderer_context_poll`.
+    /// `VirglEngine` enforces serialization by being `&mut self` — there is no shared-reference path
+    /// into the library here — so a caller wanting this from a second thread must hold the same lock
+    /// every other engine call holds. `rayland-s` does exactly that.
+    ///
+    /// # Failure modes
+    /// - [`EngineError::FenceCreateFailed`] if virglrenderer refuses the fence.
+    /// - [`EngineError::FenceTimeout`] if it does not retire within `FENCE_WAIT_TIMEOUT` (5 s). That
+    ///   is reported rather than swallowed: a caller told "retired" when nothing retired would ship
+    ///   whatever bytes happened to be in memory, which is the bug this method exists to prevent.
+    fn wait_for_work_retired(&mut self, ctx_id: u32, ring_idx: u32) -> Result<(), EngineError> {
+        self.wait_for_context_fence(ctx_id, ring_idx)
+    }
 }
 
 impl VirglEngine {
