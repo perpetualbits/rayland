@@ -69,7 +69,7 @@ Wayland/Vulkan/GPU-remoting — must painstakingly verify **every line** for cor
 
 ## Repository status and layout
 
-A Cargo workspace of sixteen crates. Each declares its own license per the policy below
+A Cargo workspace of seventeen crates. Each declares its own license per the policy below
 (library → LGPL, application/binary → GPL); all are `v0.0.x` and pre-stable.
 
 - **`crates/rayland`** — the published placeholder that reserves the crates.io name; the
@@ -147,6 +147,14 @@ A Cargo workspace of sixteen crates. Each declares its own license per the polic
   alternative to it: it still writes its uniforms through a persistent mapping with no interceptable
   call, so the pair isolates how cost scales with mapped-write volume, not the presence of mapped
   writes. GPL, `publish = false`.
+- **`crates/rayland-icosa-window`** — **a demo, not a fixture, and must never be mistaken for one.**
+  Opens a live Wayland window and shows the icosa solid actually spinning, for a human to look at —
+  no PNGs, no CSV, nothing reproducible, and therefore unusable by (c)1's netem sweep. Because it is
+  not evidence about anything, it is exempt from every rule the fixtures are bound by: it **may**
+  depend on `rayland-present` (the fixtures may not), and it **has** a wall-clock frame loop (the
+  fixtures forbid one, since it would destroy their bit-identical native-vs-remoted comparison). See
+  its crate docs for the full contrast, cross-referencing `docs/icosa-fixtures.md` and the design
+  spec's §2. GPL, `publish = false`.
 
 The work is decomposed into sub-projects, each getting its own design spec →
 implementation plan → build cycle, sequenced as a "walking skeleton" (get something

@@ -1,0 +1,43 @@
+# `rayland-icosa-window` — a live, on-screen demo: the spinning fractal icosahedron in a Wayland
+# window, so a human can watch it, rather than a fixture writing PNGs to a directory.
+#
+# # THIS IS NOT A THIRD FIXTURE — read this before assuming it is
+# `rayland-icosa-cpu` and `rayland-icosa-gpu` are option-free, wall-clock-free, and
+# `rayland-*`-ignorant *on purpose*: their entire value is being **evidence** about how an ordinary,
+# unmodified Vulkan application behaves under Rayland (see `docs/icosa-fixtures.md` and the design
+# spec's §2, "the fixture must not know"). This crate is exempt from every one of those rules,
+# because it is not evidence about anything — it is a demo, and its only job is to be looked at:
+#
+# - It **depends on `rayland-present`**, a `rayland-*` crate. The fixtures may not (§2's dependency
+#   rule); this crate is not measuring how an ignorant application behaves, so it has nothing to stay
+#   ignorant of.
+# - It **has a wall-clock frame loop** (real `std::thread::sleep`, real `Instant`-based pacing). The
+#   fixtures forbid one because a clock-driven animation would make two runs of the same binary
+#   produce different pixels, destroying the bit-identical native-vs-remoted comparison their tests
+#   perform. This crate produces no comparison, so there is nothing for a clock to destroy.
+# - It is **not usable by (c)1's netem sweep (docs/icosa-fixtures.md §11) and must never become so**:
+#   it writes no PNGs, prints no CSV, and produces no reproducible artefact of any kind — only pixels
+#   on a screen, which vanish the moment the window closes. Pointing a measurement at this binary
+#   measures the wrong program.
+#
+# A BINARY crate (it has a main), so per the repository license policy it is GPL-3.0-or-later rather
+# than the LGPL used by this workspace's library crates.
+[package]
+name = "rayland-icosa-window"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+description = "Demo: the icosahedron fixtures' spinning fractal solid, live in a Wayland window (not a fixture — see crate docs)."
+license = "GPL-3.0-or-later"
+repository = "https://github.com/perpetualbits/rayland"
+publish = false
+
+[[bin]]
+name = "rayland-icosa-window"   # binary target name
+path = "src/main.rs"            # binary entry point
+
+[dependencies]
+rayland-icosa-vk = { path = "../rayland-icosa-vk" }      # Scene, VulkanContext: the shared render loop the fixtures also use
+rayland-icosa-core = { path = "../rayland-icosa-core" }  # geometry, schedule (frame_mvp/frame_zoom), IMAGE_SIZE/FRAME_COUNT
+rayland-present = { path = "../rayland-present" }        # puts the finished frame in a real Wayland window; the fixtures may not depend on this, this crate may
+anyhow = { workspace = true }                            # top-level error handling, per the repo's binary-crate convention
