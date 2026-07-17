@@ -527,13 +527,39 @@ fixture A is ready and that is where the bit-exactness earns its keep.
 **Does (c)1's blob sync actually ship the megabyte every frame, and what does it cost?**
 
 Task 5's conservative blob sync must move it somehow: 1 MiB × 120 frames = **120 MiB** of texture
-for a three-second animation. The fractal changes **every texel of every frame** — it is a zooming
-view, not a static image with a moving overlay — so the byte-granular diff of Task 5b should find
-**nothing to elide**. That makes this close to the worst case the design can be handed, which is
-exactly what a feasibility verdict should be tested against.
+for a three-second animation, *if nothing elides*.
 
-If the diff *does* help here, that is a surprising result and worth understanding before trusting it
-elsewhere.
+**An earlier version of this section claimed nothing would elide — that the fractal "changes every
+texel of every frame", making this the worst case the design could be handed. That was wrong, and it
+was wrong without ever being measured.** The correction is worth more than the original claim:
+
+| between consecutive frames | changed | of |
+|---|---:|---:|
+| the 1 MiB staging texture (C→S) | **5.6%** mean, 6.8% worst | 1,048,576 B |
+| the 256 KiB readback (S→C) | **9.0%** mean, 11.2% worst | 262,144 B |
+
+Two reasons, both structural rather than incidental:
+
+1. **Only the dilated triangle is ever iterated** (§4 of the design spec). The surrounding ~66% of
+   the texture is written black every frame — *the same black*. Written, but unchanged.
+2. **Most of the triangle is the set's own interior**, which is black and stays black as the view
+   creeps inward. Only the boundary filigree actually moves.
+
+So a byte-granular diff should elide roughly **94%** of the C→S path, and the prediction becomes a
+fork worth measuring:
+
+- **~120 MiB C→S** over the run if the whole buffer ships each frame.
+- **~6.7 MiB C→S** if only changed bytes do — an 18× difference.
+- **~30 MiB S→C** if the whole readback ships; **~2.7 MiB** if only changed bytes do.
+
+Note the S→C figure applies to **both** fixtures: fixture B writes only 80 bytes of uniforms upward,
+but it reads back the same 256 KiB image every frame. **The pair's asymmetry is entirely in the
+upward direction** — which is not what "80 bytes versus a megabyte" suggests on its own, and is worth
+knowing before anyone reads the two CSVs side by side.
+
+The general lesson, since it is this document's recurring one: *"every texel changes"* was an
+assertion about a picture, made by the person who wrote the picture, and it took one program and
+about a minute to find out it was false by a factor of eighteen.
 
 For scale, measured locally (dop561, Intel Iris Xe / Mesa ANV, release, means over 120 frames): the
 megabyte costs **628 µs** to move on-machine — **1.2% of fixture A's frame**. Projected on bandwidth
