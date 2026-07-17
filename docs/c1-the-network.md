@@ -237,6 +237,40 @@ Fixture A, per frame:
 
 **A ratio of about 3,200×.**
 
+### 3.2.1 The megabyte is shipped **5.2 times per frame**
+
+The icosa sub-project registered a prediction *before* this sweep ran
+(`docs/icosa-fixtures.md` §11): fixture A's C→S blob sync should be **~120 MiB** over the run if the
+whole buffer ships every frame, or **~6.7 MiB** if only the 5.6% of bytes that actually change do.
+
+**Measured: 626 MiB — 5.2× more than the "nothing elides" worst case.** Per frame:
+
+| +RTT | blob sync / frame | **k** = whole 1 MiB buffers shipped per frame | wall (s) |
+|---:|---:|---:|---:|
+| 0 | 5,467,716 B | **5.214** | 93.8 |
+| 20 | 5,513,678 B | 5.258 | 134.7 |
+| 50 | 5,524,618 B | 5.269 | 164.5 |
+| 100 | 5,535,558 B | **5.279** | 200.0 |
+
+**k is structural, not a timing artefact**, and this was settled by a sub-prediction registered in
+advance: *if k came from the ring watcher happening to fire mid-write, it should rise with
+wall-clock.* **k moves +1.2% while wall-clock moves +113%.** It is flat. Whatever ships the buffer
+5.2 times does so for a structural reason, not because it caught the application mid-write.
+
+This is consistent with the message counts: **~16.4 blob-sync messages per frame** at a mean of
+332 KB — roughly five whole-texture ships plus a tail of tiny ones (the 80-byte uniform blob, also
+shipped repeatedly).
+
+So the answer to the question the fixtures were built to ask — *does (c)1's blob sync actually ship
+the megabyte every frame?* — is: **it ships it 5.2 times every frame**, for a buffer that changed by
+5.6%. Neither the "ships it once" nor the "diffs it down" model was right, and the sweep can say so
+because the prediction was on record before the run.
+
+**Note what this is not.** It is not the C→S diff failing: there **is** no C→S diff. Spec §7 rules
+out dirty tracking on C's side deliberately (Venus gives no API-level signal for which bytes
+changed), so C ships whole blobs by design. The finding is not that the shipping is undiffed — that
+was known — but that it happens **five times over**.
+
 This is the founding intuition of the whole project, confirmed and then immediately qualified.
 "Language is cheaper than pixels" is **true**, emphatically: 1.7 KB per frame carries everything the
 application asked the GPU to do. C0 measured ~4 KiB of ring traffic for a complete Vulkan
