@@ -217,6 +217,9 @@ pub struct Metrics {
     /// Nanoseconds from [`Metrics::start`] to the first frame data arriving from S. Zero means "not
     /// yet"; see [`Metrics::note_first_frame`] for what counts as a frame and why.
     first_frame_nanos: AtomicU64,
+    /// Nanoseconds from [`Metrics::start`] to the application connecting to C's vtest socket. Zero
+    /// means "not yet". See [`Metrics::note_app_connected`] for why this exists at all.
+    app_connected_nanos: AtomicU64,
     /// The instant every duration here is relative to.
     start: Instant,
 }
@@ -247,6 +250,7 @@ pub fn metrics() -> &'static Metrics {
         round_trips: AtomicU64::new(0),
         round_trip_nanos: AtomicU64::new(0),
         first_frame_nanos: AtomicU64::new(0),
+        app_connected_nanos: AtomicU64::new(0),
         start: Instant::now(),
     })
 }
@@ -334,6 +338,38 @@ impl Metrics {
         );
     }
 
+    /// Note that the application has connected to C's vtest socket.
+    ///
+    /// # Why this exists: the first smoke run reported a 3.03 s "time to first frame" that was a lie
+    /// [`Metrics::start`] is daemon startup, and in the sweep the harness starts `rayland-c`, sleeps
+    /// three seconds so it can come up, and only *then* launches the application. So the first
+    /// measured `first_frame_us` was ~3.03 s — of which three seconds was the harness sleeping. The
+    /// number was real, monotonic, and correct, and it answered a question nobody asked. That is the
+    /// failure mode this project keeps meeting: the instrument was not wrong, it was measuring a
+    /// different interval than the one being reported.
+    ///
+    /// Both intervals are now kept, because they answer different halves of spec §8.1:
+    /// - **from startup** (`first_frame_us`) includes the QUIC handshake and the capset round trip,
+    ///   which is what "startup is RTT-bound" is about — but it also includes any dead time before
+    ///   the application exists, so it is only meaningful when the harness's sleep is known.
+    /// - **from connect** (`first_frame_after_connect_us`) is what the *application* waits, and is
+    ///   the number that belongs in a table a reader will interpret as "the cost of remoting".
+    ///
+    /// Idempotent: only the first call stores anything. `serve_vtest` accepts one connection per
+    /// session, so a second call would indicate a protocol change, not a race.
+    pub fn note_app_connected(&self) {
+        if !enabled() {
+            return;
+        }
+        let elapsed = self.start.elapsed().as_nanos() as u64;
+        let _ = self.app_connected_nanos.compare_exchange(
+            0,
+            elapsed,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
     /// One line carrying every running total, in `key=value` form.
     ///
     /// # Why one line and why these names
@@ -345,11 +381,27 @@ impl Metrics {
     /// Every value is a **running total**, never a delta — see the module docs on why a truncated
     /// final print must be harmless.
     pub fn line(&self) -> String {
+        // Read both instants once: the line must be internally consistent, and `first_frame` minus
+        // `app_connected` computed from two separate loads could straddle an update and go negative.
+        let first_frame_ns = self.first_frame_nanos.load(Ordering::Relaxed);
+        let connected_ns = self.app_connected_nanos.load(Ordering::Relaxed);
+        // The application's own wait: the frame, minus the moment it arrived. Zero when either has
+        // not happened yet, and — importantly — zero rather than a wrapped huge number if a frame
+        // were ever recorded before a connection, which `saturating_sub` guarantees rather than
+        // assumes.
+        let first_frame_after_connect_ns = if first_frame_ns > 0 && connected_ns > 0 {
+            first_frame_ns.saturating_sub(connected_ns)
+        } else {
+            0
+        };
         // Start with the durations, which are what a latency sweep is actually about.
         let mut s = format!(
-            "C1METRICS elapsed_us={} first_frame_us={} round_trips={} round_trip_wait_us={}",
+            "C1METRICS elapsed_us={} app_connected_us={} first_frame_us={} \
+             first_frame_after_connect_us={} round_trips={} round_trip_wait_us={}",
             self.start.elapsed().as_micros(),
-            self.first_frame_nanos.load(Ordering::Relaxed) / 1_000,
+            connected_ns / 1_000,
+            first_frame_ns / 1_000,
+            first_frame_after_connect_ns / 1_000,
             self.round_trips.load(Ordering::Relaxed),
             self.round_trip_nanos.load(Ordering::Relaxed) / 1_000,
         );

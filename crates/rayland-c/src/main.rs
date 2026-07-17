@@ -1001,6 +1001,14 @@ fn main() -> Result<()> {
     // serves a single application.
     let (mut mesa, _) = listener.accept().context("accepting Mesa's connection")?;
     eprintln!("rayland-c: Mesa connected");
+    // Mark the application's arrival for Task 9. Everything before this instant is the daemon
+    // waiting on a socket for an application that has not been started yet — in the sweep, three
+    // seconds of the harness sleeping while the daemon comes up. A time-to-first-frame measured
+    // from daemon startup therefore reports the harness's sleep, not the protocol's cost, which is
+    // exactly the wrong answer to spec §8.1's "startup is RTT-bound but one-off". Both figures are
+    // kept: from-startup includes the QUIC handshake (which §8.1 is also about), from-connect is
+    // what the *application* waits.
+    rayland_c::metrics::metrics().note_app_connected();
 
     let outcome = serve_vtest(&mut mesa, &mut engine)
         .map_err(|e| anyhow::anyhow!("the vtest session failed: {e}"))?;
@@ -1008,6 +1016,20 @@ fn main() -> Result<()> {
         "rayland-c: session ended cleanly (context {:?}, {} inline batches relayed)",
         outcome.context_id, outcome.submitted_batches
     );
+    // Emit the authoritative totals, marked `final=1`.
+    //
+    // # Why this line matters more than the periodic ones, and what it cost to learn
+    // A harness that samples the periodic prints when the *application* exits is sampling too early:
+    // the application is gone, but this daemon is still relaying. The first sweep measured the same
+    // refapp cell at 60,319 and 10,091 bytes C->S on two runs — a 6x spread that looked like a
+    // finding about Venus and was really the harness reading the log before the session had
+    // finished. Both numbers were monotonic, both were honestly printed, and one was of a session
+    // that was still happening.
+    //
+    // The monotonic-max rule protects against a truncated *print*; it cannot protect against a
+    // truncated *session*. This line is the marker that says the session is over, so a harness can
+    // wait for it rather than guess. See `scripts/c1-sweep.sh`, which waits for the daemon to exit.
+    rayland_c::metrics::report_final();
     Ok(())
 }
 
