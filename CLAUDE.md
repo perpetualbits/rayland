@@ -151,10 +151,14 @@ A Cargo workspace of seventeen crates. Each declares its own license per the pol
   Opens a live Wayland window and shows the icosa solid actually spinning, for a human to look at —
   no PNGs, no CSV, nothing reproducible, and therefore unusable by (c)1's netem sweep. Because it is
   not evidence about anything, it is exempt from every rule the fixtures are bound by: it **may**
-  depend on `rayland-present` (the fixtures may not), and it **has** a wall-clock frame loop (the
-  fixtures forbid one, since it would destroy their bit-identical native-vs-remoted comparison). See
-  its crate docs for the full contrast, cross-referencing `docs/icosa-fixtures.md` and the design
-  spec's §2. GPL, `publish = false`.
+  depend on `rayland-*` crates (the fixtures may not) and it **has** a redraw loop paced by the
+  compositor (the fixtures forbid any such loop, since it would destroy their bit-identical
+  native-vs-remoted comparison). In practice it speaks Wayland directly, via `smithay-client-toolkit`
+  — not through `rayland-present`, whose one-static-frame-per-call shape (built for `rayland-s`) does
+  not fit an animated demo; it owns one persistent `xdg_toplevel` for its whole run and redraws it on
+  every `wl_surface::frame` callback, rather than opening a new window per animation frame. See its
+  crate docs for the full contrast and that history, cross-referencing `docs/icosa-fixtures.md` and
+  the design spec's §2. GPL, `publish = false`.
 
 The work is decomposed into sub-projects, each getting its own design spec →
 implementation plan → build cycle, sequenced as a "walking skeleton" (get something

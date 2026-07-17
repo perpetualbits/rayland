@@ -8,13 +8,18 @@
 # spec's §2, "the fixture must not know"). This crate is exempt from every one of those rules,
 # because it is not evidence about anything — it is a demo, and its only job is to be looked at:
 #
-# - It **depends on `rayland-present`**, a `rayland-*` crate. The fixtures may not (§2's dependency
+# - It talks to the compositor **directly**, via `smithay-client-toolkit`/`wayland-client` — no
+#   `rayland-*` presentation crate in between. (It still could not depend on `rayland-present` even
+#   if it wanted to: that crate draws exactly one static frame per call, which is right for its own
+#   job — see `src/main.rs`'s module doc for why an animated demo needs a persistent surface and a
+#   redraw loop instead.) The fixtures may depend on no `rayland-*` crate at all (§2's dependency
 #   rule); this crate is not measuring how an ignorant application behaves, so it has nothing to stay
 #   ignorant of.
-# - It **has a wall-clock frame loop** (real `std::thread::sleep`, real `Instant`-based pacing). The
-#   fixtures forbid one because a clock-driven animation would make two runs of the same binary
-#   produce different pixels, destroying the bit-identical native-vs-remoted comparison their tests
-#   perform. This crate produces no comparison, so there is nothing for a clock to destroy.
+# - It **has a wall-clock/refresh-paced frame loop** (a `wl_surface::frame` callback loop, paced by
+#   the compositor's own redraw signal). The fixtures forbid one because a clock- or refresh-driven
+#   animation would make two runs of the same binary produce different pixels, destroying the
+#   bit-identical native-vs-remoted comparison their tests perform. This crate produces no
+#   comparison, so there is nothing for that to destroy.
 # - It is **not usable by (c)1's netem sweep (docs/icosa-fixtures.md §11) and must never become so**:
 #   it writes no PNGs, prints no CSV, and produces no reproducible artefact of any kind — only pixels
 #   on a screen, which vanish the moment the window closes. Pointing a measurement at this binary
@@ -39,5 +44,22 @@ path = "src/main.rs"            # binary entry point
 [dependencies]
 rayland-icosa-vk = { path = "../rayland-icosa-vk" }      # Scene, VulkanContext: the shared render loop the fixtures also use
 rayland-icosa-core = { path = "../rayland-icosa-core" }  # geometry, schedule (frame_mvp/frame_zoom), IMAGE_SIZE/FRAME_COUNT
-rayland-present = { path = "../rayland-present" }        # puts the finished frame in a real Wayland window; the fixtures may not depend on this, this crate may
 anyhow = { workspace = true }                            # top-level error handling, per the repo's binary-crate convention
+# This crate owns its Wayland surface directly (see src/main.rs's module doc for why
+# `rayland-present::present`'s one-frame-per-call shape does not fit an animated demo).
+# default-features left on `smithay-client-toolkit` (the workspace default): unlike
+# `rayland-present`, which only needs `calloop`, this crate could in principle want the toolkit's
+# other default surfaces later; nothing here currently uses more than compositor/shm/xdg-shell/
+# calloop, so trimming to `default-features = false, features = ["calloop"]` (rayland-present's
+# choice) would also work and save a little compile time — left at the workspace default because
+# this is a demo binary, not a crate on anyone's hot compile path, and the smaller diff from the
+# workspace default is easier to audit.
+smithay-client-toolkit = { workspace = true }
+# Declared directly (not just pulled in transitively through smithay-client-toolkit) so its
+# `dlopen` feature — load libwayland at runtime rather than link it at build time — is selected
+# for this binary's build, matching `rayland-present`'s own reasoning ("dlopen: load libwayland at
+# runtime so CI needs no libwayland package", see the workspace manifest). Imported through
+# `smithay_client_toolkit::reexports::client` in `src/main.rs`, exactly as `rayland-present` does,
+# so the two crates' Wayland objects are always the same version — this direct dependency line is
+# what pins that version, not what main.rs's `use` paths resolve through.
+wayland-client = { workspace = true }
