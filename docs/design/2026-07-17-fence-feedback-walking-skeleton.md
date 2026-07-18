@@ -249,3 +249,52 @@ not a permanent coherency loss — which, if confirmed, points at a fix that hol
 until the readback has settled *after* the feedback signal (a bounded wait, because the feedback word
 means the GPU is genuinely done). The next step is a spike that measures exactly this relative timing
 before any more delivery code is written.
+
+## 10. Corrected root cause — a coherency problem, from reading the source (2026-07-18)
+
+§9's "encouraging" guess (relative timing; the readback settles late but eventually correct) was
+**refuted** by a spike: holding the ship until the non-ring blobs settled, swept from 1 ms to 50 ms of
+extra wait, changed nothing (119–120/120 wrong at every threshold, no trend). The correct complete
+readback **never** appears in S's view, so it is not a matter of waiting.
+
+Reading the Mesa Venus + virglrenderer source (versions on this box: virglrenderer 1.2.0, Mesa 26.0.x)
+gives the real mechanism, and it also refutes the `cad5600` commit message's claim that the feedback
+word is a host CPU store racing the readback:
+
+- **The readback blob is a genuine *shared* mapping of the app's real GPU `VkDeviceMemory`** — the fd
+  handed over `SCM_RIGHTS` is a real `vkGetMemoryFdKHR` export (`vkr_device_memory.c:582-594`), mmap'd
+  `MAP_SHARED` (`vn_renderer_vtest.c:685-687`). No wire command ever carries pixel bytes
+  (`vn_renderer_vtest.c:340-349`); there is no copy/transfer model (no `VCMD_TRANSFER*` exists).
+- **The vtest path carries no cache-coherency metadata and issues no flush/invalidate, anywhere.**
+  `vtest_bo_flush`/`vtest_bo_invalidate` are literal no-ops (`vn_renderer_vtest.c:650-666`); the host's
+  `vkFlushMappedMemoryRanges`/`vkInvalidateMappedMemoryRanges` dispatch is `NULL`
+  (`vkr_device_memory.c:479-480`); the host even computes the memory's cache type
+  (`CACHED` vs `WC`, `vkr_device_memory.c:515-528`) and then **drops it**, because the vtest reply has
+  no field to carry it. Correctness rests entirely on the pages being hardware-coherent.
+- **That coherence is only proven for one consumer: the app itself** — mapping via `vn_renderer_bo_map`
+  and reading *after its own `vkWaitForFences`*. That is exactly C0's bit-identical result. **S is a
+  second, independent `mmap` of the same fd by a process with no part in the Vulkan submission or the
+  fence**, and the protocol guarantees it nothing. The feedback word (a single-cache-line 4-byte
+  `vkCmdFillBuffer`) happens to become visible to S; the megabyte, multi-page readback does not — the
+  classic signature of write-combined / GPU-cached `HOST_VISIBLE|HOST_COHERENT` memory read by a
+  foreign mapping with no invalidate. Nothing in the stack will ever issue that invalidate, so it never
+  converges. Full trace: `scratchpad/venus-memory-model-findings.md`.
+
+**So the defect is not timing and not ordering; it is that S reads the app's GPU memory through a raw,
+unsynchronized foreign `mmap` that has no coherency contract.** The "observe the app's memory by
+diffing it" strategy is the thing at fault for readback, not any particular gating scheme on top of it.
+
+**Fix direction (grounded in APIs the source exposes), in order of preference:**
+1. **Read the resource through virglrenderer's own accessor, not a raw fd `mmap`.**
+   `virgl_renderer_resource_map` (`virglrenderer.h:423`) is the library's blessed CPU view of a
+   resource it created, and it is the party that *knows* the dropped `map_info` cache type — so it can
+   map with the correct caching attribute a raw `mmap` cannot. S already embeds virglrenderer; it
+   should use this for its own host-side reads.
+2. **Obtain the bytes through an engine-side GPU transfer** into a buffer S's own driver calls
+   allocated — making S a proper fenced consumer, the way C0's `read_back` already works — rather than
+   a foreign passive reader.
+3. If a raw mmap is kept, wrap every read in `DMA_BUF_IOCTL_SYNC_START/_END` (valid on the dma-buf fd
+   regardless of what vtest does) — but only if the fd is actually a dma-buf.
+
+The next experiment is option 1: it is small, principled, and either fixes it or proves readback must
+go through the engine (option 2).
