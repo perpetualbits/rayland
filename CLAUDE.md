@@ -200,14 +200,17 @@ Venus/virglrenderer capture/replay engine, so *unmodified* applications run.**
   reader with no fence→coherency relationship, and every patch of the observe-and-diff path hit
   a different wall (proof:
   [`docs/design/2026-07-17-fence-feedback-walking-skeleton.md`](docs/design/2026-07-17-fence-feedback-walking-skeleton.md)
-  §9–§11). **The fenced engine-side read (`virgl_renderer_transfer_read_iov`) is *not*
-  reachable** — it is a hardcoded stub for the Venus/render-server path in virglrenderer 1.2.0 **and
-  1.3.0**, and there is no engine-level coherence API at all (`resource_map` is a bare `mmap`). The
-  path now under investigation splits the two halves off the engine lock: **fence-feedback for timing**
-  (a GPU-written word S watches by `mmap`) and **`DMA_BUF_IOCTL_SYNC` for coherence** (a kernel dma-buf
-  ioctl on the fd S already holds) — neither takes the engine lock that sank the earlier fence attempt.
-  Its reachability rests on a spike (is the fd a dma-buf? is the memory write-combined? does the sync
-  converge?). See
+  §9–§11). Two candidate fixes were then **investigated and both retired**:
+  (a) the fenced engine-side read (`virgl_renderer_transfer_read_iov`) is a **hardcoded stub** for the
+  Venus/render-server path in virglrenderer 1.2.0 **and 1.3.0**, with no engine-level coherence API at
+  all; (b) `DMA_BUF_IOCTL_SYNC` on the readback dma-buf is a **measured no-op** (byte-identical to the
+  raw read in 6561/6561 samples) — the memory is already CPU-coherent, so **the tearing is not a
+  cache-coherence problem**. The robust conclusion: correctness needs the host GPU work **retired
+  through an engine call** (a context fence/poll — no lock-free substitute exists), and *that* call
+  takes Rayland's single global engine lock, which is what contends with the message-thread doorbell
+  (ring-stall `SIGABRT` / timeout, Phase 1). **So (c)2's real problem is the fence-vs-doorbell
+  contention under one non-thread-safe engine lock — a locking/threading architecture question needing
+  a design cycle, not another read-side spike.** Full trail:
   [`docs/design/2026-07-18-c2-readback-reachability.md`](docs/design/2026-07-18-c2-readback-reachability.md).
 - **(c)3 — content-addressed assets.**
 - **(c)4 — real/complex applications; GL via Zink.**

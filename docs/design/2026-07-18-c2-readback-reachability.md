@@ -85,3 +85,36 @@ real blob transfer or a coherent map) or the kernel export path — a heavier, u
 CLAUDE.md's (c)2 bullet previously named `transfer_read_iov` as the path forward. That is retracted
 here: it is a hardcoded stub. The path forward under investigation is the `mmap` +
 `DMA_BUF_IOCTL_SYNC` + fence-feedback-timing composition above, pending the spike.
+
+## Spikes run (2026-07-18): dma-buf yes, but the sync is a no-op — it is not a coherence problem
+
+Two throwaway spikes tested the reframed "lock-free coherence via `DMA_BUF_IOCTL_SYNC`" direction:
+
+1. **Is the readback fd a dma-buf?** YES. `DMA_BUF_IOCTL_SYNC` succeeds (`rc=0`) on the readback
+   (res=8) and every application blob (res 3,4,6,7); only the Venus-internal shmems (ring/reply/
+   staging, `blob_id==0`, res 1,2,5) are plain memfds (`ENOTTY`).
+2. **Do sync'd reads converge where raw reads churned?** NO — and decisively so. Across **6561
+   samples in 328 windows, the sync'd fingerprint was byte-identical to the raw one in 100% of
+   samples** (`differ=0/6561`). The ioctl changes nothing. So **the readback memory is already
+   CPU-coherent to S's mapping; the tearing is not a CPU-cache-coherence problem**, and no
+   CPU-side cache trick can fix it.
+
+The convergence data also corrected a smaller earlier claim: the readback does not churn endlessly.
+Per window it shows *old frame → one content change → new frame, then stable* (119/238 windows already
+settled, 118 change exactly once). **But a stable fingerprint is not a correct frame** — a torn frame
+is equally stable — and (c)1 Phase 1 proved that a **real GPU context fence** (`wait_for_context_fence`,
+which drives `virgl_renderer_context_poll` and retires the host work) *does* yield correct pixels where
+passive reads do not.
+
+### The reframed, robust conclusion
+
+Correctness requires **retiring the host GPU work through an engine call** (a context fence / poll) —
+there is no lock-free substitute, because a passive CPU read (raw or dma-buf-synced) does not drive
+completion. That engine call takes Rayland's single global engine lock (virglrenderer is not
+thread-safe), which is exactly what contends with the message thread's doorbell (Phase 1: ring-stall
+`SIGABRT`, or timeout when polled with the lock released).
+
+**So (c)2's real problem is not coherence and not the read primitive; it is the fence-vs-doorbell
+contention under one global engine lock.** That is a locking/threading *architecture* question — how
+to let a GPU-completion wait and the ring doorbell coexist — not something another read-side spike can
+settle. It needs a design cycle. The dma-buf-sync path recorded above is retired.
