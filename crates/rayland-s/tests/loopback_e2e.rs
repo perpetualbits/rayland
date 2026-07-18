@@ -696,7 +696,10 @@ fn icosa_cpu_renders_across_the_network_the_same_120_frames_it_renders_natively(
         .env("VN_DEBUG", "vtest")
         .env(
             "VN_PERF",
-            "no_multi_ring,no_fence_feedback,no_semaphore_feedback,no_event_feedback,no_query_feedback",
+            // Fence feedback is bought back (the stale-frame fix): the application must wait on the
+            // feedback word vkr writes at GPU completion, which S delivers, rather than on the ring
+            // head. The other feedback crutches stay pinned — this fixture uses only fences.
+            "no_multi_ring,no_semaphore_feedback,no_event_feedback,no_query_feedback",
         )
         .env("VK_ICD_FILENAMES", VENUS_ICD)
         .env("VTEST_SOCKET_NAME", &socket_path)

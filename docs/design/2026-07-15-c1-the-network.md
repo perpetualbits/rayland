@@ -322,7 +322,7 @@ The failure mode this table exists to prevent is these quietly becoming permanen
 |---|---|---|
 | `VN_DEBUG=vtest` | Required, or Mesa silently prefers virtgpu and never connects | **Permanent** — not a crutch |
 | `VN_PERF=no_multi_ring` | Forces a single ring, making the `ring_idx = 0` assumption in the fence path **legitimate** rather than lucky (it has been latent since C0 Task 3) | Remove when the relay handles multiple rings |
-| `VN_PERF=no_fence_feedback,no_semaphore_feedback,no_event_feedback,no_query_feedback` | Removes the S→C shared status pages (channel 3), making the stream self-contained | **First thing to buy back** — see §6.1 |
+| `VN_PERF=no_fence_feedback,no_semaphore_feedback,no_event_feedback,no_query_feedback` | Removes the S→C shared status pages (channel 3), making the stream self-contained | **First thing to buy back** — see §6.1. `no_fence_feedback` **bought back**: the fence-feedback fix (`docs/design/2026-07-17-fence-feedback-walking-skeleton.md`) delivers vkr's GPU-completion word to C over the existing `BlobData` path, so the icosa fixture now runs with fences enabled — it is the stale-frame fix itself, not a future one. The other three (`no_semaphore_feedback`, `no_event_feedback`, `no_query_feedback`) remain crutches; still exit via §6.1. |
 | `VN_DEBUG=no_abort` | Stops Mesa's 3.5s watchdog killing a legitimately slow networked run (`vn_common.c:278` gates the abort on this flag) | Remove once (c)1 has its own progress-aware timeout — see §6.2 |
 
 ### 6.1 Why disabling feedback is temporary, not fundamental

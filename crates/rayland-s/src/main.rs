@@ -57,7 +57,7 @@
 //! This file is written to be read, and it says where it is guessing.
 
 // The real GPU, and the gate that tells us whether this host has one.
-use rayland_engine::{RenderEngine, VirglEngine, virgl_available};
+use rayland_engine::{VirglEngine, virgl_available};
 // The relay protocol and its framing.
 use rayland_relay::{C2S, S2C, read_msg, write_msg};
 // The message applier: everything this daemon actually knows how to do.
@@ -190,142 +190,101 @@ fn send(stream: &mut QuicSend, msg: &S2C) -> Result<()> {
     stream.flush().context("flushing the link to C")
 }
 
-/// The progress thread: notice what S's GPU retired, ship what it wrote, then release C.
+/// Ship a batch of messages to C, stamping the T6 trace point for each `BlobData`.
 ///
-/// **This is the only thing that ever releases the application's synchronous Vulkan calls**, which
-/// is why the order below is the whole correctness argument rather than a detail. See the module
-/// docs for why it cannot be folded into the message loop.
-///
-/// # The three steps, and the defect that made them three
-/// This loop used to be one call: read the rings, diff the blobs, ship. That reasoned *"something
-/// retired, so S's engine **has had the chance** to write"* — and "has had the chance" is not "has".
-/// A diff answers *"did these bytes change?"*, never *"has the GPU finished?"*, and (c)1 Task 9
-/// measured what that costs: of 120 frames, **22 arrived whole and one frame stale, and 16 arrived
-/// torn** — the application exiting 0 throughout, told nothing
-/// (`docs/c1-the-network.md` §3.1). The engine could always answer the real question
-/// ([`RenderEngine::wait_for_work_retired`]); nothing asked it.
-///
-/// So: **read the frontier, wait for the GPU, then diff.**
-///
-/// # ⚠️ This ordering is right and it DOES NOT FIX THE DEFECT
-/// Stated here rather than discovered again: with the barrier in place the same 120-frame run still
-/// delivers **24 frames wrong** (18 stale, 6 torn) — inside the unfixed range of 3–39. The barrier
-/// is not idle while failing: it is called 684 times per run and waits **1.1 ms on average**. It
-/// waits for something; that something is not "the application's readback copy has landed".
-/// See [`RenderEngine::wait_for_work_retired`] for the conclusion — a virglrenderer context fence
-/// does not order against the work Venus's own ring thread dispatches — and `docs/c1-the-network.md`
-/// §3.1 for the measurements. The structure below is kept because it is *necessary* (a diff can
-/// never answer "has the GPU finished?") and because the next attempt needs somewhere to put a
-/// completion signal that actually covers the Venus queue. It is not *sufficient*.
-///
-/// 1. [`Applier::take_ring_progress`] — what retired. Cheap.
-/// 2. [`RenderEngine::wait_for_work_retired`] — **the barrier.** Intended to make step 3's diff ask
-///    about a settled buffer. It demonstrably does not achieve that for the application's readback;
-///    see the warning below before trusting this line.
-/// 3. [`Applier::take_blob_writes`] — what S wrote, now knowable.
-///
-/// Then blob bytes go out **before** the progress that releases the wait, exactly as before.
-///
-/// # Why the applier lock is dropped across the barrier
-/// A fence wait is bounded by `FENCE_WAIT_TIMEOUT` (5 s in `rayland-engine`), and Mesa aborts the
-/// application ~3.5 s after its ring stalls. Holding the applier lock across the barrier would block
-/// the message thread — the only thing that writes C's ring deltas into the ring — so a pathological
-/// fence wait would starve the ring and **kill the application it was protecting**. The lock is
-/// therefore taken twice, briefly, and never held across the wait.
-///
-/// # Lock order
-/// This thread takes `applier`, releases it, takes `engine`, releases it, takes `applier` again,
-/// releases it, and only then takes `tx`. It never holds two at once, so it cannot invert any order
-/// the message thread uses (which takes `applier`, then `engine` inside `apply`).
+/// Both the return path's retirement branch and its fence-feedback delivery branch send the same way,
+/// so the send loop lives here rather than being written twice. `BlobData` is the only pixel-bearing
+/// message, so it is the only one T6-stamped (design note §7); `RingProgress` is the head update, not
+/// pixels.
 ///
 /// # Inputs / outputs
-/// - `applier`: shared with the message thread. Locked only for steps 1 and 3, never across the wait.
-/// - `engine`: shared with the message thread. virglrenderer is process-global and **not
-///   thread-safe**, so every call into it — including the barrier — goes through this one lock.
+/// - `tx`: the shared link to C. Locked per message, never held across two.
+/// - `msgs`: the messages to send, in order. The caller is responsible for ordering pixels ahead of
+///   anything that would release the application to read them.
+/// - Returns `Err(())` if a send failed; the caller ends the session, exactly as the inline sends did.
+fn ship(tx: &Arc<Mutex<QuicSend>>, msgs: &[S2C]) -> Result<(), ()> {
+    for msg in msgs {
+        // T6 — transfer packet emitted (design note §7): the point a pixel packet leaves S for C.
+        if let S2C::BlobData { res_id, offset, bytes } = msg {
+            rayland_relay::trace::emit(
+                "T6",
+                &format!("side=S res={res_id} off={offset} len={}", bytes.len()),
+            );
+        }
+        let mut stream = tx.lock().expect("the link send lock is never poisoned");
+        if let Err(e) = send(&mut stream, msg) {
+            eprintln!("rayland-s: shipping to C failed: {e:#}");
+            return Err(());
+        }
+    }
+    Ok(())
+}
+
+/// The progress thread: deliver what S's GPU wrote, and release the application only once it has.
+///
+/// **This is the only thing that ever releases the application's synchronous Vulkan calls**, so its
+/// structure is the correctness argument, not a detail. It has two jobs each poll:
+///
+/// 1. **On ring retirement** — ship what S wrote (`take_blob_writes`) and then the `RingProgress`
+///    that advances C's `head`. `head` carries ring space and the reply arena, which the
+///    application's non-readback synchronous calls block on.
+/// 2. **On every poll** — deliver GPU-completion writes. With fence feedback bought back (see
+///    `docs/design/2026-07-17-fence-feedback-walking-skeleton.md`), the application's readback wait is
+///    no longer released by `head`; it polls a **feedback word** that vkr writes *at GPU completion*.
+///    That word, and the finished readback pixels, are ordinary blob writes S must ship — and it must
+///    ship them even while the application is blocked and producing no ring traffic. So this thread
+///    watches every non-ring blob's fingerprint and, when one moves with no retirement, ships the
+///    change. `take_blob_writes` orders application blobs (the readback) ahead of Venus-internal blobs
+///    (the feedback word), so C installs the pixels before the application is ever let go.
+///
+/// # Why there is no GPU barrier here any more
+/// This thread used to wait on `RenderEngine::wait_for_work_retired` before shipping, in the belief
+/// that a retired ring fence meant the GPU's readback had landed. `docs/c1-the-network.md` §3.1
+/// measured that this is false — the ring fence retires when the ring thread *reaches* it, up to ~20
+/// ms before the GPU's readback completes. The completion signal that *is* real is the feedback word,
+/// delivered above; the barrier is gone.
+///
+/// # Inputs / outputs
+/// - `applier`: shared with the message thread. Locked only for short reads, never across a send.
 /// - `tx`: the link to C.
 /// - Returns when the link fails; the session is over either way.
-fn progress_thread(
-    applier: Arc<Mutex<Applier>>,
-    engine: Arc<Mutex<VirglEngine>>,
-    tx: Arc<Mutex<QuicSend>>,
-) {
-    // **(c)1 Task 9 Probe A state**, per S-written blob: the fingerprint and monotonic timestamp at
-    // which the return path last *shipped* this blob (T6), and the applied-ring-delta count at that
-    // instant. On subsequent idle polls the loop re-fingerprints and, if the content has moved while
-    // the delta count has not, that is S's GPU writing after we declared the frame complete — the
-    // `T2 < T4` the design note predicts. Empty and unused unless `RAYLAND_C1_TRACE` is set.
+fn progress_thread(applier: Arc<Mutex<Applier>>, tx: Arc<Mutex<QuicSend>>) {
+    // Probe A state (trace-only) — see `ProbeBaseline`. Unused unless `RAYLAND_C1_TRACE` is set.
     let mut probe_baseline: HashMap<u32, ProbeBaseline> = HashMap::new();
+    // Fence-feedback delivery state: the fingerprint of every non-ring blob at the previous poll. A
+    // fingerprint that moves with no ring retirement is S's GPU writing a completion (the finished
+    // readback pixels and the feedback word Mesa polls); shipping it is what closes the stale-frame
+    // race and what the spike-2 hang was missing.
+    let mut prev_fp: HashMap<u32, u64> = HashMap::new();
 
     loop {
-        // --- Step 1: what retired? A handful of loads, so the message thread is never blocked
-        // behind anything slow — and crucially never behind a network write or a fence.
-        let (progress, ctx_id) = {
+        // One short lock: the retirement frontier, plus a cheap strided fingerprint of every non-ring
+        // blob. The fingerprint is the gate that keeps the full byte-diff off the idle path.
+        let (progress, cur_fp) = {
             let mut session = applier.lock().expect("the applier lock is never poisoned");
-            (session.take_ring_progress(), session.ctx_id())
+            let progress = session.take_ring_progress();
+            let cur_fp: HashMap<u32, u64> =
+                session.fingerprint_nonring_blobs().into_iter().collect();
+            (progress, cur_fp)
         };
 
         if !progress.is_empty() {
-            // --- Step 2: THE BARRIER. Nothing retired means no wait to release and nothing to ship,
-            // so this is skipped entirely on the overwhelming majority of polls — the fence is paid
-            // only when there is something to be right about.
-            //
-            // `ring_idx` is 0, which is legitimate rather than lucky only because spec §6's crutch
-            // table sets `VN_PERF=no_multi_ring`. If that crutch is ever bought back, this must
-            // carry a real ring index — see `RenderEngine::wait_for_work_retired`.
-            //
-            // A context is required to fence against. `None` means C has not created one yet, so no
-            // application work exists to have retired, and there is nothing to wait for.
-            if let Some(ctx_id) = ctx_id {
-                let barrier = {
-                    let mut engine = engine.lock().expect("the engine lock is never poisoned");
-                    engine.wait_for_work_retired(ctx_id, 0)
-                };
-                if let Err(e) = barrier {
-                    // Refuse to ship rather than ship blind. Reaching here means S cannot prove its
-                    // GPU finished — so any bytes read now are exactly the stale or torn pixels this
-                    // barrier exists to prevent, and releasing C's wait would hand them to the
-                    // application as though they were the frame it asked for.
-                    eprintln!(
-                        "rayland-s: refusing to report ring progress: S cannot confirm its GPU \
-                         retired the work being acknowledged ({e}). Releasing C's wait now would \
-                         hand the application whatever bytes happen to be in memory — the stale/torn \
-                         frame defect of docs/c1-the-network.md §3.1. Ending the session instead."
-                    );
-                    return;
-                }
-            }
-
-            // --- Step 3: what did S write? Now a settled question: the barrier above guarantees the
-            // GPU's writes have landed, so this diff cannot miss the frame it is being asked about.
+            // A ring retired. Ship what S wrote, then the progress that advances `head`. Blob bytes
+            // FIRST, progress LAST: the reply arena rides in the blobs and the reply-ready signal is
+            // `head`, so the arena must be on the wire before the update that releases a waiter on it.
             let blobs = {
                 let mut session = applier.lock().expect("the applier lock is never poisoned");
                 session.take_blob_writes()
             };
-
-            // Blob bytes FIRST, progress LAST. Progress is what releases the application's wait, and
-            // it must not cross the wire ahead of the pixels the application is about to read.
-            for msg in blobs.iter().chain(progress.iter()) {
-                // **T6 — transfer packet emitted** (design note §7): the point a `BlobData` leaves S
-                // for C. Stamped per blob, with the `res`/`off` that the C-side T7 echoes, so the
-                // join can pair each packet's departure with its installation. Only `BlobData` is a
-                // pixel packet; the trailing `RingProgress` is the release, not the pixels.
-                if let S2C::BlobData { res_id, offset, bytes } = msg {
-                    rayland_relay::trace::emit(
-                        "T6",
-                        &format!("side=S res={res_id} off={offset} len={}", bytes.len()),
-                    );
-                }
-                let mut stream = tx.lock().expect("the link send lock is never poisoned");
-                if let Err(e) = send(&mut stream, msg) {
-                    eprintln!("rayland-s: reporting ring progress to C failed: {e:#}");
-                    return;
-                }
+            if ship(&tx, &blobs).is_err() {
+                return;
+            }
+            if ship(&tx, &progress).is_err() {
+                return;
             }
 
-            // **Probe A baseline.** Record what we just shipped as the reference the idle resample
-            // compares against. Gated on tracing so a production run pays nothing. The fingerprints
-            // are read *after* the send, i.e. as late as possible, so a GPU write that lands between
-            // the diff and here is already folded into the baseline rather than counted as "late".
+            // Probe A baseline (trace-only), unchanged: record what was shipped so the idle resample
+            // can catch a GPU write that lands after it.
             if rayland_relay::trace::enabled() {
                 let ship_ns = rayland_relay::trace::monotonic_ns();
                 let session = applier.lock().expect("the applier lock is never poisoned");
@@ -334,17 +293,30 @@ fn progress_thread(
                     probe_baseline.insert(res_id, ProbeBaseline { fp, ship_ns, deltas });
                 }
             }
-        } else if rayland_relay::trace::enabled() && !probe_baseline.is_empty() {
-            // --- Probe A: the decisive `T2 < T4` test. The application is blocked (no retirement
-            // this poll); if a readback blob's content has moved since we shipped it, and no new ring
-            // delta has arrived to explain it as the *next* frame, then S's GPU is still writing the
-            // frame we already declared done. See `ProbeBaseline` and `Applier::applied_ring_deltas`.
-            probe_a_resample(&applier, &mut probe_baseline);
+        } else {
+            // Nothing retired: the application is blocked, polling its feedback word. If any non-ring
+            // blob moved since the last poll, S's GPU wrote a completion — ship it. `take_blob_writes`
+            // orders the readback (an application blob) ahead of the feedback word (Venus-internal), so
+            // C installs the finished pixels before the word that releases the application to read them.
+            if cur_fp != prev_fp {
+                let blobs = {
+                    let mut session = applier.lock().expect("the applier lock is never poisoned");
+                    session.take_blob_writes()
+                };
+                if ship(&tx, &blobs).is_err() {
+                    return;
+                }
+            }
+            // Probe A idle resample (trace-only), unchanged.
+            if rayland_relay::trace::enabled() && !probe_baseline.is_empty() {
+                probe_a_resample(&applier, &mut probe_baseline);
+            }
         }
 
-        // Wait before looking again. Sleeping unconditionally — rather than only when nothing moved
-        // — keeps this loop simple and its cost bounded; see `PROGRESS_POLL` for the trade and the
-        // honest note that it has never been measured.
+        // Remember this poll's fingerprints so the next poll can tell what moved.
+        prev_fp = cur_fp;
+
+        // Wait before looking again; see `PROGRESS_POLL`.
         std::thread::sleep(PROGRESS_POLL);
     }
 }
@@ -603,9 +575,8 @@ fn main() -> Result<()> {
         .name("rayland-s-progress".into())
         .spawn({
             let applier = Arc::clone(&applier);
-            let engine = Arc::clone(&engine);
             let tx = Arc::clone(&tx);
-            move || progress_thread(applier, engine, tx)
+            move || progress_thread(applier, tx)
         })
         .context("spawning the progress thread")?;
 

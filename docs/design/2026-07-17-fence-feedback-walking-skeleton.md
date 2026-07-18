@@ -1,6 +1,12 @@
 # The stale-frame fix, minimal-correct: buy back fence feedback and deliver it
 
-**Status:** design spec, written 2026-07-17. It specifies the **walking-skeleton** fix for (c)1 Task
+**Status:** design spec, written 2026-07-17. **Implemented 2026-07-18 exactly as specified — and it
+failed, worse than doing nothing (119–120 of 120 frames wrong). The failure is instructive and is
+recorded in §9 below; read it before trusting any part of §3–§4.** The measurement it rests on
+(§2, `T2 < T4`) is unaffected and remains correct; what §9 refutes is that *delivering the feedback
+word as ordinary blob data* is sufficient.
+
+It specifies the **walking-skeleton** fix for (c)1 Task
 9's stale-frame race — the smallest change that is *genuinely correct* (120/120 every run), not the
 smallest change that hides the symptom. It is the concrete implementation of the direction argued in
 [`2026-07-17-return-path-completion.md`](2026-07-17-return-path-completion.md) §6, narrowed to what
@@ -194,3 +200,52 @@ retired, and applied on C by writing `fence_value` into the feedback buffer at t
 This pulls forward part of note §6 and needs C to identify the feedback buffer and its layout — which
 is why it is the fallback, not the plan. It is recorded here so the pivot, if forced, starts from a
 design rather than a blank page.
+
+## 9. Implemented and it FAILED — the cross-resource visibility wall (2026-07-18)
+
+The plan ([`../superpowers/plans/2026-07-17-fence-feedback-walking-skeleton.md`](../superpowers/plans/2026-07-17-fence-feedback-walking-skeleton.md))
+was executed. Tasks 1 and 2 landed as designed (the `fingerprint_nonring_blobs` helper; the de-risk
+spike confirmed S can *see* a non-ring blob change with no wire notification). **Task 3 — the fix
+itself — was implemented verbatim and made the defect dramatically worse:** the reproducer went from
+~28/120 wrong (unfixed) to **119/120 and, on a traced run, 120/120 wrong.** The code is committed as a
+documented negative result; the tree left in the feedback-enabled state so the follow-up spike builds
+on it.
+
+**What the wrong frames are.** Not staleness (no frame equalled the *whole* previous frame) and not
+garbage: the correct geometry and rotation for the right frame index, with the readback texture **torn
+~25%** — a spatial split, roughly the left half pixel-exact and the right half a different-but-
+plausible fractal state. The signature of a **partial readback shipped and then never topped up before
+the application was released to read it.**
+
+**Why the design was wrong.** §3–§4 assumed that *when S observes the feedback word appear, the
+readback pixels are already complete and coherent in S's view*, so shipping the readback just before
+the feedback word is safe. That is false. S is a **third-party observer** of the app's GPU-written
+memory — it maps the shmem and diffs it — and the two resources involved become visible **to S's
+mappings in an order that does not track the GPU's real completion order**:
+
+- the **readback buffer** is filled by GPU DMA;
+- the **feedback word** is a CPU store by the render server's own thread, once *it* learns the fence
+  retired.
+
+The feedback store becomes visible to S's mapping *before* the DMA'd readback bytes finish becoming
+visible to S's separate mapping of that other resource. So the poll that sees "feedback changed" reads
+a still-incomplete readback in the same breath, ships both (readback first, feedback last — the wire
+order was verified perfect: `T7 before T6: 0` across 1.59M packets), and releases the app onto torn
+pixels. Task 2's spike proved changes are *eventually* visible to S; it never proved they are visible
+in the right *relative* order between two resources — and that gap is the whole failure.
+
+The deeper statement: **the application gets correct pixels natively because *it* waits on its own
+fence, which is what establishes cache-coherency to *its* CPU. S never holds that fence→coherency
+relationship — it is a bystander — so no amount of watching memory from outside manufactures the
+coherency edge.** The return-path note's §2 ("a sampled property of a polling system cannot
+manufacture a happens-before") turns out to bind not just *detecting* the write but the *coherency of
+the bytes themselves*.
+
+**One encouraging data point for the follow-up.** Probe A on the failing traced run still fired ~once
+per frame, showing the readback buffer continuing to change **1.5–62 ms after** S declared it shipped.
+So the correct bytes *do* reach S's view — just late, and after the feedback word already released the
+app. That suggests the problem may be **relative timing** (feedback visible before readback settles),
+not a permanent coherency loss — which, if confirmed, points at a fix that holds the feedback-word ship
+until the readback has settled *after* the feedback signal (a bounded wait, because the feedback word
+means the GPU is genuinely done). The next step is a spike that measures exactly this relative timing
+before any more delivery code is written.
