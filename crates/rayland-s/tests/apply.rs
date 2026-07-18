@@ -1693,3 +1693,46 @@ fn a_refusal_of_a_request_c_blocks_on_stays_solicited() {
          recvmsg behind that. An error not routed to it is an application that hangs forever"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// (c)1 fence-feedback: `Applier::fingerprint_nonring_blobs`
+// ---------------------------------------------------------------------------------------------
+
+/// `fingerprint_nonring_blobs` reports every blob that is not a ring, and omits rings — the contract
+/// the fence-feedback delivery loop relies on to watch the feedback buffer (a non-ring Venus-internal
+/// blob) from its very first write, while never mistaking a ring's `head`/command bytes for a write to
+/// return.
+#[test]
+fn fingerprint_nonring_blobs_covers_non_rings_and_omits_rings() {
+    let (mut applier, mut engine, ring_res_id) = session_with_ring();
+
+    // The app's 64-byte vertex buffer from the live capture: a real blob, but not a ring (its
+    // power-of-two size is not ring-shaped, so `RingIdentity::from_blob_request` rejects it).
+    let out = applier.apply(
+        &mut engine,
+        C2S::CreateBlob {
+            blob_mem: BLOB_MEM_HOST3D,
+            blob_flags: 0,
+            blob_id: 16,
+            size: 64,
+        },
+    );
+    let plain_res_id = match out.as_slice() {
+        [S2C::BlobCreated { res_id, .. }] => *res_id,
+        other => panic!("expected exactly one BlobCreated, got {other:?}"),
+    };
+
+    let ids: std::collections::HashSet<u32> = applier
+        .fingerprint_nonring_blobs()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert!(
+        ids.contains(&plain_res_id),
+        "a non-ring blob must be fingerprinted"
+    );
+    assert!(
+        !ids.contains(&ring_res_id),
+        "a ring blob must be omitted"
+    );
+}

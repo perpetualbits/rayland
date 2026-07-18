@@ -1015,6 +1015,32 @@ impl Applier {
             .collect()
     }
 
+    /// **(c)1 fence-feedback delivery support**: fingerprint every blob that is not a ring, cheaply.
+    ///
+    /// # What this is for
+    /// The return path's delivery loop (`rayland-s`'s `progress_thread`) calls this once per poll and
+    /// ships blob writes whenever a fingerprint moves. Unlike [`Self::fingerprint_written_blobs`],
+    /// which is scoped to blobs S has already been *observed* to write (Probe A's set), this covers
+    /// **every** non-ring blob — because the feedback buffer must be watched from its *first* write,
+    /// before it has ever been in the S-written set (see the spec's §3.2 bootstrap-deadlock note).
+    ///
+    /// Rings are excluded for the same reason [`Self::take_blob_writes`] excludes them: a ring's pages
+    /// are C's command bytes and S's `head`, not S's writes to return.
+    ///
+    /// # Inputs / outputs
+    /// - Returns `(res_id, fingerprint)` for every non-ring blob, using the same strided
+    ///   [`rayland_relay::trace::fingerprint`] as Probe A so the values are comparable across polls.
+    ///   Cheap enough (a strided hash, microseconds per blob) to call on every 200 µs poll.
+    pub fn fingerprint_nonring_blobs(&self) -> Vec<(u32, u64)> {
+        self.blobs
+            .iter()
+            // A ring's pages are not S's writes to return — exclude them, exactly as `take_blob_writes`
+            // does, so a `head` store is never mistaken for a completion write.
+            .filter(|(res_id, _)| !self.rings.contains_key(res_id))
+            .map(|(&res_id, blob)| (res_id, rayland_relay::trace::fingerprint(blob.bytes())))
+            .collect()
+    }
+
     /// **(c)1 Task 9 Probe A support**: how many `C2S::RingDelta` messages have been applied so far.
     ///
     /// Probe A samples this alongside [`Self::fingerprint_written_blobs`] to tell a late GPU write of
