@@ -177,3 +177,50 @@ exposes a `T4` fence directly (rather than the `T2` ring fence) is the next thin
 investigation, not more delivery code. Until it is answered, the daemon is left on the pre-actor path
 (the branch tip runs, with the known stale/torn readback), and the actor stands as a committed,
 smoke-tested building block that the wiring patch activates once the barrier is right.
+
+## 9. The T4 barrier exists — it is a hardcoded `ring_idx = 0` bug (2026-07-19)
+
+§8's remaining question — is there a true `T4` (GPU-DMA-completion) fence? — is answered **YES**, from
+virglrenderer source (1.2.0, unchanged in 1.3.0 and `main`@eccb534). Full trace with citations:
+`scratchpad/c2-t4-fence-findings.md`.
+
+**The fence Rayland already uses is the right one, called with the wrong argument.**
+`virgl_renderer_context_create_fence(ctx_id, flags, ring_idx, fence_id)` forks on `ring_idx` inside
+`vkr_context_submit_fence` (`src/venus/vkr_context.c:136-159`):
+
+- **`ring_idx == 0`** — "the dedicated CPU ring" (`vn_instance.h:112`) — retires **immediately and
+  synchronously**, with no wait on the GPU or anything else. **This is what Rayland hardcodes**
+  (`crates/rayland-engine/src/virgl.rs:922`, `const RING_IDX: u32 = 0`). It is not even `T2`; it is a
+  bare "request received" ack.
+- **`ring_idx >= 1`** — the app's real per-queue timeline index — routes to `vkr_queue_sync_submit`
+  (`src/venus/vkr_queue.c:78-112`): a **real empty `vkQueueSubmit(queue, 0, NULL, sync->fence)` on the
+  app's own `VkQueue`, under the same `queue->vk_mutex` the app's submits use**, then a dedicated
+  thread's real `vk->WaitForFences` (`vkr_queue.c:176-181`). By ordinary Vulkan per-queue FIFO
+  submission order, that fence signals only after every earlier submission to that queue (the app's
+  render + `vkCmdCopyImageToBuffer` + feedback fill) has completed on the GPU. **That is `T4`, with
+  zero virglrenderer changes.**
+
+**The fix.** Call `virgl_renderer_context_create_fence(ctx_id, 0, real_ring_idx, fence_id)` with the
+app's real per-queue `ring_idx`, after its readback-bearing `vkQueueSubmit` has been dispatched. The
+existing `wait_for_context_fence` poll loop and `write_context_fence`/`FenceState` plumbing are
+unchanged — only the `ring_idx` argument changes. The engine actor (§2) makes this now-genuinely-
+blocking fence deadlock-free, and Task 4's delivery structure is already correct; so **(c)2's
+completion barrier reduces to plumbing the real `ring_idx`.**
+
+**How S learns `ring_idx`.** Mesa's guest driver assigns every queue a `ring_idx >= 1` and passes it at
+`vkGetDeviceQueue2` via `VkDeviceQueueTimelineInfoMESA.ringIdx` (`vn_device.c:83-92`;
+`vn_instance_acquire_ring_idx` never returns 0). S can read it by decoding that one command from the
+ring. For the single-queue walking skeleton the value is deterministic (the first acquired index),
+so an assume-and-verify shortcut is viable before the full decode; the robust version decodes
+`vkGetDeviceQueue2`.
+
+**Two corrections this surfaced (fix when touching the code):**
+- `write_context_fence` **never** fires for the app's own `VkFence` — only for S's own
+  `context_create_fence` calls (`vkr_context.c`); the T4 signal comes from S creating the fence on the
+  right `ring_idx`, not from observing the app's fence. Confirms the Task 9 spikes' zero-callbacks
+  result and explains it.
+- The render-server **forces `VIRGL_RENDERER_FENCE_FLAG_MERGEABLE`** regardless of the flags Rayland
+  passes (`server/render_context.c:34-38`), which **contradicts** `crates/rayland-engine/src/ffi.rs:557-559`'s
+  comment ("we do not set MERGEABLE …"). Harmless here (it only permits skipping a *superseded*
+  fence's callback, and S always waits the latest per ring), but the ffi.rs comment is now false and
+  should be corrected.
