@@ -1074,27 +1074,27 @@ impl VirglEngine {
         Ok(fd)
     }
 
-    /// Blocks until every command submitted to `(ctx_id, ring_idx)` so far has retired on the GPU,
-    /// or [`FENCE_WAIT_TIMEOUT`] elapses.
+    /// Creates a fresh per-context fence on `(ctx_id, ring_idx)` and returns its id. Non-blocking:
+    /// it only submits the fence to virglrenderer; retirement must be observed later by calling
+    /// [`Self::poll_fence`] with the returned id. This is the "submit" half of what used to be one
+    /// blocking call ([`Self::wait_for_context_fence`]) — split out so the future engine actor can
+    /// create the fence and then keep servicing other commands instead of blocking its one thread
+    /// on GPU completion, which would recreate the same head-of-line-blocking problem the actor
+    /// exists to remove.
     ///
-    /// Creates a fresh per-context fence (`virgl_renderer_context_create_fence`) carrying a
-    /// monotonically-increasing `fence_id`, then repeatedly calls `virgl_renderer_context_poll`
-    /// (which drives the `write_context_fence` callback for any fence that has retired) and checks
-    /// the shared `FenceState` mailbox on the cookie, sleeping `FENCE_POLL_INTERVAL` between
-    /// attempts. See `write_context_fence`'s and `virgl_renderer_context_create_fence`'s doc
-    /// comments in `ffi.rs` for how this pairing was confirmed empirically (as opposed to the
-    /// legacy `virgl_renderer_create_fence`/`write_fence` pairing, deliberately not used here).
+    /// Carries a monotonically-increasing `fence_id` (from `self.next_fence_id`) so a caller
+    /// juggling several outstanding fences can unambiguously ask about *this* one later, rather
+    /// than an earlier, possibly-still-outstanding fence.
     ///
     /// # Inputs / outputs
-    /// - `ctx_id`, `ring_idx`: which context/ring to wait on.
-    /// - Returns `Ok(())` once the fence retires.
+    /// - `ctx_id`, `ring_idx`: which context/ring to fence.
+    /// - Returns the new fence's id, to be passed to [`Self::poll_fence`].
     ///
     /// # Failure modes
-    /// - `FenceCreateFailed`: virglrenderer rejected the fence creation itself.
-    /// - `FenceTimeout`: the fence never retired within `FENCE_WAIT_TIMEOUT`.
-    fn wait_for_context_fence(&mut self, ctx_id: u32, ring_idx: u32) -> Result<(), EngineError> {
-        // A fresh id per wait, so this call is unambiguously asking about *this* fence rather than
-        // one an earlier, possibly-still-outstanding wait created.
+    /// [`EngineError::FenceCreateFailed`] if virglrenderer rejects the fence creation itself (the
+    /// raw return code and its errno name are included for diagnosis).
+    pub fn create_fence(&mut self, ctx_id: u32, ring_idx: u32) -> Result<u64, EngineError> {
+        // A fresh id per fence, so callers juggling several outstanding fences can tell them apart.
         let fence_id = self.next_fence_id;
         self.next_fence_id = self.next_fence_id.wrapping_add(1);
 
@@ -1113,18 +1113,68 @@ impl VirglEngine {
                 reason: errno_name(rc),
             });
         }
+        Ok(fence_id)
+    }
 
-        // Poll until the fence retires or we time out. Nothing pumps fence completion in the
-        // background (see `FENCE_POLL_INTERVAL`'s doc comment), so this loop must drive it itself.
+    /// Pumps fence completion once and reports whether `fence_id` on `(ctx_id, ring_idx)` — as
+    /// returned by an earlier [`Self::create_fence`] call — has retired. Non-blocking: exactly one
+    /// `virgl_renderer_context_poll` call, no sleep, no loop. This is the "observe" half of what
+    /// used to be one blocking call ([`Self::wait_for_context_fence`]); the caller is expected to
+    /// call this repeatedly at its own cadence (e.g. once per actor tick), doing other work between
+    /// calls, until it returns `Ok(true)`.
+    ///
+    /// # Inputs / outputs
+    /// - `ctx_id`, `ring_idx`, `fence_id`: identify the fence to check, as created by
+    ///   [`Self::create_fence`].
+    /// - Returns `Ok(true)` if the fence has retired, `Ok(false)` if it has not yet.
+    ///
+    /// # Failure modes
+    /// Currently infallible (always `Ok`) — `virgl_renderer_context_poll` has no error return, and
+    /// checking `FenceState` cannot fail. The `Result` is kept so a future virglrenderer version
+    /// that can report a wedged/lost context does not need a signature change.
+    pub fn poll_fence(
+        &mut self,
+        ctx_id: u32,
+        ring_idx: u32,
+        fence_id: u64,
+    ) -> Result<bool, EngineError> {
+        // SAFETY: `ctx_id` names a live context; forcing retirement is always safe to call.
+        unsafe { ffi::virgl_renderer_context_poll(ctx_id) };
+        // Nothing pumps fence completion in the background (see `FENCE_POLL_INTERVAL`'s doc
+        // comment), so the caller must drive this itself by calling `poll_fence` repeatedly.
+        Ok(self
+            .cookie
+            .fence_state
+            .is_retired(ctx_id, ring_idx, fence_id))
+    }
+
+    /// Blocks until every command submitted to `(ctx_id, ring_idx)` so far has retired on the GPU,
+    /// or [`FENCE_WAIT_TIMEOUT`] elapses.
+    ///
+    /// Built on [`Self::create_fence`] and [`Self::poll_fence`]: creates one fence, then polls it
+    /// in a loop, sleeping [`FENCE_POLL_INTERVAL`] between attempts. This blocking form is what
+    /// `read_back` uses (a single-threaded, synchronous caller has no reason to interleave other
+    /// work); the future engine actor uses the two non-blocking halves directly instead, to avoid
+    /// blocking its one thread on GPU completion. See `write_context_fence`'s and
+    /// `virgl_renderer_context_create_fence`'s doc comments in `ffi.rs` for how this pairing was
+    /// confirmed empirically (as opposed to the legacy `virgl_renderer_create_fence`/`write_fence`
+    /// pairing, deliberately not used here).
+    ///
+    /// # Inputs / outputs
+    /// - `ctx_id`, `ring_idx`: which context/ring to wait on.
+    /// - Returns `Ok(())` once the fence retires.
+    ///
+    /// # Failure modes
+    /// - `FenceCreateFailed`: virglrenderer rejected the fence creation itself.
+    /// - `FenceTimeout`: the fence never retired within `FENCE_WAIT_TIMEOUT`.
+    fn wait_for_context_fence(&mut self, ctx_id: u32, ring_idx: u32) -> Result<(), EngineError> {
+        // Submit the fence; the id is what ties every later poll back to this specific fence.
+        let fence_id = self.create_fence(ctx_id, ring_idx)?;
+
+        // Poll until the fence retires or we time out.
         let deadline = Instant::now() + FENCE_WAIT_TIMEOUT;
         loop {
-            // SAFETY: `ctx_id` names a live context; forcing retirement is always safe to call.
-            unsafe { ffi::virgl_renderer_context_poll(ctx_id) };
-            if self
-                .cookie
-                .fence_state
-                .is_retired(ctx_id, ring_idx, fence_id)
-            {
+            if self.poll_fence(ctx_id, ring_idx, fence_id)? {
                 return Ok(());
             }
             if Instant::now() >= deadline {
@@ -1510,6 +1560,58 @@ mod tests {
             .wait_for_context_fence(1, 0)
             .expect("a fence on a live, idle context should retire well within the timeout");
         eprintln!("OK: fence created and retired on a live Venus context");
+    }
+
+    /// The split, non-blocking `create_fence`/`poll_fence` pair in isolation: proves the same
+    /// end-to-end retirement (`virgl_renderer_context_create_fence` -> `virgl_renderer_context_poll`
+    /// -> `write_context_fence` -> `FenceState`) that `fence_wait_completes_on_a_live_context` proves
+    /// for the blocking `wait_for_context_fence`, but driven by hand-rolling the poll loop the way
+    /// the future engine actor will: one `poll_fence` call per tick, doing (in the actor's case)
+    /// other work in between, rather than one call blocking the whole thread.
+    #[test]
+    fn split_fence_create_then_poll_retires_on_a_live_context() {
+        let _serialize = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let node = Path::new(RENDER_NODE);
+        if !virgl_available(node) {
+            eprintln!(
+                "SKIP split_fence_create_then_poll_retires_on_a_live_context: no usable Venus render node at {RENDER_NODE}"
+            );
+            return;
+        }
+
+        let mut engine =
+            VirglEngine::new(node).expect("VirglEngine::new should succeed on a GPU host");
+        engine
+            .create_venus_context(1)
+            .expect("create_venus_context should succeed on a GPU host");
+
+        // Submit the fence: non-blocking, just registers it with virglrenderer.
+        let fence_id = engine
+            .create_fence(1, 0)
+            .expect("create_fence should succeed on a live context");
+
+        // Hand-roll the actor's expected poll loop: check once, sleep briefly, repeat, bounded by
+        // the same timeout `wait_for_context_fence` uses so a wedged host fails the test instead of
+        // hanging it.
+        let deadline = Instant::now() + FENCE_WAIT_TIMEOUT;
+        let mut retired = false;
+        while Instant::now() < deadline {
+            if engine
+                .poll_fence(1, 0, fence_id)
+                .expect("poll_fence should not error on a live context")
+            {
+                retired = true;
+                break;
+            }
+            std::thread::sleep(FENCE_POLL_INTERVAL);
+        }
+        assert!(
+            retired,
+            "fence {fence_id} should have retired within {FENCE_WAIT_TIMEOUT:?} on a live, idle context"
+        );
+        eprintln!("OK: split create_fence/poll_fence retired the fence on a live Venus context");
     }
 
     /// `repack_tight` in isolation, with synthetic (non-GPU) data: proves the stride-honoring
