@@ -182,11 +182,28 @@ Venus/virglrenderer capture/replay engine, so *unmodified* applications run.**
   fd survives a network**. (c)1 is a protocol design task. It also owes SP1 host-side pixels
   for on-screen presentation. **Required reading:**
   [`docs/design/2026-07-15-venus-ring-findings.md`](docs/design/2026-07-15-venus-ring-findings.md).
+  **Delivered:** the **forward path** (unmodified app commands C→S, executed on S's GPU,
+  bit-identical on trivial workloads) and **presentation** both work. **Handed to (c)2:** the
+  **readback return path** — see the next bullet. Task 9 measured it (message-rate-bound, mapped
+  memory shipped 5.2×/frame) and found it silently delivers stale/torn frames; five fixes across
+  Task 9 failed, and the final one proved *why* — see
+  [`docs/c1-the-network.md`](docs/c1-the-network.md) §3.1 and
+  [`docs/design/2026-07-17-fence-feedback-walking-skeleton.md`](docs/design/2026-07-17-fence-feedback-walking-skeleton.md)
+  §11.
 - **(c)2 — mapped-memory coherence:** the `vkMapMemory` problem (apps write vertices and
   textures straight into mapped memory with **no API call to intercept**). The icosahedron
   fixtures (`rayland-icosa-cpu`/`rayland-icosa-gpu`) were built to make this bite and, run
   through C0's path, did not — see [`docs/icosa-fixtures.md`](docs/icosa-fixtures.md) for
-  why not and where the real failure is still waiting.
+  why not and where the real failure is still waiting. **Now also owns the readback return
+  path handed over by (c)1**: an application that maps a **GPU-written** buffer and reads it
+  back cannot be served by S *passively observing and diffing* that memory — S is a foreign
+  reader with no fence→coherency relationship, and every patch of the observe-and-diff path hit
+  a different wall (proof:
+  [`docs/design/2026-07-17-fence-feedback-walking-skeleton.md`](docs/design/2026-07-17-fence-feedback-walking-skeleton.md)
+  §9–§11). The path forward is to make S a **proper fenced engine-side consumer** —
+  `virgl_renderer_transfer_read_iov` after a fence, as C0's `read_back` already does bit-identically —
+  which needs blob→classic-resource support this virglrenderer (1.2.0) does not expose for the vtest
+  blob path. **(c)2's first step is investigating that reachability.**
 - **(c)3 — content-addressed assets.**
 - **(c)4 — real/complex applications; GL via Zink.**
 

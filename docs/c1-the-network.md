@@ -364,6 +364,17 @@ So the fix is not anywhere on C, and it is not a better guess on S. It is a comp
 dominates the GPU's readback — the network fence-completion protocol argued for in the design note's
 §6.
 
+> **Disposition (2026-07-18).** That completion protocol was designed and implemented, and it does
+> **not** work — the readback cannot be fixed by any completion signal layered on S *passively
+> observing and diffing* the application's memory. S is a foreign reader of GPU-written memory with no
+> fence→coherency relationship, and five successive fixes each hit a different wall. The full account
+> and the corrected conclusion are in
+> [`design/2026-07-17-fence-feedback-walking-skeleton.md`](design/2026-07-17-fence-feedback-walking-skeleton.md)
+> §9–§11. **The readback return path is rescoped to (c)2**, whose path is to make S a proper fenced
+> engine-side consumer (`transfer_read_iov` after a fence, as C0's `read_back` does bit-identically).
+> `T2 < T4` above remains the correct measurement; what is retired is the *observe-and-diff* approach to
+> acting on it.
+
 ### 3.2 The commands are free. The memory is not.
 
 Fixture A, per frame:

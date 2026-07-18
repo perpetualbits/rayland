@@ -1,10 +1,10 @@
 # The stale-frame fix, minimal-correct: buy back fence feedback and deliver it
 
-**Status:** design spec, written 2026-07-17. **Implemented 2026-07-18 exactly as specified — and it
-failed, worse than doing nothing (119–120 of 120 frames wrong). The failure is instructive and is
-recorded in §9 below; read it before trusting any part of §3–§4.** The measurement it rests on
-(§2, `T2 < T4`) is unaffected and remains correct; what §9 refutes is that *delivering the feedback
-word as ordinary blob data* is sufficient.
+**Status:** design spec, written 2026-07-17; **superseded 2026-07-18.** Implemented as specified and it
+failed (§9); the root cause was re-diagnosed twice (§10, §11); the final conclusion (§11) is that
+**app-initiated readback cannot be fixed by patching S's observe-and-diff return path at all, and is
+rescoped to (c)2.** Read §11 first — §3–§10 are the trail that led there, preserved, not current
+guidance. The one durable result is §2's `T2 < T4` measurement, which stands.
 
 It specifies the **walking-skeleton** fix for (c)1 Task
 9's stale-frame race — the smallest change that is *genuinely correct* (120/120 every run), not the
@@ -252,6 +252,13 @@ before any more delivery code is written.
 
 ## 10. Corrected root cause — a coherency problem, from reading the source (2026-07-18)
 
+> **Partly superseded by §11 (2026-07-18).** This section's fix direction — "read the resource through
+> `virgl_renderer_resource_map` (option 1)" — was tried and is a **red herring**: the accessor does not
+> fix it and contends worse. The real missing ingredient is a **GPU fence before the read**, and the
+> real wall is that fence contending with the message-thread doorbell. Read §11 before acting on §10's
+> "fix direction". The source facts §10 cites are still accurate; the *conclusion drawn from them* was
+> not.
+
 §9's "encouraging" guess (relative timing; the readback settles late but eventually correct) was
 **refuted** by a spike: holding the ship until the non-ring blobs settled, swept from 1 ms to 50 ms of
 extra wait, changed nothing (119–120/120 wrong at every threshold, no trend). The correct complete
@@ -298,3 +305,51 @@ diffing it" strategy is the thing at fault for readback, not any particular gati
 
 The next experiment is option 1: it is small, principled, and either fixes it or proves readback must
 go through the engine (option 2).
+
+## 11. Option 1 tried, and the honest conclusion: readback is (c)2, not a (c)1 tweak (2026-07-18)
+
+§10's option 1 was implemented and measured on the GPU. The result retires the whole "patch the
+observe-and-diff return path" line of attack:
+
+- **`virgl_renderer_resource_map` is a red herring.** It succeeds on the readback blob (the spike
+  proved that), but with the real fix in place it does **not** improve correctness over a plain raw
+  read, it lags the small feedback word, and its per-blob engine lock **contends worse**. The
+  accessor was never the missing piece.
+- **The missing piece is a GPU fence before the read.** A passive wait alone never converged (the §5
+  settle sweep, 1–50 ms, all wrong); a raw `MAP_SHARED` read taken *after a retired GPU context
+  fence* is (mostly) coherent. So §10's "foreign mmap has no coherency contract" over-stated it: the
+  raw read tears when taken **concurrently** with the GPU's writes, and a fence both waits for
+  completion and triggers the coherency flush. This reconciles with §2's original `T2 < T4` — it was
+  a completion/coherency race all along, and the fence is what closes it.
+- **But the fence cannot be made both correct and live in this architecture.** virglrenderer is
+  process-global under one lock. The fence-wait either **holds** that lock and starves the message
+  thread's per-delta doorbell (`engine.submit`) → S's ring thread parks → Mesa aborts with a
+  ring-stall **SIGABRT**; or it is **polled with the lock released**, and the added latency times the
+  application's `vkWaitForFences` out. Splitting the wait into create/poll did not resolve it.
+- **The correctness win was real but could not be made to *run*.** In the rare completing runs the
+  implementer saw `wrong=0` (no torn/stale frames). But an independent re-run of the committed
+  approach was **0 for 7** — 4 SIGABRT, 3 timeout, zero completions — so even the correctness result is
+  not reproducible end-to-end. The exploration diff is preserved at
+  `.superpowers/sdd/phase1-exploration.patch` (git-ignored scratch); it was **reverted**, not
+  committed, because it mostly crashes.
+
+### The conclusion
+
+**App-initiated readback cannot be fixed by patching the "S passively observes and diffs the app's
+memory" return path.** Five attempts, each hitting a different wall (early release → torn cache →
+foreign-mmap incoherence → fence-vs-doorbell contention), are the evidence that the *architecture* is
+wrong for this case, not the tuning.
+
+The right shape is **§10's option 2**: S stops being a foreign memory-watcher and becomes a **proper
+fenced engine-side consumer** for the readback — copy the app's blob into a resource S's own driver
+owns and read it back with `virgl_renderer_transfer_read_iov`, exactly the mechanism C0's `read_back`
+already proves bit-identical. That removes the foreign-observer coherency problem *and* changes the
+contention picture (the readback happens while the app is blocked on its fence and the ring is
+quiescent). It needs blob→classic-resource support that virglrenderer 1.2.0 does not expose for the
+vtest blob path, and careful doorbell orchestration — a design cycle, not a patch.
+
+**Therefore readback is rescoped to (c)2** (the "apps map GPU-written memory and read it back"
+problem), whose first step is investigating option 2's reachability on this virglrenderer. (c)1's
+delivered scope is the **forward path** (unmodified app commands C→S, executed on S's GPU,
+bit-identical on trivial workloads) and **presentation** — both of which work. The stale/torn readback
+is a known, documented limitation handed to (c)2, not a regression in what (c)1 set out to prove.
