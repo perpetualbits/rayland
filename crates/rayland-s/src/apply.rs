@@ -918,13 +918,38 @@ impl Applier {
                 *res_id,
             )
         });
+        self.emit_blob_writes(&res_ids)
+    }
 
+    /// Emit one `S2C::BlobData` per run of bytes S wrote, for the blobs named by `res_ids`, in the
+    /// order given.
+    ///
+    /// # Why this exists
+    /// [`Self::take_blob_writes`], [`Self::take_venus_blob_writes`] and [`Self::take_app_blob_writes`]
+    /// differ only in *which* blobs they visit and *in what order* — the per-blob diff-and-emit logic
+    /// (ring exclusion, the `take_bytes_s_wrote` call, the T5 trace, folding into `s_written`) is
+    /// identical across all three, so it lives here once rather than three times where it could drift.
+    ///
+    /// Rings are never passed in by any of the three callers — a ring's pages are C's command bytes
+    /// and S's `head`, not S's writes to return (see [`Self::take_blob_writes`]'s docs on why the
+    /// ring is excluded structurally rather than by a guess about its bytes). This function still
+    /// guards against one anyway, at no real cost, so a caller mistake fails by omission rather than
+    /// by corrupting the ring.
+    ///
+    /// # Inputs / outputs
+    /// - `res_ids`: which blobs to diff, and in what order the resulting messages appear. A blob that
+    ///   has since been unref'd (a race between listing it and this call, or a caller composing a
+    ///   stale list) is skipped rather than panicked on — this is called from a poll loop, where a
+    ///   panic would take out the only thing that ever releases the application's waits.
+    /// - Returns one [`S2C::BlobData`] per run of bytes S wrote, across the named blobs, in the order
+    ///   given. Empty if none of them had anything to say.
+    fn emit_blob_writes(&mut self, res_ids: &[u32]) -> Vec<S2C> {
         let mut out = Vec::new();
         // **(c)1 Task 9 diagnostic.** The res_ids that produced a run on *this* call, folded into
         // `self.s_written` after the loop rather than during it — inserting mid-loop would need a
         // second mutable borrow of `self` while `blob` still borrows `self.blobs`.
         let mut wrote_this_call: Vec<u32> = Vec::new();
-        for res_id in res_ids {
+        for &res_id in res_ids {
             // **The ring is excluded structurally, by `res_id`.** S's engine genuinely writes a
             // ring's pages — `vkr_ring_store_head` (`vkr_ring.c:60-67`) stores `head` into them
             // after each dispatched command — so the observed-writes rule would rightly report them,
@@ -936,12 +961,11 @@ impl Applier {
             if self.rings.contains_key(&res_id) {
                 continue;
             }
-            // `expect` is unreachable: `res_ids` was just built from this map's own keys, and
-            // nothing removes a blob between there and here — this method holds `&mut self`.
-            let blob = self
-                .blobs
-                .get_mut(&res_id)
-                .expect("res_ids came from self.blobs' keys");
+            // A blob may have been unref'd between the caller listing it and this loop reaching it —
+            // skip rather than panic on what is, in production, a poll loop.
+            let Some(blob) = self.blobs.get_mut(&res_id) else {
+                continue;
+            };
             let runs = blob.take_bytes_s_wrote();
             if runs.is_empty() {
                 continue;
@@ -983,6 +1007,69 @@ impl Applier {
             self.s_written.insert(res_id);
         }
         out
+    }
+
+    /// **Return path, retirement half:** the Venus-internal blob writes — the reply arena, whose bytes
+    /// answer the application's non-readback synchronous calls and are needed for its forward progress.
+    ///
+    /// # Why this ships at ring retirement rather than after the GPU fence
+    /// Mesa's `vn_ring_wait_seqno` releases the application the instant `head` moves past the seqno it
+    /// is waiting on (`vn_ring.c:176-179`) — it never waits on a GPU fence for the reply arena, only on
+    /// the ring's own retirement. So the reply arena's bytes must be on the wire by the time C applies
+    /// that `RingProgress`, which is ring-retirement time, not fence time; waiting for the fence as well
+    /// would needlessly delay a message the application is about to spin-read regardless.
+    ///
+    /// # Inputs / outputs
+    /// - Returns one [`S2C::BlobData`] per run of bytes S wrote, across every Venus-internal, non-ring
+    ///   blob (the reply arena; never the ring, and never the staging pool, which S never writes — see
+    ///   [`Self::take_blob_writes`]'s docs for why an observed-writes rule already excludes the pool
+    ///   without needing to know what it is). Empty when S has written none of them since the last
+    ///   call.
+    pub fn take_venus_blob_writes(&mut self) -> Vec<S2C> {
+        // Collected into an owned `Vec` before the mutable diff pass: `emit_blob_writes` needs
+        // `&mut self`, so the filter over `self.rings`/`self.venus_internal` must finish and drop its
+        // borrows first.
+        let ids: Vec<u32> = self
+            .blobs
+            .keys()
+            .copied()
+            .filter(|id| !self.rings.contains_key(id) && self.venus_internal.contains(id))
+            .collect();
+        self.emit_blob_writes(&ids)
+    }
+
+    /// **Return path, post-fence half:** the application's own blob writes — the readback buffer and
+    /// the feedback word — **largest blob first**, so the megabyte-scale readback ships ahead of the
+    /// tiny feedback word, and the feedback word (which releases the application onto the picture)
+    /// lands last, after the pixels it releases the application onto.
+    ///
+    /// # Why this must wait for the GPU fence and `take_venus_blob_writes` need not
+    /// Unlike the reply arena, nothing about these blobs' contents is guaranteed correct merely
+    /// because the ring retired: the readback buffer is written by the GPU's own DMA, which can
+    /// legitimately still be in flight after virglrenderer's ring thread has moved `head` (this is
+    /// (c)1's stale-frame defect — a diff answers "did these bytes change?", never "has the GPU
+    /// finished?"; see [`Self::take_blob_writes`]'s docs). So this half of the split is the one the
+    /// caller must gate on [`RenderEngine::wait_for_work_retired`], not ring retirement alone.
+    ///
+    /// # Inputs / outputs
+    /// - Returns one [`S2C::BlobData`] per run of bytes S wrote, across every non-Venus-internal,
+    ///   non-ring blob, ordered by blob size descending (ties broken by resource id, purely for a
+    ///   reproducible order — nothing depends on it). Empty when S has written none of them since the
+    ///   last call.
+    pub fn take_app_blob_writes(&mut self) -> Vec<S2C> {
+        // `(res_id, size)` pairs so the sort below can order by size without a second map lookup.
+        let mut ids: Vec<(u32, u64)> = self
+            .blobs
+            .iter()
+            .filter(|(id, _)| !self.rings.contains_key(id) && !self.venus_internal.contains(id))
+            .map(|(&id, blob)| (id, blob.size()))
+            .collect();
+        // Largest first — the readback buffer (megabytes) must lead the feedback word (bytes) so the
+        // pixels it reports on are already in flight before the word that reports them. Ties broken
+        // by id purely so the order is reproducible rather than hash-ordered.
+        ids.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let ids: Vec<u32> = ids.into_iter().map(|(id, _)| id).collect();
+        self.emit_blob_writes(&ids)
     }
 
     /// **(c)1 Task 9 Probe A support**: fingerprint every blob S has ever written, cheaply.

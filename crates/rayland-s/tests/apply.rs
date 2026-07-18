@@ -1736,3 +1736,53 @@ fn fingerprint_nonring_blobs_covers_non_rings_and_omits_rings() {
         "a ring blob must be omitted"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// (c)2 Task 1: the blob-write split — Venus-internal writes at retirement, app writes post-fence
+// ---------------------------------------------------------------------------------------------
+
+/// Fill one byte of a blob, standing in for **S's engine** touching a single byte of it.
+///
+/// A thin wrapper over [`RecordingEngine::write_blob_range`] rather than a new engine-double API:
+/// the brief for this task is explicit that a one-byte write is enough to produce a run, and the
+/// double already has the primitive.
+fn write_blob_byte(engine: &RecordingEngine, res_id: u32, offset: u64, fill: u8) {
+    engine.write_blob_range(res_id, offset, fill, 1);
+}
+
+/// The `res_id` of an [`S2C::BlobData`], or `None` for any other message — for filtering a
+/// `take_*_blob_writes` result down to which resources it named, independent of run count.
+fn res_id_of_blobdata(msg: &S2C) -> Option<u32> {
+    match msg {
+        S2C::BlobData { res_id, .. } => Some(*res_id),
+        _ => None,
+    }
+}
+
+/// The blob-write split feeds the fence-gated return path: reply-arena (Venus-internal) ships at
+/// ring retirement, the readback + feedback word (application blobs, largest first so the big
+/// readback leads the tiny feedback word) ship after the GPU fence. This pins that partition and
+/// that ordering.
+#[test]
+fn blob_write_split_partitions_venus_from_app_and_orders_app_largest_first() {
+    let (mut applier, mut engine, _ring) = session_with_ring();
+
+    // A Venus-internal blob (blob_id == 0) and two application blobs (blob_id != 0) of different
+    // sizes, so the largest-first ordering is observable.
+    let venus = create_blob(&mut applier, &mut engine, /*blob_id*/ 0, /*size*/ 256);
+    let app_small = create_blob(&mut applier, &mut engine, /*blob_id*/ 16, /*size*/ 64);
+    let app_big = create_blob(&mut applier, &mut engine, /*blob_id*/ 16, /*size*/ 1024);
+
+    // Make S "write" a byte into each so each produces a run.
+    write_blob_byte(&engine, venus, 0, 0xAA);
+    write_blob_byte(&engine, app_small, 0, 0xBB);
+    write_blob_byte(&engine, app_big, 0, 0xCC);
+
+    let venus_out = applier.take_venus_blob_writes();
+    let venus_ids: Vec<u32> = venus_out.iter().filter_map(res_id_of_blobdata).collect();
+    assert_eq!(venus_ids, vec![venus], "only the Venus-internal blob ships in the venus split");
+
+    let app_out = applier.take_app_blob_writes();
+    let app_ids: Vec<u32> = app_out.iter().filter_map(res_id_of_blobdata).collect();
+    assert_eq!(app_ids, vec![app_big, app_small], "app split ships app blobs, largest first");
+}
