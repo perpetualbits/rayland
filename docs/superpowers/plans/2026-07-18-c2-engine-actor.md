@@ -486,15 +486,18 @@ Replace the engine `Mutex` with the actor, and restructure the return path to th
 - Consumes: `rayland_engine::{spawn_engine, EngineClient, VirglEngine}`; `Applier::take_venus_blob_writes`/`take_app_blob_writes` (Task 1); `EngineClient::wait_for_work_retired` via the `RenderEngine` trait (Task 3); the existing `ship`/`send` helpers, `PROGRESS_POLL`.
 - Produces: a `progress_thread(applier: Arc<Mutex<Applier>>, engine: EngineClient, tx: Arc<Mutex<QuicSend>>)`.
 
-- [ ] **Step 1: `main` spawns the actor.** In `main` (around `virgl.rs` construction at `main.rs:528`), replace `let engine = Arc::new(Mutex::new(VirglEngine::new(...)?));` with:
+- [ ] **Step 1: `main` spawns the actor.** **UPDATED for the Task 3 EGL-affinity finding:** virglrenderer's EGL context is thread-affine, so the engine must be constructed **on the actor thread** — `spawn_engine` therefore takes the render-node **path** and returns a `Result` (it does the `VirglEngine::new` itself, inside the thread). `main` no longer calls `VirglEngine::new` directly. In `main` (around `main.rs:528`), replace `let engine = Arc::new(Mutex::new(VirglEngine::new(&render_node)...?));` with:
 ```rust
     // One thread owns virglrenderer; `serve` and the progress thread hold clients and message it. This
     // replaces the `Arc<Mutex<VirglEngine>>` whose lock deadlocked the readback fence against the ring
-    // doorbell (docs/design/2026-07-18-c2-engine-actor.md).
-    let virgl = VirglEngine::new(&render_node).map_err(|e| { /* keep the existing error context */ })?;
-    let (engine, _engine_thread) = rayland_engine::spawn_engine(virgl);
+    // doorbell (docs/design/2026-07-18-c2-engine-actor.md). The actor builds the engine on its own
+    // thread because virglrenderer's EGL context is thread-affine (Task 3 finding), so `spawn_engine`
+    // takes the render-node path, not a pre-built engine.
+    let (engine, _engine_thread) = rayland_engine::spawn_engine(render_node.clone())
+        .map_err(|e| /* preserve main's existing "no usable render node / engine cannot be created"
+                        startup error context — the same message VirglEngine::new was wrapped in */)?;
 ```
-Pass `engine.clone()` where the code previously passed `&engine`/`Arc::clone(&engine)`. (Preserve the existing `.map_err(...)` context block verbatim inside the `VirglEngine::new` call.)
+`engine` is now an `EngineClient`; pass `engine.clone()` where the code previously passed `&engine`/`Arc::clone(&engine)`. Confirm `spawn_engine`'s exact signature against `crates/rayland-engine/src/actor.rs` (`spawn_engine(render_node: PathBuf) -> Result<(EngineClient, std::thread::JoinHandle<()>), EngineError>`), and pass whatever path type it wants (`render_node` may be a `&str`/`Path` today — convert to the expected type). Remove the now-unused `VirglEngine`/`Mutex` imports from `main.rs` if clippy flags them (the message thread no longer locks the engine). Keep `_engine_thread` bound so the actor thread lives for the session.
 
 - [ ] **Step 2: `serve` takes an `EngineClient`.** Change its signature from `engine: &Arc<Mutex<VirglEngine>>` to `engine: &mut EngineClient` (or take it by value — it is `Clone`; `serve` needs `&mut` to call trait methods). In the message loop, replace
 ```rust
