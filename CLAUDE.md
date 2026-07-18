@@ -208,9 +208,16 @@ Venus/virglrenderer capture/replay engine, so *unmodified* applications run.**
   cache-coherence problem**. The robust conclusion: correctness needs the host GPU work **retired
   through an engine call** (a context fence/poll — no lock-free substitute exists), and *that* call
   takes Rayland's single global engine lock, which is what contends with the message-thread doorbell
-  (ring-stall `SIGABRT` / timeout, Phase 1). **So (c)2's real problem is the fence-vs-doorbell
-  contention under one non-thread-safe engine lock — a locking/threading architecture question needing
-  a design cycle, not another read-side spike.** Full trail:
+  (ring-stall `SIGABRT` / timeout, Phase 1). That fence-vs-doorbell contention was the architecture
+  problem, and it is **solved**: the **engine actor** (`crates/rayland-engine/src/actor.rs`, committed
+  and smoke-tested) makes one thread own virglrenderer while an `EngineClient` implements `RenderEngine`
+  by messaging it, so the fence and the doorbell cooperate on one thread instead of deadlocking — **the
+  refapp e2e passes through the actor with no wedge.** What remains is a *different* half: the delivery
+  still waits on the **ring** fence (`T2`), which retires ~20 ms before the GPU's readback/feedback-word
+  actually lands (`T4`), so the multi-frame icosa fixture wedges on a missed late write. **(c)2's
+  remaining work is a true `T4` (GPU-DMA-completion) barrier**, now unconstrained by the deadlock; the
+  daemon stays on the pre-actor path until it lands (the actor wiring is preserved as a patch). Full
+  trail: [`docs/design/2026-07-18-c2-engine-actor.md`](docs/design/2026-07-18-c2-engine-actor.md) §8 and
   [`docs/design/2026-07-18-c2-readback-reachability.md`](docs/design/2026-07-18-c2-readback-reachability.md).
 - **(c)3 — content-addressed assets.**
 - **(c)4 — real/complex applications; GL via Zink.**

@@ -1,6 +1,12 @@
 # (c)2 walking skeleton — the engine actor: one thread owns virglrenderer
 
-**Status:** design spec, 2026-07-18. First implementation step of (c)2 (correct app-initiated readback).
+**Status:** design spec, 2026-07-18; **implemented and partly validated 2026-07-19 (see §8).** The
+actor (§2) was built (Tasks 1–3, committed) and wired in (Task 4): it **solves the deadlock** — the
+refapp e2e passes through the actor with no wedge — but the icosa fixture still wedges because
+`wait_for_work_retired` is the **wrong fence** (ring retirement `T2`, not GPU-DMA completion `T4`), the
+open question §7.3 anticipated. The deadlock half is done; the **T4-completion-barrier half is the
+remaining (c)2 work.** Read §8 before acting.
+
 It specifies the **walking-skeleton** fix — the smallest change that reaches **120/120 on the icosa
 fixture without deadlocking** — deferring performance and generality. It rests on a chain of retired
 alternatives; read [`2026-07-18-c2-readback-reachability.md`](2026-07-18-c2-readback-reachability.md)
@@ -135,3 +141,39 @@ The `RenderEngine` trait and `VirglEngine` are unchanged. The actor lives in `ra
   fences the ring rather than the GPU readback — yet Phase 1 measured it yielding correct pixels. If
   the actor makes the fence reliable and frames are still wrong (not wedged), that reopens *which*
   fence is needed — a correctness question the skeleton's gate would surface distinctly from a wedge.
+
+## 8. Implemented — the actor solves the deadlock; the T4 barrier remains (2026-07-19)
+
+Tasks 1–3 (committed): the `Applier` venus/app blob-write split, the non-blocking
+`VirglEngine::create_fence`/`poll_fence`, and the **engine actor + `EngineClient`** (`crates/rayland-engine/src/actor.rs`).
+Task 4 (the wiring — `serve`/`progress_thread` on the client, `main` spawning the actor) was
+implemented and run but **not committed**; it is preserved as `scratchpad/task4-wiring.patch`.
+
+**What was proven — the deadlock is gone.** The **refapp e2e passes 1/1 through the actor**: the whole
+message-thread → actor → progress-thread path delivers a correct readback with no wedge, and S's
+`wait_for_work_retired` never times out and never `SIGABRT`s. The two-threads-one-lock deadlock that
+killed (c)1 Phase 1 *and* (c)2 prototype A — the thing that made "embed non-thread-safe virglrenderer
+for this" look impossible — is **solved by construction**. A real, hardware-affine subtlety was found
+and fixed along the way: virglrenderer's EGL context is **thread-affine**, so the engine must be
+*constructed on the actor thread* (`spawn_engine(render_node: PathBuf)`, not a pre-built engine handed
+across the boundary, which reliably `SIGABRT`s).
+
+**What is not done — the completion barrier.** The icosa fixture wedges (3/3, `vkWaitForFences`
+timeout at a non-deterministic frame). The cause is *not* the actor and *not* wrong pixels: it is that
+`wait_for_work_retired` waits on the **ring** fence (`virgl_renderer_context_create_fence` on ring 0),
+which retires when the ring thread *reaches* the work — Task 9's `T2`, up to ~20 ms before the GPU's
+DMA and the feedback-word write actually land (`T4`). When the ring fence wins that race,
+`take_app_blob_writes` finds the feedback word unchanged, ships nothing, and clears the pending flag;
+with the old idle re-check removed, the late write is never delivered and the app hangs. So §7.3's
+"the fence retires but is the wrong fence" is **confirmed**, now surfacing as a wedge rather than a
+tear (because the single-shot delivery gives up instead of re-sampling).
+
+**The remaining problem, precisely.** S needs a barrier that is true only at **`T4`** — GPU-DMA
+completion for the app's readback/feedback-word — not `T2`. The actor has removed the *deadlock
+constraint*, so such a barrier no longer has to be lock-free or cheap; what is missing is the barrier
+itself. The feedback word *is* the `T4` signal (vkr writes it at completion), so gating the ship on it
+is the principled shape; the recurring difficulty has been detecting it reliably. Whether virglrenderer
+exposes a `T4` fence directly (rather than the `T2` ring fence) is the next thing to establish — an
+investigation, not more delivery code. Until it is answered, the daemon is left on the pre-actor path
+(the branch tip runs, with the known stale/torn readback), and the actor stands as a committed,
+smoke-tested building block that the wiring patch activates once the barrier is right.
