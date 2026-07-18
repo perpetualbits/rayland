@@ -1349,23 +1349,32 @@ pub fn virgl_available(render_node: &Path) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     // Only this module's tests need explicit mutual exclusion between GPU-touching tests within
     // this binary (see `GPU_TEST_LOCK` below); `c_int`, `c_void`, and `Path` are already in scope
     // via `use super::*`.
     use std::sync::Mutex;
 
-    /// Serializes this module's GPU-touching tests against each other, mirroring
-    /// `tests/reliability.rs`'s `GPU_TEST_LOCK`. This is a *separate* lock (and, because
-    /// `#[cfg(test)]` unit tests and `tests/*.rs` integration tests build into separate binaries /
-    /// separate OS processes, a separate process) from that one — no cross-binary contention is
-    /// possible for a process-global C singleton, so each test binary only needs to serialize its
-    /// own GPU tests against each other.
-    static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
+    /// Serializes GPU-touching tests against each other, mirroring `tests/reliability.rs`'s
+    /// `GPU_TEST_LOCK`. This is a *separate* lock from that one — because `#[cfg(test)]` unit tests
+    /// and `tests/*.rs` integration tests build into separate binaries / separate OS processes, no
+    /// cross-binary contention is possible for a process-global C singleton.
+    ///
+    /// **`pub(crate)`, and shared beyond this module:** `actor.rs`'s GPU-gated smoke test also runs
+    /// in this crate's `--lib` binary — the same OS process as this module's tests — and
+    /// `VirglEngine::new` enforces a process-global singleton (`ENGINE_ACTIVE`). Two GPU tests from
+    /// different modules racing inside that one process is exactly the contention this lock exists
+    /// to prevent, so `actor.rs` must serialize against *this* lock rather than defining its own
+    /// (a second, independent lock would leave the two modules' GPU tests free to still race each
+    /// other, which reintroduces the intermittent `EngineError::AlreadyActive` failure this lock is
+    /// here to rule out). If a third module ever grows a GPU test in this binary, it must join the
+    /// same lock too.
+    pub(crate) static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    /// The DRM render node used throughout this crate's GPU tests.
-    const RENDER_NODE: &str = "/dev/dri/renderD128";
+    /// The DRM render node used throughout this crate's GPU tests. `pub(crate)` for the same
+    /// cross-module reason as [`GPU_TEST_LOCK`] — see its doc comment.
+    pub(crate) const RENDER_NODE: &str = "/dev/dri/renderD128";
 
     /// `VIRGL_FORMAT_B8G8R8A8_UNORM` (from virglrenderer's `virgl_hw.h`) — a plausible Venus
     /// swapchain pixel format, and the one this task's round-trip test creates resources with.
