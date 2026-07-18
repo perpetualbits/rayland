@@ -200,10 +200,15 @@ Venus/virglrenderer capture/replay engine, so *unmodified* applications run.**
   reader with no fence→coherency relationship, and every patch of the observe-and-diff path hit
   a different wall (proof:
   [`docs/design/2026-07-17-fence-feedback-walking-skeleton.md`](docs/design/2026-07-17-fence-feedback-walking-skeleton.md)
-  §9–§11). The path forward is to make S a **proper fenced engine-side consumer** —
-  `virgl_renderer_transfer_read_iov` after a fence, as C0's `read_back` already does bit-identically —
-  which needs blob→classic-resource support this virglrenderer (1.2.0) does not expose for the vtest
-  blob path. **(c)2's first step is investigating that reachability.**
+  §9–§11). **The fenced engine-side read (`virgl_renderer_transfer_read_iov`) is *not*
+  reachable** — it is a hardcoded stub for the Venus/render-server path in virglrenderer 1.2.0 **and
+  1.3.0**, and there is no engine-level coherence API at all (`resource_map` is a bare `mmap`). The
+  path now under investigation splits the two halves off the engine lock: **fence-feedback for timing**
+  (a GPU-written word S watches by `mmap`) and **`DMA_BUF_IOCTL_SYNC` for coherence** (a kernel dma-buf
+  ioctl on the fd S already holds) — neither takes the engine lock that sank the earlier fence attempt.
+  Its reachability rests on a spike (is the fd a dma-buf? is the memory write-combined? does the sync
+  converge?). See
+  [`docs/design/2026-07-18-c2-readback-reachability.md`](docs/design/2026-07-18-c2-readback-reachability.md).
 - **(c)3 — content-addressed assets.**
 - **(c)4 — real/complex applications; GL via Zink.**
 
