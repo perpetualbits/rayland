@@ -43,12 +43,21 @@
 //! - [`VtestTransport`] — the transport seam the vtest protocol is served over (a byte stream
 //!   **plus** SCM_RIGHTS fd passing; see its doc comment for why the fd half cannot be optional).
 //! - [`EngineError`] — the typed error every C return code maps into.
+//! - [`actor`] — the engine actor ((c)2 Task 3): a dedicated thread owns `VirglEngine`, and
+//!   [`EngineClient`] implements `RenderEngine` by messaging it, so `virglrenderer`'s
+//!   not-thread-safe, process-global state has exactly one caller. See the module's own docs for
+//!   why an `Arc<Mutex<VirglEngine>>` deadlocks and this design does not.
 
 // The raw, hand-written C FFI surface. All `unsafe extern "C"` declarations and callbacks live here.
 mod ffi;
 // The engine and its availability probe: the only module left in this crate that drives
 // virglrenderer, which is precisely why it is the only one that could not move to `rayland-vtest`.
 mod virgl;
+// The engine actor ((c)2 Task 3): a dedicated thread owns `VirglEngine`; `EngineClient` implements
+// `RenderEngine` by messaging it instead of sharing it behind a lock. `pub` (not just re-exported)
+// so its module docs — the deadlock story and the fence/doorbell interleaving — are reachable at
+// `rayland_engine::actor` for anyone tracing why this exists.
+pub mod actor;
 
 // `rayland-engine` was the whole of C0's engine; (c)1 split the protocol out into `rayland-vtest`
 // so the C side can link this crate's *absence*. Re-exported so existing dependents (this crate's
@@ -60,3 +69,8 @@ pub use rayland_vtest::{
 
 // The concrete engine this crate exists to provide. Not a re-export: this is the GPU.
 pub use virgl::{VirglEngine, virgl_available};
+
+// The actor's public surface, re-exported beside `VirglEngine` so callers can `use
+// rayland_engine::{VirglEngine, spawn_engine, EngineClient}` without reaching into the `actor`
+// module directly — mirrors how `virgl`'s items are re-exported above.
+pub use actor::{EngineClient, spawn_engine};

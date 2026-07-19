@@ -238,9 +238,11 @@ impl RingMirror {
     /// buffer's **start**, so this function re-splits it there — mirroring Mesa's own producer
     /// (`vn_ring_write_buffer`, `vn_ring.c:127-142`) exactly.
     ///
-    /// Ring-findings §8 records that **no live run has ever reached a wrap** (peak `tail` was 7.58%
-    /// of the buffer), so this arithmetic is untested against real Mesa and is pinned by a unit test
-    /// instead.
+    /// An older (c)1 finding (a *shorter* capture, peak `tail` 7.58%) suggested runs never wrap, but
+    /// the full 120-frame icosa run **does** wrap the buffer around frame ~82 — so this re-split path
+    /// is exercised on every real run past that point, not just by the unit test that also pins it.
+    /// (See `docs/design/2026-07-19-c2-ringidx-decode.md` §2 — the wrap is why (c)2's position-based
+    /// fence trigger tracks *free-running* offsets, never masked buffer offsets.)
     ///
     /// # Ordering
     /// The buffer bytes are written first, then `tail` is stored with [`Ordering::Release`]. That is
@@ -404,6 +406,28 @@ impl RingMirror {
         }
         self.reported_head = head;
         Some(head)
+    }
+
+    /// Peek the ring's `head` — the ring thread's consume frontier — **without** the movement filter.
+    ///
+    /// # Why this is separate from [`Self::take_progress`]
+    /// `take_progress` reports `head` only when it *moved*, because its job is to release the
+    /// application's waits and a repeat is worthless (see its docs). This peek instead answers a
+    /// different question — *"has the ring thread dispatched up to byte offset X yet?"* — for which the
+    /// current value is what matters, moved or not, and mutating `reported_head` would be wrong (it
+    /// would suppress a later genuine progress report). So this is a read-only accessor.
+    ///
+    /// It is the signal (c)2's completion barrier gates on: virglrenderer stores `head` **after**
+    /// dispatching each command (`vkr_ring.c:232-233`), so `head >= (a command's end offset)` proves
+    /// that command — e.g. the app's `vkGetDeviceQueue2`, which registers its queue — has been
+    /// dispatched on the host. See [`crate::apply::Applier::retirement_ring_idx`].
+    ///
+    /// # Inputs / outputs
+    /// - `blob`: the ring blob's mapping.
+    /// - Returns the current free-running `head`, read with [`Ordering::Acquire`] so it pairs with
+    ///   virglrenderer's `Release` store — the same pairing [`Self::take_progress`] relies on.
+    pub fn head(&self, blob: &HostBlob) -> u32 {
+        self.head_word(blob).load(Ordering::Acquire)
     }
 
     /// The ring's `tail` word, as an atomic.

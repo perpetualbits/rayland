@@ -55,3 +55,7 @@ pub mod relay_engine;
 pub mod blob_sync;
 // The RelayLink over SP2's QUIC transport: the network itself.
 pub mod link;
+// Task 9's instrument: bytes per channel, round-trip stalls, time to first frame. Lives in the
+// library rather than the binary because `link` — which is where every message is classified — is
+// here, and a metric that the binary alone could see would miss exactly the layer being measured.
+pub mod metrics;

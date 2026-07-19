@@ -553,11 +553,16 @@ unsafe extern "C" {
     /// context/ring has completed, virglrenderer invokes `write_context_fence(cookie, ctx_id,
     /// ring_idx, fence_id)` — confirmed empirically (a scratch harness observed exactly this
     /// ctx_id/ring_idx/fence_id echoed back). This is the fence-wait primitive `VirglEngine::
-    /// read_back` uses before reading pixels: it proves the GPU has actually finished the work
-    /// that produced them (the correctness point this task exists for). `flags` is 0 in Rayland's
-    /// usage (we do not set `VIRGL_RENDERER_FENCE_FLAG_MERGEABLE`, since we want every fence we
-    /// create to reliably invoke the callback, never be silently coalesced away). Returns 0 on
-    /// success, errno otherwise.
+    /// read_back` uses before reading pixels — but **only when called with the app's real per-queue
+    /// `ring_idx` (≥1)** does it prove GPU completion: that routes to a real `vkQueueSubmit` +
+    /// `vkWaitForFences` on the app's queue. `ring_idx == 0` (the "dedicated CPU ring") retires
+    /// immediately, tied to no GPU work — see `docs/design/2026-07-18-c2-engine-actor.md` §9.
+    /// `flags`: Rayland passes 0, **but under the `VIRGL_RENDERER_RENDER_SERVER` configuration Rayland
+    /// uses, the render server forces `VIRGL_RENDERER_FENCE_FLAG_MERGEABLE` regardless**
+    /// (`server/render_context.c`), so the caller's flags are effectively ignored. Mergeable only
+    /// permits skipping the callback for a fence *superseded* by a later one on the same ring; since
+    /// Rayland always waits for the latest `fence_id` it created per ring, this is harmless. Returns 0
+    /// on success, errno otherwise.
     pub fn virgl_renderer_context_create_fence(
         ctx_id: u32,
         flags: u32,

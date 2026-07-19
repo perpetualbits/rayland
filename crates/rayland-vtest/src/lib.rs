@@ -280,4 +280,69 @@ pub trait RenderEngine {
     /// - `resource_id`: a resource id previously returned by [`Self::create_resource`].
     /// - Returns a tightly-packed [`EngineFrame`] on success, or an [`EngineError`].
     fn read_back(&mut self, resource_id: u32) -> Result<EngineFrame, EngineError>;
+
+    /// Block until every command already submitted on `(ctx_id, ring_idx)` has **retired on the
+    /// GPU**, so that whatever those commands wrote is visible in memory to whoever looks next.
+    ///
+    /// # Why this exists on the trait, and the bug that put it here
+    /// [`Self::read_back`] already states the principle this method generalises: *"`submit` only
+    /// proves the GPU accepted a command stream, not that it finished it, so reading pixels without
+    /// waiting could return a partially-rendered or stale frame."* `read_back` obeys that by
+    /// fence-waiting internally — but `read_back` is C0's offscreen path, and **(c)1 does not use
+    /// it**. (c)1's return path is `rayland-s`'s poll loop, which discovers what S's GPU wrote by
+    /// *comparing bytes against a baseline* and had no way to ask this question at all.
+    ///
+    /// It therefore inferred completion from a `memcmp` — and a `memcmp` answers *"did these bytes
+    /// change?"*, never *"has the GPU finished?"*. Those coincide until they don't: (c)1 Task 9
+    /// measured a 120-frame workload receiving **the previous frame, whole and intact, in 22 of 120
+    /// frames, and a torn mix in 16 more** — silently, with the application exiting 0
+    /// (`docs/c1-the-network.md` §3.1).
+    ///
+    /// # ⚠️ This is NOT sufficient, and the measurement says so
+    /// Calling this before the diff **does not fix that defect**. Measured on `rayland-s`'s poll
+    /// loop: the barrier is genuinely doing work — 684 calls averaging **1.1 ms of real waiting** in
+    /// a 120-frame run, so it is not a no-op — and the run still delivered **24 of 120 frames wrong**
+    /// (18 stale, 6 torn), indistinguishable from no barrier at all (the unfixed range is 3–39).
+    ///
+    /// The inference to draw is about `VirglEngine`, not about this trait: **a virglrenderer context
+    /// fence does not order against the work Venus's own ring thread dispatches.** `read_back` gets a
+    /// correct frame from the same primitive because it fences resources made by
+    /// [`Self::create_resource`] — C0's offscreen path — never the application's Venus queue. So this
+    /// method asks a real question and gets a real answer, and it is **still the wrong question** for
+    /// the caller that needs it. Whoever resumes this: start there, and do not assume the barrier is
+    /// the missing piece merely because it is the obvious one. It was tried.
+    ///
+    /// # Why a barrier rather than a fence handle
+    /// The caller has no fence to name. (c)1's S never submits the application's work — Venus's own
+    /// ring thread inside virglrenderer consumes the ring and dispatches, so no code here observes a
+    /// submission it could attach an id to. What the caller *can* say is "everything up to now", and
+    /// per-context fences signal in creation order within a context, so a fence created now retires
+    /// only after all earlier work on that ring. That makes "wait for a fence created now" exactly
+    /// the barrier the caller needs and the only one it can express.
+    ///
+    /// # Inputs / outputs
+    /// - `ctx_id`: the context whose work must retire — the one [`Self::create_venus_context`] made.
+    /// - `ring_idx`: the ring within that context. (c)1 passes `0`, which is legitimate rather than
+    ///   lucky only because spec §6's crutch table sets `VN_PERF=no_multi_ring`; if that crutch is
+    ///   ever bought back, this argument must start carrying a real ring index.
+    /// - Returns `Ok(())` once the work has retired, or an [`EngineError`] if the fence could not be
+    ///   created or did not retire within the implementation's timeout.
+    ///
+    /// # Failure modes, and why a timeout is an error rather than a shrug
+    /// A fence that never retires means the GPU is wedged or the context is gone. Returning `Ok(())`
+    /// on timeout would resurrect exactly the defect this method exists to kill — the caller would
+    /// proceed to ship whatever bytes happen to be in memory — so an implementation that cannot
+    /// prove retirement must say so.
+    ///
+    /// # Default: a no-op, and when that is honest
+    /// An engine that does not drive a real GPU asynchronously has nothing to retire: whatever its
+    /// `submit` did, it did before returning. The default therefore returns `Ok(())`, which is the
+    /// truth for the in-process mocks the tests use. **A real GPU engine must override it** — and
+    /// `VirglEngine` does.
+    fn wait_for_work_retired(&mut self, ctx_id: u32, ring_idx: u32) -> Result<(), EngineError> {
+        // Named with leading underscores in the default body: an engine with no asynchronous GPU
+        // behind it has no work in flight to wait for, so it needs neither argument.
+        let (_ctx_id, _ring_idx) = (ctx_id, ring_idx);
+        Ok(())
+    }
 }

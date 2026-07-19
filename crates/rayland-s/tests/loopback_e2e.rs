@@ -209,6 +209,46 @@ impl Drop for Daemon {
 /// # Panics
 /// Panics if Cargo cannot be run, if the build fails, or if the expected executable is missing
 /// afterwards — all environment faults that would make the test meaningless.
+/// Build `package` in **release** and return the path to its executable.
+///
+/// # Why this test needs release when the refapp test does not
+/// `rayland-icosa-cpu` computes a 1 MiB Mandelbrot on the CPU every frame — ~49 ms in release,
+/// ~270 ms in debug, and about **4 seconds per frame through the relay** in debug. That is not
+/// merely slow: 120 frames would take ~8 minutes, and Mesa's ring-stall abort (deliberately left
+/// armed — see the test body) fires on the resulting idle ring, so the run dies with SIGABRT before
+/// it can compare a single pixel. The failure then says "signal 6" instead of naming the frames
+/// that were wrong, which is the one thing this test exists to say.
+///
+/// The refapp test renders one trivial frame and is unaffected, so it keeps the debug build and the
+/// faster link between an edit and a result.
+fn build_binary_release(package: &str) -> PathBuf {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let status = Command::new(cargo)
+        .args(["build", "--release", "-p", package])
+        .status()
+        .unwrap_or_else(|e| panic!("cargo must be runnable to build {package}: {e}"));
+    assert!(
+        status.success(),
+        "building {package} in release must succeed"
+    );
+
+    // The test binary lives in <target>/<profile>/deps/, so <target> is two levels up. The release
+    // artefacts are siblings of that profile directory, never inside it.
+    let test_exe = std::env::current_exe().expect("the test binary must have a path");
+    let target_dir = test_exe
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .expect("the test binary must live in <target>/<profile>/deps/");
+    let binary = target_dir.join("release").join(package);
+    assert!(
+        binary.is_file(),
+        "cargo built {package} in release but no executable is at {}",
+        binary.display()
+    );
+    binary
+}
+
 fn build_binary(package: &str) -> PathBuf {
     // `CARGO` is set by Cargo when it runs a test and points at the very same Cargo driving this
     // run — safer than assuming a `cargo` on `PATH` is the same toolchain.
@@ -541,4 +581,201 @@ fn refapp_renders_across_the_network_the_same_triangle_it_renders_natively() {
          COMMAND STREAM across a QUIC connection to another process, which replayed it on \
          {RENDER_NODE}. Wall-clock for the relayed run: {elapsed:?}."
     );
+}
+
+/// **The stale-frame race, as an executable assertion** (Task 9's headline finding).
+///
+/// # What this test exists to catch, and why refapp cannot catch it
+/// The test above renders **one** frame and asserts it is right. That is the entire reason it never
+/// found this: with a single frame there is no "previous frame" for the relay to hand back, so the
+/// defect is not merely unlikely there — it is *unrepresentable*.
+///
+/// `rayland-icosa-cpu` renders 120 frames, and — the property that makes this test possible — frame
+/// N is a **pure function of N**: there is no wall-clock anywhere in `rayland-icosa-core`, so the
+/// same binary produces the same 120 PNGs on every run, on this GPU, forever. That is what turns
+/// "the animation looked fine" into "frame 13 is byte-for-byte frame 12, here is the proof".
+///
+/// # The measured defect this pins
+/// Across the relay, a run drops 3–39 of its 120 frames onto the **previous** frame's pixels. Not
+/// torn, not corrupt: the whole prior frame, geometry and texture together, intact. The application
+/// exits 0 and is never told. See `docs/c1-the-network.md` §3.1.
+///
+/// The rate is wildly variable run to run — it is a race, and this test will therefore *sometimes*
+/// pass against a broken relay. That is a real weakness and it is stated rather than hidden: it is
+/// still worth having, because a run that fails is unambiguous proof, and because after the fix the
+/// only acceptable result is 120/120 on every run forever.
+///
+/// # Why this is slow, and why that is not a reason to shrink it
+/// ~30 s: the fixture spends ~49 ms per frame computing a Mandelbrot on the CPU, by design. The
+/// fixtures are deliberately option-free (`docs/icosa-fixtures.md` §11, and the design spec's §2) —
+/// no `--frames`, no size knob — because a fixture with opinions about how it is run stops being
+/// evidence about how real applications behave. The temptation to add `--frames 10` to make this
+/// test quick is exactly the pressure that rule exists to resist.
+#[test]
+fn icosa_cpu_renders_across_the_network_the_same_120_frames_it_renders_natively() {
+    let node = Path::new(RENDER_NODE);
+    if !virgl_available(node) {
+        eprintln!(
+            "SKIP icosa_cpu_renders_across_the_network_the_same_120_frames_it_renders_natively: \
+             no usable Venus render node at {RENDER_NODE}"
+        );
+        return;
+    }
+    if !Path::new(VENUS_ICD).is_file() {
+        eprintln!(
+            "SKIP icosa_cpu_renders_across_the_network_the_same_120_frames_it_renders_natively: \
+             no Venus ICD manifest at {VENUS_ICD}"
+        );
+        return;
+    }
+
+    let fixture = build_binary_release("rayland-icosa-cpu");
+    let rayland_c = build_binary_release("rayland-c");
+    let rayland_s = build_binary_release("rayland-s");
+
+    // --- The baseline: the same binary, this host's own driver, no Rayland anywhere.
+    // C and S are the same machine here, so this host *is* S — the only legitimate baseline
+    // (spec §10.2): bit-identity may only be asserted against the GPU that will actually draw the
+    // remote frame.
+    //
+    // The output directory MUST already exist: the fixtures exit 1 with `No such file or directory`
+    // otherwise, which once made 120 frames appear to take 0.48 s — a failed run wearing a
+    // measurement's clothes (`docs/icosa-fixtures.md` §11).
+    let native_dir =
+        std::env::temp_dir().join(format!("rayland-icosa-native-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&native_dir);
+    std::fs::create_dir_all(&native_dir).expect("the fixture's output directory must exist");
+    let status = Command::new(&fixture)
+        .arg(&native_dir)
+        .env_remove("VK_ICD_FILENAMES")
+        .env_remove("VN_DEBUG")
+        .env_remove("VN_PERF")
+        .env_remove("VTEST_SOCKET_NAME")
+        .status()
+        .expect("the fixture must be launchable");
+    assert!(
+        status.success(),
+        "the fixture must render natively; got {status}"
+    );
+
+    // --- S: the machine with the GPU.
+    let s_port = free_udp_port();
+    let s_addr = format!("127.0.0.1:{s_port}");
+    let mut s = {
+        let mut command = Command::new(&rayland_s);
+        command
+            .env("RAYLAND_C1_S_LISTEN", &s_addr)
+            .env("RAYLAND_C1_RENDER_NODE", RENDER_NODE)
+            .env("RAYLAND_C1_NO_PRESENT", "1");
+        Daemon::spawn("rayland-s", command)
+    };
+    s.wait_for_log("listening on");
+
+    // --- C: the machine with the application and no GPU. Short socket path: sun_path is 108 bytes.
+    let socket_path = PathBuf::from(format!("/tmp/rl-c1-icosa-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket_path);
+    let mut c = {
+        let mut command = Command::new(&rayland_c);
+        command
+            .env("RAYLAND_C1_SOCKET", &socket_path)
+            .env("RAYLAND_C1_S_ADDR", &s_addr);
+        Daemon::spawn("rayland-c", command)
+    };
+    c.wait_for_log("listening at");
+
+    // --- The application: unmodified, unaware, and pointed at C.
+    let venus_dir =
+        std::env::temp_dir().join(format!("rayland-icosa-venus-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&venus_dir);
+    std::fs::create_dir_all(&venus_dir).expect("the fixture's output directory must exist");
+    let mut app = Command::new(&fixture)
+        .arg(&venus_dir)
+        // The same four client variables the refapp test documents at length. Three of them fail
+        // SILENTLY if omitted. `VN_DEBUG=no_abort` is deliberately absent: 120 frames give a ring
+        // stall far more chances to occur than one frame ever did, and an abort is the detector.
+        .env("VN_DEBUG", "vtest")
+        .env(
+            "VN_PERF",
+            // Fence feedback is bought back (the stale-frame fix): the application must wait on the
+            // feedback word vkr writes at GPU completion, which S delivers, rather than on the ring
+            // head. The other feedback crutches stay pinned — this fixture uses only fences.
+            "no_multi_ring,no_semaphore_feedback,no_event_feedback,no_query_feedback",
+        )
+        .env("VK_ICD_FILENAMES", VENUS_ICD)
+        .env("VTEST_SOCKET_NAME", &socket_path)
+        .env_remove("VK_LOADER_DRIVERS_SELECT")
+        .spawn()
+        .expect("the fixture must be launchable");
+
+    // Proof the network was involved at all, before a single pixel is looked at.
+    c.wait_for_log("Mesa connected");
+    c.wait_for_log("watching command ring");
+
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = app.try_wait().expect("the fixture must be waitable") {
+            break status;
+        }
+        if let Ok(Some(status)) = s.child.try_wait() {
+            let _ = app.kill();
+            panic!("rayland-s exited during the session ({status}); the app would hang forever");
+        }
+        if let Ok(Some(status)) = c.child.try_wait() {
+            let _ = app.kill();
+            panic!("rayland-c exited during the session ({status}); the app would hang forever");
+        }
+        // 120 frames at ~49 ms of CPU fractal each, plus the relay: minutes, not seconds. The
+        // generous bound distinguishes "slow" from "wedged", which are different findings.
+        assert!(
+            started.elapsed() < Duration::from_secs(600),
+            "the fixture did not finish within 600s; a hang here is a finding, not a nuisance"
+        );
+        std::thread::sleep(POLL_INTERVAL);
+    };
+    assert!(
+        status.success(),
+        "the fixture must exit cleanly through the relay; got {status}"
+    );
+
+    // --- The assertion: every frame, byte for byte, against S's own native run.
+    //
+    // Reported in full rather than failing on the first mismatch: *which* frames differ and *what
+    // they are* is the whole diagnostic. A frame that equals its predecessor is the stale-frame
+    // race; a frame that equals nothing is tearing; they are different bugs and the message must
+    // say which.
+    let mut wrong = Vec::new();
+    for frame in 0..120u32 {
+        let name = format!("frame_{frame:04}.png");
+        let native = std::fs::read(native_dir.join(&name)).expect("native frame must exist");
+        let venus = std::fs::read(venus_dir.join(&name)).expect("relayed frame must exist");
+        if native == venus {
+            continue;
+        }
+        // Is it the *previous* frame, whole and intact? That is the signature of the relay
+        // releasing the application before its pixels arrived, rather than of corruption.
+        let previous_frame_note = if frame > 0 {
+            let previous = std::fs::read(native_dir.join(format!("frame_{:04}.png", frame - 1)))
+                .expect("previous native frame must exist");
+            if venus == previous {
+                " (== the PREVIOUS native frame, byte for byte: the stale-frame race)"
+            } else {
+                " (matches no native frame: NOT staleness — investigate as corruption)"
+            }
+        } else {
+            ""
+        };
+        wrong.push(format!("{name}{previous_frame_note}"));
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} of 120 frames differ from the native run on S's own GPU:\n  {}\n\
+         Only the transport changed, so every frame must be bit-identical.",
+        wrong.len(),
+        wrong.join("\n  ")
+    );
+
+    let _ = std::fs::remove_dir_all(&native_dir);
+    let _ = std::fs::remove_dir_all(&venus_dir);
+    drop(c);
+    drop(s);
 }

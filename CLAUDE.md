@@ -93,7 +93,10 @@ A Cargo workspace of seventeen crates. Each declares its own license per the pol
 - **`crates/rayland-relay`** — the **(c)1 relay wire protocol**: the `C2S`/`S2C` messages that
   cross the network between C and S (ring deltas, blob syncs, replies) and their `postcard`
   framing. Pure data — no GPU, no sockets, no async runtime — because both `rayland-c` and the
-  future `rayland-s` depend on it and C must never link a GPU stack. LGPL.
+  future `rayland-s` depend on it and C must never link a GPU stack. It also carries one diagnostic
+  module, `trace` (the (c)1 Task 9 stage tracer): env-gated stderr timestamps on a shared
+  `CLOCK_MONOTONIC`, used by **both** daemons to record the return path's stages against one clock —
+  none of a GPU stack, network I/O, or a socket, so the purity above holds. LGPL.
 - **`crates/rayland-c`** — **C's daemon ((c)1).** A local vtest server that a stock, unmodified
   Mesa Venus ICD connects to: it hands the application plain local memfds for its ring and blobs,
   **watches the ring** (where 100% of the application's Vulkan commands actually live), and relays
@@ -191,11 +194,43 @@ Venus/virglrenderer capture/replay engine, so *unmodified* applications run.**
   fd survives a network**. (c)1 is a protocol design task. It also owes SP1 host-side pixels
   for on-screen presentation. **Required reading:**
   [`docs/design/2026-07-15-venus-ring-findings.md`](docs/design/2026-07-15-venus-ring-findings.md).
+  **Delivered:** the **forward path** (unmodified app commands C→S, executed on S's GPU,
+  bit-identical on trivial workloads) and **presentation** both work. **Handed to (c)2:** the
+  **readback return path** — see the next bullet. Task 9 measured it (message-rate-bound, mapped
+  memory shipped 5.2×/frame) and found it silently delivers stale/torn frames; five fixes across
+  Task 9 failed, and the final one proved *why* — see
+  [`docs/c1-the-network.md`](docs/c1-the-network.md) §3.1 and
+  [`docs/design/2026-07-17-fence-feedback-walking-skeleton.md`](docs/design/2026-07-17-fence-feedback-walking-skeleton.md)
+  §11.
 - **(c)2 — mapped-memory coherence:** the `vkMapMemory` problem (apps write vertices and
   textures straight into mapped memory with **no API call to intercept**). The icosahedron
   fixtures (`rayland-icosa-cpu`/`rayland-icosa-gpu`) were built to make this bite and, run
   through C0's path, did not — see [`docs/icosa-fixtures.md`](docs/icosa-fixtures.md) for
-  why not and where the real failure is still waiting.
+  why not and where the real failure is still waiting. **Now also owns the readback return
+  path handed over by (c)1**: an application that maps a **GPU-written** buffer and reads it
+  back cannot be served by S *passively observing and diffing* that memory — S is a foreign
+  reader with no fence→coherency relationship, and every patch of the observe-and-diff path hit
+  a different wall (proof:
+  [`docs/design/2026-07-17-fence-feedback-walking-skeleton.md`](docs/design/2026-07-17-fence-feedback-walking-skeleton.md)
+  §9–§11). Two candidate fixes were then **investigated and both retired**:
+  (a) the fenced engine-side read (`virgl_renderer_transfer_read_iov`) is a **hardcoded stub** for the
+  Venus/render-server path in virglrenderer 1.2.0 **and 1.3.0**, with no engine-level coherence API at
+  all; (b) `DMA_BUF_IOCTL_SYNC` on the readback dma-buf is a **measured no-op** (byte-identical to the
+  raw read in 6561/6561 samples) — the memory is already CPU-coherent, so **the tearing is not a
+  cache-coherence problem**. The robust conclusion: correctness needs the host GPU work **retired
+  through an engine call** (a context fence/poll — no lock-free substitute exists), and *that* call
+  takes Rayland's single global engine lock, which is what contends with the message-thread doorbell
+  (ring-stall `SIGABRT` / timeout, Phase 1). That fence-vs-doorbell contention was the architecture
+  problem, and it is **solved**: the **engine actor** (`crates/rayland-engine/src/actor.rs`, committed
+  and smoke-tested) makes one thread own virglrenderer while an `EngineClient` implements `RenderEngine`
+  by messaging it, so the fence and the doorbell cooperate on one thread instead of deadlocking — **the
+  refapp e2e passes through the actor with no wedge.** What remains is a *different* half: the delivery
+  still waits on the **ring** fence (`T2`), which retires ~20 ms before the GPU's readback/feedback-word
+  actually lands (`T4`), so the multi-frame icosa fixture wedges on a missed late write. **(c)2's
+  remaining work is a true `T4` (GPU-DMA-completion) barrier**, now unconstrained by the deadlock; the
+  daemon stays on the pre-actor path until it lands (the actor wiring is preserved as a patch). Full
+  trail: [`docs/design/2026-07-18-c2-engine-actor.md`](docs/design/2026-07-18-c2-engine-actor.md) §8 and
+  [`docs/design/2026-07-18-c2-readback-reachability.md`](docs/design/2026-07-18-c2-readback-reachability.md).
 - **(c)3 — content-addressed assets.**
 - **(c)4 — real/complex applications; GL via Zink.**
 

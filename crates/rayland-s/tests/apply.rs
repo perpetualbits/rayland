@@ -35,6 +35,35 @@ use rayland_vtest::{BlobResource, EngineError, EngineFrame, RenderEngine};
 use std::collections::HashMap;
 use std::os::fd::{AsFd, OwnedFd};
 
+/// The return path's three steps, composed — the shape [`Applier`] used to expose as one method.
+///
+/// # Why these tests may skip the barrier that production must not
+/// The real loop in `rayland-s` is: [`Applier::take_ring_progress`] →
+/// [`RenderEngine::wait_for_work_retired`] → [`Applier::take_blob_writes`], and **skipping the
+/// middle step is (c)1's stale-frame defect** (`docs/c1-the-network.md` §3.1): a diff answers "did
+/// these bytes change?", never "has the GPU finished?".
+///
+/// It is a genuine no-op here rather than a convenience. These tests drive `Applier` against mock
+/// engines and a plain memfd: nothing renders asynchronously, so no GPU work is ever in flight and
+/// there is nothing to retire. That is the same reasoning behind
+/// `RenderEngine::wait_for_work_retired`'s default implementation.
+///
+/// It also means **these tests cannot catch a missing barrier** — only the live e2e can
+/// (`tests/loopback_e2e.rs`'s icosa test). That is not a gap to be closed here: a mock engine has no
+/// GPU to be ahead of, so the defect is unrepresentable rather than merely absent.
+fn poll_progress(applier: &mut Applier) -> Vec<S2C> {
+    let progress = applier.take_ring_progress();
+    if progress.is_empty() {
+        // Nothing retired: no wait to release, and nothing S can honestly claim its GPU wrote.
+        return Vec::new();
+    }
+    let mut out = applier.take_blob_writes();
+    // Blob bytes first, progress last: progress releases the application's wait and must not precede
+    // the pixels it is about to read.
+    out.extend(progress);
+    out
+}
+
 /// The context id used throughout, mirroring the live capture's single-context session.
 const CTX_ID: u32 = 1;
 
@@ -434,7 +463,7 @@ fn progress_reports_the_head_the_engine_wrote_not_the_tail_that_was_relayed() {
     // intra-cs, after each command, so a partial head is entirely normal).
     engine.write_control(ring, RING_HEAD_OFFSET, 32);
 
-    let out = applier.poll_progress();
+    let out = poll_progress(&mut applier);
 
     assert!(
         matches!(
@@ -465,7 +494,7 @@ fn no_progress_is_reported_while_the_engine_has_consumed_nothing() {
 
     // `head` is untouched: the ring thread has not run.
     assert!(
-        applier.poll_progress().is_empty(),
+        poll_progress(&mut applier).is_empty(),
         "an unconsumed ring has no progress to report; reporting one would release the \
          application's wait on a reply that does not exist"
     );
@@ -490,12 +519,12 @@ fn progress_is_reported_once_per_movement_not_on_every_poll() {
     engine.write_control(ring, RING_HEAD_OFFSET, 16);
 
     assert_eq!(
-        applier.poll_progress().len(),
+        poll_progress(&mut applier).len(),
         1,
         "the first poll sees the move"
     );
     assert!(
-        applier.poll_progress().is_empty(),
+        poll_progress(&mut applier).is_empty(),
         "`head` has not moved since, so there is nothing new to say; a repeat would be a \
          keepalive that proves only that S's process is running"
     );
@@ -1166,7 +1195,7 @@ fn the_reply_arena_crosses_because_s_wrote_it_not_because_s_knows_what_it_is() {
     engine.write_blob_range(arena, 0, 0x5a, 128);
     engine.write_control(ring, RING_HEAD_OFFSET, 64);
 
-    let out = applier.poll_progress();
+    let out = poll_progress(&mut applier);
 
     let runs = blob_runs_for(&out, arena);
     assert_eq!(
@@ -1219,7 +1248,7 @@ fn a_blob_s_never_wrote_is_not_shipped_back_even_though_c_wrote_it() {
     // S wrote nothing into it.
     relay_and_retire(&mut applier, &mut engine, ring, 0, 64);
 
-    let out = applier.poll_progress();
+    let out = poll_progress(&mut applier);
 
     assert_eq!(
         blob_runs_for(&out, vertices),
@@ -1252,7 +1281,7 @@ fn the_ring_is_excluded_by_res_id_even_though_s_wrote_its_head() {
 
     relay_and_retire(&mut applier, &mut engine, ring, 0, 64);
 
-    let out = applier.poll_progress();
+    let out = poll_progress(&mut applier);
 
     assert_eq!(
         blob_runs_for(&out, ring),
@@ -1283,7 +1312,7 @@ fn an_inbound_blob_data_re_snapshots_so_c_s_own_write_is_never_shipped_back() {
     relay_and_retire(&mut applier, &mut engine, ring, 0, 64);
     engine.write_blob(app_blob, 0x5a);
     assert!(
-        !blob_runs_for(&applier.poll_progress(), app_blob).is_empty(),
+        !blob_runs_for(&poll_progress(&mut applier), app_blob).is_empty(),
         "S wrote this blob, so round 1 must ship it — otherwise round 2 proves nothing"
     );
 
@@ -1299,7 +1328,7 @@ fn an_inbound_blob_data_re_snapshots_so_c_s_own_write_is_never_shipped_back() {
     assert!(out.is_empty(), "a blob sync has no reply; got {out:?}");
     relay_and_retire(&mut applier, &mut engine, ring, 64, 128);
 
-    let out = applier.poll_progress();
+    let out = poll_progress(&mut applier);
 
     assert_eq!(
         blob_runs_for(&out, app_blob),
@@ -1325,7 +1354,7 @@ fn only_the_bytes_s_wrote_cross_not_the_whole_blob() {
     engine.write_blob_range(app_blob, 2 * A_PAGE as u64, 0xc3, 4);
     relay_and_retire(&mut applier, &mut engine, ring, 0, 64);
 
-    let out = applier.poll_progress();
+    let out = poll_progress(&mut applier);
 
     let runs = blob_runs_for(&out, app_blob);
     assert_eq!(
@@ -1352,7 +1381,7 @@ fn contiguous_changed_bytes_coalesce_and_a_gap_splits_them() {
     engine.write_blob_range(app_blob, 3 * A_PAGE as u64, 0xb2, 16);
     relay_and_retire(&mut applier, &mut engine, ring, 0, 64);
 
-    let out = applier.poll_progress();
+    let out = poll_progress(&mut applier);
 
     let runs = blob_runs_for(&out, app_blob);
     let shapes: Vec<(u64, usize)> = runs.iter().map(|(o, b)| (*o, b.len())).collect();
@@ -1403,7 +1432,7 @@ fn s_s_run_does_not_carry_the_application_s_bytes_from_the_same_page() {
     engine.write_blob_range(app_blob, 0, 0xc3, 4);
     relay_and_retire(&mut applier, &mut engine, ring, 0, 64);
 
-    let out = applier.poll_progress();
+    let out = poll_progress(&mut applier);
 
     let runs = blob_runs_for(&out, app_blob);
     assert_eq!(
@@ -1447,7 +1476,7 @@ fn the_command_buffer_staging_pool_never_crosses_because_s_never_writes_it() {
 
     relay_and_retire(&mut applier, &mut engine, ring, 0, 64);
 
-    let out = applier.poll_progress();
+    let out = poll_progress(&mut applier);
 
     assert_eq!(
         blob_runs_for(&out, pool),
@@ -1472,7 +1501,7 @@ fn the_command_buffer_staging_pool_never_crosses_because_s_never_writes_it() {
 fn the_gpu_s_pixels_are_shipped_before_the_progress_that_releases_the_app_s_wait() {
     let (mut applier, _engine, _ring, app_blob) = a_retired_batch_with_pixels(0x5a);
 
-    let out = applier.poll_progress();
+    let out = poll_progress(&mut applier);
 
     let blob_at = out
         .iter()
@@ -1497,7 +1526,7 @@ fn the_gpu_s_pixels_are_shipped_before_the_progress_that_releases_the_app_s_wait
 fn the_shipped_blob_carries_the_bytes_s_s_gpu_actually_wrote() {
     let (mut applier, _engine, _ring, app_blob) = a_retired_batch_with_pixels(0x5a);
 
-    let out = applier.poll_progress();
+    let out = poll_progress(&mut applier);
 
     let (offset, bytes) = out
         .iter()
@@ -1543,7 +1572,7 @@ fn a_poll_that_finds_no_movement_ships_nothing_at_all() {
     engine.write_blob(app_blob, 0x77);
 
     assert!(
-        applier.poll_progress().is_empty(),
+        poll_progress(&mut applier).is_empty(),
         "with `head` unmoved there is no retired batch, so no progress and therefore no reason to \
          ship a blob; a blob per poll would make this loop a bandwidth source"
     );
@@ -1560,13 +1589,13 @@ fn a_quiescent_ring_re_ships_nothing_on_subsequent_polls() {
 
     // First poll: the batch retired, so pixels and progress both go.
     assert!(
-        !applier.poll_progress().is_empty(),
+        !poll_progress(&mut applier).is_empty(),
         "the first poll after a retired batch owes C both"
     );
 
     // Nothing has moved since.
     assert!(
-        applier.poll_progress().is_empty(),
+        poll_progress(&mut applier).is_empty(),
         "an unmoved `head` is not progress and not a reason to re-ship a blob"
     );
 }
@@ -1662,5 +1691,292 @@ fn a_refusal_of_a_request_c_blocks_on_stays_solicited() {
         sole_error_is_solicited(&out),
         "C is blocked in a request/reply for this blob's resource id, and its Mesa is blocked in \
          recvmsg behind that. An error not routed to it is an application that hangs forever"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// (c)1 fence-feedback: `Applier::fingerprint_nonring_blobs`
+// ---------------------------------------------------------------------------------------------
+
+/// `fingerprint_nonring_blobs` reports every blob that is not a ring, and omits rings — the contract
+/// the fence-feedback delivery loop relies on to watch the feedback buffer (a non-ring Venus-internal
+/// blob) from its very first write, while never mistaking a ring's `head`/command bytes for a write to
+/// return.
+#[test]
+fn fingerprint_nonring_blobs_covers_non_rings_and_omits_rings() {
+    let (mut applier, mut engine, ring_res_id) = session_with_ring();
+
+    // The app's 64-byte vertex buffer from the live capture: a real blob, but not a ring (its
+    // power-of-two size is not ring-shaped, so `RingIdentity::from_blob_request` rejects it).
+    let out = applier.apply(
+        &mut engine,
+        C2S::CreateBlob {
+            blob_mem: BLOB_MEM_HOST3D,
+            blob_flags: 0,
+            blob_id: 16,
+            size: 64,
+        },
+    );
+    let plain_res_id = match out.as_slice() {
+        [S2C::BlobCreated { res_id, .. }] => *res_id,
+        other => panic!("expected exactly one BlobCreated, got {other:?}"),
+    };
+
+    let ids: std::collections::HashSet<u32> = applier
+        .fingerprint_nonring_blobs()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert!(
+        ids.contains(&plain_res_id),
+        "a non-ring blob must be fingerprinted"
+    );
+    assert!(
+        !ids.contains(&ring_res_id),
+        "a ring blob must be omitted"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// (c)2 Task 1: the blob-write split — Venus-internal writes at retirement, app writes post-fence
+// ---------------------------------------------------------------------------------------------
+
+/// Fill one byte of a blob, standing in for **S's engine** touching a single byte of it.
+///
+/// A thin wrapper over [`RecordingEngine::write_blob_range`] rather than a new engine-double API:
+/// the brief for this task is explicit that a one-byte write is enough to produce a run, and the
+/// double already has the primitive.
+fn write_blob_byte(engine: &RecordingEngine, res_id: u32, offset: u64, fill: u8) {
+    engine.write_blob_range(res_id, offset, fill, 1);
+}
+
+/// The `res_id` of an [`S2C::BlobData`], or `None` for any other message — for filtering a
+/// `take_*_blob_writes` result down to which resources it named, independent of run count.
+fn res_id_of_blobdata(msg: &S2C) -> Option<u32> {
+    match msg {
+        S2C::BlobData { res_id, .. } => Some(*res_id),
+        _ => None,
+    }
+}
+
+/// The blob-write split feeds the fence-gated return path: reply-arena (Venus-internal) ships at
+/// ring retirement, the readback + feedback word (application blobs, largest first so the big
+/// readback leads the tiny feedback word) ship after the GPU fence. This pins that partition and
+/// that ordering.
+#[test]
+fn blob_write_split_partitions_venus_from_app_and_orders_app_largest_first() {
+    let (mut applier, mut engine, _ring) = session_with_ring();
+
+    // A Venus-internal blob (blob_id == 0) and two application blobs (blob_id != 0) of different
+    // sizes, so the largest-first ordering is observable.
+    let venus = create_blob(&mut applier, &mut engine, /*blob_id*/ 0, /*size*/ 256);
+    let app_small = create_blob(&mut applier, &mut engine, /*blob_id*/ 16, /*size*/ 64);
+    let app_big = create_blob(&mut applier, &mut engine, /*blob_id*/ 16, /*size*/ 1024);
+
+    // Make S "write" a byte into each so each produces a run.
+    write_blob_byte(&engine, venus, 0, 0xAA);
+    write_blob_byte(&engine, app_small, 0, 0xBB);
+    write_blob_byte(&engine, app_big, 0, 0xCC);
+
+    let venus_out = applier.take_venus_blob_writes();
+    let venus_ids: Vec<u32> = venus_out.iter().filter_map(res_id_of_blobdata).collect();
+    assert_eq!(venus_ids, vec![venus], "only the Venus-internal blob ships in the venus split");
+
+    let app_out = applier.take_app_blob_writes();
+    let app_ids: Vec<u32> = app_out.iter().filter_map(res_id_of_blobdata).collect();
+    assert_eq!(app_ids, vec![app_big, app_small], "app split ships app blobs, largest first");
+}
+
+// ---------------------------------------------------------------------------------------------
+// (c)2 completion barrier: the queue lifecycle gate (retirement_ring_idx)
+// ---------------------------------------------------------------------------------------------
+
+/// A synthetic `vkGetDeviceQueue2` command (80 bytes) carrying `ring_idx`/`device`, laid out exactly
+/// as `docs/design/2026-07-19-c2-ringidx-decode.md` §1 specifies. Constructed (not captured) because
+/// this test exercises the **wiring** — the decode itself is proven against real bytes in
+/// `rayland-vtest`'s `captured` module.
+fn synthetic_get_device_queue2(ring_idx: u32, device: u64) -> Vec<u8> {
+    let mut c = Vec::with_capacity(80);
+    c.extend_from_slice(&155u32.to_le_bytes()); // 0x00 cmd_type vkGetDeviceQueue2
+    c.extend_from_slice(&0u32.to_le_bytes()); // 0x04 flags (async)
+    c.extend_from_slice(&device.to_le_bytes()); // 0x08 VkDevice
+    c.extend_from_slice(&1u64.to_le_bytes()); // 0x10 pQueueInfo marker
+    c.extend_from_slice(&1000145003u32.to_le_bytes()); // 0x18 VkDeviceQueueInfo2.sType
+    c.extend_from_slice(&1u64.to_le_bytes()); // 0x1c pNext marker
+    c.extend_from_slice(&1000384005u32.to_le_bytes()); // 0x24 TimelineInfoMESA.sType
+    c.extend_from_slice(&0u64.to_le_bytes()); // 0x28 inner pNext marker (NULL)
+    c.extend_from_slice(&ring_idx.to_le_bytes()); // 0x30 ringIdx
+    c.extend_from_slice(&0u32.to_le_bytes()); // 0x34 flags
+    c.extend_from_slice(&0u32.to_le_bytes()); // 0x38 queueFamilyIndex
+    c.extend_from_slice(&0u32.to_le_bytes()); // 0x3c queueIndex
+    c.extend_from_slice(&1u64.to_le_bytes()); // 0x40 pQueue marker
+    c.extend_from_slice(&5u64.to_le_bytes()); // 0x48 pQueue VkQueue handle
+    assert_eq!(c.len(), 80, "the command is fixed at 80 bytes");
+    c
+}
+
+/// A synthetic `vkDestroyDevice` command (24 bytes) for `device`, NULL allocator.
+fn synthetic_destroy_device(device: u64) -> Vec<u8> {
+    let mut c = Vec::with_capacity(24);
+    c.extend_from_slice(&12u32.to_le_bytes()); // cmd_type vkDestroyDevice
+    c.extend_from_slice(&0u32.to_le_bytes()); // flags (async)
+    c.extend_from_slice(&device.to_le_bytes()); // VkDevice
+    c.extend_from_slice(&0u64.to_le_bytes()); // pAllocator NULL marker
+    c
+}
+
+/// **The (c)2 gate, end to end without a GPU:** `retirement_ring_idx` is `None` until the queue is
+/// both decoded *and* registered (the ring's `head` has passed the `vkGetDeviceQueue2`), then `Some`,
+/// then `None` again once the device is destroyed.
+///
+/// This is the whole safety argument in one test: the completion fence is a real GPU barrier only
+/// while `retirement_ring_idx` is `Some`, and it is `Some` only in the window where a fence on that
+/// `ring_idx` is valid — after the host registered the queue, before it freed it. A fence outside that
+/// window is render-server-fatal, so the three transitions here are what keep it from ever firing there.
+#[test]
+fn retirement_ring_idx_opens_on_registration_and_closes_on_destroy() {
+    let (mut applier, mut engine, ring) = session_with_ring();
+    let device = 3u64;
+
+    // Nothing decoded yet: no queue, no fence.
+    assert_eq!(applier.retirement_ring_idx(), None, "no queue before vkGetDeviceQueue2");
+
+    // A ring delta carrying the app's vkGetDeviceQueue2 latches the queue (ring_idx=1, ends at 80).
+    let gdq2 = synthetic_get_device_queue2(1, device);
+    applier.apply(
+        &mut engine,
+        C2S::RingDelta { ring_res_id: ring, tail: 80, bytes: gdq2 },
+    );
+
+    // Latched, but the ring thread has not dispatched it yet (head still 0 < 80): still `None`, so a
+    // fence would be premature — and premature is render-server-fatal.
+    assert_eq!(
+        applier.retirement_ring_idx(),
+        None,
+        "decoded but not yet registered: the fence must not fire"
+    );
+
+    // The ring thread dispatches up to and past the command (head reaches its end): now registered.
+    engine.write_control(ring, RING_HEAD_OFFSET, 80);
+    assert_eq!(
+        applier.retirement_ring_idx(),
+        Some(1),
+        "head reached the command end: the queue is registered and the fence is safe"
+    );
+    // Head well past the command is still `Some` — the gate does not re-close on its own.
+    engine.write_control(ring, RING_HEAD_OFFSET, 50_000);
+    assert_eq!(applier.retirement_ring_idx(), Some(1));
+
+    // The application destroys its device. The gate closes *as the delta is applied* (before any
+    // doorbell could let the host free the queue), so no later fence can hit the freed queue.
+    let destroy = synthetic_destroy_device(device);
+    applier.apply(
+        &mut engine,
+        C2S::RingDelta { ring_res_id: ring, tail: 80 + 24, bytes: destroy },
+    );
+    assert_eq!(
+        applier.retirement_ring_idx(),
+        None,
+        "gate closed on vkDestroyDevice: no fence on the freed queue"
+    );
+}
+
+/// A `vkDestroyDevice` for a *different* device does not close this queue's gate — the device-handle
+/// discriminator is what makes the destroy scan safe against a stray `12` in argument bytes.
+#[test]
+fn a_foreign_destroy_does_not_close_the_gate() {
+    let (mut applier, mut engine, ring) = session_with_ring();
+    let gdq2 = synthetic_get_device_queue2(1, 3);
+    applier.apply(&mut engine, C2S::RingDelta { ring_res_id: ring, tail: 80, bytes: gdq2 });
+    engine.write_control(ring, RING_HEAD_OFFSET, 80);
+    assert_eq!(applier.retirement_ring_idx(), Some(1));
+
+    // A destroy for device 9, not our device 3.
+    let foreign = synthetic_destroy_device(9);
+    applier.apply(
+        &mut engine,
+        C2S::RingDelta { ring_res_id: ring, tail: 80 + 24, bytes: foreign },
+    );
+    assert_eq!(
+        applier.retirement_ring_idx(),
+        Some(1),
+        "another device's destroy must not close this queue's gate"
+    );
+}
+
+/// The gate does not open on a ring that is only *partially* consumed: `queue_ring_drained` is true
+/// only when `head` has caught up to `applied_tail`. That is the anti-overtake property — the fence
+/// waits until the host ring thread has dispatched everything S relayed (including the app's submit).
+#[test]
+fn queue_ring_drained_is_true_only_when_head_reaches_applied_tail() {
+    let (mut applier, mut engine, ring) = session_with_ring();
+    let gdq2 = synthetic_get_device_queue2(1, 3);
+    applier.apply(&mut engine, C2S::RingDelta { ring_res_id: ring, tail: 80, bytes: gdq2 });
+
+    // applied_tail is 80; head still 0 — the ring thread has not caught up, so not drained.
+    engine.write_control(ring, RING_HEAD_OFFSET, 0);
+    assert!(!applier.queue_ring_drained(), "head 0 < applied_tail 80: not drained");
+    // Partway: still behind.
+    engine.write_control(ring, RING_HEAD_OFFSET, 40);
+    assert!(!applier.queue_ring_drained(), "head 40 < applied_tail 80: not drained");
+    // Caught up exactly: drained — the app's submit is dispatched and the fence cannot overtake it.
+    engine.write_control(ring, RING_HEAD_OFFSET, 80);
+    assert!(applier.queue_ring_drained(), "head 80 == applied_tail 80: drained");
+}
+
+/// A synthetic `vkQueueSubmit` prefix (28 bytes) for `queue`, one batch — the fixed prefix the
+/// scanner reads, laid out per the Mesa encoding.
+fn synthetic_queue_submit(queue: u64) -> Vec<u8> {
+    let mut c = Vec::with_capacity(28);
+    c.extend_from_slice(&18u32.to_le_bytes()); // vkQueueSubmit
+    c.extend_from_slice(&0u32.to_le_bytes()); // flags async
+    c.extend_from_slice(&queue.to_le_bytes()); // VkQueue
+    c.extend_from_slice(&1u32.to_le_bytes()); // submitCount 1
+    c.extend_from_slice(&1u64.to_le_bytes()); // array marker == count
+    c
+}
+
+/// **The (c)2 fence trigger, end to end without a GPU:** once the queue is latched, a ring delta
+/// carrying its `vkQueueSubmit` makes `latest_submit_pos` report that submit's position — the
+/// structural signal (with a drained ring) that this frame's submit is dispatched and the readback
+/// fence may fire without overtaking it.
+#[test]
+fn latest_submit_pos_reports_the_apps_submit() {
+    let (mut applier, mut engine, ring) = session_with_ring();
+    // Latch the queue (queue handle 5, from the synthetic vkGetDeviceQueue2's pQueue).
+    let gdq2 = synthetic_get_device_queue2(1, 3);
+    applier.apply(&mut engine, C2S::RingDelta { ring_res_id: ring, tail: 80, bytes: gdq2 });
+    // No submit yet.
+    assert_eq!(applier.latest_submit_pos(), None);
+
+    // A ring delta carrying the app's vkQueueSubmit for queue 5, appended after the gdq2 (at offset 80).
+    let submit = synthetic_queue_submit(5);
+    let submit_len = submit.len() as u32;
+    applier.apply(
+        &mut engine,
+        C2S::RingDelta { ring_res_id: ring, tail: 80 + submit_len, bytes: submit },
+    );
+    assert_eq!(
+        applier.latest_submit_pos(),
+        Some(80),
+        "the app's submit is found at ring offset 80, right after the vkGetDeviceQueue2"
+    );
+
+    // A submit for a *different* queue does not register as this queue's.
+    let (mut applier2, mut engine2, ring2) = session_with_ring();
+    applier2.apply(
+        &mut engine2,
+        C2S::RingDelta { ring_res_id: ring2, tail: 80, bytes: synthetic_get_device_queue2(1, 3) },
+    );
+    let foreign = synthetic_queue_submit(9);
+    let flen = foreign.len() as u32;
+    applier2.apply(
+        &mut engine2,
+        C2S::RingDelta { ring_res_id: ring2, tail: 80 + flen, bytes: foreign },
+    );
+    assert_eq!(
+        applier2.latest_submit_pos(),
+        None,
+        "another queue's submit is not this queue's trigger"
     );
 }

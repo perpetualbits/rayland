@@ -43,7 +43,14 @@
 //! wire value is done in a width that could truncate before it is checked.
 
 // The engine seam C0 built, and the errors it speaks.
-use rayland_vtest::venus_ring::{RingIdentity, notify_ring_command, ring_handle_from_create};
+// The ring-command decoder: (c)2 reads the app's per-queue `ring_idx` out of its `vkGetDeviceQueue2`,
+// finds its `vkQueueSubmit`s to trigger the readback fence, and closes the gate on its `vkDestroyDevice`.
+use rayland_vtest::venus_ring::decode::{
+    find_destroy_device, find_get_device_queue2, find_queue_submit,
+};
+use rayland_vtest::venus_ring::{
+    RING_BUFFER_OFFSET, RingIdentity, notify_ring_command, ring_handle_from_create,
+};
 use rayland_vtest::{EngineError, RenderEngine};
 // The relay protocol.
 use rayland_relay::{BlobRun, C2S, S2C};
@@ -221,6 +228,35 @@ pub struct Applier {
     /// (see `RingIdentity`'s docs). S has no such ambiguity: every `C2S::RingDelta` names its own
     /// `ring_res_id`, so S can simply mirror whatever C tells it about and let the message choose.
     rings: HashMap<u32, RingMirror>,
+    /// The blobs C declared as **Venus's own internal shmems** — `blob_id == 0` per ring-findings
+    /// §6, which is the ring, the reply arena, and the staging pool. Everything else is an
+    /// application `VkDeviceMemory` allocation.
+    ///
+    /// # Why this exists, when spec §7.2 deliberately stopped recording `blob_id`
+    /// It was removed because it decided **what S publishes** — and it is "a number a remote peer
+    /// chose, unverified against anything" (see [`HostBlob::map`]). That rule is retired and stays
+    /// retired: [`Applier::take_blob_writes`] still ships *exactly the bytes S wrote*, for every
+    /// blob, deciding nothing from this set.
+    ///
+    /// This uses it only to **order** those bytes on the wire, and that is a different bargain:
+    ///
+    /// - **The need.** The reply arena is the blob whose contents *release the application's wait* —
+    ///   Mesa reads its fence reply and then reads its own mapped memory. If it crosses the wire
+    ///   ahead of the application's readback blob, C applies the release first and the application
+    ///   reads pixels that have not landed yet. That is (c)1's residual stale-frame defect, measured
+    ///   at 2 of 120 frames after the GPU barrier removed the other 36
+    ///   (`docs/c1-the-network.md` §3.1). The blobs live in a `HashMap`, so before this the order was
+    ///   whatever hashing chose — and it chose the reply arena first.
+    /// - **The exposure, in full.** A hostile or buggy C can lie about `blob_id`. The worst it
+    ///   achieves is a bad *order*: no byte is dropped, no byte is invented, and nothing S owns is
+    ///   published. A peer that lies here makes **its own application** read stale frames. That is
+    ///   self-harm, not a hole in S — which is exactly what the retired rule could not say, because
+    ///   there a lie silently suppressed data S was obliged to send.
+    ///
+    /// Identifying the arena precisely is not available: spec §7.2 records that decoding
+    /// `vkSetReplyCommandStreamMESA` to learn its `res_id` is **silently unsound**, because the reply
+    /// pool mints a new id when it grows. So the choice is this coarse split or no ordering at all.
+    venus_internal: std::collections::HashSet<u32>,
     /// The context C created, remembered because [`C2S::CreateBlob`] does not carry one and
     /// `RenderEngine::create_blob_resource` needs one. `None` until [`C2S::CreateContext`] arrives.
     ctx_id: Option<u32>,
@@ -240,6 +276,77 @@ pub struct Applier {
     /// refuses a second rather than silently picking one, so the day that crutch is removed presents
     /// as a named refusal instead of a doorbell delivered to the wrong ring.
     venus_ring_handle: Option<u64>,
+    /// **(c)1 Task 9 diagnostic only.** The res_ids S has *ever* been observed to write — the set
+    /// [`Self::take_blob_writes`] (and the born-with-contents [`C2S::CreateBlob`] path) has produced a
+    /// run for at least once.
+    ///
+    /// This is the set Probe A (`rayland-s`'s progress loop) re-fingerprints on idle polls to catch
+    /// S's GPU still writing after the return path declared the work retired. Restricting the probe to
+    /// this set is what makes an idle-poll content change attributable to the **GPU** rather than to
+    /// the message thread: the blobs C writes forward (its vertex/uniform/fractal memory) are applied
+    /// via [`HostBlob::copy_in`], which re-baselines rather than counting as an S write, so they never
+    /// enter this set. A change here, with no new `RingDelta` applied, is therefore a GPU DMA landing
+    /// late — the `T2 < T4` the design note predicts. It decides nothing on the wire; it only tells
+    /// the probe which blobs are worth watching.
+    s_written: std::collections::HashSet<u32>,
+    /// **(c)1 Task 9 diagnostic only.** A monotonic count of `C2S::RingDelta` messages applied.
+    ///
+    /// Probe A reads this to disambiguate the one thing that would otherwise make it lie: a readback
+    /// blob whose contents change during an idle poll could be S's GPU finishing the *shipped* frame
+    /// late (the `T2 < T4` we are hunting) **or** the *next* frame's readback already landing before
+    /// its retirement. The application is synchronous, so between S releasing frame N and the
+    /// application submitting frame N+1 there is a long CPU-bound quiet window with no new delta — and
+    /// a content change in that window is unambiguously a late write of frame N. This counter is how
+    /// the progress loop knows the window is still quiet: if it has not advanced since the frame was
+    /// shipped, any change is attributable to the shipped frame. Once it advances, the probe stops
+    /// watching that blob until the next ship re-baselines it.
+    applied_ring_deltas: u64,
+    /// **(c)2 completion barrier.** The application's queue as learned from its `vkGetDeviceQueue2`
+    /// on the ring — `None` until that command has been seen and decoded. See [`QueueRegistration`]
+    /// and [`Self::retirement_ring_idx`]; the value is what the readback fence must be issued on.
+    queue: Option<QueueRegistration>,
+    /// **(c)2 completion-fence trigger.** The free-running ring position of the latest `vkQueueSubmit`
+    /// on the app's queue, updated in the `C2S::RingDelta` arm as each delta's bytes are scanned. See
+    /// [`Self::latest_submit_pos`] for why this is tracked from the linear delta stream (wrap-safe)
+    /// rather than by scanning the circular ring buffer (which breaks once the ring wraps).
+    latest_submit_pos: Option<u32>,
+}
+
+/// What S has learned about the application's queue from its `vkGetDeviceQueue2` command.
+///
+/// # Why S needs this at all
+/// The readback completion fence is only a real GPU barrier when issued on the app's actual per-queue
+/// timeline index (`ring_idx`); on the hardcoded `ring_idx = 0` it retires instantly, tied to no GPU
+/// work (the stale/torn-readback bug). Mesa hands that index to the host inside `vkGetDeviceQueue2`,
+/// so S decodes it from the ring — see `docs/design/2026-07-19-c2-ringidx-decode.md`.
+///
+/// # Why the end offset, not just the index
+/// A fence on a `ring_idx` whose queue is not yet registered on the host is **render-server-fatal**
+/// (`sync_queues[ring_idx] == NULL` → the context worker dies → the app `SIGABRT`s). The queue is
+/// registered while virglrenderer's ring thread *dispatches* `vkGetDeviceQueue2`, and that thread
+/// stores the ring's `head` after each dispatch — so `head >= end_offset` is exactly "the queue is
+/// registered". [`Applier::retirement_ring_idx`] gates on it.
+#[derive(Debug, Clone, Copy)]
+struct QueueRegistration {
+    /// The ring resource whose stream carried the `vkGetDeviceQueue2` — the ring whose `head` the
+    /// registration gate reads.
+    ring_res_id: u32,
+    /// The app's real per-queue `ring_idx` (≥ 1), from `VkDeviceQueueTimelineInfoMESA.ringIdx`.
+    ring_idx: u32,
+    /// The free-running ring position at which the `vkGetDeviceQueue2` command ends. The gate opens
+    /// once the ring's `head` reaches it. It is a **free-running** counter, not a masked buffer offset,
+    /// so it stays directly comparable with `head` even after the ring wraps (which it does mid-run);
+    /// and because `vkGetDeviceQueue2` is emitted during device init at a tiny `tail`, its buffer offset
+    /// equalled its free-running position when it was decoded (design doc §2).
+    end_offset: u32,
+    /// The `VkDevice` handle this queue belongs to. Used to recognise *this* device's
+    /// `vkDestroyDevice` and close the gate before its queue is freed — see the `C2S::RingDelta` arm
+    /// of [`Applier::apply`], which clears `Applier::queue` on that command.
+    device_handle: u64,
+    /// The `VkQueue` handle the application submits to. Used to recognise *this* queue's
+    /// `vkQueueSubmit` (see [`Applier::latest_submit_pos`] / [`find_queue_submit`]), so the readback fence
+    /// fires only after a real submit has crossed the ring — never on a between-deltas transient drain.
+    queue_handle: u64,
 }
 
 impl Applier {
@@ -432,6 +539,15 @@ impl Applier {
                     ApplyError::from(source)
                 })?;
                 self.blobs.insert(res_id, host_blob);
+                // Remember which side of the ordering split this blob falls on. `blob_id == 0` is
+                // ring-findings §6's marker for Venus's own shmems — the ring, the reply arena, the
+                // staging pool — and the reply arena is the one whose bytes release the
+                // application's wait, so it must not cross the wire ahead of the application's own
+                // memory. See `venus_internal`'s docs for why using this number for *ordering* is
+                // sound while using it for *routing* was not.
+                if blob_id == 0 {
+                    self.venus_internal.insert(res_id);
+                }
 
                 // A ring-shaped blob gets a mirror. Unlike C, S needs no "first match only" rule:
                 // every delta names its own ring, so a second ring is simply a second mirror.
@@ -473,8 +589,15 @@ impl Applier {
                     .blobs
                     .get_mut(&res_id)
                     .expect("the blob was just inserted");
-                let initial = created
-                    .take_bytes_s_wrote()
+                let initial_runs = created.take_bytes_s_wrote();
+                // **(c)1 Task 9 diagnostic.** A blob born with contents is one S has "written" (the
+                // GPU rendered into it before Mesa's lazy `vkMapMemory` made it a blob), so it joins
+                // the S-written set Probe A watches — this is the very first readback buffer, whose
+                // first frame the retirement gate would otherwise never re-examine.
+                if !initial_runs.is_empty() {
+                    self.s_written.insert(res_id);
+                }
+                let initial = initial_runs
                     .into_iter()
                     .map(|run| BlobRun {
                         offset: run.offset,
@@ -544,6 +667,86 @@ impl Applier {
                         source,
                     })?;
 
+                // **T0 — guest/API submission accepted** (design note §7). The application's Vulkan
+                // commands for this delta are now in the ring's memory where S's engine will find
+                // them; `tail` names the frontier. Stamped here so the offline join can measure
+                // T0→T2 (how long S's ring thread took to retire) and place this cycle on the shared
+                // clock. Diagnostic only — the `tail` is the natural correlation key, since the
+                // `RingProgress` that eventually releases the wait echoes it back as `consumed_tail`.
+                self.applied_ring_deltas = self.applied_ring_deltas.wrapping_add(1);
+                rayland_relay::trace::emit(
+                    "T0",
+                    &format!("side=S res={ring_res_id} tail={tail} bytes={}", bytes.len()),
+                );
+
+                // **(c)2 completion barrier — the app's queue lifecycle, decoded from the ring.** The
+                // readback fence must be issued on the app's real per-queue `ring_idx` (`ring_idx = 0`
+                // fences no GPU work), and *only while that queue is alive on the host* — a fence on a
+                // freed queue is render-server-fatal. So S watches the queue's lifecycle events: its
+                // birth (`vkGetDeviceQueue2`, carrying the `ring_idx`), its death (`vkDestroyDevice`,
+                // which closes the gate), and each `vkQueueSubmit` (which arms the fence trigger). All
+                // decided **here, in the message thread, as the delta is applied.** See
+                // `docs/design/2026-07-19-c2-ringidx-decode.md` §7–§8.
+                match self.queue {
+                    // Not yet latched: watch for the queue's birth. `vkGetDeviceQueue2` is emitted
+                    // during device init at a tiny `tail`, before the ring first wraps, and has a
+                    // four-magic-word signature, so scanning the linear buffer `[0, applied_tail)` for
+                    // it — once, until latched — is both cheap and false-positive-proof. `buf_end` is
+                    // clamped to the mapping so a wrapped/hostile `applied_tail` can only read stale
+                    // bytes, never index out of bounds.
+                    None => {
+                        let buf_end = (RING_BUFFER_OFFSET + mirror.applied_tail() as usize)
+                            .min(blob.size() as usize);
+                        if buf_end > RING_BUFFER_OFFSET {
+                            let stream = &blob.bytes()[RING_BUFFER_OFFSET..buf_end];
+                            if let Some(found) = find_get_device_queue2(stream) {
+                                // `found.end_offset` is a buffer offset that (pre-wrap) equals the
+                                // command's free-running ring position — so it stays comparable against
+                                // the free-running `head` in `retirement_ring_idx` for the whole run.
+                                self.queue = Some(QueueRegistration {
+                                    ring_res_id,
+                                    ring_idx: found.ring_idx,
+                                    end_offset: found.end_offset as u32,
+                                    device_handle: found.device_handle,
+                                    queue_handle: found.queue_handle,
+                                });
+                                eprintln!(
+                                    "rayland-s: decoded application queue ring_idx={} (its \
+                                     vkGetDeviceQueue2 ends at ring offset {}; the readback fence \
+                                     waits for head to reach it before firing)",
+                                    found.ring_idx, found.end_offset
+                                );
+                            }
+                        }
+                    }
+                    // Latched: scan **this delta's bytes** (never the circular buffer) for the queue's
+                    // destroy or a new submit. Scanning the delta — linear, un-wrapped, and read once —
+                    // rather than re-scanning the whole wrapped buffer every delta is what makes both
+                    // wrap-safe *and* keeps their (low-entropy) signatures off a large aliasing surface:
+                    // each byte is inspected exactly once, when it first arrives. Deltas end at command
+                    // boundaries (fundamental to the relay), so neither command is ever split.
+                    Some(q) => {
+                        if find_destroy_device(&bytes, q.device_handle).is_some() {
+                            // The app destroyed its device: close the gate. From here
+                            // `retirement_ring_idx` returns `None`, so no further fence is issued —
+                            // exactly the fences that would otherwise hit the freed queue at teardown.
+                            self.queue = None;
+                            eprintln!(
+                                "rayland-s: application destroyed its device (vkDestroyDevice for \
+                                 device {}); retiring the readback gate for ring_idx={} so no fence \
+                                 can race the queue's destruction",
+                                q.device_handle, q.ring_idx
+                            );
+                        } else if let Some(off) = find_queue_submit(&bytes, q.queue_handle) {
+                            // A new frame's submit: record its **free-running** position, which
+                            // `progress_thread` compares against the last delivered to fire the fence.
+                            // `bytes` spans free-running `[tail - bytes.len(), tail)`.
+                            let frontier_before = tail.wrapping_sub(bytes.len() as u32);
+                            self.latest_submit_pos = Some(frontier_before.wrapping_add(off as u32));
+                        }
+                    }
+                }
+
                 // **Wake S's ring thread — and do it here, after `apply_delta`, never before.**
                 //
                 // `apply_delta` has just stored `tail` with `Release`. That ordering is the entire
@@ -607,6 +810,12 @@ impl Applier {
                 engine.unref_resource(res_id);
                 self.blobs.remove(&res_id);
                 self.rings.remove(&res_id);
+                // Forget the send-order classification too. virglrenderer is free to hand the same
+                // `res_id` to a later blob, and a leftover entry here would silently sort a fresh
+                // application buffer into Venus's group — putting the application's own pixels
+                // *after* the reply that releases it, which is the exact defect this classification
+                // exists to prevent. Cheap to drop; invisible and sporadic if not.
+                self.venus_internal.remove(&res_id);
                 Ok(Vec::new())
             }
         }
@@ -720,7 +929,140 @@ impl Applier {
     /// correctness one, and it is required to be fixed — with a wire change carrying many runs per
     /// message, never by merging runs across bytes S did not write — before this carries any
     /// non-toy workload; Task 9 measures the exact numbers.
-    pub fn poll_progress(&mut self) -> Vec<S2C> {
+    /// The context C created, if any. The progress loop needs it to name the context whose GPU work
+    /// must retire before pixels are shipped; see [`Applier::take_ring_progress`].
+    pub fn ctx_id(&self) -> Option<u32> {
+        self.ctx_id
+    }
+
+    /// **(c)2 completion barrier — the readback fence's `ring_idx`, or `None` if it is not yet safe
+    /// to fire.**
+    ///
+    /// The return-path fence is a real GPU-completion barrier only when issued on the application's
+    /// actual per-queue `ring_idx`; on `ring_idx = 0` it retires instantly, tied to no GPU work. But
+    /// a fence on a `ring_idx` whose queue is **not yet registered** on the host is render-server-
+    /// fatal (it permanently kills the context worker → the app `SIGABRT`s). So this returns
+    /// `Some(ring_idx)` only when **both** hold:
+    ///
+    /// 1. the app's `vkGetDeviceQueue2` has been decoded (its `ring_idx` is known — see the
+    ///    `C2S::RingDelta` arm of [`Self::apply`]), and
+    /// 2. the ring's `head` has reached that command's end offset — i.e. virglrenderer's ring thread
+    ///    has dispatched it (`vkr_ring.c:232-233` stores `head` after each dispatch), so
+    ///    `sync_queues[ring_idx]` is populated and a fence on it is valid.
+    ///
+    /// Until both hold it returns `None`, and the caller (`progress_thread`) must **not** issue the
+    /// fence — it leaves the delivery pending and retries. In practice the queue is registered during
+    /// device init, long before the first readback, so this is already `Some` by the first delivery;
+    /// the `None` window is a safety precondition, not a path a healthy session lingers in.
+    ///
+    /// # Inputs / outputs
+    /// - Takes `&self`; reads the ring's `head` (a cheap acquire load — [`RingMirror::head`]).
+    /// - Returns `Some(ring_idx)` when the fence is safe to issue on it, else `None`.
+    pub fn retirement_ring_idx(&self) -> Option<u32> {
+        // No queue decoded yet: nothing to fence on.
+        let q = self.queue?;
+        // The ring that carried the vkGetDeviceQueue2, and its live pages. Both must exist — the
+        // registration was recorded from a delta on this very ring — but look them up rather than
+        // assume, since a hostile/buggy C could have unref'd the ring in between.
+        let mirror = self.rings.get(&q.ring_res_id)?;
+        let blob = self.blobs.get(&q.ring_res_id)?;
+        // `head` reaching the command's end offset is exactly "the ring thread dispatched the
+        // vkGetDeviceQueue2, so the queue is registered". A plain `>=` is correct because both are
+        // **free-running** counters: `head` keeps growing past the buffer size when the ring wraps
+        // mid-run, `end_offset` is a fixed early position, and neither approaches the 2^32 counter
+        // boundary in a session — so once `head` passes `end_offset` the gate stays open (design doc §2).
+        if mirror.head(blob) >= q.end_offset {
+            Some(q.ring_idx)
+        } else {
+            None
+        }
+    }
+
+    /// **(c)2 completion-fence trigger:** is the application's ring fully **drained** — the host ring
+    /// thread's `head` caught up to every byte S has relayed (`head == applied_tail`)?
+    ///
+    /// # Why this is the trigger, and why it cannot overtake the application's submit
+    /// The readback fence must be issued *after* the application's own `vkQueueSubmit` has been
+    /// dispatched on the host, or S's fence (which travels the render-server context-op path,
+    /// independent of the ring thread) can enqueue its empty submit *ahead* of the application's on the
+    /// shared queue and retire against the previous frame — S then ships a torn readback. `head`
+    /// reaching `applied_tail` means the ring thread has consumed **everything S wrote**, which
+    /// includes that submit, so the submit is already dispatched and a fence issued now lands strictly
+    /// after it. This is **content-independent**: unlike watching the readback bytes change, it is
+    /// immune to two frames rendering identical pixels and to the timing races of sampling a buffer a
+    /// cross-process GPU is writing. The application is synchronous, so a drained ring also means it is
+    /// blocked awaiting this frame's result — exactly when the fence should fire.
+    ///
+    /// The readback DMA itself may still be in flight when this returns true (dispatched ≠ GPU-
+    /// complete); the fence the caller then issues is what waits for that completion.
+    ///
+    /// # Inputs / outputs
+    /// - Returns `true` only when a queue is latched and its ring's `head` has reached `applied_tail`.
+    ///   `false` while the ring thread is still catching up (a frame's commands are mid-flight) or when
+    ///   no queue is latched. Reads `head` with the same acquire load as [`Self::retirement_ring_idx`].
+    pub fn queue_ring_drained(&self) -> bool {
+        let Some(q) = self.queue else { return false };
+        let (Some(mirror), Some(blob)) =
+            (self.rings.get(&q.ring_res_id), self.blobs.get(&q.ring_res_id))
+        else {
+            return false;
+        };
+        // Equality, not `>=`: `head` can never pass `applied_tail` (the ring thread cannot consume
+        // bytes S has not written), so "caught up" is exactly equality. Both are free-running `u32`
+        // counters from the same origin; they grow past the buffer size when the ring wraps mid-run
+        // (so this must NOT use a masked buffer offset) but never approach the 2^32 wrap in a session,
+        // so the equality is exact (design doc §2).
+        mirror.head(blob) == mirror.applied_tail()
+    }
+
+    /// **(c)2 completion-fence trigger:** the free-running ring position of the **latest**
+    /// `vkQueueSubmit` the application has issued on its queue, or `None` if it has issued none yet.
+    ///
+    /// # Why this is the trigger, with [`Self::queue_ring_drained`]
+    /// The readback fence must fire only once a *new* submit (this frame's) has actually crossed the
+    /// ring — not merely when the ring is drained, because a synchronous frame's commands arrive in
+    /// several deltas and the ring is transiently drained *between* them, before the submit delta lands.
+    /// The caller remembers the position it last delivered and fences only when this returns a **larger**
+    /// position (a newer submit) that a drained ring proves is dispatched. That is a structural signal —
+    /// no timing settle, immune to identical frames and to the between-deltas transient drain.
+    ///
+    /// # Why free-running, tracked from the delta stream (not a buffer scan)
+    /// The value is recorded in the `C2S::RingDelta` arm of [`Self::apply`] by scanning each delta's
+    /// **bytes** — which arrive un-wrapped and linear — for the app's queue submit, at the delta's
+    /// free-running position. This is deliberately **not** a scan of the ring's circular *buffer*: over
+    /// a 120-frame run the ring **does wrap**, after which a buffer offset no longer equals a ring
+    /// position and the "newer than last delivered" comparison would break. A free-running position
+    /// grows monotonically past the buffer size and never wraps within a session, so the comparison is
+    /// always meaningful. (Deltas end at command boundaries — fundamental to the relay working at all —
+    /// so a submit is never split across two deltas, and no cross-delta carry is needed.)
+    pub fn latest_submit_pos(&self) -> Option<u32> {
+        self.latest_submit_pos
+    }
+
+    /// **Step 1 of the return path**: which rings retired, and how far.
+    ///
+    /// # Why the return path is three steps rather than one function
+    /// This used to be the first half of a single `poll_progress`, and that shape carried (c)1's
+    /// worst defect. The caller must be able to do something *between* learning that the ring
+    /// retired and asking the blobs what changed — namely **wait for S's GPU to actually finish the
+    /// work that retirement covers** ([`RenderEngine::wait_for_work_retired`]). Inside one function
+    /// that barrier would run with the applier lock held, and a pathological fence wait (5 s) would
+    /// starve the message thread that feeds the ring, so Mesa's ~3.5 s stall abort would kill the
+    /// application. Splitting lets the caller drop the lock across the barrier.
+    ///
+    /// The order the three steps must run in, and why each is where it is:
+    /// 1. **this** — read the rings' frontiers. Cheap; a handful of loads.
+    /// 2. **barrier** — `wait_for_work_retired`, *without* this lock held.
+    /// 3. [`Applier::take_blob_writes`] — diff, now that the GPU's writes are guaranteed visible.
+    ///
+    /// Ship step 3's bytes **before** step 1's progress: progress is what releases the application's
+    /// wait, so it must not cross the wire ahead of the pixels the application is about to read.
+    ///
+    /// # Inputs / outputs
+    /// - Returns one [`S2C::RingProgress`] per ring that moved since the last call, empty if none.
+    ///   **Empty means the caller must do nothing else**: no retirement, so no wait to release and
+    ///   nothing S can honestly claim its GPU wrote.
+    pub fn take_ring_progress(&mut self) -> Vec<S2C> {
         // Ask the rings first, before copying anything: on the overwhelming majority of polls
         // nothing moved, and shipping a blob per poll regardless would make this loop a bandwidth
         // source rather than the latency mechanism it is meant to be.
@@ -734,24 +1076,105 @@ impl Applier {
                 continue;
             };
             if let Some(consumed_tail) = mirror.take_progress(blob) {
+                // **T2 — host Vulkan fence/timeline signal** (design note §7): S's ring retired up to
+                // `consumed_tail`, which today's code treats as license to diff and ship. The whole
+                // §7 question is whether the GPU's readback (T4) is really done by now; this stamp is
+                // the T2 the join compares T4-evidence against. Emitted before the barrier runs, so
+                // the trace shows the ordering the code *assumes* (T2 then wait then diff) against
+                // what Probe A observes.
+                rayland_relay::trace::emit(
+                    "T2",
+                    &format!("side=S res={res_id} tail={consumed_tail}"),
+                );
                 progress.push(S2C::RingProgress {
                     ring_res_id: res_id,
                     consumed_tail,
                 });
             }
         }
-        if progress.is_empty() {
-            // Nothing retired, so there is nothing S can honestly claim its GPU wrote — and no wait
-            // to release, so nothing that needs pixels shipped ahead of it.
-            return Vec::new();
-        }
+        progress
+    }
 
-        // Something retired, so S's engine has had the chance to write memory C cannot see. v1 does
-        // not know — and deliberately does not ask — *which* blobs those commands touched: that
-        // would mean decoding the ring, which spec §7 rules out. It asks each blob a question it can
-        // answer from bytes alone: which of your bytes did S write? See the rule above.
+    /// **Step 3 of the return path**: the bytes S is *observed* to have written.
+    ///
+    /// # The caller MUST have run the barrier first
+    /// This diffs each blob against its baseline, and a diff answers *"did these bytes change?"* —
+    /// never *"has the GPU finished?"*. Calling it without [`RenderEngine::wait_for_work_retired`]
+    /// in between is precisely (c)1's stale-frame defect: the predecessor of these two methods
+    /// reasoned that *"something retired, so S's engine has had the chance to write"*, and **"has
+    /// had the chance" is not "has"**. Task 9 measured the result — 22 of 120 frames delivered whole
+    /// and one frame old, 16 more torn, application exiting 0 throughout
+    /// (`docs/c1-the-network.md` §3.1). The ordering is a contract this type cannot enforce, so it
+    /// is stated here and obeyed in `rayland-s`'s progress loop.
+    ///
+    /// v1 does not know — and deliberately does not ask — *which* blobs the retired commands
+    /// touched: that would mean decoding the ring, which spec §7 rules out. It asks each blob a
+    /// question it can answer from bytes alone; the barrier is what makes that question's answer
+    /// mean what the caller needs it to mean.
+    ///
+    /// # Inputs / outputs
+    /// - Returns one [`S2C::BlobData`] per run of bytes S wrote, across every non-ring blob. Empty
+    ///   when S wrote nothing since the last call.
+    pub fn take_blob_writes(&mut self) -> Vec<S2C> {
+        // **The application's own memory ships before Venus's.**
+        //
+        // The reply arena is a Venus-internal blob, and its bytes are what release the application's
+        // wait: Mesa reads its fence reply and then reads its own mapped pages. Ship it first and C
+        // applies the release before the pixels, so the application reads a frame that has not
+        // arrived — which is not hypothetical, it is the 2-of-120 residue the GPU barrier alone left
+        // behind (`docs/c1-the-network.md` §3.1). Before this, the order was a `HashMap`'s, and
+        // hashing happened to put the arena first.
+        //
+        // Within each group the order is still arbitrary and that is fine: two application blobs
+        // have no ordering relationship to each other — neither one's arrival releases anything —
+        // and the same holds for two of Venus's. The only edge that matters is between the groups.
+        //
+        // This decides ORDER only, never whether a blob ships: every blob below is asked the same
+        // question and every answer is sent. See `venus_internal` for why that distinction is what
+        // makes leaning on a peer-supplied `blob_id` acceptable here and unacceptable in the rule
+        // spec §7.2 retired.
+        let mut res_ids: Vec<u32> = self.blobs.keys().copied().collect();
+        res_ids.sort_by_key(|res_id| {
+            (
+                // false (0) sorts first: application memory leads.
+                self.venus_internal.contains(res_id),
+                // Then by id, purely so a run is reproducible rather than hash-ordered. Nothing
+                // depends on this and it costs nothing to have.
+                *res_id,
+            )
+        });
+        self.emit_blob_writes(&res_ids)
+    }
+
+    /// Emit one `S2C::BlobData` per run of bytes S wrote, for the blobs named by `res_ids`, in the
+    /// order given.
+    ///
+    /// # Why this exists
+    /// [`Self::take_blob_writes`], [`Self::take_venus_blob_writes`] and [`Self::take_app_blob_writes`]
+    /// differ only in *which* blobs they visit and *in what order* — the per-blob diff-and-emit logic
+    /// (ring exclusion, the `take_bytes_s_wrote` call, the T5 trace, folding into `s_written`) is
+    /// identical across all three, so it lives here once rather than three times where it could drift.
+    ///
+    /// Rings are never passed in by any of the three callers — a ring's pages are C's command bytes
+    /// and S's `head`, not S's writes to return (see [`Self::take_blob_writes`]'s docs on why the
+    /// ring is excluded structurally rather than by a guess about its bytes). This function still
+    /// guards against one anyway, at no real cost, so a caller mistake fails by omission rather than
+    /// by corrupting the ring.
+    ///
+    /// # Inputs / outputs
+    /// - `res_ids`: which blobs to diff, and in what order the resulting messages appear. A blob that
+    ///   has since been unref'd (a race between listing it and this call, or a caller composing a
+    ///   stale list) is skipped rather than panicked on — this is called from a poll loop, where a
+    ///   panic would take out the only thing that ever releases the application's waits.
+    /// - Returns one [`S2C::BlobData`] per run of bytes S wrote, across the named blobs, in the order
+    ///   given. Empty if none of them had anything to say.
+    fn emit_blob_writes(&mut self, res_ids: &[u32]) -> Vec<S2C> {
         let mut out = Vec::new();
-        for (&res_id, blob) in self.blobs.iter_mut() {
+        // **(c)1 Task 9 diagnostic.** The res_ids that produced a run on *this* call, folded into
+        // `self.s_written` after the loop rather than during it — inserting mid-loop would need a
+        // second mutable borrow of `self` while `blob` still borrows `self.blobs`.
+        let mut wrote_this_call: Vec<u32> = Vec::new();
+        for &res_id in res_ids {
             // **The ring is excluded structurally, by `res_id`.** S's engine genuinely writes a
             // ring's pages — `vkr_ring_store_head` (`vkr_ring.c:60-67`) stores `head` into them
             // after each dispatched command — so the observed-writes rule would rightly report them,
@@ -759,10 +1182,41 @@ impl Applier {
             // and command bytes are C's. Shipping a ring back as blob data would overwrite the very
             // commands C is in the middle of relaying with S's copy of them. `self.rings` is S's own
             // record of which blobs it built a mirror for, so this is a fact rather than a guess.
+            // Checked before the `get_mut` below so the two field borrows never overlap.
             if self.rings.contains_key(&res_id) {
                 continue;
             }
-            for run in blob.take_bytes_s_wrote() {
+            // A blob may have been unref'd between the caller listing it and this loop reaching it —
+            // skip rather than panic on what is, in production, a poll loop.
+            let Some(blob) = self.blobs.get_mut(&res_id) else {
+                continue;
+            };
+            let runs = blob.take_bytes_s_wrote();
+            if runs.is_empty() {
+                continue;
+            }
+
+            // **T5 — first changed byte observed in mapped host memory** (design note §7). This is
+            // the moment the return path *first sees* S's write for this cycle; the whole §7 question
+            // is whether the GPU had actually finished (T4) by now. The fingerprint is of the blob's
+            // current contents, and becomes Probe A's baseline: if it later changes while the
+            // application is blocked and no new `RingDelta` has arrived, the GPU was still writing
+            // past this point — the `T2 < T4` the note predicts. Guarded on `enabled()` so the
+            // ~1 MiB strided hash is never paid when tracing is off.
+            if rayland_relay::trace::enabled() {
+                let fp = rayland_relay::trace::fingerprint(blob.bytes());
+                rayland_relay::trace::emit(
+                    "T5",
+                    &format!(
+                        "side=S res={res_id} off={} runs={} fp={fp:#x}",
+                        runs[0].offset,
+                        runs.len()
+                    ),
+                );
+            }
+            wrote_this_call.push(res_id);
+
+            for run in runs {
                 out.push(S2C::BlobData {
                     res_id,
                     // No longer always 0: `offset` has been on the wire since Task 4 and this is
@@ -772,9 +1226,140 @@ impl Applier {
                 });
             }
         }
-        // **Last, always.** See the ordering argument above: this is what releases the application's
-        // wait, and it must not do so before the bytes it is waiting for are on their way.
-        out.extend(progress);
+        // Record the S-written set for Probe A. A blob only ever joins this set — once S has written
+        // a resource, it is a GPU-write target forever, and the probe wants to keep watching it.
+        for res_id in wrote_this_call {
+            self.s_written.insert(res_id);
+        }
         out
+    }
+
+    /// **Return path, retirement half:** the Venus-internal blob writes — the reply arena, whose bytes
+    /// answer the application's non-readback synchronous calls and are needed for its forward progress.
+    ///
+    /// # Why this ships at ring retirement rather than after the GPU fence
+    /// Mesa's `vn_ring_wait_seqno` releases the application the instant `head` moves past the seqno it
+    /// is waiting on (`vn_ring.c:176-179`) — it never waits on a GPU fence for the reply arena, only on
+    /// the ring's own retirement. So the reply arena's bytes must be on the wire by the time C applies
+    /// that `RingProgress`, which is ring-retirement time, not fence time; waiting for the fence as well
+    /// would needlessly delay a message the application is about to spin-read regardless.
+    ///
+    /// # Inputs / outputs
+    /// - Returns one [`S2C::BlobData`] per run of bytes S wrote, across every Venus-internal, non-ring
+    ///   blob (the reply arena; never the ring, and never the staging pool, which S never writes — see
+    ///   [`Self::take_blob_writes`]'s docs for why an observed-writes rule already excludes the pool
+    ///   without needing to know what it is). Empty when S has written none of them since the last
+    ///   call.
+    pub fn take_venus_blob_writes(&mut self) -> Vec<S2C> {
+        // Collected into an owned `Vec` before the mutable diff pass: `emit_blob_writes` needs
+        // `&mut self`, so the filter over `self.rings`/`self.venus_internal` must finish and drop its
+        // borrows first.
+        let ids: Vec<u32> = self
+            .blobs
+            .keys()
+            .copied()
+            .filter(|id| !self.rings.contains_key(id) && self.venus_internal.contains(id))
+            .collect();
+        self.emit_blob_writes(&ids)
+    }
+
+    /// **Return path, post-fence half:** the application's own blob writes — the readback buffer and
+    /// the feedback word — **largest blob first**, so the megabyte-scale readback ships ahead of the
+    /// tiny feedback word, and the feedback word (which releases the application onto the picture)
+    /// lands last, after the pixels it releases the application onto.
+    ///
+    /// # Why this must wait for the GPU fence and `take_venus_blob_writes` need not
+    /// Unlike the reply arena, nothing about these blobs' contents is guaranteed correct merely
+    /// because the ring retired: the readback buffer is written by the GPU's own DMA, which can
+    /// legitimately still be in flight after virglrenderer's ring thread has moved `head` (this is
+    /// (c)1's stale-frame defect — a diff answers "did these bytes change?", never "has the GPU
+    /// finished?"; see [`Self::take_blob_writes`]'s docs). So this half of the split is the one the
+    /// caller must gate on [`RenderEngine::wait_for_work_retired`], not ring retirement alone.
+    ///
+    /// # Inputs / outputs
+    /// - Returns one [`S2C::BlobData`] per run of bytes S wrote, across every non-Venus-internal,
+    ///   non-ring blob, ordered by blob size descending (ties broken by resource id, purely for a
+    ///   reproducible order — nothing depends on it). Empty when S has written none of them since the
+    ///   last call.
+    pub fn take_app_blob_writes(&mut self) -> Vec<S2C> {
+        // `(res_id, size)` pairs so the sort below can order by size without a second map lookup.
+        let mut ids: Vec<(u32, u64)> = self
+            .blobs
+            .iter()
+            .filter(|(id, _)| !self.rings.contains_key(id) && !self.venus_internal.contains(id))
+            .map(|(&id, blob)| (id, blob.size()))
+            .collect();
+        // Largest first — the readback buffer (megabytes) must lead the feedback word (bytes) so the
+        // pixels it reports on are already in flight before the word that reports them. Ties broken
+        // by id purely so the order is reproducible rather than hash-ordered.
+        ids.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let ids: Vec<u32> = ids.into_iter().map(|(id, _)| id).collect();
+        self.emit_blob_writes(&ids)
+    }
+
+    /// **(c)1 Task 9 Probe A support**: fingerprint every blob S has ever written, cheaply.
+    ///
+    /// # What this is for
+    /// The design note (`docs/design/2026-07-17-return-path-completion.md` §7) predicts the defect is
+    /// `T2 < T4`: S's return path treats a ring retirement as proof the GPU's readback is done, and it
+    /// is not. This method is how the progress loop *catches the GPU in the act* — it re-fingerprints
+    /// the readback blobs on idle polls (when no new `RingDelta` has arrived, so the application is
+    /// blocked and nothing on C's side is writing this memory), and a fingerprint that has moved since
+    /// the return path shipped the frame is a GPU DMA landing **after** we declared completion.
+    ///
+    /// It is restricted to [`Self::s_written`] precisely so a moved fingerprint is attributable to the
+    /// GPU and not to C's forward writes — see that field's docs.
+    ///
+    /// # Inputs / outputs
+    /// - Returns `(res_id, fingerprint)` for every blob S has ever written that still exists, using
+    ///   the same strided [`rayland_relay::trace::fingerprint`] as the T5 baseline so the two are
+    ///   directly comparable. Cheap enough (microseconds per blob) to call on every 200 µs poll.
+    pub fn fingerprint_written_blobs(&self) -> Vec<(u32, u64)> {
+        self.s_written
+            .iter()
+            // A blob can be unref'd out from under the set; skip a res_id whose blob is gone rather
+            // than carry a stale entry. The set is diagnostic, so a lingering id is harmless.
+            .filter_map(|&res_id| {
+                self.blobs
+                    .get(&res_id)
+                    .map(|blob| (res_id, rayland_relay::trace::fingerprint(blob.bytes())))
+            })
+            .collect()
+    }
+
+    /// **(c)1 fence-feedback delivery support**: fingerprint every blob that is not a ring, cheaply.
+    ///
+    /// # What this is for
+    /// The return path's delivery loop (`rayland-s`'s `progress_thread`) calls this once per poll and
+    /// ships blob writes whenever a fingerprint moves. Unlike [`Self::fingerprint_written_blobs`],
+    /// which is scoped to blobs S has already been *observed* to write (Probe A's set), this covers
+    /// **every** non-ring blob — because the feedback buffer must be watched from its *first* write,
+    /// before it has ever been in the S-written set (see the spec's §3.2 bootstrap-deadlock note).
+    ///
+    /// Rings are excluded for the same reason [`Self::take_blob_writes`] excludes them: a ring's pages
+    /// are C's command bytes and S's `head`, not S's writes to return.
+    ///
+    /// # Inputs / outputs
+    /// - Returns `(res_id, fingerprint)` for every non-ring blob, using the same strided
+    ///   [`rayland_relay::trace::fingerprint`] as Probe A so the values are comparable across polls.
+    ///   Cheap enough (a strided hash, microseconds per blob) to call on every 200 µs poll.
+    pub fn fingerprint_nonring_blobs(&self) -> Vec<(u32, u64)> {
+        self.blobs
+            .iter()
+            // A ring's pages are not S's writes to return — exclude them, exactly as `take_blob_writes`
+            // does, so a `head` store is never mistaken for a completion write.
+            .filter(|(res_id, _)| !self.rings.contains_key(res_id))
+            .map(|(&res_id, blob)| (res_id, rayland_relay::trace::fingerprint(blob.bytes())))
+            .collect()
+    }
+
+
+    /// **(c)1 Task 9 Probe A support**: how many `C2S::RingDelta` messages have been applied so far.
+    ///
+    /// Probe A samples this alongside [`Self::fingerprint_written_blobs`] to tell a late GPU write of
+    /// the shipped frame from the next frame's readback arriving early — see [`Self::applied_ring_deltas`]'s
+    /// field docs for the full argument. Monotonic (modulo a `u64` wrap that no real session reaches).
+    pub fn applied_ring_deltas(&self) -> u64 {
+        self.applied_ring_deltas
     }
 }

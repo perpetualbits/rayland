@@ -457,13 +457,25 @@ impl RelayLink for ChannelLink {
     }
 
     fn recv(&mut self) -> Result<S2C, EngineError> {
+        // This is the *only* place in `rayland-c` where a thread blocks waiting for S, which makes
+        // it the only honest place to measure a round trip. Ring deltas are fire-and-forget and cost
+        // bandwidth, not latency; the requests that land here — the capset, blob creation — are the
+        // ones the application genuinely waits on, and spec §8.1 predicts they cluster at startup
+        // and go quiet afterwards. Timing the wait here is what tests that.
+        let waited = std::time::Instant::now();
         // A closed channel means the reader thread is gone, i.e. S dropped the connection. That is
         // a link failure, not an end of stream: whoever is waiting here will never get its answer.
-        self.replies
+        let r = self
+            .replies
             .recv()
             .map_err(|_| EngineError::RelayLinkFailed {
                 detail: "the reader thread ended before S answered this request".into(),
-            })
+            });
+        // Record the stall even when the wait ended in failure: time spent blocked on an answer that
+        // never came is still time the application lost, and dropping it would flatter a failing
+        // link by making its worst stalls invisible.
+        rayland_c::metrics::metrics().round_trip(waited.elapsed());
+        r
     }
 }
 
@@ -616,6 +628,15 @@ fn apply_blob_data(blobs: &BlobTable, res_id: u32, offset: u64, bytes: &[u8]) ->
 
     let start = offset as usize;
     blob.bytes_mut()[start..end as usize].copy_from_slice(bytes);
+
+    // **T7 — packet installed on C** (design note §7): the moment S's bytes are in the pages Mesa
+    // mapped. The `res`/`off` match the S-side T6 so the join can pair departure with installation
+    // across the two processes' shared monotonic clock, and the whole point of the graph is whether
+    // this precedes T8 (the fence release) and T9 (the application's read), or trails them.
+    rayland_relay::trace::emit(
+        "T7",
+        &format!("side=C res={res_id} off={offset} len={}", bytes.len()),
+    );
     Ok(())
 }
 
@@ -819,6 +840,17 @@ fn ring_watcher_thread(
                 // S reporting a tail we never sent (`Progress::note_consumed` is the first line of
                 // that defence and makes this assert unreachable).
                 watcher.advance_head(blob.bytes_mut(), consumed);
+                // **T8 — application-visible fence signalled** (design note §7). Writing `head` here
+                // is precisely what releases the application: `vn_ring_wait_seqno` busy-polls this
+                // word, so the instant it reaches the awaited seqno the application's synchronous
+                // Vulkan call returns and it proceeds to read its pixels (T9). Stamped with the
+                // `consumed` tail so the join can line this release up against the T6/T7 that carried
+                // the pixels it is releasing the application onto — the ordering the whole graph is
+                // built to check.
+                rayland_relay::trace::emit(
+                    "T8",
+                    &format!("side=C res={} tail={consumed}", identity.res_id),
+                );
                 // Reaching here *is* the evidence of ring progress: `consumed` only ever advances
                 // (`note_consumed` clamps it) and it differs from what we last published, so S has
                 // demonstrably replayed more of the ring since the last heartbeat. That is exactly
@@ -907,6 +939,14 @@ fn main() -> Result<()> {
     let s_socket = s_addr
         .parse()
         .with_context(|| format!("{ENV_S_ADDR}={s_addr:?} is not a valid host:port address"))?;
+    // Start Task 9's clock *before* the QUIC handshake, not after: spec §8.1 predicts startup is
+    // round-trip-bound but one-off, and a time-to-first-frame that excluded the handshake could not
+    // test that claim. `metrics()` fixes the start instant on first call, so this call is the
+    // measurement's zero. It is a no-op unless RAYLAND_C1_METRICS is set.
+    rayland_c::metrics::metrics();
+    // The reporter prints running totals every 100 ms, so the sweep harness always holds a last-good
+    // sample even when it kills the daemon rather than letting it exit.
+    rayland_c::metrics::start_reporter();
     let (tx, rx) = rayland_c::link::connect(s_socket).map_err(|e| {
         anyhow::anyhow!("connecting to S at {s_addr} (set {ENV_S_ADDR} to change it): {e}")
     })?;
@@ -981,6 +1021,14 @@ fn main() -> Result<()> {
     // serves a single application.
     let (mut mesa, _) = listener.accept().context("accepting Mesa's connection")?;
     eprintln!("rayland-c: Mesa connected");
+    // Mark the application's arrival for Task 9. Everything before this instant is the daemon
+    // waiting on a socket for an application that has not been started yet — in the sweep, three
+    // seconds of the harness sleeping while the daemon comes up. A time-to-first-frame measured
+    // from daemon startup therefore reports the harness's sleep, not the protocol's cost, which is
+    // exactly the wrong answer to spec §8.1's "startup is RTT-bound but one-off". Both figures are
+    // kept: from-startup includes the QUIC handshake (which §8.1 is also about), from-connect is
+    // what the *application* waits.
+    rayland_c::metrics::metrics().note_app_connected();
 
     let outcome = serve_vtest(&mut mesa, &mut engine)
         .map_err(|e| anyhow::anyhow!("the vtest session failed: {e}"))?;
@@ -988,6 +1036,20 @@ fn main() -> Result<()> {
         "rayland-c: session ended cleanly (context {:?}, {} inline batches relayed)",
         outcome.context_id, outcome.submitted_batches
     );
+    // Emit the authoritative totals, marked `final=1`.
+    //
+    // # Why this line matters more than the periodic ones, and what it cost to learn
+    // A harness that samples the periodic prints when the *application* exits is sampling too early:
+    // the application is gone, but this daemon is still relaying. The first sweep measured the same
+    // refapp cell at 60,319 and 10,091 bytes C->S on two runs — a 6x spread that looked like a
+    // finding about Venus and was really the harness reading the log before the session had
+    // finished. Both numbers were monotonic, both were honestly printed, and one was of a session
+    // that was still happening.
+    //
+    // The monotonic-max rule protects against a truncated *print*; it cannot protect against a
+    // truncated *session*. This line is the marker that says the session is over, so a harness can
+    // wait for it rather than guess. See `scripts/c1-sweep.sh`, which waits for the daemon to exit.
+    rayland_c::metrics::report_final();
     Ok(())
 }
 
