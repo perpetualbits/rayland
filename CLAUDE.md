@@ -224,13 +224,26 @@ Venus/virglrenderer capture/replay engine, so *unmodified* applications run.**
   problem, and it is **solved**: the **engine actor** (`crates/rayland-engine/src/actor.rs`, committed
   and smoke-tested) makes one thread own virglrenderer while an `EngineClient` implements `RenderEngine`
   by messaging it, so the fence and the doorbell cooperate on one thread instead of deadlocking — **the
-  refapp e2e passes through the actor with no wedge.** What remains is a *different* half: the delivery
-  still waits on the **ring** fence (`T2`), which retires ~20 ms before the GPU's readback/feedback-word
-  actually lands (`T4`), so the multi-frame icosa fixture wedges on a missed late write. **(c)2's
-  remaining work is a true `T4` (GPU-DMA-completion) barrier**, now unconstrained by the deadlock; the
-  daemon stays on the pre-actor path until it lands (the actor wiring is preserved as a patch). Full
-  trail: [`docs/design/2026-07-18-c2-engine-actor.md`](docs/design/2026-07-18-c2-engine-actor.md) §8 and
+  refapp e2e passes through the actor with no wedge.** The actor is now **wired in**, and the true `T4`
+  barrier is **delivered**: the daemon issues `virgl_renderer_context_create_fence` on the application's
+  **real per-queue `ring_idx`** — decoded from its `vkGetDeviceQueue2` on the ring — which does a
+  genuine `vkQueueSubmit`+`vkWaitForFences` on the app's own queue (`ring_idx = 0`, the old hardcode,
+  fenced no GPU work). The fence is gated to fire only when it is a safe, real barrier: not before the
+  queue is registered on the host (a premature fence is render-server-fatal), not after the app's
+  `vkDestroyDevice` frees it (a late fence is fatal too), and not before the app's own `vkQueueSubmit`
+  has crossed the ring and been dispatched (an early fence overtakes it and ships a torn readback) —
+  with submit positions tracked **free-running** so the gate survives the ring wrapping mid-run. The
+  `icosa_cpu` fixture now renders **bit-identical across the (c)1 loopback relay** (`loopback_e2e
+  icosa_cpu_renders`, 0/120 frames differing across consecutive runs). This proves the **readback
+  return path**, not the mapped-memory forward path: on loopback the fixture's uninterceptable mapped
+  writes still reach S, so that break (a true network, where they cannot) is not yet exercised. Full
+  trail:
+  [`docs/design/2026-07-19-c2-ringidx-decode.md`](docs/design/2026-07-19-c2-ringidx-decode.md),
+  [`docs/design/2026-07-18-c2-engine-actor.md`](docs/design/2026-07-18-c2-engine-actor.md) §8–§9, and
   [`docs/design/2026-07-18-c2-readback-reachability.md`](docs/design/2026-07-18-c2-readback-reachability.md).
+  **Still open in (c)2:** the *original* mapped-memory-coherence problem above (the `rayland-icosa-cpu`
+  fixture's uninterceptable per-frame mapped writes), plus multi-queue support and splitting
+  render/readback across separate submits.
 - **(c)3 — content-addressed assets.**
 - **(c)4 — real/complex applications; GL via Zink.**
 
