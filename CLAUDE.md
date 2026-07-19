@@ -241,9 +241,19 @@ Venus/virglrenderer capture/replay engine, so *unmodified* applications run.**
   [`docs/design/2026-07-19-c2-ringidx-decode.md`](docs/design/2026-07-19-c2-ringidx-decode.md),
   [`docs/design/2026-07-18-c2-engine-actor.md`](docs/design/2026-07-18-c2-engine-actor.md) §8–§9, and
   [`docs/design/2026-07-18-c2-readback-reachability.md`](docs/design/2026-07-18-c2-readback-reachability.md).
-  **Still open in (c)2:** the *original* mapped-memory-coherence problem above (the `rayland-icosa-cpu`
-  fixture's uninterceptable per-frame mapped writes), plus multi-queue support and splitting
-  render/readback across separate submits.
+  A **two-machine (real-network) run** confirmed the readback barrier holds off loopback: `rayland-refapp`
+  is bit-identical apollo→dop561 (and presents on dop561's screen), and `rayland-icosa-cpu` delivers
+  faithfully whatever S rendered, with no wedge/`SIGABRT`/`invalid ring_idx`.
+  **The open (c)2 problem is now *located*, not just anticipated:** the mapped-memory-coherence problem
+  **bites over the true network** — ~2/120 icosa frames come back as the *whole previous frame* because
+  the app's uninterceptable per-frame mapped writes (fractal + uniforms) reach S **one frame behind**
+  the ring's draw commands, so S renders current geometry over stale mapped inputs (proven from S's own
+  per-frame readback: it *never* produced the stale frames). It is a **forward-path relay-ordering
+  race**, not a readback defect, and loopback hides it (0/120). See
+  [`docs/design/2026-07-19-c2-true-remote-mapped-sync.md`](docs/design/2026-07-19-c2-true-remote-mapped-sync.md).
+  The next (c)2 step is making the mapped-blob relay coherent with the ring stream. Also still open:
+  multi-queue support and splitting render/readback across separate submits (the icosa app already uses
+  two submits per frame).
 - **(c)3 — content-addressed assets.**
 - **(c)4 — real/complex applications; GL via Zink.**
 

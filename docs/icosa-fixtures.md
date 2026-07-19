@@ -392,13 +392,20 @@ paths that worked — it is the most valuable one for whoever picks up (c)2. Not
 should be read as a defect in these fixtures; each is a boundary the fixtures were built up
 to but not past, because something else has to exist first.
 
-**The relay path was never exercised, and this is where the hard problem actually lives.**
-Every result above ran over C0's path — one machine, a local socket, shared physical
-memory. `rayland-c` → `rayland-s`, (c)1's QUIC relay, is where a shared page genuinely
-cannot exist and a file descriptor genuinely cannot cross, and neither daemon currently
-knows how to launch either icosa fixture. No test anywhere in this project has pointed a
-fixture at that path. Building that wiring is not optional groundwork for (c)2 — it is
-where (c)2's actual subject matter begins.
+**The relay path is where the hard problem actually lives — and as of 2026-07-19 it has been
+exercised, and the problem caught.** Everything else in this doc ran over C0's path — one
+machine, a local socket, shared physical memory. `rayland-c` → `rayland-s`, (c)1's QUIC
+relay, is where a shared page genuinely cannot exist and a file descriptor genuinely cannot
+cross. `rayland-icosa-cpu` was run two-machine (C = apollo, S = dop561) over that relay, and
+the mapped-memory race the fixture was built to expose **does bite there**: ~2 of 120 frames
+come back as the *whole previous frame*, because the fixture's uninterceptable per-frame
+mapped writes reach S **one frame behind** the ring's draw commands (proven from S's own
+per-frame readback — S itself never produced the stale frames). It is a forward-path relay
+coherence race, invisible on loopback (0/120). Full evidence and method:
+[`design/2026-07-19-c2-true-remote-mapped-sync.md`](design/2026-07-19-c2-true-remote-mapped-sync.md).
+The two-machine launch is still ad-hoc (a scratchpad script, not committed test wiring);
+making it a repeatable fixture-vs-native comparison, and then fixing the relay ordering, is
+where (c)2's remaining subject matter now lives.
 
 **Fixture A's fence wait and post-copy barrier are spec-correct, and one of the two is not
 observable through the local test suite at all.** §6 above is the detailed version; the
