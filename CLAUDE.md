@@ -244,16 +244,25 @@ Venus/virglrenderer capture/replay engine, so *unmodified* applications run.**
   A **two-machine (real-network) run** confirmed the readback barrier holds off loopback: `rayland-refapp`
   is bit-identical apollo→dop561 (and presents on dop561's screen), and `rayland-icosa-cpu` delivers
   faithfully whatever S rendered, with no wedge/`SIGABRT`/`invalid ring_idx`.
-  **The open (c)2 problem is now *located*, not just anticipated:** the mapped-memory-coherence problem
-  **bites over the true network** — ~2/120 icosa frames come back as the *whole previous frame* because
-  the app's uninterceptable per-frame mapped writes (fractal + uniforms) reach S **one frame behind**
-  the ring's draw commands, so S renders current geometry over stale mapped inputs (proven from S's own
-  per-frame readback: it *never* produced the stale frames). It is a **forward-path relay-ordering
-  race**, not a readback defect, and loopback hides it (0/120). See
+  **The open (c)2 problem is now *located precisely*, and it is the opposite of what a first spike
+  suggested:** over the true network ~2/120 icosa frames come back as the *whole previous frame*, but the
+  cause is a **readback-completion lag on S**, not a forward mapped-blob relay race — the forward relay is
+  ordered and verified fresh. A per-delivery correlation on S (env-gated `RAYLAND_C1_FPLOG`, throwaway
+  instrumentation) fingerprinted both the delivered readback image **and** an independent forward-input
+  witness: the resident per-frame **uniform** the draw reads directly. Across two independent stale runs,
+  every stale frame showed `uniform = N (fresh), delivered image = N−1 (stale)`, and frame N's image was
+  **never delivered at all** — S already held frame N's forward inputs when it shipped frame N−1's pixels.
+  The earlier spike, which dumped *only* S's readback, misread "S delivered N−1 repeatedly" as "S rendered
+  against stale forward inputs (forward lag)"; the uniform witness shows S's forward inputs were correct
+  and the **readback delivery** lagged. The defect is in S's own (c)2 completion barrier interacting with
+  the fixture's **two submits per frame**: the trigger ships `res6` (the readback blob) without
+  guaranteeing its *content* corresponds to the newest submitted draw, so under real-network timing it
+  ships the previous frame's pixels for the current frame's submits and drops the current frame's readback.
+  Loopback hides it (0/120). See
   [`docs/design/2026-07-19-c2-true-remote-mapped-sync.md`](docs/design/2026-07-19-c2-true-remote-mapped-sync.md).
-  The next (c)2 step is making the mapped-blob relay coherent with the ring stream. Also still open:
-  multi-queue support and splitting render/readback across separate submits (the icosa app already uses
-  two submits per frame).
+  The next (c)2 step is a **`rayland-s` readback-barrier fix**: make the delivered readback provably
+  correspond to the frame whose completion released it, robust to N submits per frame. Also still open:
+  multi-queue support (the two-submits-per-frame structure is now central to this bug, not an aside).
 - **(c)3 — content-addressed assets.**
 - **(c)4 — real/complex applications; GL via Zink.**
 

@@ -393,18 +393,24 @@ should be read as a defect in these fixtures; each is a boundary the fixtures we
 to but not past, because something else has to exist first.
 
 **The relay path is where the hard problem actually lives — and as of 2026-07-19 it has been
-exercised, and the problem caught.** Everything else in this doc ran over C0's path — one
-machine, a local socket, shared physical memory. `rayland-c` → `rayland-s`, (c)1's QUIC
-relay, is where a shared page genuinely cannot exist and a file descriptor genuinely cannot
-cross. `rayland-icosa-cpu` was run two-machine (C = apollo, S = dop561) over that relay, and
-the mapped-memory race the fixture was built to expose **does bite there**: ~2 of 120 frames
-come back as the *whole previous frame*, because the fixture's uninterceptable per-frame
-mapped writes reach S **one frame behind** the ring's draw commands (proven from S's own
-per-frame readback — S itself never produced the stale frames). It is a forward-path relay
-coherence race, invisible on loopback (0/120). Full evidence and method:
+exercised, a defect caught, and its cause pinned (after one false start).** Everything else in
+this doc ran over C0's path — one machine, a local socket, shared physical memory. `rayland-c`
+→ `rayland-s`, (c)1's QUIC relay, is where a shared page genuinely cannot exist and a file
+descriptor genuinely cannot cross. `rayland-icosa-cpu` was run two-machine (C = apollo, S =
+dop561) over that relay, and ~2 of 120 frames come back as the *whole previous frame*. The
+cause is **not** the forward mapped-memory relay this fixture was built to stress — that relay
+is ordered and, when measured directly, verifiably fresh. It is a **readback-completion lag on
+S**: a per-delivery correlation that fingerprinted both the delivered image and an independent
+forward-input witness (the resident per-frame **uniform** the draw reads) found that at every
+stale frame the uniform was already the new frame N while the delivered image was the old N−1,
+and frame N's image was *never delivered at all*. S's forward inputs were fresh; its readback
+*delivery* lagged, driven by the (c)2 completion barrier interacting with the fixture's two
+submits per frame. (An earlier spike that dumped only S's readback misread this as a forward
+race; the uniform witness inverted it.) Invisible on loopback (0/120). Full evidence, the
+inversion, and method:
 [`design/2026-07-19-c2-true-remote-mapped-sync.md`](design/2026-07-19-c2-true-remote-mapped-sync.md).
 The two-machine launch is still ad-hoc (a scratchpad script, not committed test wiring);
-making it a repeatable fixture-vs-native comparison, and then fixing the relay ordering, is
+making it a repeatable fixture-vs-native comparison, and then fixing S's readback barrier, is
 where (c)2's remaining subject matter now lives.
 
 **Fixture A's fence wait and post-copy barrier are spec-correct, and one of the two is not
