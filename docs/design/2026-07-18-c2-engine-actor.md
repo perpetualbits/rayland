@@ -224,3 +224,26 @@ so an assume-and-verify shortcut is viable before the full decode; the robust ve
   comment ("we do not set MERGEABLE …"). Harmless here (it only permits skipping a *superseded*
   fence's callback, and S always waits the latest per ring), but the ffi.rs comment is now false and
   should be corrected.
+
+### §9 correction (2026-07-19): the assume-`ring_idx=1` shortcut is unsafe — the decode is required
+
+The finish attempt tried `ring_idx = 1` (and `2`) directly. **Both fail, deterministically and
+fatally.** When S calls `virgl_renderer_context_create_fence(ctx, 0, 1, id)`, the render server's
+`vkr_context_submit_fence` finds `sync_queues[1] == NULL` and returns `false`, which **permanently
+kills the render-server context worker** — every subsequent `submit_cmd` then `EPERM`s and the
+application `SIGABRT`s. This regresses even the refapp (which passes with `ring_idx = 0`, the
+no-lookup CPU-ring branch). The first fence fires while the app is live (not a teardown race), so
+`sync_queues[1]` is genuinely unset at that moment — either the app's real queue index is not `1`, or
+its `vkGetDeviceQueue2` has not been dispatched yet, or both.
+
+**Consequence: a wrong `ring_idx` is not merely ineffective, it is render-server-fatal — so S cannot
+probe.** The completion barrier therefore *requires*, not "as hardening" but as a precondition:
+
+1. **Decode the app's `vkGetDeviceQueue2`** from the ring and read `VkDeviceQueueTimelineInfoMESA.ringIdx`
+   from its `pNext` chain — S's first real Venus-command decode beyond ring-delta relaying.
+2. **Defer the readback fence until that queue is registered** (the `ringIdx` seen *and* its
+   `sync_queues[ringIdx]` populated on the host), so the very first fence S issues is already valid.
+
+Both are real work — a bounded, well-specified next task, but not the one-argument change §9 first
+hoped for. The T4 mechanism itself (a fence on the real per-queue `ring_idx` = genuine GPU completion)
+is unchanged and still the target; only the "guess `1`" path to it is retired.
