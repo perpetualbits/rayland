@@ -68,6 +68,17 @@ pub const VK_COMMAND_TYPE_VK_CREATE_RING_MESA: u32 = 188;
 /// doorbell literally says *"my tail is now X, come look"*.
 pub const VK_COMMAND_TYPE_VK_NOTIFY_RING_MESA: u32 = 190;
 
+/// `VK_COMMAND_TYPE_vkGetDeviceQueue2_EXT` — the command that carries the application's per-queue
+/// timeline **`ring_idx`**, the one value S needs to fence on real GPU completion (see
+/// [`find_get_device_queue2`]).
+///
+/// Unlike the commands above, this one is **fixed-size** (80 bytes, no strings/arrays/variable pNext
+/// for Mesa's queue-init shape), so it *could* be sized — but it is deliberately kept out of
+/// [`encoded_size`] and the linear walk, because the walk cannot *reach* it: variable-size commands
+/// (`vkCreateInstance`, `vkCreateDevice`, …) precede it and correctly stop the walk long before. It is
+/// instead found by a self-verifying **signature scan** ([`find_get_device_queue2`]).
+pub const VK_COMMAND_TYPE_VK_GET_DEVICE_QUEUE2: u32 = 155;
+
 /// The size in bytes of a command's `[type][flags]` prologue: two little-endian `u32`s.
 const COMMAND_HEADER_BYTES: usize = 8;
 
@@ -331,4 +342,102 @@ pub fn decode_reply_command_stream(
         offset: read_u64_le(stream, body + 4)?,
         size: read_u64_le(stream, body + 12)?,
     })
+}
+
+/// The total encoded size of a `vkGetDeviceQueue2` command, in bytes. Fixed: Mesa's queue-init shape
+/// has no strings, arrays, or variable pNext (exactly one `VkDeviceQueueTimelineInfoMESA`, inner
+/// pNext NULL), so the whole command is always this long. Source: `vn_sizeof_vkGetDeviceQueue2`
+/// summed field by field — see `docs/design/2026-07-19-c2-ringidx-decode.md` §1.
+const GET_DEVICE_QUEUE2_SIZE: usize = 80;
+
+/// Byte offset of the outer `VkDeviceQueueInfo2.sType` within an encoded `vkGetDeviceQueue2`. Its
+/// value is a fixed structure-type constant used as a signature magic word (see
+/// [`find_get_device_queue2`]).
+const QUEUE_INFO2_STYPE_OFFSET: usize = 24;
+
+/// Byte offset of the `VkDeviceQueueTimelineInfoMESA.sType` — the second, MESA-specific magic word.
+const TIMELINE_INFO_STYPE_OFFSET: usize = 36;
+
+/// Byte offset of the `ringIdx` `u32` — the value this whole decode exists to read.
+const RING_IDX_OFFSET: usize = 48;
+
+/// `VkStructureType VK_STRUCTURE_TYPE_DEVICE_QUEUE_INFO_2`, as written on the wire (a raw
+/// little-endian `int32`; Venus does not remap sTypes). A core Vulkan constant.
+const STYPE_DEVICE_QUEUE_INFO_2: u32 = 1000145003;
+
+/// `VkStructureType VK_STRUCTURE_TYPE_DEVICE_QUEUE_TIMELINE_INFO_MESA`, as written on the wire. A
+/// Venus/MESA extension constant; its presence in the pNext chain is what makes a match unambiguous.
+const STYPE_DEVICE_QUEUE_TIMELINE_INFO_MESA: u32 = 1000384005;
+
+/// The decoded result of [`find_get_device_queue2`]: the application's per-queue `ring_idx`, and
+/// where in the stream the command ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GetDeviceQueue2 {
+    /// The `VkDeviceQueueTimelineInfoMESA.ringIdx` Mesa assigned this queue — an integer ≥ 1 that is
+    /// the app's real per-queue timeline index. Fencing on it (once the queue is registered on the
+    /// host) is a genuine GPU-completion barrier; fencing on `0` is not, and fencing on a wrong value
+    /// is render-server-fatal. See `docs/design/2026-07-19-c2-ringidx-decode.md`.
+    pub ring_idx: u32,
+    /// Byte offset of the **first byte past** this command, relative to the start of `stream`. When
+    /// `stream` is the ring's linear command buffer (no-wrap session), this equals the command's
+    /// free-running ring position, so a caller can gate on `head >= end_offset` to know the host's
+    /// ring thread has dispatched this command (and thus registered the queue).
+    pub end_offset: usize,
+}
+
+/// Find the application's `vkGetDeviceQueue2` in a Venus command stream and read its `ring_idx`.
+///
+/// # Why this is a signature scan and not part of the linear walk
+/// [`decode_commands`] cannot reach this command: it walks from the stream's start and stops at the
+/// first command it cannot size, and the app's init emits several variable-size commands
+/// (`vkCreateInstance`, `vkCreateDevice`, …) *before* `vkGetDeviceQueue2`. So this instead scans for
+/// the command's fixed 80-byte signature directly. That is not the "guess a size and desynchronize"
+/// failure [`decode_commands`] refuses — it matches on **four independent, self-verifying constants**:
+/// the command type (155), the async command flags (0), and two 32-bit `VkStructureType` magic words
+/// ([`STYPE_DEVICE_QUEUE_INFO_2`], [`STYPE_DEVICE_QUEUE_TIMELINE_INFO_MESA`]). A coincidental match of
+/// all four in unrelated argument bytes is astronomically unlikely.
+///
+/// # Inputs / outputs
+/// - `stream`: a Venus command stream — normally the ring's **linear** command buffer
+///   `&blob[RING_BUFFER_OFFSET..][..applied_tail]` (the session never wraps the ring; the app's queue
+///   is obtained during device init at a tiny `tail`, far below the buffer size — see the design doc).
+/// - Returns `Some(GetDeviceQueue2)` for the **first** match, or `None` if the command is not present
+///   (or not yet fully in `stream`). For (c)1's single-queue configuration the first match is the
+///   app's one queue; multiple queues are out of scope (design doc §6).
+///
+/// # Failure modes / pitfalls
+/// - Cannot panic: every read is bounds-checked, and a candidate too close to the end to hold all 80
+///   bytes is skipped rather than read out of bounds.
+/// - Scans on a **4-byte stride**: Venus encodes every command 4-byte-aligned (`vn_encode` asserts
+///   `size % 4 == 0`) and the ring buffer starts 4-aligned, so a command can only begin at a
+///   multiple-of-4 offset. Scanning every byte would be slower and could only ever match the same
+///   aligned offsets.
+/// - `None` is not "the app has no queue"; it can equally mean "the delta carrying it has not arrived
+///   yet". A caller latching the result must keep calling until it returns `Some`.
+pub fn find_get_device_queue2(stream: &[u8]) -> Option<GetDeviceQueue2> {
+    // Step by 4: every Venus command begins on a 4-byte boundary (see the doc comment). The last
+    // possible start is `len - 80`; `step_by` naturally stops before running past it.
+    let mut offset = 0usize;
+    while offset + GET_DEVICE_QUEUE2_SIZE <= stream.len() {
+        // The four magic words. `read_u32_le` is bounds-checked, but the loop condition already
+        // guarantees all of `[offset, offset + 80)` is in range, so none of these can be `None`.
+        let is_match = read_u32_le(stream, offset) == Some(VK_COMMAND_TYPE_VK_GET_DEVICE_QUEUE2)
+            // Async command flags: `vkGetDeviceQueue2` is emitted `vn_async_*`, so flags == 0.
+            && read_u32_le(stream, offset + 4) == Some(0)
+            // The outer struct's sType — a core Vulkan constant, written raw little-endian.
+            && read_u32_le(stream, offset + QUEUE_INFO2_STYPE_OFFSET) == Some(STYPE_DEVICE_QUEUE_INFO_2)
+            // The MESA timeline struct's sType — the decisive, extension-specific magic word.
+            && read_u32_le(stream, offset + TIMELINE_INFO_STYPE_OFFSET)
+                == Some(STYPE_DEVICE_QUEUE_TIMELINE_INFO_MESA);
+        if is_match {
+            // All four constants agreed; `ring_idx` at +48 is the value we came for.
+            let ring_idx = read_u32_le(stream, offset + RING_IDX_OFFSET)?;
+            return Some(GetDeviceQueue2 {
+                ring_idx,
+                end_offset: offset + GET_DEVICE_QUEUE2_SIZE,
+            });
+        }
+        offset += 4;
+    }
+    None
 }
