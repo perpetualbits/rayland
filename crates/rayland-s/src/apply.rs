@@ -43,7 +43,14 @@
 //! wire value is done in a width that could truncate before it is checked.
 
 // The engine seam C0 built, and the errors it speaks.
-use rayland_vtest::venus_ring::{RingIdentity, notify_ring_command, ring_handle_from_create};
+// The ring-command decoder: (c)2 reads the app's per-queue `ring_idx` out of its `vkGetDeviceQueue2`,
+// finds its `vkQueueSubmit`s to trigger the readback fence, and closes the gate on its `vkDestroyDevice`.
+use rayland_vtest::venus_ring::decode::{
+    find_destroy_device, find_get_device_queue2, find_queue_submit,
+};
+use rayland_vtest::venus_ring::{
+    RING_BUFFER_OFFSET, RingIdentity, notify_ring_command, ring_handle_from_create,
+};
 use rayland_vtest::{EngineError, RenderEngine};
 // The relay protocol.
 use rayland_relay::{BlobRun, C2S, S2C};
@@ -294,6 +301,52 @@ pub struct Applier {
     /// shipped, any change is attributable to the shipped frame. Once it advances, the probe stops
     /// watching that blob until the next ship re-baselines it.
     applied_ring_deltas: u64,
+    /// **(c)2 completion barrier.** The application's queue as learned from its `vkGetDeviceQueue2`
+    /// on the ring — `None` until that command has been seen and decoded. See [`QueueRegistration`]
+    /// and [`Self::retirement_ring_idx`]; the value is what the readback fence must be issued on.
+    queue: Option<QueueRegistration>,
+    /// **(c)2 completion-fence trigger.** The free-running ring position of the latest `vkQueueSubmit`
+    /// on the app's queue, updated in the `C2S::RingDelta` arm as each delta's bytes are scanned. See
+    /// [`Self::latest_submit_pos`] for why this is tracked from the linear delta stream (wrap-safe)
+    /// rather than by scanning the circular ring buffer (which breaks once the ring wraps).
+    latest_submit_pos: Option<u32>,
+}
+
+/// What S has learned about the application's queue from its `vkGetDeviceQueue2` command.
+///
+/// # Why S needs this at all
+/// The readback completion fence is only a real GPU barrier when issued on the app's actual per-queue
+/// timeline index (`ring_idx`); on the hardcoded `ring_idx = 0` it retires instantly, tied to no GPU
+/// work (the stale/torn-readback bug). Mesa hands that index to the host inside `vkGetDeviceQueue2`,
+/// so S decodes it from the ring — see `docs/design/2026-07-19-c2-ringidx-decode.md`.
+///
+/// # Why the end offset, not just the index
+/// A fence on a `ring_idx` whose queue is not yet registered on the host is **render-server-fatal**
+/// (`sync_queues[ring_idx] == NULL` → the context worker dies → the app `SIGABRT`s). The queue is
+/// registered while virglrenderer's ring thread *dispatches* `vkGetDeviceQueue2`, and that thread
+/// stores the ring's `head` after each dispatch — so `head >= end_offset` is exactly "the queue is
+/// registered". [`Applier::retirement_ring_idx`] gates on it.
+#[derive(Debug, Clone, Copy)]
+struct QueueRegistration {
+    /// The ring resource whose stream carried the `vkGetDeviceQueue2` — the ring whose `head` the
+    /// registration gate reads.
+    ring_res_id: u32,
+    /// The app's real per-queue `ring_idx` (≥ 1), from `VkDeviceQueueTimelineInfoMESA.ringIdx`.
+    ring_idx: u32,
+    /// The free-running ring position at which the `vkGetDeviceQueue2` command ends. The gate opens
+    /// once the ring's `head` reaches it. It is a **free-running** counter, not a masked buffer offset,
+    /// so it stays directly comparable with `head` even after the ring wraps (which it does mid-run);
+    /// and because `vkGetDeviceQueue2` is emitted during device init at a tiny `tail`, its buffer offset
+    /// equalled its free-running position when it was decoded (design doc §2).
+    end_offset: u32,
+    /// The `VkDevice` handle this queue belongs to. Used to recognise *this* device's
+    /// `vkDestroyDevice` and close the gate before its queue is freed — see the `C2S::RingDelta` arm
+    /// of [`Applier::apply`], which clears `Applier::queue` on that command.
+    device_handle: u64,
+    /// The `VkQueue` handle the application submits to. Used to recognise *this* queue's
+    /// `vkQueueSubmit` (see [`Applier::submit_seen`] / [`find_queue_submit`]), so the readback fence
+    /// fires only after a real submit has crossed the ring — never on a between-deltas transient drain.
+    queue_handle: u64,
 }
 
 impl Applier {
@@ -626,6 +679,91 @@ impl Applier {
                     &format!("side=S res={ring_res_id} tail={tail} bytes={}", bytes.len()),
                 );
 
+                // **(c)2 completion barrier — the app's queue lifecycle.** The readback fence must be
+                // issued on the app's real per-queue `ring_idx` (`ring_idx = 0` fences no GPU work),
+                // and *only while that queue is alive on the host* — a fence on a freed queue is
+                // render-server-fatal. So this watches the queue's two lifecycle events on the ring:
+                // its birth (`vkGetDeviceQueue2`, which carries the `ring_idx`) and its death
+                // (`vkDestroyDevice`). See `docs/design/2026-07-19-c2-ringidx-decode.md` §7.
+                //
+                // Both are decided **here, in the message thread, as the delta is applied** — before
+                // the doorbell below lets the host's ring thread dispatch these very bytes. Closing the
+                // gate on `vkDestroyDevice` before that doorbell is what guarantees no readback fence
+                // can ever race the queue's destruction: by the time the host can free the queue, S has
+                // already stopped issuing fences on it.
+                //
+                // These two scans read the ring's circular buffer, and the ring **does** wrap mid-run —
+                // but neither needs a byte's *position*, only its *presence*, so a wrapped buffer is
+                // fine. `vkGetDeviceQueue2` is found once, during device init before any wrap. There is
+                // exactly one `vkDestroyDevice` per session, so finding it *anywhere* in the buffer at
+                // teardown closes the gate correctly regardless of where the wrap left it (the fence
+                // trigger, which *does* need positions, uses free-running counters instead — see the
+                // submit scan below). `buf_end` is clamped to the mapping so a hostile or wrapped
+                // `applied_tail` (a free-running counter `apply_delta` permits) can only make the scan
+                // read stale bytes, never index out of bounds — and a false match would need the full
+                // signature to coincide, which it will not.
+                let buf_end = (RING_BUFFER_OFFSET + mirror.applied_tail() as usize)
+                    .min(blob.size() as usize);
+                if buf_end > RING_BUFFER_OFFSET {
+                    let stream = &blob.bytes()[RING_BUFFER_OFFSET..buf_end];
+                    match self.queue {
+                        // Not yet latched: watch for the queue's birth.
+                        None => {
+                            if let Some(found) = find_get_device_queue2(stream) {
+                                // `found.end_offset` is relative to the buffer start; because
+                                // `vkGetDeviceQueue2` is decoded during device init, before the ring
+                                // first wraps, that offset equals its free-running ring position — so it
+                                // stays directly comparable against the free-running `head` in
+                                // `retirement_ring_idx` for the rest of the run.
+                                self.queue = Some(QueueRegistration {
+                                    ring_res_id,
+                                    ring_idx: found.ring_idx,
+                                    end_offset: found.end_offset as u32,
+                                    device_handle: found.device_handle,
+                                    queue_handle: found.queue_handle,
+                                });
+                                eprintln!(
+                                    "rayland-s: decoded application queue ring_idx={} (its \
+                                     vkGetDeviceQueue2 ends at ring offset {}; the readback fence \
+                                     waits for head to reach it before firing)",
+                                    found.ring_idx, found.end_offset
+                                );
+                            }
+                        }
+                        // Latched: watch for *this device's* destroy, and close the gate on it. From
+                        // here `retirement_ring_idx` returns `None`, so no further fence is issued —
+                        // exactly the fences that would otherwise hit the freed queue at teardown. A
+                        // full re-scan each delta is used (not an incremental cursor): it is simple and
+                        // reliably catches the command wherever it lands, and its cost no longer affects
+                        // frame correctness now that the fence is gated on the GPU-write fingerprint
+                        // (see `progress_thread`), not on scan timing.
+                        Some(q) => {
+                            if let Some(off) = find_destroy_device(stream, q.device_handle) {
+                                self.queue = None;
+                                eprintln!(
+                                    "rayland-s: application destroyed its device (vkDestroyDevice at \
+                                     ring offset {off}); retiring the readback gate for ring_idx={} \
+                                     so no fence can race the queue's destruction",
+                                    q.ring_idx
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // **(c)2 fence trigger — record this frame's `vkQueueSubmit` position.** Scan the
+                // delta's own bytes (linear and un-wrapped, unlike the circular ring buffer) for the
+                // app's queue submit, and remember its **free-running** position. This is what
+                // `progress_thread` compares against the last delivered submit to fire the readback
+                // fence for a new frame — and doing it from the delta stream is why it survives the
+                // ring wrapping mid-run. `bytes` spans free-running `[tail - bytes.len(), tail)`.
+                if let Some(q) = self.queue {
+                    if let Some(off) = find_queue_submit(&bytes, q.queue_handle) {
+                        let frontier_before = tail.wrapping_sub(bytes.len() as u32);
+                        self.latest_submit_pos = Some(frontier_before.wrapping_add(off as u32));
+                    }
+                }
+
                 // **Wake S's ring thread — and do it here, after `apply_delta`, never before.**
                 //
                 // `apply_delta` has just stored `tail` with `Release`. That ordering is the entire
@@ -812,6 +950,110 @@ impl Applier {
     /// must retire before pixels are shipped; see [`Applier::take_ring_progress`].
     pub fn ctx_id(&self) -> Option<u32> {
         self.ctx_id
+    }
+
+    /// **(c)2 completion barrier — the readback fence's `ring_idx`, or `None` if it is not yet safe
+    /// to fire.**
+    ///
+    /// The return-path fence is a real GPU-completion barrier only when issued on the application's
+    /// actual per-queue `ring_idx`; on `ring_idx = 0` it retires instantly, tied to no GPU work. But
+    /// a fence on a `ring_idx` whose queue is **not yet registered** on the host is render-server-
+    /// fatal (it permanently kills the context worker → the app `SIGABRT`s). So this returns
+    /// `Some(ring_idx)` only when **both** hold:
+    ///
+    /// 1. the app's `vkGetDeviceQueue2` has been decoded (its `ring_idx` is known — see the
+    ///    `C2S::RingDelta` arm of [`Self::apply`]), and
+    /// 2. the ring's `head` has reached that command's end offset — i.e. virglrenderer's ring thread
+    ///    has dispatched it (`vkr_ring.c:232-233` stores `head` after each dispatch), so
+    ///    `sync_queues[ring_idx]` is populated and a fence on it is valid.
+    ///
+    /// Until both hold it returns `None`, and the caller (`progress_thread`) must **not** issue the
+    /// fence — it leaves the delivery pending and retries. In practice the queue is registered during
+    /// device init, long before the first readback, so this is already `Some` by the first delivery;
+    /// the `None` window is a safety precondition, not a path a healthy session lingers in.
+    ///
+    /// # Inputs / outputs
+    /// - Takes `&self`; reads the ring's `head` (a cheap acquire load — [`RingMirror::head`]).
+    /// - Returns `Some(ring_idx)` when the fence is safe to issue on it, else `None`.
+    pub fn retirement_ring_idx(&self) -> Option<u32> {
+        // No queue decoded yet: nothing to fence on.
+        let q = self.queue?;
+        // The ring that carried the vkGetDeviceQueue2, and its live pages. Both must exist — the
+        // registration was recorded from a delta on this very ring — but look them up rather than
+        // assume, since a hostile/buggy C could have unref'd the ring in between.
+        let mirror = self.rings.get(&q.ring_res_id)?;
+        let blob = self.blobs.get(&q.ring_res_id)?;
+        // `head` reaching the command's end offset is exactly "the ring thread dispatched the
+        // vkGetDeviceQueue2, so the queue is registered". A plain `>=` is correct because both are
+        // **free-running** counters: `head` keeps growing past the buffer size when the ring wraps
+        // mid-run, `end_offset` is a fixed early position, and neither approaches the 2^32 counter
+        // boundary in a session — so once `head` passes `end_offset` the gate stays open (design doc §2).
+        if mirror.head(blob) >= q.end_offset {
+            Some(q.ring_idx)
+        } else {
+            None
+        }
+    }
+
+    /// **(c)2 completion-fence trigger:** is the application's ring fully **drained** — the host ring
+    /// thread's `head` caught up to every byte S has relayed (`head == applied_tail`)?
+    ///
+    /// # Why this is the trigger, and why it cannot overtake the application's submit
+    /// The readback fence must be issued *after* the application's own `vkQueueSubmit` has been
+    /// dispatched on the host, or S's fence (which travels the render-server context-op path,
+    /// independent of the ring thread) can enqueue its empty submit *ahead* of the application's on the
+    /// shared queue and retire against the previous frame — S then ships a torn readback. `head`
+    /// reaching `applied_tail` means the ring thread has consumed **everything S wrote**, which
+    /// includes that submit, so the submit is already dispatched and a fence issued now lands strictly
+    /// after it. This is **content-independent**: unlike watching the readback bytes change, it is
+    /// immune to two frames rendering identical pixels and to the timing races of sampling a buffer a
+    /// cross-process GPU is writing. The application is synchronous, so a drained ring also means it is
+    /// blocked awaiting this frame's result — exactly when the fence should fire.
+    ///
+    /// The readback DMA itself may still be in flight when this returns true (dispatched ≠ GPU-
+    /// complete); the fence the caller then issues is what waits for that completion.
+    ///
+    /// # Inputs / outputs
+    /// - Returns `true` only when a queue is latched and its ring's `head` has reached `applied_tail`.
+    ///   `false` while the ring thread is still catching up (a frame's commands are mid-flight) or when
+    ///   no queue is latched. Reads `head` with the same acquire load as [`Self::retirement_ring_idx`].
+    pub fn queue_ring_drained(&self) -> bool {
+        let Some(q) = self.queue else { return false };
+        let (Some(mirror), Some(blob)) =
+            (self.rings.get(&q.ring_res_id), self.blobs.get(&q.ring_res_id))
+        else {
+            return false;
+        };
+        // Equality, not `>=`: `head` can never pass `applied_tail` (the ring thread cannot consume
+        // bytes S has not written), so "caught up" is exactly equality. Both are free-running `u32`
+        // counters from the same origin; they grow past the buffer size when the ring wraps mid-run
+        // (so this must NOT use a masked buffer offset) but never approach the 2^32 wrap in a session,
+        // so the equality is exact (design doc §2).
+        mirror.head(blob) == mirror.applied_tail()
+    }
+
+    /// **(c)2 completion-fence trigger:** the free-running ring position of the **latest**
+    /// `vkQueueSubmit` the application has issued on its queue, or `None` if it has issued none yet.
+    ///
+    /// # Why this is the trigger, with [`Self::queue_ring_drained`]
+    /// The readback fence must fire only once a *new* submit (this frame's) has actually crossed the
+    /// ring — not merely when the ring is drained, because a synchronous frame's commands arrive in
+    /// several deltas and the ring is transiently drained *between* them, before the submit delta lands.
+    /// The caller remembers the position it last delivered and fences only when this returns a **larger**
+    /// position (a newer submit) that a drained ring proves is dispatched. That is a structural signal —
+    /// no timing settle, immune to identical frames and to the between-deltas transient drain.
+    ///
+    /// # Why free-running, tracked from the delta stream (not a buffer scan)
+    /// The value is recorded in the `C2S::RingDelta` arm of [`Self::apply`] by scanning each delta's
+    /// **bytes** — which arrive un-wrapped and linear — for the app's queue submit, at the delta's
+    /// free-running position. This is deliberately **not** a scan of the ring's circular *buffer*: over
+    /// a 120-frame run the ring **does wrap**, after which a buffer offset no longer equals a ring
+    /// position and the "newer than last delivered" comparison would break. A free-running position
+    /// grows monotonically past the buffer size and never wraps within a session, so the comparison is
+    /// always meaningful. (Deltas end at command boundaries — fundamental to the relay working at all —
+    /// so a submit is never split across two deltas, and no cross-delta carry is needed.)
+    pub fn latest_submit_pos(&self) -> Option<u32> {
+        self.latest_submit_pos
     }
 
     /// **Step 1 of the return path**: which rings retired, and how far.
@@ -1127,6 +1369,7 @@ impl Applier {
             .map(|(&res_id, blob)| (res_id, rayland_relay::trace::fingerprint(blob.bytes())))
             .collect()
     }
+
 
     /// **(c)1 Task 9 Probe A support**: how many `C2S::RingDelta` messages have been applied so far.
     ///

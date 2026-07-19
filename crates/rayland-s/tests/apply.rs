@@ -1786,3 +1786,197 @@ fn blob_write_split_partitions_venus_from_app_and_orders_app_largest_first() {
     let app_ids: Vec<u32> = app_out.iter().filter_map(res_id_of_blobdata).collect();
     assert_eq!(app_ids, vec![app_big, app_small], "app split ships app blobs, largest first");
 }
+
+// ---------------------------------------------------------------------------------------------
+// (c)2 completion barrier: the queue lifecycle gate (retirement_ring_idx)
+// ---------------------------------------------------------------------------------------------
+
+/// A synthetic `vkGetDeviceQueue2` command (80 bytes) carrying `ring_idx`/`device`, laid out exactly
+/// as `docs/design/2026-07-19-c2-ringidx-decode.md` §1 specifies. Constructed (not captured) because
+/// this test exercises the **wiring** — the decode itself is proven against real bytes in
+/// `rayland-vtest`'s `captured` module.
+fn synthetic_get_device_queue2(ring_idx: u32, device: u64) -> Vec<u8> {
+    let mut c = Vec::with_capacity(80);
+    c.extend_from_slice(&155u32.to_le_bytes()); // 0x00 cmd_type vkGetDeviceQueue2
+    c.extend_from_slice(&0u32.to_le_bytes()); // 0x04 flags (async)
+    c.extend_from_slice(&device.to_le_bytes()); // 0x08 VkDevice
+    c.extend_from_slice(&1u64.to_le_bytes()); // 0x10 pQueueInfo marker
+    c.extend_from_slice(&1000145003u32.to_le_bytes()); // 0x18 VkDeviceQueueInfo2.sType
+    c.extend_from_slice(&1u64.to_le_bytes()); // 0x1c pNext marker
+    c.extend_from_slice(&1000384005u32.to_le_bytes()); // 0x24 TimelineInfoMESA.sType
+    c.extend_from_slice(&0u64.to_le_bytes()); // 0x28 inner pNext marker (NULL)
+    c.extend_from_slice(&ring_idx.to_le_bytes()); // 0x30 ringIdx
+    c.extend_from_slice(&0u32.to_le_bytes()); // 0x34 flags
+    c.extend_from_slice(&0u32.to_le_bytes()); // 0x38 queueFamilyIndex
+    c.extend_from_slice(&0u32.to_le_bytes()); // 0x3c queueIndex
+    c.extend_from_slice(&1u64.to_le_bytes()); // 0x40 pQueue marker
+    c.extend_from_slice(&5u64.to_le_bytes()); // 0x48 pQueue VkQueue handle
+    assert_eq!(c.len(), 80, "the command is fixed at 80 bytes");
+    c
+}
+
+/// A synthetic `vkDestroyDevice` command (24 bytes) for `device`, NULL allocator.
+fn synthetic_destroy_device(device: u64) -> Vec<u8> {
+    let mut c = Vec::with_capacity(24);
+    c.extend_from_slice(&12u32.to_le_bytes()); // cmd_type vkDestroyDevice
+    c.extend_from_slice(&0u32.to_le_bytes()); // flags (async)
+    c.extend_from_slice(&device.to_le_bytes()); // VkDevice
+    c.extend_from_slice(&0u64.to_le_bytes()); // pAllocator NULL marker
+    c
+}
+
+/// **The (c)2 gate, end to end without a GPU:** `retirement_ring_idx` is `None` until the queue is
+/// both decoded *and* registered (the ring's `head` has passed the `vkGetDeviceQueue2`), then `Some`,
+/// then `None` again once the device is destroyed.
+///
+/// This is the whole safety argument in one test: the completion fence is a real GPU barrier only
+/// while `retirement_ring_idx` is `Some`, and it is `Some` only in the window where a fence on that
+/// `ring_idx` is valid — after the host registered the queue, before it freed it. A fence outside that
+/// window is render-server-fatal, so the three transitions here are what keep it from ever firing there.
+#[test]
+fn retirement_ring_idx_opens_on_registration_and_closes_on_destroy() {
+    let (mut applier, mut engine, ring) = session_with_ring();
+    let device = 3u64;
+
+    // Nothing decoded yet: no queue, no fence.
+    assert_eq!(applier.retirement_ring_idx(), None, "no queue before vkGetDeviceQueue2");
+
+    // A ring delta carrying the app's vkGetDeviceQueue2 latches the queue (ring_idx=1, ends at 80).
+    let gdq2 = synthetic_get_device_queue2(1, device);
+    applier.apply(
+        &mut engine,
+        C2S::RingDelta { ring_res_id: ring, tail: 80, bytes: gdq2 },
+    );
+
+    // Latched, but the ring thread has not dispatched it yet (head still 0 < 80): still `None`, so a
+    // fence would be premature — and premature is render-server-fatal.
+    assert_eq!(
+        applier.retirement_ring_idx(),
+        None,
+        "decoded but not yet registered: the fence must not fire"
+    );
+
+    // The ring thread dispatches up to and past the command (head reaches its end): now registered.
+    engine.write_control(ring, RING_HEAD_OFFSET, 80);
+    assert_eq!(
+        applier.retirement_ring_idx(),
+        Some(1),
+        "head reached the command end: the queue is registered and the fence is safe"
+    );
+    // Head well past the command is still `Some` — the gate does not re-close on its own.
+    engine.write_control(ring, RING_HEAD_OFFSET, 50_000);
+    assert_eq!(applier.retirement_ring_idx(), Some(1));
+
+    // The application destroys its device. The gate closes *as the delta is applied* (before any
+    // doorbell could let the host free the queue), so no later fence can hit the freed queue.
+    let destroy = synthetic_destroy_device(device);
+    applier.apply(
+        &mut engine,
+        C2S::RingDelta { ring_res_id: ring, tail: 80 + 24, bytes: destroy },
+    );
+    assert_eq!(
+        applier.retirement_ring_idx(),
+        None,
+        "gate closed on vkDestroyDevice: no fence on the freed queue"
+    );
+}
+
+/// A `vkDestroyDevice` for a *different* device does not close this queue's gate — the device-handle
+/// discriminator is what makes the destroy scan safe against a stray `12` in argument bytes.
+#[test]
+fn a_foreign_destroy_does_not_close_the_gate() {
+    let (mut applier, mut engine, ring) = session_with_ring();
+    let gdq2 = synthetic_get_device_queue2(1, 3);
+    applier.apply(&mut engine, C2S::RingDelta { ring_res_id: ring, tail: 80, bytes: gdq2 });
+    engine.write_control(ring, RING_HEAD_OFFSET, 80);
+    assert_eq!(applier.retirement_ring_idx(), Some(1));
+
+    // A destroy for device 9, not our device 3.
+    let foreign = synthetic_destroy_device(9);
+    applier.apply(
+        &mut engine,
+        C2S::RingDelta { ring_res_id: ring, tail: 80 + 24, bytes: foreign },
+    );
+    assert_eq!(
+        applier.retirement_ring_idx(),
+        Some(1),
+        "another device's destroy must not close this queue's gate"
+    );
+}
+
+/// The gate does not open on a ring that is only *partially* consumed: `queue_ring_drained` is true
+/// only when `head` has caught up to `applied_tail`. That is the anti-overtake property — the fence
+/// waits until the host ring thread has dispatched everything S relayed (including the app's submit).
+#[test]
+fn queue_ring_drained_is_true_only_when_head_reaches_applied_tail() {
+    let (mut applier, mut engine, ring) = session_with_ring();
+    let gdq2 = synthetic_get_device_queue2(1, 3);
+    applier.apply(&mut engine, C2S::RingDelta { ring_res_id: ring, tail: 80, bytes: gdq2 });
+
+    // applied_tail is 80; head still 0 — the ring thread has not caught up, so not drained.
+    engine.write_control(ring, RING_HEAD_OFFSET, 0);
+    assert!(!applier.queue_ring_drained(), "head 0 < applied_tail 80: not drained");
+    // Partway: still behind.
+    engine.write_control(ring, RING_HEAD_OFFSET, 40);
+    assert!(!applier.queue_ring_drained(), "head 40 < applied_tail 80: not drained");
+    // Caught up exactly: drained — the app's submit is dispatched and the fence cannot overtake it.
+    engine.write_control(ring, RING_HEAD_OFFSET, 80);
+    assert!(applier.queue_ring_drained(), "head 80 == applied_tail 80: drained");
+}
+
+/// A synthetic `vkQueueSubmit` prefix (28 bytes) for `queue`, one batch — the fixed prefix the
+/// scanner reads, laid out per the Mesa encoding.
+fn synthetic_queue_submit(queue: u64) -> Vec<u8> {
+    let mut c = Vec::with_capacity(28);
+    c.extend_from_slice(&18u32.to_le_bytes()); // vkQueueSubmit
+    c.extend_from_slice(&0u32.to_le_bytes()); // flags async
+    c.extend_from_slice(&queue.to_le_bytes()); // VkQueue
+    c.extend_from_slice(&1u32.to_le_bytes()); // submitCount 1
+    c.extend_from_slice(&1u64.to_le_bytes()); // array marker == count
+    c
+}
+
+/// **The (c)2 fence trigger, end to end without a GPU:** once the queue is latched, a ring delta
+/// carrying its `vkQueueSubmit` makes `latest_submit_pos` report that submit's position — the
+/// structural signal (with a drained ring) that this frame's submit is dispatched and the readback
+/// fence may fire without overtaking it.
+#[test]
+fn latest_submit_pos_reports_the_apps_submit() {
+    let (mut applier, mut engine, ring) = session_with_ring();
+    // Latch the queue (queue handle 5, from the synthetic vkGetDeviceQueue2's pQueue).
+    let gdq2 = synthetic_get_device_queue2(1, 3);
+    applier.apply(&mut engine, C2S::RingDelta { ring_res_id: ring, tail: 80, bytes: gdq2 });
+    // No submit yet.
+    assert_eq!(applier.latest_submit_pos(), None);
+
+    // A ring delta carrying the app's vkQueueSubmit for queue 5, appended after the gdq2 (at offset 80).
+    let submit = synthetic_queue_submit(5);
+    let submit_len = submit.len() as u32;
+    applier.apply(
+        &mut engine,
+        C2S::RingDelta { ring_res_id: ring, tail: 80 + submit_len, bytes: submit },
+    );
+    assert_eq!(
+        applier.latest_submit_pos(),
+        Some(80),
+        "the app's submit is found at ring offset 80, right after the vkGetDeviceQueue2"
+    );
+
+    // A submit for a *different* queue does not register as this queue's.
+    let (mut applier2, mut engine2, ring2) = session_with_ring();
+    applier2.apply(
+        &mut engine2,
+        C2S::RingDelta { ring_res_id: ring2, tail: 80, bytes: synthetic_get_device_queue2(1, 3) },
+    );
+    let foreign = synthetic_queue_submit(9);
+    let flen = foreign.len() as u32;
+    applier2.apply(
+        &mut engine2,
+        C2S::RingDelta { ring_res_id: ring2, tail: 80 + flen, bytes: foreign },
+    );
+    assert_eq!(
+        applier2.latest_submit_pos(),
+        None,
+        "another queue's submit is not this queue's trigger"
+    );
+}

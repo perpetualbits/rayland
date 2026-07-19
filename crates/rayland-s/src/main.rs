@@ -56,8 +56,12 @@
 //!
 //! This file is written to be read, and it says where it is guessing.
 
-// The real GPU, and the gate that tells us whether this host has one.
-use rayland_engine::{VirglEngine, virgl_available};
+// The engine actor and its client, plus the gate that tells us whether this host has a usable GPU.
+// The daemon no longer holds a `VirglEngine` directly — one actor thread owns it and everything else
+// messages it through an `EngineClient` (see `spawn_engine` in main).
+// `RenderEngine` is the trait `EngineClient` implements; it must be in scope for the progress thread
+// to call `wait_for_work_retired` and for `apply` to receive the client as `&mut dyn RenderEngine`.
+use rayland_engine::{EngineClient, RenderEngine, spawn_engine, virgl_available};
 // The relay protocol and its framing.
 use rayland_relay::{C2S, S2C, read_msg, write_msg};
 // The message applier: everything this daemon actually knows how to do.
@@ -73,10 +77,9 @@ use anyhow::{Context, Result};
 // `flush` on the link to C: `write_msg` hands bytes to the stream, but an unflushed reply is a
 // reply C never sees.
 use std::io::Write;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Environment variable naming the address S listens on, as `host:port`.
 const ENV_LISTEN: &str = "RAYLAND_C1_S_LISTEN";
@@ -119,6 +122,19 @@ const DEFAULT_RENDER_NODE: &str = "/dev/dri/renderD128";
 /// the obvious improvement and has not been done, because a fixed interval is the honest starting
 /// point for something with no measurements behind it.
 const PROGRESS_POLL: Duration = Duration::from_micros(200);
+
+/// How long the progress thread will wait for the application's per-queue `ring_idx` to become
+/// available (its `vkGetDeviceQueue2` decoded *and* its queue registered on the host) before giving
+/// up on a pending readback and **ending the session loudly**.
+///
+/// On (c)1's pinned single-queue path this never elapses: the queue is registered during device
+/// init, milliseconds in, so `retirement_ring_idx` returns `Some` before the very first readback is
+/// pending. The deadline exists only so an unsupported case — an application whose queue is never
+/// decoded (e.g. it obtained the queue via `vkGetDeviceQueue` v1, or on a ring this skeleton cannot
+/// follow) — surfaces as a clear diagnostic instead of the application hanging forever in
+/// `vkWaitForFences` with nothing pointing at the cause. Five seconds is far above the millisecond
+/// registration latency yet well under Mesa's own multi-second stall aborts.
+const QUEUE_REGISTER_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Read an environment variable, falling back to a default.
 fn env_or(name: &str, default: &str) -> String {
@@ -220,183 +236,123 @@ fn ship(tx: &Arc<Mutex<QuicSend>>, msgs: &[S2C]) -> Result<(), ()> {
     Ok(())
 }
 
-/// The progress thread: deliver what S's GPU wrote, and release the application only once it has.
+/// The return path: deliver what S's GPU wrote, releasing the application only once the GPU has
+/// actually retired the work — driven through the engine actor so the fence never starves the doorbell.
 ///
-/// **This is the only thing that ever releases the application's synchronous Vulkan calls**, so its
-/// structure is the correctness argument, not a detail. It has two jobs each poll:
+/// Each frame: the message thread applies the app's commands and the ring retires, which this thread
+/// sees as a non-empty `take_ring_progress`. It ships the **reply arena** (Venus-internal writes) and
+/// the `RingProgress` immediately — those carry the app's non-readback synchronous replies and its
+/// ring-space news. It does **not** ship the readback or the feedback word yet: the GPU has not
+/// finished them. It marks the frame's readback in flight. On a later poll (the app now blocked in
+/// `vkWaitForFences`), it waits for the GPU work to retire — via `wait_for_work_retired` **through the
+/// `EngineClient`**, which the actor drives cooperatively, so this wait no longer deadlocks the
+/// doorbell — and only then ships the application blobs (readback largest-first, feedback word last),
+/// whose feedback word is what releases the application onto the finished pixels.
 ///
-/// 1. **On ring retirement** — ship what S wrote (`take_blob_writes`) and then the `RingProgress`
-///    that advances C's `head`. `head` carries ring space and the reply arena, which the
-///    application's non-readback synchronous calls block on.
-/// 2. **On every poll** — deliver GPU-completion writes. With fence feedback bought back (see
-///    `docs/design/2026-07-17-fence-feedback-walking-skeleton.md`), the application's readback wait is
-///    no longer released by `head`; it polls a **feedback word** that vkr writes *at GPU completion*.
-///    That word, and the finished readback pixels, are ordinary blob writes S must ship — and it must
-///    ship them even while the application is blocked and producing no ring traffic. So this thread
-///    watches every non-ring blob's fingerprint and, when one moves with no retirement, ships the
-///    change. `take_blob_writes` orders application blobs (the readback) ahead of Venus-internal blobs
-///    (the feedback word), so C installs the pixels before the application is ever let go.
-///
-/// # Why there is no GPU barrier here any more
-/// This thread used to wait on `RenderEngine::wait_for_work_retired` before shipping, in the belief
-/// that a retired ring fence meant the GPU's readback had landed. `docs/c1-the-network.md` §3.1
-/// measured that this is false — the ring fence retires when the ring thread *reaches* it, up to ~20
-/// ms before the GPU's readback completes. The completion signal that *is* real is the feedback word,
-/// delivered above; the barrier is gone.
-///
-/// # Inputs / outputs
-/// - `applier`: shared with the message thread. Locked only for short reads, never across a send.
-/// - `tx`: the link to C.
-/// - Returns when the link fails; the session is over either way.
-fn progress_thread(applier: Arc<Mutex<Applier>>, tx: Arc<Mutex<QuicSend>>) {
-    // Probe A state (trace-only) — see `ProbeBaseline`. Unused unless `RAYLAND_C1_TRACE` is set.
-    let mut probe_baseline: HashMap<u32, ProbeBaseline> = HashMap::new();
-    // Fence-feedback delivery state: the fingerprint of every non-ring blob at the previous poll. A
-    // fingerprint that moves with no ring retirement is S's GPU writing a completion (the finished
-    // readback pixels and the feedback word Mesa polls); shipping it is what closes the stale-frame
-    // race and what the spike-2 hang was missing.
-    let mut prev_fp: HashMap<u32, u64> = HashMap::new();
-
+/// # Lock discipline (the no-deadlock argument, docs §4)
+/// This thread holds the applier lock only for the short reads (`take_ring_progress`,
+/// `take_*_blob_writes`) and **never across the fence wait**. The actor never takes the applier lock.
+/// So no cycle can form between this thread, the message thread, and the actor.
+fn progress_thread(applier: Arc<Mutex<Applier>>, mut engine: EngineClient, tx: Arc<Mutex<QuicSend>>) {
+    // Whether a submitted frame's readback still needs delivering.
+    let mut delivery_pending = false;
+    // When the current pending delivery began. Bounds the wait into a loud session end if it can never
+    // complete (see `QUEUE_REGISTER_DEADLINE`); on the healthy path each delivery finishes within a few
+    // polls, so this barely arms.
+    let mut pending_since: Option<Instant> = None;
+    // The ring position of the `vkQueueSubmit` whose readback S last delivered. A submit at a *larger*
+    // position is a new frame; that, plus a drained ring (proving it is dispatched), is the fence
+    // trigger. `None` before the first delivery.
+    let mut last_delivered_submit: Option<u32> = None;
     loop {
-        // One short lock: the retirement frontier, plus a cheap strided fingerprint of every non-ring
-        // blob. The fingerprint is the gate that keeps the full byte-diff off the idle path.
-        let (progress, cur_fp) = {
+        // One short lock: advance the ring frontier, note the context, read the fence's `ring_idx`,
+        // whether the ring is drained, and the latest submit's position — all read together so they are
+        // mutually consistent. `latest_queue_submit_start` scans the ring buffer, but only meaningfully
+        // once a delivery is pending (the app blocked, message thread idle), so it never contends the
+        // lock during active rendering.
+        let (progress, ctx_id, ring_idx, drained, latest_submit) = {
             let mut session = applier.lock().expect("the applier lock is never poisoned");
-            let progress = session.take_ring_progress();
-            let cur_fp: HashMap<u32, u64> =
-                session.fingerprint_nonring_blobs().into_iter().collect();
-            (progress, cur_fp)
+            (
+                session.take_ring_progress(),
+                session.ctx_id(),
+                session.retirement_ring_idx(),
+                session.queue_ring_drained(),
+                session.latest_submit_pos(),
+            )
         };
 
         if !progress.is_empty() {
-            // A ring retired. Ship what S wrote, then the progress that advances `head`. Blob bytes
-            // FIRST, progress LAST: the reply arena rides in the blobs and the reply-ready signal is
-            // `head`, so the arena must be on the wire before the update that releases a waiter on it.
-            let blobs = {
+            // A frame's commands retired on the ring. Ship the reply arena, then the progress that
+            // advances C's head — NOT the readback/feedback (the GPU has not finished them). This is
+            // what releases the application's non-readback synchronous calls.
+            let venus = {
                 let mut session = applier.lock().expect("the applier lock is never poisoned");
-                session.take_blob_writes()
+                session.take_venus_blob_writes()
             };
-            if ship(&tx, &blobs).is_err() {
-                return;
+            if ship(&tx, &venus).is_err() { return; }
+            if ship(&tx, &progress).is_err() { return; }
+            if !delivery_pending {
+                // A new delivery begins; start the completion-wait clock.
+                delivery_pending = true;
+                pending_since = Some(Instant::now());
             }
-            if ship(&tx, &progress).is_err() {
-                return;
-            }
+        }
 
-            // Probe A baseline (trace-only), unchanged: record what was shipped so the idle resample
-            // can catch a GPU write that lands after it.
-            if rayland_relay::trace::enabled() {
-                let ship_ns = rayland_relay::trace::monotonic_ns();
-                let session = applier.lock().expect("the applier lock is never poisoned");
-                let deltas = session.applied_ring_deltas();
-                for (res_id, fp) in session.fingerprint_written_blobs() {
-                    probe_baseline.insert(res_id, ProbeBaseline { fp, ship_ns, deltas });
-                }
-            }
-        } else {
-            // Nothing retired: the application is blocked, polling its feedback word. If any non-ring
-            // blob moved since the last poll, S's GPU wrote a completion — ship it. `take_blob_writes`
-            // orders the readback (an application blob) ahead of the feedback word (Venus-internal), so
-            // C installs the finished pixels before the word that releases the application to read them.
-            if cur_fp != prev_fp {
-                let blobs = {
-                    let mut session = applier.lock().expect("the applier lock is never poisoned");
-                    session.take_blob_writes()
-                };
-                if ship(&tx, &blobs).is_err() {
+        // Deliver the readback once **a new `vkQueueSubmit` has crossed the ring and been dispatched**.
+        // `latest_submit > last_delivered_submit` means this frame's submit is present (not a stale
+        // earlier one, and not a between-deltas transient drain before the submit delta arrived); the
+        // drained ring (`head == applied_tail`) proves the host ring thread has dispatched it, so the
+        // fence issued now lands strictly after the application's own submit and cannot overtake it. This
+        // is a structural trigger — no timing settle, and content-independent, so it is immune to
+        // identical frames and to the races of sampling a buffer a cross-process GPU is writing (both of
+        // which defeated earlier triggers; see docs/design/2026-07-19-c2-ringidx-decode.md §8).
+        let new_submit_dispatched =
+            drained && latest_submit.is_some() && latest_submit > last_delivered_submit;
+        if delivery_pending && new_submit_dispatched {
+            if let (Some(ctx), Some(ring_idx)) = (ctx_id, ring_idx) {
+                // Wait for the GPU work to retire (through the actor — no deadlock), holding NO applier
+                // lock across the wait.
+                if let Err(e) = engine.wait_for_work_retired(ctx, ring_idx) {
+                    // Cannot confirm the GPU finished: shipping now would hand the app stale/torn
+                    // pixels. End the session rather than release it onto them.
+                    eprintln!(
+                        "rayland-s: readback fence failed ({e}); ending the session rather than \
+                         releasing the application onto unfinished pixels."
+                    );
                     return;
                 }
+                // Retired: the readback is complete. Ship the application blobs, readback largest-first
+                // so the feedback word (which releases the app) lands after the pixels it reports on.
+                let app = {
+                    let mut session = applier.lock().expect("the applier lock is never poisoned");
+                    session.take_app_blob_writes()
+                };
+                if ship(&tx, &app).is_err() { return; }
+                delivery_pending = false;
+                pending_since = None;
+                // Remember which submit we just delivered, so only a *newer* one triggers the next fence.
+                last_delivered_submit = latest_submit;
             }
-            // Probe A idle resample (trace-only), unchanged.
-            if rayland_relay::trace::enabled() && !probe_baseline.is_empty() {
-                probe_a_resample(&applier, &mut probe_baseline);
-            }
+            // else: a new submit is dispatched but the queue is not fencing-ready — not registered yet,
+            // or already destroyed at teardown (`retirement_ring_idx` is `None`). Do not fence; the
+            // deadline guard below ends the session if this persists.
         }
 
-        // Remember this poll's fingerprints so the next poll can tell what moved.
-        prev_fp = cur_fp;
-
-        // Wait before looking again; see `PROGRESS_POLL`.
-        std::thread::sleep(PROGRESS_POLL);
-    }
-}
-
-/// **(c)1 Task 9 Probe A state**: what the return path last shipped for one blob.
-///
-/// See [`progress_thread`]'s `probe_baseline` for how these fields are used. Diagnostic only.
-struct ProbeBaseline {
-    /// The blob's fingerprint at ship time (T6) — the reference the idle resample compares against.
-    fp: u64,
-    /// The monotonic timestamp (ns) at which it was shipped, so a later change reports how long
-    /// *after* completion-was-declared the GPU actually wrote.
-    ship_ns: u64,
-    /// The applied-ring-delta count at ship time. If it advances, a new frame is in flight and this
-    /// baseline is retired rather than risk mislabelling the next frame's arrival as a late write.
-    deltas: u64,
-}
-
-/// **(c)1 Task 9 Probe A**: one idle-poll re-fingerprint of the S-written blobs.
-///
-/// Locks the applier once, reads the applied-ring-delta count and every S-written blob's current
-/// fingerprint together (so they are consistent), and for each blob we are still watching:
-///
-/// - if the delta count has advanced since the baseline was set, a **new frame** is in flight and the
-///   content is about to legitimately change, so the baseline is retired (a fresh one is set on that
-///   frame's ship);
-/// - otherwise, if the fingerprint has moved, S's GPU wrote **after** the return path declared the
-///   frame complete — the `T2 < T4` defect — and this emits an `A_RESAMPLE` line carrying how long
-///   after the ship the change was seen, then advances the baseline so a multi-burst late write is
-///   reported once per burst rather than continuously.
-///
-/// # Inputs / outputs
-/// - `applier`: the shared session; locked briefly for a consistent (count, fingerprints) read.
-/// - `baseline`: the per-blob Probe A state, mutated in place (entries advanced or retired).
-/// - Emits `A_RESAMPLE` trace lines as a side effect; returns nothing.
-fn probe_a_resample(applier: &Arc<Mutex<Applier>>, baseline: &mut HashMap<u32, ProbeBaseline>) {
-    let now = rayland_relay::trace::monotonic_ns();
-    // One consistent snapshot: the delta count and the fingerprints must be read under the same lock,
-    // or a delta applied between the two reads could make a legitimate new-frame write look late.
-    let (deltas, current): (u64, HashMap<u32, u64>) = {
-        let session = applier.lock().expect("the applier lock is never poisoned");
-        (
-            session.applied_ring_deltas(),
-            session.fingerprint_written_blobs().into_iter().collect(),
-        )
-    };
-
-    // Blobs whose baseline is retired this poll because a new frame started or the blob is gone;
-    // removed after the scan so the map is not mutated while borrowed.
-    let mut retire: Vec<u32> = Vec::new();
-    for (res_id, base) in baseline.iter_mut() {
-        // A blob with no current fingerprint was unref'd; retire its baseline.
-        let Some(&cur_fp) = current.get(res_id) else {
-            retire.push(*res_id);
-            continue;
-        };
-        if deltas != base.deltas {
-            // A new ring delta landed since we shipped: the next frame is arriving, so any change now
-            // is ambiguous. Stop watching until that frame's ship re-baselines this blob.
-            retire.push(*res_id);
-            continue;
-        }
-        if cur_fp != base.fp {
-            // The smoking gun: content moved with no new work to explain it. `dt_ns` is how long
-            // after we told C "your frame is ready" the GPU was still writing it.
-            rayland_relay::trace::emit(
-                "A_RESAMPLE",
-                &format!(
-                    "side=S res={res_id} dt_ns={} old_fp={:#x} new_fp={cur_fp:#x} changed=1",
-                    now.saturating_sub(base.ship_ns),
-                    base.fp,
-                ),
+        if delivery_pending && pending_since.is_some_and(|t| t.elapsed() > QUEUE_REGISTER_DEADLINE) {
+            // The delivery has been stuck past the deadline: no new submit was dispatched with a
+            // registered queue — the app's `vkGetDeviceQueue2`/`vkQueueSubmit` was never decoded (an
+            // unsupported app/config, see `QUEUE_REGISTER_DEADLINE`), or the host ring thread wedged.
+            // Leaving `delivery_pending` set would spin here forever while the application hangs in
+            // `vkWaitForFences`; end the session loudly instead.
+            eprintln!(
+                "rayland-s: a pending readback could not be completed within {QUEUE_REGISTER_DEADLINE:?} \
+                 (no new queue submit was dispatched on a registered queue); ending the session. (This \
+                 walking skeleton supports the single-queue Venus configuration only.)"
             );
-            // Advance so a write that lands in several bursts is reported per burst, each `dt_ns`
-            // still measured from the original ship.
-            base.fp = cur_fp;
+            return;
         }
-    }
-    for res_id in retire {
-        baseline.remove(&res_id);
+
+        std::thread::sleep(PROGRESS_POLL);
     }
 }
 
@@ -406,8 +362,9 @@ fn probe_a_resample(applier: &Arc<Mutex<Applier>>, baseline: &mut HashMap<u32, P
 /// - `rx`: the reading half of the link to C. Owned exclusively — nothing else may read it.
 /// - `tx`: the shared writing half, also used by the progress thread.
 /// - `applier`: the session state, shared with the progress thread.
-/// - `engine`: S's real GPU. Owned by this thread rather than shared, so the progress thread can
-///   never be blocked behind GPU work.
+/// - `engine`: a client for the engine actor (the one thread that owns virglrenderer). `apply`
+///   messages the actor through it; there is no engine lock to contend, and the progress thread holds
+///   its own clone, so neither thread can block the other behind GPU work.
 /// - `capture`: collects the application's readback buffer as it goes past, for presentation after
 ///   the session. Owned by this thread — the progress thread never touches it.
 /// - Returns when C closes the link or a read fails.
@@ -415,7 +372,7 @@ fn serve(
     mut rx: QuicRecv,
     tx: Arc<Mutex<QuicSend>>,
     applier: Arc<Mutex<Applier>>,
-    engine: &Arc<Mutex<VirglEngine>>,
+    engine: &mut EngineClient,
     capture: &mut FrameCapture,
 ) -> Result<()> {
     loop {
@@ -454,14 +411,12 @@ fn serve(
         // No deadlock: the progress thread takes `applier` and releases it **before** taking `tx`,
         // so it never holds both, and this is the only path that holds them together.
         let mut session = applier.lock().expect("the applier lock is never poisoned");
-        // The engine is shared with the progress thread, which needs it for the GPU barrier (see
-        // `progress_thread`). virglrenderer is process-global and not thread-safe, so this lock is
-        // the one gate every call into it passes. Taken INSIDE the applier lock, which is the same
-        // order the progress thread would use if it ever held both — it never does.
-        let out = {
-            let mut engine = engine.lock().expect("the engine lock is never poisoned");
-            session.apply(&mut *engine, msg)
-        };
+        // No engine lock any more: `apply` drives the engine through the client, which messages the
+        // actor (the one thread that owns virglrenderer). The applier lock is still held across
+        // `apply` and the sends below — its BlobCreated-before-BlobData reason (this function's docs)
+        // is unchanged. `apply`'s engine calls block only on the actor, which services them promptly
+        // even while a readback fence is in flight, so this can no longer deadlock the doorbell.
+        let out = session.apply(engine, msg);
 
         // **Look for the frame here, before the lock is released and before the replies go out.**
         // Spec §7.3: Mesa creates a blob resource lazily, at `vkMapMemory`, so the readback buffer's
@@ -516,21 +471,18 @@ fn main() -> Result<()> {
          with the GPU; without one there is nothing for it to be.",
         render_node.display()
     );
-    // Shared with the progress thread, which needs it for the GPU barrier that keeps stale frames
-    // off the wire (see `progress_thread`). virglrenderer is process-global and NOT thread-safe, so
-    // this mutex is the single gate every call into it passes through — the message thread's
-    // `apply` and the progress thread's fence alike.
-    //
-    // Contention is low by construction rather than by luck: after setup the message thread barely
-    // touches the engine at all. Ring deltas are written into the ring blob's *memory* and never
-    // enter the engine, and `submit` carries essentially only the `vkCreateRingMESA` that creates
-    // the ring (see CLAUDE.md). virglrenderer's own ring thread does the work, holding nothing here.
-    let engine = Arc::new(Mutex::new(VirglEngine::new(&render_node).map_err(|e| {
+    // One thread owns virglrenderer; `serve` and the progress thread hold clients and message it. This
+    // replaces the `Arc<Mutex<VirglEngine>>` whose lock deadlocked the readback fence against the ring
+    // doorbell (docs/design/2026-07-18-c2-engine-actor.md). The actor builds the engine on its own
+    // thread because virglrenderer's EGL context is thread-affine (Task 3 finding), so `spawn_engine`
+    // takes the render-node path, not a pre-built engine. `_engine_thread` is bound (not dropped) so
+    // the actor thread lives for the whole session.
+    let (engine, _engine_thread) = spawn_engine(render_node.clone()).map_err(|e| {
         anyhow::anyhow!(
             "creating the render engine on {}: {e}",
             render_node.display()
         )
-    })?));
+    })?;
 
     let bind_addr = listen
         .parse()
@@ -570,13 +522,15 @@ fn main() -> Result<()> {
     let tx = Arc::new(Mutex::new(tx));
     let applier = Arc::new(Mutex::new(Applier::new()));
 
-    // The poller: the only thing that ever releases the application's synchronous calls.
+    // The poller: the only thing that ever releases the application's synchronous calls. It holds its
+    // own `EngineClient` clone so it can drive the readback fence through the actor.
     std::thread::Builder::new()
         .name("rayland-s-progress".into())
         .spawn({
             let applier = Arc::clone(&applier);
+            let engine = engine.clone();
             let tx = Arc::clone(&tx);
-            move || progress_thread(applier, tx)
+            move || progress_thread(applier, engine, tx)
         })
         .context("spawning the progress thread")?;
 
@@ -586,7 +540,10 @@ fn main() -> Result<()> {
     let (present_width, present_height) = frame_size_from_env()?;
     let mut capture = FrameCapture::new(present_width, present_height);
 
-    serve(rx, tx, applier, &engine, &mut capture)?;
+    // `serve` needs `&mut` to call the `RenderEngine` trait methods through the client; the message
+    // thread keeps this original `engine`, the progress thread got a clone above.
+    let mut engine = engine;
+    serve(rx, tx, applier, &mut engine, &mut capture)?;
     eprintln!("rayland-s: session ended");
 
     // Now that the session is over, put the frame on screen — and keep it there until a human closes

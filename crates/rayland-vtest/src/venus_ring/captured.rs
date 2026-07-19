@@ -34,7 +34,8 @@
 use super::decode::{
     DecodeStop, GetDeviceQueue2, VK_COMMAND_TYPE_VK_CREATE_INSTANCE,
     VK_COMMAND_TYPE_VK_ENUMERATE_INSTANCE_VERSION, VK_COMMAND_TYPE_VK_SET_REPLY_COMMAND_STREAM_MESA,
-    decode_commands, decode_reply_command_stream, encoded_size, find_get_device_queue2,
+    decode_commands, decode_reply_command_stream, encoded_size, find_destroy_device,
+    find_get_device_queue2, find_queue_submit,
 };
 use super::{RING_BUFFER_OFFSET, RING_HEAD_OFFSET, RING_TAIL_OFFSET};
 
@@ -446,8 +447,8 @@ fn get_device_queue2_ring_idx_decodes_from_real_bytes() {
     let found = find_get_device_queue2(&bytes).expect("the captured command must be recognized");
     assert_eq!(
         found,
-        GetDeviceQueue2 { ring_idx: 1, end_offset: 80 },
-        "real Mesa bytes yield ring_idx=1, and the command ends at byte 80"
+        GetDeviceQueue2 { ring_idx: 1, end_offset: 80, device_handle: 3, queue_handle: 5 },
+        "real Mesa bytes yield ring_idx=1, device handle 3, queue handle 5, command ending at byte 80"
     );
 }
 
@@ -532,4 +533,125 @@ fn a_wrong_timeline_stype_defeats_the_match() {
         None,
         "with the MESA sType corrupted the signature no longer matches"
     );
+}
+
+/// Build a `vkDestroyDevice` command for a given device handle, with a NULL `pAllocator`.
+///
+/// # Why this one is constructed rather than captured
+/// Unlike the `vkGetDeviceQueue2` fixture above, no live capture of a `vkDestroyDevice` was on hand
+/// when [`find_destroy_device`] was written. These bytes are therefore **constructed from the
+/// Mesa-documented encoding** (`[type=12 u32][flags=0 u32][VkDevice u64][pAllocator NULL-marker u64]`
+/// — 24 bytes, no padding), which is acceptable *only* because the decoder reads three fixed-position
+/// fields (type@0, flags@4, device@8) and does no length inference that a real byte image could catch
+/// out. The authoritative real-data check for this path is the live `icosa`/`refapp` gate, which drives
+/// an actual application through teardown; if that ever disagrees with these offsets, the offsets are
+/// wrong — the same rule the captured fixtures state.
+fn synthetic_destroy_device(device_handle: u64) -> Vec<u8> {
+    let mut cmd = Vec::with_capacity(24);
+    cmd.extend_from_slice(&12u32.to_le_bytes()); // VkCommandTypeEXT vkDestroyDevice_EXT
+    cmd.extend_from_slice(&0u32.to_le_bytes()); // VkCommandFlagsEXT — async
+    cmd.extend_from_slice(&device_handle.to_le_bytes()); // VkDevice handle
+    cmd.extend_from_slice(&0u64.to_le_bytes()); // pAllocator: NULL presence marker
+    cmd
+}
+
+/// `find_destroy_device` recognizes the latched device's destroy, at its true offset within a stream.
+///
+/// Uses the **real** captured `vkGetDeviceQueue2` (device handle 3) so the two decoders agree on the
+/// same handle a live session would carry, then places a constructed `vkDestroyDevice(3)` after some
+/// filler and confirms it is found. This mirrors the teardown order S sees: the queue is latched from
+/// the real command, and the destroy for that exact device closes the gate.
+#[test]
+fn destroy_device_is_found_for_the_latched_device() {
+    // Latch the device handle from the real gdq2 bytes — this is the value the live path carries.
+    let gdq2 = find_get_device_queue2(&captured_gdq2_bytes()).expect("gdq2 decodes");
+    assert_eq!(gdq2.device_handle, 3);
+
+    let prefix = vec![0x11u8; 40]; // 4-aligned filler with no destroy signature
+    let mut stream = prefix.clone();
+    stream.extend_from_slice(&synthetic_destroy_device(gdq2.device_handle));
+
+    assert_eq!(
+        find_destroy_device(&stream, gdq2.device_handle),
+        Some(prefix.len()),
+        "the destroy for the latched device is found at its offset"
+    );
+}
+
+/// A `vkDestroyDevice` for a *different* device does not close *this* device's gate.
+///
+/// The device-handle discriminator is the whole reason the match is trustworthy: a stray `12` in
+/// argument bytes, or another device's teardown, must not be mistaken for this queue's device being
+/// destroyed (which would wedge a still-live session).
+#[test]
+fn destroy_device_for_a_different_device_does_not_match() {
+    let stream = synthetic_destroy_device(7); // some *other* device
+    assert_eq!(
+        find_destroy_device(&stream, 3),
+        None,
+        "a destroy of device 7 must not match a gate latched on device 3"
+    );
+    // And the real command data (reply-stream setup, enumerate-version) contains no destroy at all.
+    let ring = captured_ring_bytes();
+    assert_eq!(find_destroy_device(&ring[RING_BUFFER_OFFSET..], 3), None);
+}
+
+/// A stream too short to hold the 16 bytes `find_destroy_device` reads yields `None`, never a panic.
+#[test]
+fn destroy_device_truncated_yields_none() {
+    let full = synthetic_destroy_device(3);
+    for len in 0..16 {
+        assert_eq!(find_destroy_device(&full[..len], 3), None);
+    }
+    // 16 bytes is exactly enough for the three fields it reads (type, flags, device).
+    assert_eq!(find_destroy_device(&full[..16], 3), Some(0));
+}
+
+/// Build a synthetic `vkQueueSubmit` prefix (28 bytes read by the scanner) for `queue`, one batch.
+/// Constructed from the Mesa-documented fixed prefix (type/flags/VkQueue/submitCount/array-marker);
+/// the live gate is the real-data check, as for `synthetic_destroy_device`.
+fn synthetic_queue_submit(cmd_type: u32, queue: u64, submit_count: u32) -> Vec<u8> {
+    let mut c = Vec::with_capacity(28);
+    c.extend_from_slice(&cmd_type.to_le_bytes()); // 0: 18 or 206
+    c.extend_from_slice(&0u32.to_le_bytes()); // 4: flags async
+    c.extend_from_slice(&queue.to_le_bytes()); // 8: VkQueue
+    c.extend_from_slice(&submit_count.to_le_bytes()); // 16: submitCount
+    c.extend_from_slice(&u64::from(submit_count).to_le_bytes()); // 20: array marker == count
+    c
+}
+
+/// `find_queue_submit` recognizes a submit for the queue, matches both `vkQueueSubmit`(18) and
+/// `vkQueueSubmit2`(206), and returns the **latest** when several are present.
+#[test]
+fn find_queue_submit_returns_the_latest_submit_for_the_queue() {
+    let queue = 5u64;
+    // Two submits for the queue, separated by filler; the scanner must return the *second* one.
+    let mut stream = vec![0u8; 8];
+    stream.extend_from_slice(&synthetic_queue_submit(18, queue, 1));
+    let second_off = stream.len();
+    stream.extend_from_slice(&[0x33u8; 12]);
+    stream.extend_from_slice(&synthetic_queue_submit(206, queue, 1)); // submit2, later
+    stream.extend_from_slice(&[0x44u8; 8]);
+    assert_eq!(
+        find_queue_submit(&stream, queue),
+        Some(second_off + 12),
+        "the latest submit (a vkQueueSubmit2) is returned"
+    );
+}
+
+/// A submit for a *different* queue, or one whose count/marker disagree, does not match — the
+/// discriminators that keep a stray `18`/`206` in argument bytes from firing the fence early.
+#[test]
+fn find_queue_submit_rejects_wrong_queue_and_inconsistent_count() {
+    // Right type, wrong queue.
+    assert_eq!(find_queue_submit(&synthetic_queue_submit(18, 9, 1), 5), None);
+    // Right queue, but the array-size marker does not equal submitCount (corrupt the marker).
+    let mut bad = synthetic_queue_submit(18, 5, 1);
+    bad[20..28].copy_from_slice(&7u64.to_le_bytes()); // marker 7 != count 1
+    assert_eq!(find_queue_submit(&bad, 5), None);
+    // submitCount 0 is not a real batch.
+    assert_eq!(find_queue_submit(&synthetic_queue_submit(18, 5, 0), 5), None);
+    // The captured init-only ring prefix contains no submit for queue 5.
+    let ring = captured_ring_bytes();
+    assert_eq!(find_queue_submit(&ring[RING_BUFFER_OFFSET..], 5), None);
 }

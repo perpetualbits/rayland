@@ -361,6 +361,25 @@ const TIMELINE_INFO_STYPE_OFFSET: usize = 36;
 /// Byte offset of the `ringIdx` `u32` — the value this whole decode exists to read.
 const RING_IDX_OFFSET: usize = 48;
 
+/// Byte offset of the `VkDevice` handle (a `u64` object id) in commands whose first argument is the
+/// device — both `vkGetDeviceQueue2` and `vkDestroyDevice` encode it here, right after the 8-byte
+/// prologue. Used to tie a `vkDestroyDevice` to the *same* device whose queue was latched (see
+/// [`find_destroy_device`]).
+const DEVICE_HANDLE_OFFSET: usize = 8;
+
+/// Byte offset of the `pQueue` out-parameter's `VkQueue` handle within an encoded `vkGetDeviceQueue2`
+/// (after the pQueue presence marker at +64). Venus object ids are client-assigned, so this is the
+/// handle the application's own `vkQueueSubmit` will name — [`find_queue_submit`] matches on it to
+/// recognise *this* queue's submits.
+const GET_DEVICE_QUEUE2_QUEUE_HANDLE_OFFSET: usize = 72;
+
+/// `VK_COMMAND_TYPE_vkDestroyDevice_EXT` — the command that frees the device and, with it, the
+/// per-queue timeline registered at `vkGetDeviceQueue2`. Once the host dispatches this, a fence on
+/// that queue's `ring_idx` is render-server-fatal; [`find_destroy_device`] lets S close its readback
+/// gate *before* that happens. Fixed 24-byte encoding for the no-allocator case, but this decoder
+/// only reads its first 16 bytes (type, flags, device), which are fixed regardless of `pAllocator`.
+pub const VK_COMMAND_TYPE_VK_DESTROY_DEVICE: u32 = 12;
+
 /// `VkStructureType VK_STRUCTURE_TYPE_DEVICE_QUEUE_INFO_2`, as written on the wire (a raw
 /// little-endian `int32`; Venus does not remap sTypes). A core Vulkan constant.
 const STYPE_DEVICE_QUEUE_INFO_2: u32 = 1000145003;
@@ -379,10 +398,19 @@ pub struct GetDeviceQueue2 {
     /// is render-server-fatal. See `docs/design/2026-07-19-c2-ringidx-decode.md`.
     pub ring_idx: u32,
     /// Byte offset of the **first byte past** this command, relative to the start of `stream`. When
-    /// `stream` is the ring's linear command buffer (no-wrap session), this equals the command's
-    /// free-running ring position, so a caller can gate on `head >= end_offset` to know the host's
-    /// ring thread has dispatched this command (and thus registered the queue).
+    /// `stream` is the ring's linear command buffer, this equals the command's free-running ring
+    /// position **because `vkGetDeviceQueue2` is decoded during device init, before the ring first
+    /// wraps** — so a caller can gate on `head >= end_offset` (both free-running) to know the host's
+    /// ring thread has dispatched this command, and that stays true for the rest of the run even after
+    /// the ring wraps.
     pub end_offset: usize,
+    /// The `VkDevice` handle (Venus object id) this queue belongs to. Kept so the caller can later
+    /// recognise the matching [`find_destroy_device`] — i.e. close the gate when *this* device is
+    /// destroyed, not some other.
+    pub device_handle: u64,
+    /// The `VkQueue` handle (Venus object id) this call returned — the queue the application submits
+    /// its rendering to. Kept so [`find_queue_submit`] can recognise *this* queue's `vkQueueSubmit`.
+    pub queue_handle: u64,
 }
 
 /// Find the application's `vkGetDeviceQueue2` in a Venus command stream and read its `ring_idx`.
@@ -399,8 +427,9 @@ pub struct GetDeviceQueue2 {
 ///
 /// # Inputs / outputs
 /// - `stream`: a Venus command stream — normally the ring's **linear** command buffer
-///   `&blob[RING_BUFFER_OFFSET..][..applied_tail]` (the session never wraps the ring; the app's queue
-///   is obtained during device init at a tiny `tail`, far below the buffer size — see the design doc).
+///   `&blob[RING_BUFFER_OFFSET..][..applied_tail]`. The app's queue is obtained during device init at a
+///   tiny `tail`, far below the buffer size, so it is decoded before the ring first wraps (see the
+///   design doc — the ring *does* wrap later in the run, but not this early).
 /// - Returns `Some(GetDeviceQueue2)` for the **first** match, or `None` if the command is not present
 ///   (or not yet fully in `stream`). For (c)1's single-queue configuration the first match is the
 ///   app's one queue; multiple queues are out of scope (design doc §6).
@@ -430,12 +459,138 @@ pub fn find_get_device_queue2(stream: &[u8]) -> Option<GetDeviceQueue2> {
             && read_u32_le(stream, offset + TIMELINE_INFO_STYPE_OFFSET)
                 == Some(STYPE_DEVICE_QUEUE_TIMELINE_INFO_MESA);
         if is_match {
-            // All four constants agreed; `ring_idx` at +48 is the value we came for.
+            // All four constants agreed; `ring_idx` at +48 is the value we came for, and the
+            // `VkDevice` handle at +8 identifies the device so its later destroy can be recognised.
             let ring_idx = read_u32_le(stream, offset + RING_IDX_OFFSET)?;
+            let device_handle = read_u64_le(stream, offset + DEVICE_HANDLE_OFFSET)?;
+            let queue_handle =
+                read_u64_le(stream, offset + GET_DEVICE_QUEUE2_QUEUE_HANDLE_OFFSET)?;
             return Some(GetDeviceQueue2 {
                 ring_idx,
                 end_offset: offset + GET_DEVICE_QUEUE2_SIZE,
+                device_handle,
+                queue_handle,
             });
+        }
+        offset += 4;
+    }
+    None
+}
+
+/// `VK_COMMAND_TYPE_vkQueueSubmit_EXT` and `_vkQueueSubmit2_EXT` — the commands that submit rendering
+/// (and, for a readback frame, the copy-to-buffer) to the application's queue. Both encode an
+/// identical fixed prefix; [`find_queue_submit`] matches either. Source: `vn_protocol_driver_defines.h`.
+pub const VK_COMMAND_TYPE_VK_QUEUE_SUBMIT: u32 = 18;
+/// See [`VK_COMMAND_TYPE_VK_QUEUE_SUBMIT`].
+pub const VK_COMMAND_TYPE_VK_QUEUE_SUBMIT2: u32 = 206;
+
+/// Byte offset of `submitCount` (`u32`) within an encoded `vkQueueSubmit`/`vkQueueSubmit2`.
+const QUEUE_SUBMIT_COUNT_OFFSET: usize = 16;
+/// Byte offset of the `pSubmits` array-size marker (`u64`, equal to `submitCount` when non-NULL).
+const QUEUE_SUBMIT_ARRAY_MARKER_OFFSET: usize = 20;
+/// Bytes of a `vkQueueSubmit` prefix this decoder reads (through the array-size marker). The rest of
+/// the command (the per-batch submit infos and the trailing `VkFence`) is variable and not read.
+const QUEUE_SUBMIT_PREFIX_SPAN: usize = QUEUE_SUBMIT_ARRAY_MARKER_OFFSET + 8;
+
+/// Find the **latest** `vkQueueSubmit`/`vkQueueSubmit2` for a specific queue in a Venus command stream.
+///
+/// # Why S needs this — firing the readback fence exactly once the submit is in the ring
+/// The completion fence must be issued *after* the application's own `vkQueueSubmit` has crossed the
+/// ring, or S's fence (via the render-server context-op path, which can overtake the ring thread)
+/// enqueues its empty submit ahead of the application's and ships a torn readback. Watching the ring
+/// merely *drain* is not enough: a synchronous frame's commands arrive in several deltas, so the ring
+/// is transiently drained between them — before the submit delta arrives. Knowing the position of the
+/// latest submit lets S wait until a submit **newer than the last delivered one** is present (and then
+/// dispatched, which a drained ring proves) — a structural signal, not a timing guess. Returning the
+/// *latest* match (not the first) is what makes "newer than last delivered" a simple offset compare.
+///
+/// # The signature
+/// Matches `u32@X ∈ {18, 206}` (submit / submit2 — identical prefix), `u32@X+4 == 0` (async flags),
+/// `u64@X+8 == queue_handle` (this queue), `u32@X+16 == submitCount ≥ 1`, and `u64@X+20 ==
+/// submitCount` (the array-size marker equals the count). The queue handle plus that count/marker
+/// self-consistency makes a coincidental match in unrelated argument bytes vanishingly unlikely — which
+/// matters, because a *false* match that is newer than the real submit would fire the fence early and
+/// tear the frame. Source offsets: `docs/design/2026-07-19-c2-ringidx-decode.md` and Mesa
+/// `vn_protocol_driver_queue.h`.
+///
+/// # Inputs / outputs
+/// - `stream`: a Venus command stream (normally the ring's linear buffer `&blob[RING_BUFFER_OFFSET..]`).
+/// - `queue_handle`: the `VkQueue` id from the latched [`GetDeviceQueue2::queue_handle`].
+/// - Returns `Some(offset)` of the **last** matching submit's first byte (relative to `stream`), or
+///   `None` if no submit for this queue is present. Cannot panic (bounds-checked); 4-byte stride.
+pub fn find_queue_submit(stream: &[u8], queue_handle: u64) -> Option<usize> {
+    let mut latest = None;
+    let mut offset = 0usize;
+    while offset + QUEUE_SUBMIT_PREFIX_SPAN <= stream.len() {
+        let ty = read_u32_le(stream, offset);
+        let submit_count = read_u32_le(stream, offset + QUEUE_SUBMIT_COUNT_OFFSET);
+        let is_match = (ty == Some(VK_COMMAND_TYPE_VK_QUEUE_SUBMIT)
+            || ty == Some(VK_COMMAND_TYPE_VK_QUEUE_SUBMIT2))
+            // Async flags — the guest emits submits fire-and-forget (flags 0) by default.
+            && read_u32_le(stream, offset + 4) == Some(0)
+            // This queue, not another — the decisive discriminator.
+            && read_u64_le(stream, offset + DEVICE_HANDLE_OFFSET) == Some(queue_handle)
+            // A real batch (>= 1) whose array-size marker agrees with the count: a strong internal
+            // consistency check that stray argument bytes will not satisfy.
+            && submit_count.is_some_and(|c| c >= 1)
+            && read_u64_le(stream, offset + QUEUE_SUBMIT_ARRAY_MARKER_OFFSET)
+                == submit_count.map(u64::from);
+        if is_match {
+            // Keep scanning: we want the *latest* submit, so remember this and look for a later one.
+            latest = Some(offset);
+        }
+        offset += 4;
+    }
+    latest
+}
+
+/// Find a `vkDestroyDevice` for a specific device in a Venus command stream.
+///
+/// # Why S needs this — closing the readback gate before the queue disappears
+/// Once the host dispatches `vkDestroyDevice`, the per-queue timeline registered at
+/// `vkGetDeviceQueue2` is gone, and a fence on that `ring_idx` becomes render-server-fatal (it kills
+/// the context → the application `SIGABRT`s). S must therefore stop issuing readback fences the moment
+/// this command appears. Because the application is synchronous, this command only arrives during
+/// teardown, strictly after the last frame has been delivered — so detecting it here (in the message
+/// thread, as the delta is applied, *before* the doorbell that lets the host dispatch it) closes the
+/// gate with no fence ever racing the queue's destruction. See
+/// `docs/design/2026-07-19-c2-ringidx-decode.md` §7.
+///
+/// # The signature
+/// Matches `u32@X == 12` (`vkDestroyDevice_EXT`), `u32@X+4 == 0` (async flags), and
+/// `u64@X+8 == device_handle` — the **same device** whose queue was latched. Requiring the specific
+/// device handle (rather than the type alone) is what keeps this from firing on unrelated argument
+/// bytes that merely start with a `12`. The command's `pAllocator` tail is not read, so a match holds
+/// whether or not the application passed an allocator.
+///
+/// # Inputs / outputs
+/// - `stream`: a Venus command stream (normally the ring's linear buffer `&blob[RING_BUFFER_OFFSET..]`);
+///   only *presence* is used (there is one destroy per session), so a wrapped buffer is fine.
+/// - `device_handle`: the `VkDevice` id from the latched [`GetDeviceQueue2::device_handle`].
+/// - Returns `Some(offset)` of the first match (the command's first byte, relative to `stream`), or
+///   `None` if this device's `vkDestroyDevice` is not present.
+///
+/// # Failure modes / pitfalls
+/// Cannot panic: bounds-checked, and a candidate too close to the end to hold the 16 read bytes is
+/// skipped. Scans on a 4-byte stride, like [`find_get_device_queue2`], for the same alignment reason.
+/// A false *positive* (matching non-destroy bytes) would close the gate early and, on the next real
+/// readback, wedge — but the type + async-flags + exact-device-handle triple makes that vanishingly
+/// unlikely, and the caller's registration deadline turns even that into a loud session end rather
+/// than a silent hang. A false *negative* (missing a real destroy) is the dangerous direction — it
+/// re-admits the fatal teardown fence — so the signature is kept minimal and exact rather than
+/// over-constrained.
+pub fn find_destroy_device(stream: &[u8], device_handle: u64) -> Option<usize> {
+    // The bytes this reads span `[offset, offset + 16)` — type (4) + flags (4) + device (8).
+    const READ_SPAN: usize = DEVICE_HANDLE_OFFSET + 8;
+    let mut offset = 0usize;
+    while offset + READ_SPAN <= stream.len() {
+        let is_match = read_u32_le(stream, offset) == Some(VK_COMMAND_TYPE_VK_DESTROY_DEVICE)
+            // Async command flags: `vkDestroyDevice` is void, emitted `vn_async_*`, so flags == 0.
+            && read_u32_le(stream, offset + 4) == Some(0)
+            // The decisive discriminator: this must be *this* device's destroy, not a stray `12`.
+            && read_u64_le(stream, offset + DEVICE_HANDLE_OFFSET) == Some(device_handle);
+        if is_match {
+            return Some(offset);
         }
         offset += 4;
     }
