@@ -484,6 +484,10 @@ pub const VK_COMMAND_TYPE_VK_QUEUE_SUBMIT: u32 = 18;
 /// See [`VK_COMMAND_TYPE_VK_QUEUE_SUBMIT`].
 pub const VK_COMMAND_TYPE_VK_QUEUE_SUBMIT2: u32 = 206;
 
+/// Byte offset of the `VkQueue` handle (`u64`) — the submit's first argument, right after the prologue.
+/// Numerically the same 8 as the device handle in device-first commands, but named for its own command
+/// so the read in [`find_queue_submit`] is not misread as touching a *device* handle.
+const QUEUE_SUBMIT_QUEUE_HANDLE_OFFSET: usize = 8;
 /// Byte offset of `submitCount` (`u32`) within an encoded `vkQueueSubmit`/`vkQueueSubmit2`.
 const QUEUE_SUBMIT_COUNT_OFFSET: usize = 16;
 /// Byte offset of the `pSubmits` array-size marker (`u64`, equal to `submitCount` when non-NULL).
@@ -504,14 +508,23 @@ const QUEUE_SUBMIT_PREFIX_SPAN: usize = QUEUE_SUBMIT_ARRAY_MARKER_OFFSET + 8;
 /// dispatched, which a drained ring proves) — a structural signal, not a timing guess. Returning the
 /// *latest* match (not the first) is what makes "newer than last delivered" a simple offset compare.
 ///
-/// # The signature
+/// # The signature, and where its entropy actually comes from
 /// Matches `u32@X ∈ {18, 206}` (submit / submit2 — identical prefix), `u32@X+4 == 0` (async flags),
 /// `u64@X+8 == queue_handle` (this queue), `u32@X+16 == submitCount ≥ 1`, and `u64@X+20 ==
-/// submitCount` (the array-size marker equals the count). The queue handle plus that count/marker
-/// self-consistency makes a coincidental match in unrelated argument bytes vanishingly unlikely — which
-/// matters, because a *false* match that is newer than the real submit would fire the fence early and
-/// tear the frame. Source offsets: `docs/design/2026-07-19-c2-ringidx-decode.md` and Mesa
-/// `vn_protocol_driver_queue.h`.
+/// submitCount` (the array-size marker equals the count). Venus object ids are small sequential
+/// integers (e.g. queue handle 5), and `flags == 0` is ubiquitous, so the **load-bearing**
+/// discriminator is the `submitCount == array-marker` self-consistency: two adjacent fields, one `u32`
+/// and one `u64`, that must agree *and* be ≥ 1 — a shape stray argument bytes essentially never take.
+/// This matters because a false match newer than the real submit would fire the fence early and tear
+/// the frame; the caller further limits exposure by only ever scanning each delta's **new** bytes once
+/// (never re-scanning the buffer). Source offsets: `docs/design/2026-07-19-c2-ringidx-decode.md` §8 and
+/// Mesa `vn_protocol_driver_queue.h`.
+///
+/// # Scope assumption (single submit per readback frame)
+/// The caller treats the latest submit as *this frame's readback submit*. That holds when a frame's
+/// render + readback copy ride **one** `vkQueueSubmit` (the pinned fixtures). An app that split them
+/// into two submits could have the render submit satisfy the trigger before the copy submit arrives —
+/// out of scope here, alongside the single-queue restriction.
 ///
 /// # Inputs / outputs
 /// - `stream`: a Venus command stream (normally the ring's linear buffer `&blob[RING_BUFFER_OFFSET..]`).
@@ -528,8 +541,8 @@ pub fn find_queue_submit(stream: &[u8], queue_handle: u64) -> Option<usize> {
             || ty == Some(VK_COMMAND_TYPE_VK_QUEUE_SUBMIT2))
             // Async flags — the guest emits submits fire-and-forget (flags 0) by default.
             && read_u32_le(stream, offset + 4) == Some(0)
-            // This queue, not another — the decisive discriminator.
-            && read_u64_le(stream, offset + DEVICE_HANDLE_OFFSET) == Some(queue_handle)
+            // This queue, not another.
+            && read_u64_le(stream, offset + QUEUE_SUBMIT_QUEUE_HANDLE_OFFSET) == Some(queue_handle)
             // A real batch (>= 1) whose array-size marker agrees with the count: a strong internal
             // consistency check that stray argument bytes will not satisfy.
             && submit_count.is_some_and(|c| c >= 1)

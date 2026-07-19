@@ -157,18 +157,25 @@ async flags 0, and the **same `VkDevice` handle** the `vkGetDeviceQueue2` carrie
 less-likely — rests on two facts:
 
 1. **The application is synchronous**, so `vkDestroyDevice` is emitted strictly *after* the last
-   frame's readback has been delivered and the app released. There is never a live readback fence
-   in flight when the destroy arrives.
-2. **The gate is closed in the message thread, as the destroy delta is applied, before the doorbell**
-   that lets the host's ring thread dispatch those very bytes. So by the time the host *can* free the
-   queue, S has already stopped issuing fences on it (`retirement_ring_idx` returns `None`). No fence
-   can be created after the queue becomes freeable.
+   frame's readback has been delivered and the app released — and the fence trigger (§8) only ever
+   fires on a *new* `vkQueueSubmit`, which the destroy delta does not carry. So the destroy never
+   arms a fence, whatever the host does with the queue.
+2. **`Applier::queue` is cleared in the message thread, under the applier lock, as the destroy delta
+   is applied.** The progress thread must take that same lock to read `retirement_ring_idx`, so it
+   observes the clear atomically: it never reads `queue = Some` in the same critical section in which
+   the host could already have freed the queue. (Note the weaker fact that this is *not* strictly
+   "before the doorbell": `apply_delta` publishes `tail` with `Release` before the clear runs, so a
+   ring thread already busy-polling could dispatch the destroy before the explicit `vkNotifyRingMESA`.
+   The safety rests on the under-lock clear and fact #1, not on doorbell ordering.)
 
-A false *positive* on the destroy signature would close the gate early and wedge the next readback —
-but the type + async-flags + exact-device-handle triple, matched only while a queue is latched, makes
-that vanishingly unlikely, and the `QUEUE_REGISTER_DEADLINE` turns even that into a loud session end
-rather than a silent hang. A false *negative* (missing a real destroy) is the dangerous direction — it
-re-admits the fatal fence — so the signature is kept minimal and exact.
+A false *positive* on the destroy signature would close the gate early and wedge the next readback.
+The type + async-flags + exact-device-handle triple is not high-entropy on its own (Venus object ids
+are small integers), so the real protection is that the scan reads **only each delta's new bytes,
+once** (never the whole wrapped buffer repeatedly) and only while a queue is latched — a tiny aliasing
+surface — and that a stuck delivery ends the session loudly via `QUEUE_REGISTER_DEADLINE` rather than
+hanging. A false *negative* (missing a real destroy) is the dangerous direction — it re-admits the
+fatal fence — so the signature is kept minimal, and the destroy sits in one delta (deltas end at
+command boundaries, so it is never split).
 
 ## 8. The tearing race, and gating the fence on the GPU write
 

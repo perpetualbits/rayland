@@ -333,21 +333,31 @@ fn progress_thread(applier: Arc<Mutex<Applier>>, mut engine: EngineClient, tx: A
                 // Remember which submit we just delivered, so only a *newer* one triggers the next fence.
                 last_delivered_submit = latest_submit;
             }
-            // else: a new submit is dispatched but the queue is not fencing-ready — not registered yet,
-            // or already destroyed at teardown (`retirement_ring_idx` is `None`). Do not fence; the
-            // deadline guard below ends the session if this persists.
+            // else: a new submit is dispatched but the queue is not fencing-ready — handled just below.
+        }
+
+        // No registered queue to fence on (`retirement_ring_idx` is `None`) means either the queue is
+        // not yet registered — during init, where a retirement carries no readback — or it has already
+        // been destroyed at teardown. Either way there is no readback we could deliver, so drop the
+        // pending delivery rather than let it spin to the deadline and print a misleading
+        // "unsupported configuration" line on an otherwise clean shutdown. This never drops a
+        // deliverable readback: a real frame's readback only becomes pending once its queue is
+        // registered (its commands retire far past the early `vkGetDeviceQueue2`).
+        if delivery_pending && ring_idx.is_none() {
+            delivery_pending = false;
+            pending_since = None;
         }
 
         if delivery_pending && pending_since.is_some_and(|t| t.elapsed() > QUEUE_REGISTER_DEADLINE) {
-            // The delivery has been stuck past the deadline: no new submit was dispatched with a
-            // registered queue — the app's `vkGetDeviceQueue2`/`vkQueueSubmit` was never decoded (an
-            // unsupported app/config, see `QUEUE_REGISTER_DEADLINE`), or the host ring thread wedged.
-            // Leaving `delivery_pending` set would spin here forever while the application hangs in
-            // `vkWaitForFences`; end the session loudly instead.
+            // Stuck past the deadline *with a registered queue* (the `ring_idx.is_none()` drop above did
+            // not fire): a frame's commands retired, but no `vkQueueSubmit` newer than the last
+            // delivered was ever dispatched — the host ring thread wedged, or an unsupported app never
+            // issued one. Leaving `delivery_pending` set would spin forever while the application hangs
+            // in `vkWaitForFences`; end the session loudly instead.
             eprintln!(
                 "rayland-s: a pending readback could not be completed within {QUEUE_REGISTER_DEADLINE:?} \
-                 (no new queue submit was dispatched on a registered queue); ending the session. (This \
-                 walking skeleton supports the single-queue Venus configuration only.)"
+                 (no new queue submit was dispatched on the registered queue); ending the session. \
+                 (This walking skeleton supports the single-queue Venus configuration only.)"
             );
             return;
         }

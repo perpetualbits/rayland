@@ -344,7 +344,7 @@ struct QueueRegistration {
     /// of [`Applier::apply`], which clears `Applier::queue` on that command.
     device_handle: u64,
     /// The `VkQueue` handle the application submits to. Used to recognise *this* queue's
-    /// `vkQueueSubmit` (see [`Applier::submit_seen`] / [`find_queue_submit`]), so the readback fence
+    /// `vkQueueSubmit` (see [`Applier::latest_submit_pos`] / [`find_queue_submit`]), so the readback fence
     /// fires only after a real submit has crossed the ring — never on a between-deltas transient drain.
     queue_handle: u64,
 }
@@ -679,42 +679,30 @@ impl Applier {
                     &format!("side=S res={ring_res_id} tail={tail} bytes={}", bytes.len()),
                 );
 
-                // **(c)2 completion barrier — the app's queue lifecycle.** The readback fence must be
-                // issued on the app's real per-queue `ring_idx` (`ring_idx = 0` fences no GPU work),
-                // and *only while that queue is alive on the host* — a fence on a freed queue is
-                // render-server-fatal. So this watches the queue's two lifecycle events on the ring:
-                // its birth (`vkGetDeviceQueue2`, which carries the `ring_idx`) and its death
-                // (`vkDestroyDevice`). See `docs/design/2026-07-19-c2-ringidx-decode.md` §7.
-                //
-                // Both are decided **here, in the message thread, as the delta is applied** — before
-                // the doorbell below lets the host's ring thread dispatch these very bytes. Closing the
-                // gate on `vkDestroyDevice` before that doorbell is what guarantees no readback fence
-                // can ever race the queue's destruction: by the time the host can free the queue, S has
-                // already stopped issuing fences on it.
-                //
-                // These two scans read the ring's circular buffer, and the ring **does** wrap mid-run —
-                // but neither needs a byte's *position*, only its *presence*, so a wrapped buffer is
-                // fine. `vkGetDeviceQueue2` is found once, during device init before any wrap. There is
-                // exactly one `vkDestroyDevice` per session, so finding it *anywhere* in the buffer at
-                // teardown closes the gate correctly regardless of where the wrap left it (the fence
-                // trigger, which *does* need positions, uses free-running counters instead — see the
-                // submit scan below). `buf_end` is clamped to the mapping so a hostile or wrapped
-                // `applied_tail` (a free-running counter `apply_delta` permits) can only make the scan
-                // read stale bytes, never index out of bounds — and a false match would need the full
-                // signature to coincide, which it will not.
-                let buf_end = (RING_BUFFER_OFFSET + mirror.applied_tail() as usize)
-                    .min(blob.size() as usize);
-                if buf_end > RING_BUFFER_OFFSET {
-                    let stream = &blob.bytes()[RING_BUFFER_OFFSET..buf_end];
-                    match self.queue {
-                        // Not yet latched: watch for the queue's birth.
-                        None => {
+                // **(c)2 completion barrier — the app's queue lifecycle, decoded from the ring.** The
+                // readback fence must be issued on the app's real per-queue `ring_idx` (`ring_idx = 0`
+                // fences no GPU work), and *only while that queue is alive on the host* — a fence on a
+                // freed queue is render-server-fatal. So S watches the queue's lifecycle events: its
+                // birth (`vkGetDeviceQueue2`, carrying the `ring_idx`), its death (`vkDestroyDevice`,
+                // which closes the gate), and each `vkQueueSubmit` (which arms the fence trigger). All
+                // decided **here, in the message thread, as the delta is applied.** See
+                // `docs/design/2026-07-19-c2-ringidx-decode.md` §7–§8.
+                match self.queue {
+                    // Not yet latched: watch for the queue's birth. `vkGetDeviceQueue2` is emitted
+                    // during device init at a tiny `tail`, before the ring first wraps, and has a
+                    // four-magic-word signature, so scanning the linear buffer `[0, applied_tail)` for
+                    // it — once, until latched — is both cheap and false-positive-proof. `buf_end` is
+                    // clamped to the mapping so a wrapped/hostile `applied_tail` can only read stale
+                    // bytes, never index out of bounds.
+                    None => {
+                        let buf_end = (RING_BUFFER_OFFSET + mirror.applied_tail() as usize)
+                            .min(blob.size() as usize);
+                        if buf_end > RING_BUFFER_OFFSET {
+                            let stream = &blob.bytes()[RING_BUFFER_OFFSET..buf_end];
                             if let Some(found) = find_get_device_queue2(stream) {
-                                // `found.end_offset` is relative to the buffer start; because
-                                // `vkGetDeviceQueue2` is decoded during device init, before the ring
-                                // first wraps, that offset equals its free-running ring position — so it
-                                // stays directly comparable against the free-running `head` in
-                                // `retirement_ring_idx` for the rest of the run.
+                                // `found.end_offset` is a buffer offset that (pre-wrap) equals the
+                                // command's free-running ring position — so it stays comparable against
+                                // the free-running `head` in `retirement_ring_idx` for the whole run.
                                 self.queue = Some(QueueRegistration {
                                     ring_res_id,
                                     ring_idx: found.ring_idx,
@@ -730,37 +718,32 @@ impl Applier {
                                 );
                             }
                         }
-                        // Latched: watch for *this device's* destroy, and close the gate on it. From
-                        // here `retirement_ring_idx` returns `None`, so no further fence is issued —
-                        // exactly the fences that would otherwise hit the freed queue at teardown. A
-                        // full re-scan each delta is used (not an incremental cursor): it is simple and
-                        // reliably catches the command wherever it lands, and its cost no longer affects
-                        // frame correctness now that the fence is gated on the GPU-write fingerprint
-                        // (see `progress_thread`), not on scan timing.
-                        Some(q) => {
-                            if let Some(off) = find_destroy_device(stream, q.device_handle) {
-                                self.queue = None;
-                                eprintln!(
-                                    "rayland-s: application destroyed its device (vkDestroyDevice at \
-                                     ring offset {off}); retiring the readback gate for ring_idx={} \
-                                     so no fence can race the queue's destruction",
-                                    q.ring_idx
-                                );
-                            }
-                        }
                     }
-                }
-
-                // **(c)2 fence trigger — record this frame's `vkQueueSubmit` position.** Scan the
-                // delta's own bytes (linear and un-wrapped, unlike the circular ring buffer) for the
-                // app's queue submit, and remember its **free-running** position. This is what
-                // `progress_thread` compares against the last delivered submit to fire the readback
-                // fence for a new frame — and doing it from the delta stream is why it survives the
-                // ring wrapping mid-run. `bytes` spans free-running `[tail - bytes.len(), tail)`.
-                if let Some(q) = self.queue {
-                    if let Some(off) = find_queue_submit(&bytes, q.queue_handle) {
-                        let frontier_before = tail.wrapping_sub(bytes.len() as u32);
-                        self.latest_submit_pos = Some(frontier_before.wrapping_add(off as u32));
+                    // Latched: scan **this delta's bytes** (never the circular buffer) for the queue's
+                    // destroy or a new submit. Scanning the delta — linear, un-wrapped, and read once —
+                    // rather than re-scanning the whole wrapped buffer every delta is what makes both
+                    // wrap-safe *and* keeps their (low-entropy) signatures off a large aliasing surface:
+                    // each byte is inspected exactly once, when it first arrives. Deltas end at command
+                    // boundaries (fundamental to the relay), so neither command is ever split.
+                    Some(q) => {
+                        if find_destroy_device(&bytes, q.device_handle).is_some() {
+                            // The app destroyed its device: close the gate. From here
+                            // `retirement_ring_idx` returns `None`, so no further fence is issued —
+                            // exactly the fences that would otherwise hit the freed queue at teardown.
+                            self.queue = None;
+                            eprintln!(
+                                "rayland-s: application destroyed its device (vkDestroyDevice for \
+                                 device {}); retiring the readback gate for ring_idx={} so no fence \
+                                 can race the queue's destruction",
+                                q.device_handle, q.ring_idx
+                            );
+                        } else if let Some(off) = find_queue_submit(&bytes, q.queue_handle) {
+                            // A new frame's submit: record its **free-running** position, which
+                            // `progress_thread` compares against the last delivered to fire the fence.
+                            // `bytes` spans free-running `[tail - bytes.len(), tail)`.
+                            let frontier_before = tail.wrapping_sub(bytes.len() as u32);
+                            self.latest_submit_pos = Some(frontier_before.wrapping_add(off as u32));
+                        }
                     }
                 }
 
