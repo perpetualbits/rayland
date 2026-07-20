@@ -135,3 +135,43 @@ before the fence).
 - **Cap coordinate correctness across ring wrap.** `latest_submit_pos` and `head` are free-running and the
   ring wraps mid-run (~frame 82); the `min` must be in free-running space, never masked buffer offsets.
   The readback fence already relies on this invariant, so the plan reuses it rather than re-deriving it.
+
+## Outcome (2026-07-20): Direction A regressed — the fence is the real blocker
+
+**Direction A was built, code-reviewed (incl. an opus review of the release logic), and it made the
+residual WORSE, not better.** Over the real network the release-ordering fix produced ~3 stale
+frames/run (16 over 5 runs, all the same `N == N−1` whole-frame signature), versus ~1/11 with the
+landed gate alone. It was not merged.
+
+**Root cause (evidence, not reasoning).** The step-2 *empty* state (`take_app_blob_writes` returns
+nothing after `wait_for_work_retired`) is **ambiguous** between two cases that need **opposite** head
+actions:
+
+- a **copy submit** — must have its head **released** (the app's upload fence-wait is head-based:
+  removing the empty-path release → immediate **deadlock + SIGABRT, 119/120 missing**);
+- a **draw whose readback DMA has not yet landed** — must have its head **held** (releasing → the app
+  reads its stale local `res6` → the `N−1` stale frame).
+
+The two are indistinguishable in the empty state, and the enabler is that **the completion fence does
+not reliably guarantee the readback is visible when it retires.** This is the *same* `T2 < T4` gap
+documented in `2026-07-17-return-path-completion.md` §8 and fought in `2026-07-19-c2-ringidx-decode.md`
+§8: the fence is an empty `vkQueueSubmit(queue, 0, NULL, fence)` reaching virglrenderer over the
+render-server's context-op socket, a path that can overtake the ring thread; the submit-dispatch
+trigger reduced this to a rare residual on loopback but not over a real link. So `spec §5`'s
+"post-fence empty is safe to release" is **false in practice** — a small fraction of empty-after-fence
+polls are draw-DMA-pending, and Direction A's ~2000 empty-path releases/run turn that small fraction
+into several stale frames. (It is timing-sensitive: adding per-poll logging on S slows it enough that
+the DMA always lands first, hiding the defect — a Heisenbug that confirms the diagnosis.)
+
+**What "rethink from the fence" concludes.** Making "empty" unambiguous requires the fence to reliably
+wait for `T4` (readback complete and host-visible). The current virglrenderer context-fence path
+cannot promise that over a real network, and §8 already found the content-based completion signals
+(fingerprint/stability polling) to be a nest of races. A reliable fix therefore needs either a
+careful, race-free content-stability completion signal, or a virglrenderer-level guarantee that the
+context fence FIFO-follows the app's submit and covers the readback DMA — a substantial research
+effort, not a small change.
+
+**Status: Direction A is a dead end as designed.** The landed readback-completion gate
+(`2026-07-19-c2-readback-completion-gate.md`) remains the shipped state (10/11 runs clean, on `main`,
+pushed). The next attempt should start from this fence finding rather than from the release-ordering
+idea.
