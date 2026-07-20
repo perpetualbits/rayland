@@ -47,6 +47,8 @@
 pub mod apply;
 // S's writable view of a blob resource's shared pages.
 pub mod blob;
+// The readback-completion gate: when a pending readback delivery may complete.
+pub mod delivery;
 // Putting the frame on S's display — and the one question (c)1 must ask that spec §7.2 forbids.
 pub mod present;
 // S's side of the command ring: where C's relayed bytes are laid down for virglrenderer to find.
