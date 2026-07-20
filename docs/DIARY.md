@@ -289,3 +289,67 @@ puts `vkWaitForFences` inline in the ring (where a byte-scan like `find_queue_su
 out-of-line execute stream. Submit is inline — the scan works today — so the prior is good, but the wait
 must be confirmed against Mesa's `vn_ring`/`vn_cs_encoder` before building. Spec written
 (`docs/design/2026-07-21-c2-waitdrain-completion.md`); that read is the first task of the plan.
+
+### 2026-07-21 — The gate fired: venus polls, it does not wait
+
+The first task of the plan was a gate: confirm the application's `vkWaitForFences` is carried inline in
+the ring, since the whole wait-drain design rested on the ring thread *blocking* in it. It is not, and
+the design's premise is simply false. A one-run scan found zero `vkWaitForFences` (command type 39) in the
+deltas, and Mesa's own source said why: `vn_WaitForFences` (`vn_queue.c`) does not send a wait command at
+all — it **polls** `vkGetFenceStatus` in a relax-backoff loop until the fence reads signalled. With fence
+feedback off — our only real-network config — that poll round-trips the ring as `vkGetFenceStatus`
+(type 38); the async `vkWaitForFences` (type 39) is emitted only when feedback is *on*. So there is no
+blocking host-side wait whose drain I could key on. The design I wrote a spec and a plan for cannot work
+as written.
+
+Two feelings, both worth recording honestly. The first is that this stings — I read `vkr_dispatch_vkWaitForFences`
+on the host side (it *does* block), verified the fixture calls `wait_for_fences`, and reasoned a clean
+mechanism from those two true facts without checking the one link between them: whether the guest ever
+*sends* the command. It does not. Same shape of error as the FIFO argument earlier this session — a chain
+of correct local facts assembled into a wrong conclusion because one joint went unverified.
+
+The second feeling is the one that matters: **this is the process working exactly as designed.** The gate
+existed precisely because this premise was the plan's one unproven assumption, and it was placed first, and
+cheap, so a wrong answer would cost one run and one reverted scan rather than four built-and-reviewed tasks
+undone. It caught the error at the cheapest possible moment. That the plan's author (me) was confident and
+wrong is not the failure; shipping that confidence into code unchecked would have been. Nothing was built
+on the false premise, and the branch has no commits to unwind.
+
+What survives is better than what died. There *is* a real completion signal in the ring — a
+`vkGetFenceStatus` whose reply is `VK_SUCCESS`, which the app is polling for and which fires exactly when
+the fence signals and `res6` is complete. The spirit of the fix (key on a real in-ring completion signal,
+order pixels before the release) is intact; only the signal's identity changed, from a blocking wait to a
+polled status reply. The next decision — how to detect that reply, and how much complexity it is worth
+versus a simpler content-ordering or a bounded fallback — is the human's to weigh, so I am stopping here
+rather than picking one unilaterally.
+
+### 2026-07-21 — G-lite: the ordering was right, the missing barrier was the problem
+
+Tried the cheap first thing: ship the readback `res6` ahead of the head-advance that releases the
+application, gated by a cheap fingerprint so a new frame is shipped the moment it appears. Two lessons,
+one painful and one clarifying.
+
+The painful one: a wholesale rewrite of the progress thread broke *initialization* — every run reported
+120/120 "stale", which turned out to mean the application never rendered a frame at all
+(`VK_ERROR_INITIALIZATION_FAILED`). The res6 shipping was innocent (it never fired during init); the
+culprit was that I also restructured how the reply arena and ring-progress are shipped — combining their
+reads into one lock and shipping unconditionally every poll instead of in the old progress-gated
+lockstep. The init handshake depends on that lockstep. A control run of the committed code rendered
+cleanly, which localized the break to my change; reverting just the venus/progress handling to old-style
+restored rendering. The lesson is blunt: the progress thread's reply/head cadence is load-bearing for
+init, and it is not the thing to casually rewrite.
+
+The clarifying one: once init worked, res6-first shipping *did* fix the residual it was meant to — across
+a batch, **zero** whole-previous (`N−1`) frames, where before that was the entire defect. But it traded
+one failure for another: ~4 frames per run came back **torn** — matching no native frame at all — because
+without any completion barrier the fingerprint fires at the *start* of the copy DMA and ships a
+half-written buffer. The committed gate never tore because its (weak) fence plus once-per-frame sampling
+happened to sample `res6` away from mid-copy; G-lite's eager every-poll detection samples right into it.
+
+So the shape of the real fix is now clear and it is not either-or: it needs the res6-first **ordering**
+(which demonstrably kills the `N−1` residual) **and** a completion barrier so only a *whole* frame ships.
+The barrier is the one the earlier gate result already handed us — the `vkGetFenceStatus` reply reading
+`VK_SUCCESS`, which the application is polling for and which the host writes exactly when the fence
+signals and the copy is complete. That is G': couple the res6 ship to that reply. It costs a reply-arena
+decode, but it is the first candidate that satisfies both constraints at once. Reporting up before
+building it, since G-lite was the agreed cheap-first bet and it has now been settled.

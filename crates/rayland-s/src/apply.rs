@@ -1297,19 +1297,21 @@ impl Applier {
         self.emit_blob_writes(&ids)
     }
 
-    /// **(c)2 throwaway fence-probe, 2026-07-20:** read-only fingerprint of the **readback buffer**,
-    /// i.e. the largest non-ring, non-Venus-internal blob — the exact blob [`Self::take_app_blob_writes`]
-    /// ships first. Distinct from that method in two load-bearing ways: it takes `&self` and **never
-    /// touches the shadow**, so calling it does not consume/adopt any pending write, and it returns the
-    /// raw current content fingerprint rather than a diff.
+    /// **(c)2 return-path change-detector:** read-only fingerprint of the **readback buffer**, i.e. the
+    /// largest non-ring, non-Venus-internal blob — the exact blob [`Self::take_app_blob_writes`] ships
+    /// first. Distinct from that method in two load-bearing ways: it takes `&self` and **never touches
+    /// the shadow**, so calling it does not consume/adopt any pending write, and it returns the raw
+    /// current content fingerprint rather than a diff.
     ///
     /// # Why it exists
-    /// To settle whether the current real-`ring_idx` completion fence actually covers the readback DMA
-    /// (H1 vs H2 in `docs/DIARY.md`, 2026-07-20). The progress thread samples this at each pending
-    /// fence-poll; if `res6`'s fingerprint changes across two consecutive *empty* polls **without a new
-    /// `vkQueueSubmit` crossing the ring**, the fence retired before the DMA landed (`T2 < T4` is still
-    /// real with today's fence). If it only ever changes when `latest_submit_pos` advances, the fence is
-    /// sound and the residual lives on the C-side release ordering. Delete once that is answered.
+    /// The progress thread must ship a finished readback frame *before* the head-advance that releases
+    /// the application onto it (see `progress_thread`'s docs). To decide *whether* a new frame exists on
+    /// each 200 µs poll without paying the full ~1 MiB diff every time — which would starve the message
+    /// thread — it calls this cheap strided fingerprint and runs the authoritative
+    /// [`Self::take_app_blob_writes`] only when the fingerprint moved. The strided sample can in
+    /// principle miss a change that lands entirely between its samples, so it is a *gate* on the diff,
+    /// never a substitute for it; for a frame-scale change (a spinning object over a mostly-constant
+    /// background) ~4096 samples detect every frame in practice.
     ///
     /// # Inputs / outputs
     /// - Returns `Some((res_id, size, fingerprint))` for the largest such blob, or `None` if the session
@@ -1328,14 +1330,14 @@ impl Applier {
             .map(|(&id, blob)| (id, blob.size(), Self::sampled_fp(blob.bytes())))
     }
 
-    /// **(c)2 throwaway fence-probe helper, 2026-07-20:** a near-zero-cost content fingerprint that
-    /// reads only ~64 evenly-spaced 8-byte words rather than one byte per cache line. It exists purely
-    /// so [`Self::readback_probe`] can run under the applier lock ~20×/frame **without perturbing the
-    /// return-path timing** — the full `trace::fingerprint` (16k iterations over a 1 MiB blob, ~25 µs
-    /// under the lock) demonstrably starved the message thread and inflated the very defect being
-    /// measured (the classic Heisenbug this project has been bitten by). A whole-frame `N` vs `N−1`
-    /// readback differs across essentially every pixel, so ~64 samples detect the change reliably; this
-    /// is a change-detector, not a hash against adversarial collisions. Delete with the probe.
+    /// **(c)2 return-path change-detector helper:** a near-zero-cost content fingerprint that reads
+    /// ~4096 evenly-spaced 8-byte words rather than one byte per cache line. It exists so
+    /// [`Self::readback_probe`] can run under the applier lock on every 200 µs poll **without perturbing
+    /// the return-path timing** — the full `trace::fingerprint` (16k iterations over a 1 MiB blob, ~25 µs
+    /// under the lock) starves the message thread (the classic Heisenbug this project has been bitten
+    /// by). A whole-frame `N` vs `N−1` readback differs across essentially every pixel, so a few thousand
+    /// samples detect the change reliably; this is a change-detector, not a hash against adversarial
+    /// collisions.
     fn sampled_fp(bytes: &[u8]) -> u64 {
         const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
         const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
