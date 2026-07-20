@@ -50,7 +50,12 @@ scp -q "$BIN/rayland-c" "$BIN/rayland-icosa-cpu" "$C_HOST:/tmp/"
 ssh "$C_HOST" 'chmod +x /tmp/rayland-c /tmp/rayland-icosa-cpu'
 
 S_PID=""
-cleanup() { [ -n "$S_PID" ] && kill "$S_PID" 2>/dev/null || true; ssh "$C_HOST" 'pkill -f /tmp/rayland-c; pkill -f /tmp/rayland-icosa-cpu' 2>/dev/null || true; }
+# Kill only by exact PID — the local rayland-s by the PID we captured, and the remote C-side by the
+# PIDs it wrote to /tmp on launch. Never `pkill`/pattern: a pattern kill can match unrelated processes.
+cleanup() {
+  [ -n "$S_PID" ] && kill "$S_PID" 2>/dev/null || true
+  ssh "$C_HOST" 'for p in /tmp/rayland-c.pid /tmp/rayland-app.pid; do kill "$(cat "$p" 2>/dev/null)" 2>/dev/null || true; done' 2>/dev/null || true
+}
 trap cleanup EXIT
 
 total_stale=0
@@ -61,10 +66,13 @@ for run in $(seq 1 "$RUNS"); do
   kill -0 "$S_PID" 2>/dev/null || { echo "rayland-s died:"; cat "/tmp/rayland-s-c2-$run.log"; exit 1; }
   ssh "$C_HOST" "
     RAYLAND_C1_S_ADDR=$S_IP:$PORT RAYLAND_C1_SOCKET=$SOCK nohup /tmp/rayland-c >/tmp/rayland-c-icosa.log 2>&1 &
+    echo \$! > /tmp/rayland-c.pid
     sleep 3
     VN_DEBUG=vtest VN_PERF=no_multi_ring,no_fence_feedback,no_semaphore_feedback,no_event_feedback,no_query_feedback \
     VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/virtio_icd.json VTEST_SOCKET_NAME=$SOCK \
-    env -u VK_LOADER_DRIVERS_SELECT /tmp/rayland-icosa-cpu /tmp/icosa-relay >/dev/null 2>&1 || echo APP_EXIT_NONZERO
+    env -u VK_LOADER_DRIVERS_SELECT /tmp/rayland-icosa-cpu /tmp/icosa-relay >/dev/null 2>&1 &
+    app_pid=\$!; echo \$app_pid > /tmp/rayland-app.pid
+    wait \$app_pid || echo APP_EXIT_NONZERO
   "
   sleep 1
   rm -rf /tmp/icosa-relay && scp -q -r "$C_HOST:/tmp/icosa-relay" /tmp/icosa-relay
