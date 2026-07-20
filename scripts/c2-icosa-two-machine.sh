@@ -18,6 +18,14 @@
 #
 # WHY no VN_DEBUG=no_abort (do not add it): Mesa's ~3.5s stall-abort is the stall detector.
 #
+# EXPECTED RESULT TODAY (read before treating a non-zero exit as a regression): the readback-
+#   completion gate is a *measured partial fix*. It takes the rate from most-runs-losing-1-4-frames
+#   to ~10/11 runs fully clean, but a ~1/11 residual of the same N==N-1 signature REMAINS — the
+#   design's §9 C-side release race (the RingProgress head-advance releases the app before the gated
+#   readback delivery lands on C). So an occasional `FAIL` here is the KNOWN §9 residual, not a new
+#   break; the fix for it is a separate return-path-ordering change. See
+#   docs/design/2026-07-19-c2-readback-completion-gate.md §9.
+#
 # Usage:  scripts/c2-icosa-two-machine.sh [RUNS]     # default 10 runs; exits non-zero on any stale frame
 set -euo pipefail
 
