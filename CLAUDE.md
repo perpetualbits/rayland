@@ -67,6 +67,26 @@ Wayland/Vulkan/GPU-remoting — must painstakingly verify **every line** for cor
 - **Never omit information for the sake of brevity.** Be clear *and* complete; if a
   concept needs 300 words to be understood correctly, use them.
 
+## The development diary (keep it, every working turn)
+
+[`docs/DIARY.md`](docs/DIARY.md) is the **story** of Rayland — the reasoning as it actually
+unfolded, including the wrong turns. It is deliberately **not** a commit log (git has that) and
+**not** a status report (the design docs and this file carry the current truth). Its purpose is
+twofold and both halves matter: it is a **map for whoever tries the idea again** if Rayland fails
+(a dead end that is *understood* is worth more than a green test whose reason nobody wrote down),
+and it is **trust-material** for software written by an AI under human supervision — trust that
+cannot be asserted, only earned by showing the work honestly, mistakes included.
+
+The binding rule: **on every working turn, add an entry** to the `## Entries` section of
+`docs/DIARY.md`, dated, in the project's own voice. An entry records the *thinking* — what we were
+unsure of, what we tried, what surprised us, what we now believe and how confident we are — not the
+diff. A turn that is purely conversational (a question answered, nothing built or decided) needs no
+entry; a turn that plans, builds, debugs, decides, or learns something does. **Tell it straight:**
+record uncertainty while it is still uncertain, and when a belief is later overturned, leave the
+entry in and give the overturning its own entry — never quietly edit the history. The diary is
+allowed to be wrong in places; it may never be dishonest about it. Read `docs/DIARY.md`'s own
+preface and "How this diary continues" for the full spirit before writing in it.
+
 ## Repository status and layout
 
 A Cargo workspace of seventeen crates. Each declares its own license per the policy below

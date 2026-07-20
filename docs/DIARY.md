@@ -173,3 +173,14 @@ memory visibility — which is a real systems question with a real answer, not a
 Writing this entry is itself the small meta-moment worth marking: the project decided its story was
 worth telling *before* knowing how it ends. That is either confidence or foolishness, and the diary
 exists partly so a later reader can judge which.
+
+### 2026-07-20 — Making the diary keep itself
+
+A gap, caught by the human within minutes of the diary being created: the rule "add an entry every
+turn" lived only *inside* this file, and a new session loads `CLAUDE.md`, not necessarily this. So the
+diary would have quietly died the moment the session that started it ended — an irony worth recording,
+since a story about honest continuity that failed to continue would have proved the opposite of its
+point. Fixed by writing the obligation, and the reason for it, into `CLAUDE.md` itself, where every
+future session is guaranteed to see it. Small entry, but the load-bearing one: it is what turns a
+single-session artifact into a habit the project keeps. This entry exists partly to test that the habit
+now holds — the first turn to follow the rule it just wrote down.
