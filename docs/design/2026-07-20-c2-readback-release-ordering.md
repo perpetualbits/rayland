@@ -82,12 +82,29 @@ settles which; both express the same invariant.
 
 The landed gate's "empty → keep the delivery pending and poll again" behavior (for the copy submit and
 the in-flight-DMA case) is what makes the cap tricky: a capped head plus a still-pending delivery is
-exactly the deadlock shape. The two must be reconciled so that **the head is released for the copy submit
-even though the delivery does not complete on it.** Concretely, "release the head" (let the app proceed)
-and "complete the delivery" (ship the readback, advance `last_delivered_submit`) become two distinct
-events: the copy submit does the former but not the latter; the draw submit does both. The plan must make
-that separation explicit and test it, because getting it wrong reproduces the deadlock rather than the
-stale frame.
+exactly the deadlock shape. "Release the head" (let the app proceed) and "complete the delivery" (ship
+the readback, advance `last_delivered_submit`) must become **two distinct events**: the copy submit does
+the former but not the latter; the draw submit does both.
+
+**The correctness key that makes this safe — and dissolves the copy-vs-draw ambiguity — is that the head
+is released only *after* the fence.** `wait_for_work_retired` guarantees the pending submit's GPU work,
+*including any readback DMA into `res6`*, has fully retired before S reads `take_app_blob_writes`. So a
+post-fence **empty** result means, unambiguously, that no new pixels exist — and releasing the head is
+correct in every empty case:
+
+- **Copy submit:** it wrote a texture image, not `res6`; the application's next act after its upload
+  fence-wait is to submit the draw, not to read `res6`. Releasing lets it proceed. Correct.
+- **Identical-frame draw:** `res6` equals the last shipped frame, so the application reads its own
+  unchanged — and therefore correct — local `res6`. Releasing is correct.
+- **Draw with new pixels:** not empty (the fence already landed the DMA), so this is the *non-empty* path
+  — ship the readback first, then release. The "DMA not landed yet" case cannot produce a post-fence
+  empty, because the fence waited for exactly that DMA.
+
+So the rule is simply: **on the non-empty path, ship the readback and then release the full head and
+complete the delivery; on the empty path, release the full head (safe, per above) but do not complete —
+keep polling for the real readback.** The plan must implement and test both, because getting the empty
+path wrong reproduces either the deadlock (if it fails to release) or the stale frame (if it released
+before the fence).
 
 ## 6. What does not change
 
