@@ -264,6 +264,21 @@ fn progress_thread(applier: Arc<Mutex<Applier>>, mut engine: EngineClient, tx: A
     // position is a new frame; that, plus a drained ring (proving it is dispatched), is the fence
     // trigger. `None` before the first delivery.
     let mut last_delivered_submit: Option<u32> = None;
+    // **(c)2 throwaway fence-probe (2026-07-20).** When `RAYLAND_C2_FENCEPROBE` names a file, append one
+    // CSV line per *fence-poll* (not per tight 200 µs poll — that would be the documented Heisenbug) so a
+    // post-run script can settle H1 vs H2 (`docs/DIARY.md`, 2026-07-20): does `res6` change across two
+    // consecutive *empty* fence-polls **without `latest_submit` advancing** (H1: fence retired before the
+    // DMA), or only when a new submit crosses (H2: fence is sound, residual is C-side release). Opened
+    // once; each record is a single `write_all` (no user-space buffer), so lines survive the oracle's
+    // `SIGTERM`. Delete once the question is answered.
+    let mut fenceprobe = std::env::var_os("RAYLAND_C2_FENCEPROBE")
+        .and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok());
+    let mut fence_poll_seq: u64 = 0;
+    if let Some(f) = fenceprobe.as_mut() {
+        let _ = f.write_all(
+            b"# seq,t_ms_since_pending,latest_submit,drained,readback_advanced,res6_id,res6_size,res6_fp\n",
+        );
+    }
     loop {
         // One short lock: advance the ring frontier, note the context, read the fence's `ring_idx`,
         // whether the ring is drained, and the latest submit's position — all read together so they are
@@ -326,14 +341,34 @@ fn progress_thread(applier: Arc<Mutex<Applier>>, mut engine: EngineClient, tx: A
                 // application blob, and an in-flight readback DMA has not changed the blob yet — and
                 // non-empty exactly when a readback-bearing submit has produced a new frame. That
                 // emptiness is the signal the gate keys on; see `crate::delivery`.
-                let app = {
+                let (app, probe) = {
                     let mut session = applier.lock().expect("the applier lock is never poisoned");
-                    session.take_app_blob_writes()
+                    let app = session.take_app_blob_writes();
+                    // Read the live readback fingerprint in the *same* lock, only when probing — it must
+                    // reflect res6 *after* the fence so a stale fingerprint here means the DMA truly had
+                    // not landed. `readback_probe` is `&self` and never touches the shadow, so it does
+                    // not disturb the diff `take_app_blob_writes` just took.
+                    let probe = if fenceprobe.is_some() { session.readback_probe() } else { None };
+                    (app, probe)
                 };
                 // A non-empty write set means the readback advanced past the last delivered frame.
                 let readback_advanced = !app.is_empty();
                 // How long this delivery has been pending — only the identical-frame fallback reads it.
                 let pending_elapsed = pending_since.map(|t| t.elapsed()).unwrap_or_default();
+                // (c)2 fence-probe: one line per fence-poll. `readback_advanced` with an unchanged
+                // `res6_fp` vs the prior empty line at the *same* `latest_submit` is the H1 signature.
+                if let Some(f) = fenceprobe.as_mut() {
+                    let (rid, rsize, rfp) = probe.unwrap_or((0, 0, 0));
+                    let line = format!(
+                        "{fence_poll_seq},{:.3},{},{},{},{rid},{rsize},{rfp:#x}\n",
+                        pending_elapsed.as_secs_f64() * 1000.0,
+                        latest_submit.unwrap_or(0),
+                        drained as u8,
+                        readback_advanced as u8,
+                    );
+                    let _ = f.write_all(line.as_bytes());
+                    fence_poll_seq += 1;
+                }
                 if rayland_s::delivery::readback_delivery_ready(readback_advanced, pending_elapsed) {
                     // The frame is ready (fresh readback, or the bounded fallback for an identical
                     // frame whose unchanged bytes are already correct on C). Ship largest-first so the

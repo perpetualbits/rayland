@@ -1297,6 +1297,64 @@ impl Applier {
         self.emit_blob_writes(&ids)
     }
 
+    /// **(c)2 throwaway fence-probe, 2026-07-20:** read-only fingerprint of the **readback buffer**,
+    /// i.e. the largest non-ring, non-Venus-internal blob — the exact blob [`Self::take_app_blob_writes`]
+    /// ships first. Distinct from that method in two load-bearing ways: it takes `&self` and **never
+    /// touches the shadow**, so calling it does not consume/adopt any pending write, and it returns the
+    /// raw current content fingerprint rather than a diff.
+    ///
+    /// # Why it exists
+    /// To settle whether the current real-`ring_idx` completion fence actually covers the readback DMA
+    /// (H1 vs H2 in `docs/DIARY.md`, 2026-07-20). The progress thread samples this at each pending
+    /// fence-poll; if `res6`'s fingerprint changes across two consecutive *empty* polls **without a new
+    /// `vkQueueSubmit` crossing the ring**, the fence retired before the DMA landed (`T2 < T4` is still
+    /// real with today's fence). If it only ever changes when `latest_submit_pos` advances, the fence is
+    /// sound and the residual lives on the C-side release ordering. Delete once that is answered.
+    ///
+    /// # Inputs / outputs
+    /// - Returns `Some((res_id, size, fingerprint))` for the largest such blob, or `None` if the session
+    ///   has no application blob yet (before the first `vkMapMemory`). The fingerprint is the same
+    ///   strided [`rayland_relay::trace::fingerprint`] the T5 baseline uses, so it is cheap
+    ///   (microseconds) and directly comparable to those traces.
+    pub fn readback_probe(&self) -> Option<(u32, u64, u64)> {
+        // Same selection as `take_app_blob_writes`: exclude rings (C's command bytes / S's `head`) and
+        // Venus-internal blobs (the tiny feedback/reply arena), leaving the application's own buffers.
+        self.blobs
+            .iter()
+            .filter(|(id, _)| !self.rings.contains_key(id) && !self.venus_internal.contains(id))
+            // Largest is the readback buffer (megabytes) — the feedback word, were it not already
+            // excluded, is bytes; the uniform/vertex blobs are far smaller than a frame.
+            .max_by_key(|(_, blob)| blob.size())
+            .map(|(&id, blob)| (id, blob.size(), Self::sampled_fp(blob.bytes())))
+    }
+
+    /// **(c)2 throwaway fence-probe helper, 2026-07-20:** a near-zero-cost content fingerprint that
+    /// reads only ~64 evenly-spaced 8-byte words rather than one byte per cache line. It exists purely
+    /// so [`Self::readback_probe`] can run under the applier lock ~20×/frame **without perturbing the
+    /// return-path timing** — the full `trace::fingerprint` (16k iterations over a 1 MiB blob, ~25 µs
+    /// under the lock) demonstrably starved the message thread and inflated the very defect being
+    /// measured (the classic Heisenbug this project has been bitten by). A whole-frame `N` vs `N−1`
+    /// readback differs across essentially every pixel, so ~64 samples detect the change reliably; this
+    /// is a change-detector, not a hash against adversarial collisions. Delete with the probe.
+    fn sampled_fp(bytes: &[u8]) -> u64 {
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+        // ~4096 word-samples regardless of size: dense enough to catch a small spinning object on a
+        // mostly-constant background (64 samples missed it — most of a 1 MiB frame is background), yet
+        // ~4× cheaper than the full one-byte-per-cache-line fingerprint that starved the message thread.
+        let step = (bytes.len() / 4096).max(8);
+        let mut hash = FNV_OFFSET;
+        let mut i = 0;
+        while i + 8 <= bytes.len() {
+            // Mix an 8-byte word each step — more entropy per sample than one byte, still ~64 reads.
+            let w = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
+            hash = (hash ^ w).wrapping_mul(FNV_PRIME);
+            i += step;
+        }
+        // Fold the length so a resize that aligns with the stride still changes the fingerprint.
+        (hash ^ bytes.len() as u64).wrapping_mul(FNV_PRIME)
+    }
+
     /// **(c)1 Task 9 Probe A support**: fingerprint every blob S has ever written, cheaply.
     ///
     /// # What this is for

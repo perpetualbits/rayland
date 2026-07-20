@@ -184,3 +184,108 @@ point. Fixed by writing the obligation, and the reason for it, into `CLAUDE.md` 
 future session is guaranteed to see it. Small entry, but the load-bearing one: it is what turns a
 single-session artifact into a habit the project keeps. This entry exists partly to test that the habit
 now holds — the first turn to follow the rule it just wrote down.
+
+### 2026-07-20 — Reading the fence code disagrees with our own conclusion
+
+Picked up the (c)2 residual to hunt the `T2 < T4` fence gap the handoff names as the blocker. First
+confirmed the state over the real network — but the batch was *worse* than the documented ~1/11: two
+runs clean, three stale (nine stale frames in five runs). That variance is itself a clue; a defect that
+swings from 1-in-11 to 3-in-5 between sessions is timing- and load-sensitive, which is what a race looks
+like, not a fixed logic hole.
+
+Then I read the actual fence path in virglrenderer 1.3.0 (`vkr_ring.c`, `vkr_queue.c`) line by line, and
+it points somewhere uncomfortable: **the current real-`ring_idx` fence looks like it should already
+cover the readback.** The ring thread advances `head` *after* `vn_dispatch_command` returns, and
+`vkr_dispatch_vkQueueSubmit` calls `vk->QueueSubmit` **synchronously, inline** (under `queue->vk_mutex`)
+before it returns. So when S observes `head == applied_tail` (drained) and fences, the app's own submit
+has already been enqueued on the VkQueue; the fence's empty `vkQueueSubmit` — on the *same* queue, same
+mutex — is FIFO-ordered strictly after it, and its retirement should therefore imply the readback copy
+in that submit has completed. If that reasoning holds, a post-fence *empty* can only be a copy submit or
+an identical frame — never a draw whose DMA is still in flight — and Direction A's "empty is safe to
+release" would have been *true*.
+
+But Direction A demonstrably regressed, which says empty-is-a-pending-draw *does* happen. Two things
+can't both be right. The most likely reconciliation: the `T2 < T4` evidence we lean on was measured on
+2026-07-17, **before** the real-`ring_idx` fence existed — back when the fence fired on `ring_idx = 0`,
+which retires immediately and waits on no GPU work at all. That measurement characterises the *old*
+broken fence, not today's. So we may have carried forward a conclusion that the current code has already
+outgrown, and mis-attributed a C-side release-ordering residual (the head-advance in step 1 releasing
+the app before the step-2 readback lands on C) to a fence gap that no longer bites.
+
+Two hypotheses, and I refuse to design against either until measured — this project's most expensive
+mistake was exactly that. **H1 (the recorded belief):** the current fence still retires before the
+readback DMA, so empty is genuinely ambiguous. **H2 (what the code reads like):** the fence covers the
+readback; the residual is pure C-side release ordering. The decisive experiment is a single field:
+instrument S so that, on a post-fence *empty* poll, it watches whether `res6` changes **without a new
+submit crossing the ring**. H1 predicts yes (the same submit's DMA lands late); H2 predicts never (only
+the next draw's copy moves `res6`). Env-gated, in-memory, dumped once at session end — because the
+handoff's own hard-won lesson is that per-poll logging on S is a Heisenbug that hides this defect.
+Confidence right now: ~60% H2, but that is a reading, not a measurement, and the whole point is to make
+it one.
+
+### 2026-07-20 — Measured it. I was wrong; the fence really does retire early — and now we know why
+
+The measurement came back and refuted my own H2. It is not close: on ~**60% of every 120-frame run**, the
+readback buffer changes **1.7–16 ms after** the completion fence retired, at a *constant* submit — the DMA
+for a submit S had already fenced lands *after* the fence said done. `T2 < T4` is not a stale 2026-07-17
+artifact; it is the common case with today's real-`ring_idx` fence. The handoff was right and my clever
+FIFO reading was wrong. Good — this is exactly the failure mode the "pin the mechanism before designing"
+rule exists to catch, and this time we caught it on the measurement instead of three fixes later.
+
+The satisfying part is *why* the FIFO argument was wrong, because the answer is precise. The argument
+proved the empty fence submit is *enqueued* after the app's submit B. It is. But enqueue order is not
+completion order: **an empty `vkQueueSubmit(queue, 0, NULL, fence)` waits only for its own zero work, never
+for prior submissions.** So it signals the instant the queue reaches the workless submit, before B's
+readback copy drains. And this does not mean venus is broken for the whole world — the app's *real*
+`VkFence` rides its *real* submit and waits correctly; the empty-submit `create_fence` is a separate
+ring-timeline thing ordinary venus never uses for app-visible completion. We *repurposed* it as a
+"readback done?" barrier, and for that it is the wrong tool. That is a clean, teachable reason, not a
+shrug.
+
+Two more things the data settled. First, the gate is doing more than the ~10/11 headline implied: it
+re-polls until `res6` genuinely changes, absorbing that pervasive early-fence storm on almost every frame
+— the clean runs each swallow ~70 of these silently. The stale frame is not the early fence; it is the
+rare escape on the C side before the gate ships the fresh readback. Second, the Heisenbug is real and I
+walked straight into it: the first probe fingerprinted 1 MiB under the applier lock ~20×/frame and
+collapsed a run to 109/120 stale — the instrument inflating its own defect. Too-light a probe went blind
+instead (a spinning object on a constant background hides from 64 sparse samples). ~4096 samples is the
+seam that sees the frames without starving the thread. "Measure carefully" was not advice; it was the
+difference between an answer and an artifact.
+
+So the mechanism is pinned with evidence, written up in
+`docs/design/2026-07-20-c2-fence-empty-submit-finding.md`. The fence needs to become a barrier that waits
+for B's *completion*, which the public virglrenderer fence API does not express — so the next turn is a
+real fix brainstorm across three directions (a genuine engine-level `vkQueueWaitIdle`-class barrier;
+tolerating the weak fence and fixing only the C-side release by the gate's *resolution outcome* rather
+than the ambiguous instantaneous empty; or a race-free content-stability signal), not another spike.
+Confidence in the mechanism now: high — code path, elimination of the alternatives, and 357 consistent
+events across five runs all point the same way.
+
+### 2026-07-21 — The fix was hiding in the application's own fence
+
+Spent the fix brainstorm first proving what *isn't* available: virglrenderer's public API has no
+queue-completion barrier at all — 60 exports, and the only fence path is the empty-submit one we just
+proved weak. So the "correct" fix (a real `vkQueueWaitIdle`-class barrier) would mean patching
+virglrenderer, i.e. forking the engine we deliberately borrow. That felt like a dead end, and the
+fallbacks were the timing-heuristic class the diary keeps burying.
+
+Then the reachability survey turned up the answer in the opposite place. The application isn't relying on
+S's proxy fence — it waits on its *own* `VkFence`, and on S that `vkWaitForFences` is dispatched
+**blocking, on the ring thread** (`vkr_dispatch_vkWaitForFences`). The ring `head` only advances past that
+command once the wait returns. So the moment the ring drains *past* a `vkWaitForFences` is a genuine
+completion barrier — stronger than anything the fence API offers, already sitting in the stream, free. The
+gate never used it: it fires a beat earlier, at the transient drain between the submit delta and the wait
+delta, exactly where `res6` is still last frame. That single "a beat too early" is the whole residual.
+
+So direction G: key the delivery on the wait-drain, read `res6` there (provably fresh or provably
+unchanged — the copy-vs-draw call that was ambiguous under the weak fence is now reliable), ship the
+pixels before the head-advance that releases the app. And the risky half — the wrap-safe head cap —
+already exists, built and twice-reviewed on the abandoned Direction A branch; only its trigger was wrong.
+That is a good feeling: not a clever new mechanism, but the realization that the correct signal was one
+the system was already producing and we were reading the wrong edge of.
+
+One honest unknown remains, and it is a code-reading question, not a mystery: whether Mesa's venus encoder
+puts `vkWaitForFences` inline in the ring (where a byte-scan like `find_queue_submit` can see it) or in an
+out-of-line execute stream. Submit is inline — the scan works today — so the prior is good, but the wait
+must be confirmed against Mesa's `vn_ring`/`vn_cs_encoder` before building. Spec written
+(`docs/design/2026-07-21-c2-waitdrain-completion.md`); that read is the first task of the plan.
