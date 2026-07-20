@@ -409,9 +409,15 @@ submits per frame. (An earlier spike that dumped only S's readback misread this 
 race; the uniform witness inverted it.) Invisible on loopback (0/120). Full evidence, the
 inversion, and method:
 [`design/2026-07-19-c2-true-remote-mapped-sync.md`](design/2026-07-19-c2-true-remote-mapped-sync.md).
-The two-machine launch is still ad-hoc (a scratchpad script, not committed test wiring);
-making it a repeatable fixture-vs-native comparison, and then fixing S's readback barrier, is
-where (c)2's remaining subject matter now lives.
+The repeatable fixture-vs-native comparison now exists as `scripts/c2-icosa-two-machine.sh`, and
+S's readback barrier has a **landed partial fix**: the readback-completion gate
+([`design/2026-07-19-c2-readback-completion-gate.md`](design/2026-07-19-c2-readback-completion-gate.md))
+delivers a frame only once S's readback write advances, which took the rate from *most runs losing
+1–4 frames* to **10/11 runs fully clean**. A ~1/11 residual of the same `N == N−1` signature remains
+and is located by reasoning as the **C-side release race**: with Venus feedback disabled the app is
+released by the `RingProgress` head-advance, which S ships ahead of the readback delivery, so the app
+can read its own stale local readback before the frame's pixels land on C. Ordering that release after
+the readback is where (c)2's remaining subject matter now lives.
 
 **Fixture A's fence wait and post-copy barrier are spec-correct, and one of the two is not
 observable through the local test suite at all.** §6 above is the detailed version; the

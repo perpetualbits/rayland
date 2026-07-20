@@ -260,9 +260,23 @@ Venus/virglrenderer capture/replay engine, so *unmodified* applications run.**
   ships the previous frame's pixels for the current frame's submits and drops the current frame's readback.
   Loopback hides it (0/120). See
   [`docs/design/2026-07-19-c2-true-remote-mapped-sync.md`](docs/design/2026-07-19-c2-true-remote-mapped-sync.md).
-  The next (c)2 step is a **`rayland-s` readback-barrier fix**: make the delivered readback provably
-  correspond to the frame whose completion released it, robust to N submits per frame. Also still open:
-  multi-queue support (the two-submits-per-frame structure is now central to this bug, not an aside).
+  **Landed (2026-07-19), and it sharply reduces but does not eliminate the defect:** the `rayland-s`
+  **readback-completion gate** (`crates/rayland-s/src/delivery.rs`, wired into `progress_thread`)
+  completes a delivery only once `take_app_blob_writes` shows the readback blob actually advanced past
+  the last delivered frame (or a 250 ms identical-frame bound expires), so a two-submits-per-frame app's
+  copy submit can no longer ship the previous frame's pixels. Over the real network
+  (`scripts/c2-icosa-two-machine.sh`) this took 11 runs from *most runs losing 1–4 frames* to **10/11
+  runs fully clean**. Design + plan:
+  [`docs/design/2026-07-19-c2-readback-completion-gate.md`](docs/design/2026-07-19-c2-readback-completion-gate.md).
+  **A ~1/11 residual of the same `N == N−1` signature remains, and it is *located by reasoning*, not an
+  S-side gate hole:** it is the **C-side release race** the design's §9 anticipated. With all Venus
+  feedback disabled the application's `vkWaitForFences` is released by the `RingProgress` head-advance
+  (`vn_ring_wait_seqno`), and `progress_thread` ships that head-advance *before* the gated readback
+  delivery — so the app can occasionally read its own local `res6` on C after `RingProgress` applies but
+  before the frame's readback `BlobData` applies. The next (c)2 step is ordering the head-advance that
+  releases a readback-bearing draw *after* that frame's readback pixels, without stalling the frame's
+  other synchronous calls — the harder half of the return path (c)1 handed over. Also still open:
+  multi-queue support (the two-submits-per-frame structure is central to this bug, not an aside).
 - **(c)3 — content-addressed assets.**
 - **(c)4 — real/complex applications; GL via Zink.**
 

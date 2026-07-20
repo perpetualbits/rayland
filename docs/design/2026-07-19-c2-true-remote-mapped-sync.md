@@ -146,3 +146,16 @@ The problem is **located and its layer proven**: a **readback-completion deliver
 forward mapped-blob relay verified fresh. The fix is a **`rayland-s` readback-barrier change** — make
 the delivered readback provably correspond to the frame whose completion released it, robust to N
 submits per frame — **not** a `rayland-c` mapped-blob relay change.
+
+## Partially fixed by
+
+`docs/design/2026-07-19-c2-readback-completion-gate.md` (the readback-completion gate) — **landed and
+a real reduction, not a full fix.** Over the real network (`scripts/c2-icosa-two-machine.sh`) the gate
+took the rate from *most runs losing 1–4 frames* to **10/11 runs fully clean**. A ~1/11 residual of the
+same `N == N−1` signature remains, and reasoning (not a hunt) locates it as the design's §9 **C-side
+release race**: `copy_in` re-baselines forward blobs and all Venus feedback is disabled, so S writes
+only `res6` among app blobs and the gate is tight — but the application's `vkWaitForFences` is released
+by the `RingProgress` head-advance, which `progress_thread` ships *before* the gated readback delivery,
+so the app can occasionally read its own local `res6` on C after `RingProgress` applies but before the
+frame's readback `BlobData` applies. The remaining (c)2 step is to order the head-advance that releases
+a readback-bearing draw *after* that frame's readback pixels.
