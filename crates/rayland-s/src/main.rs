@@ -321,17 +321,34 @@ fn progress_thread(applier: Arc<Mutex<Applier>>, mut engine: EngineClient, tx: A
                     );
                     return;
                 }
-                // Retired: the readback is complete. Ship the application blobs, readback largest-first
-                // so the feedback word (which releases the app) lands after the pixels it reports on.
+                // Read what S has written into the application's blobs since the last delivery. This is
+                // empty when nothing new landed — a bare copy submit writes a texture image, not an
+                // application blob, and an in-flight readback DMA has not changed the blob yet — and
+                // non-empty exactly when a readback-bearing submit has produced a new frame. That
+                // emptiness is the signal the gate keys on; see `crate::delivery`.
                 let app = {
                     let mut session = applier.lock().expect("the applier lock is never poisoned");
                     session.take_app_blob_writes()
                 };
-                if ship(&tx, &app).is_err() { return; }
-                delivery_pending = false;
-                pending_since = None;
-                // Remember which submit we just delivered, so only a *newer* one triggers the next fence.
-                last_delivered_submit = latest_submit;
+                // A non-empty write set means the readback advanced past the last delivered frame.
+                let readback_advanced = !app.is_empty();
+                // How long this delivery has been pending — only the identical-frame fallback reads it.
+                let pending_elapsed = pending_since.map(|t| t.elapsed()).unwrap_or_default();
+                if rayland_s::delivery::readback_delivery_ready(readback_advanced, pending_elapsed) {
+                    // The frame is ready (fresh readback, or the bounded fallback for an identical
+                    // frame whose unchanged bytes are already correct on C). Ship largest-first so the
+                    // feedback word lands after the pixels it reports on, then complete the delivery.
+                    if ship(&tx, &app).is_err() {
+                        return;
+                    }
+                    delivery_pending = false;
+                    pending_since = None;
+                    // Only a submit newer than this one may trigger the next delivery.
+                    last_delivered_submit = latest_submit;
+                }
+                // else: the readback has not advanced and we are still within the bound — this was a
+                // copy submit or the draw's DMA has not landed. Leave `delivery_pending` set and fall
+                // through; the next poll re-fences and re-checks, delivering once the readback advances.
             }
             // else: a new submit is dispatched but the queue is not fencing-ready — handled just below.
         }
