@@ -282,6 +282,11 @@ fn progress_thread(applier: Arc<Mutex<Applier>>, tx: Arc<Mutex<QuicSend>>) {
                     return;
                 }
             }
+            // **This ship order is load-bearing — do not reorder.** `progress` (the head-advance) is what
+            // releases the application on C, so it must go LAST, after the readback pixels (`app`) and the
+            // reply arena (`venus`). It is the sole guarantee that C applies the finished frame before it is
+            // released onto it, and the reason an early/stale completion signal cannot torn- or stale-ship
+            // (see `Applier::reply_arena_fence_signaled`'s "real safety property").
             if ship(&tx, &venus).is_err() {
                 return;
             }

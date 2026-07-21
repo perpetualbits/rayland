@@ -1275,22 +1275,48 @@ impl Applier {
     /// # Why the **live** bytes, not the shipped diff
     /// [`Self::take_venus_blob_writes`] fragments the reply into one run per *changed* byte (the result
     /// byte often does not change from the previous reply), so the contiguous `[38][0]` pattern is not
-    /// visible in what S ships. The live arena holds the whole reply. Scanning it is safe against a
-    /// *lingering* previous success because the application polls `[38][1]` (`VK_NOT_READY`) continuously
-    /// while a fence is still in flight — so during a copy's DMA the arena reads `[38][1]`, not `[38][0]`.
-    /// The caller further gates on [`Self::take_app_blob_writes`] being non-empty, which is true only when
-    /// `res6` actually advanced, so a stale success cannot re-ship a frame.
+    /// visible in what S ships. The live arena holds the whole reply.
+    ///
+    /// # Why only the reply arena, not every `blob_id == 0` shmem
+    /// Three shmems share Venus's `blob_id == 0` marker: the ring, the ~1 MiB reply arena, and the ~8 MiB
+    /// command-buffer **staging pool**. The staging pool holds the *application's own* command-buffer bytes
+    /// (forward-relayed from C, never written by S), where a coincidental `[38][0]` word could otherwise
+    /// stick this signal `true`. So the scan is restricted to [`Self::s_written`] — the set of blobs S has
+    /// actually written — which contains the reply arena (S's ring thread writes replies into it) but not
+    /// the staging pool. This is **sound across pool growth**: when the reply pool fills, Mesa mints a new
+    /// `res_id` (`vn_renderer_util.c`), and S writes replies into that one too, so it joins `s_written` on
+    /// its first reply — whereas decoding `vkSetReplyCommandStreamMESA` for the arena's `res_id` would go
+    /// stale at exactly that moment (see [`Self::take_blob_writes`]'s docs for why that decode is unsound).
+    ///
+    /// # Why an early or stale match cannot cause a wrong frame (the real safety property)
+    /// A stale `[38][0]` *can* linger — reply streams **chain** at advancing offsets rather than
+    /// overwriting in place — and the caller does not treat this as a precise per-frame barrier. It does
+    /// not need to. Correctness comes from the **ship order** in `progress_thread`: the readback `BlobData`
+    /// and the reply arena are shipped *before* the `RingProgress` head-advance, and the application is
+    /// released **only** by that head-advance (`vn_ring_wait_seqno` on `head`), which S ships **last** and
+    /// only once the application's own `vkGetFenceStatus` poll actually succeeded. Because
+    /// [`HostBlob::take_bytes_s_wrote`](crate::blob::HostBlob::take_bytes_s_wrote) is consuming and
+    /// per-byte, any early/partial `res6` shipped on a mid-DMA poll is completed by later polls, so the
+    /// union on the wire is the whole frame *before* the releasing head-advance. This signal therefore only
+    /// controls *when* `res6` ships (ideally once, at completion), never whether C reads a torn or stale
+    /// frame. The caller's [`Self::take_app_blob_writes`]-non-empty gate keeps it to a draw with fresh
+    /// pixels (an upload copy or a re-poll ships nothing).
     ///
     /// # Inputs / outputs
-    /// - Takes `&self`; scans the live bytes of every Venus-internal, non-ring blob. Returns `true` on the
-    ///   first `[38u32][0u32]` little-endian match (aligned scan — Venus encodes 4-byte aligned).
+    /// - Takes `&self`; scans the live bytes of the reply arena. Returns `true` on the first
+    ///   `[38u32][0u32]` little-endian match (aligned scan — Venus encodes 4-byte aligned).
     pub fn reply_arena_fence_signaled(&self) -> bool {
         // `vkGetFenceStatus`'s command type and the result it reports once the fence has signalled.
         const GET_FENCE_STATUS: u32 = 38;
         const VK_SUCCESS: u32 = 0;
         for (&res_id, blob) in &self.blobs {
-            // The reply arena is Venus-internal; the ring is not it, and app blobs are not either.
-            if self.rings.contains_key(&res_id) || !self.venus_internal.contains(&res_id) {
+            // The reply arena only: Venus-internal (`blob_id == 0`), not the ring, and — crucially —
+            // one S has written (`s_written`), which excludes the same-marker staging pool whose
+            // application command bytes could hold a coincidental `[38][0]`.
+            if self.rings.contains_key(&res_id)
+                || !self.venus_internal.contains(&res_id)
+                || !self.s_written.contains(&res_id)
+            {
                 continue;
             }
             let b = blob.bytes();

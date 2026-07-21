@@ -45,15 +45,30 @@ unchanged from the previous reply), so the contiguous `[38][0]` pattern is *not 
 the first implementation scanned the diff, never matched, and shipped no `res6` at all (all 120 frames came
 back identical). The **live** arena holds the whole reply. `Applier::reply_arena_fence_signaled` scans it.
 
-### Why scanning the live arena is safe (the two races that don't bite)
-- **A lingering previous success does not false-trigger mid-DMA.** While a fence is still in flight the
-  application is *actively polling* it and getting `VK_NOT_READY` (`[38][1]`), which overwrites the arena —
-  so during a copy's DMA the arena reads `[38][1]`, not `[38][0]`. `[38][0]` in live memory therefore means
-  a fence really did just signal.
-- **A stale success cannot re-ship a frame**, and an upload copy cannot ship one: the call site gates on
-  `take_app_blob_writes` being **non-empty**, which is true only when `res6` actually advanced. An upload
-  copy leaves `res6` unchanged (empty → nothing shipped); a repeat poll of an already-shipped frame is also
-  unchanged (empty). Only a *new draw's* readback ships.
+### Why only the reply arena (the scan is narrowed to `s_written`)
+Three shmems share Venus's `blob_id == 0` marker: the ring, the ~1 MiB reply arena, and the ~8 MiB
+command-buffer **staging pool**. The staging pool holds the *application's own* command-buffer bytes
+(forward-relayed from C), where a coincidental `[38][0]` word could stick the signal `true`. So the scan is
+restricted to `Applier::s_written` — blobs S has actually written — which contains the reply arena (S's ring
+thread writes replies into it) but **not** the staging pool (S never writes it). This is sound across pool
+growth: when the reply pool fills Mesa mints a new `res_id`, and S writes replies into that one too, so it
+joins `s_written` on its first reply — whereas decoding `vkSetReplyCommandStreamMESA` for the arena's
+`res_id` would go stale at exactly that moment (that decode is documented-unsound; see `apply.rs`'s
+`take_blob_writes` docs).
+
+### Why an early or stale match cannot cause a wrong frame (the real safety property)
+The signal is **not** treated as a precise per-frame barrier, and it does not need to be. A stale `[38][0]`
+*can* linger — reply streams **chain** at advancing offsets rather than overwriting in place. Correctness
+comes from the **ship order**: `res6` and the reply arena are shipped *before* the `RingProgress`
+head-advance, and the application is released **only** by that head-advance (`vn_ring_wait_seqno` on `head`),
+which S ships **last** and only once the application's own `vkGetFenceStatus` poll actually succeeded.
+Because `take_bytes_s_wrote` is consuming and per-byte, any early/partial `res6` shipped on a mid-DMA poll
+is completed by later polls, so the union on the wire is the whole frame *before* the releasing head-advance.
+The signal therefore only controls *when* `res6` ships (ideally once, at completion), never whether C reads a
+torn or stale frame. The `take_app_blob_writes`-non-empty gate keeps it to a draw with fresh pixels (an
+upload copy or a re-poll ships nothing). This is why the fix is robust rather than merely empirically clean:
+a future change that reordered the ship (progress before `res6`) is the one thing that would reintroduce the
+defect.
 
 ## 4. The mechanism
 
