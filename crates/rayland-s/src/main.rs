@@ -58,9 +58,9 @@
 
 // The engine actor and its client, plus the gate that tells us whether this host has a usable GPU.
 // The daemon no longer holds a `VirglEngine` directly — one actor thread owns it and everything else
-// messages it through an `EngineClient` (see `spawn_engine` in main).
-// `RenderEngine` is the trait `EngineClient` implements; it must be in scope for the progress thread
-// to call `wait_for_work_retired` and for `apply` to receive the client as `&mut dyn RenderEngine`.
+// messages it through an `EngineClient` (see `spawn_engine` in main). The progress thread no longer
+// drives the engine at all (the return path keys on the application's own `vkGetFenceStatus` completion,
+// not an S-issued fence), so only `apply` needs the client, as `&mut dyn RenderEngine`.
 use rayland_engine::{EngineClient, spawn_engine, virgl_available};
 // The relay protocol and its framing.
 use rayland_relay::{C2S, S2C, read_msg, write_msg};
@@ -227,84 +227,61 @@ fn ship(tx: &Arc<Mutex<QuicSend>>, msgs: &[S2C]) -> Result<(), ()> {
 /// The return path: ship each finished readback frame **ahead of** the ring-progress that releases the
 /// application onto it. This thread is the only thing that releases the application's synchronous calls.
 ///
-/// # Why `res6` ships first (the (c)2 return-path ordering, 2026-07-21)
-/// With fence feedback disabled — the only configuration that renders over a real network — the
-/// application does **not** send a blocking `vkWaitForFences`. Mesa's `vn_WaitForFences`
-/// (`vn_queue.c`) implements it by **polling `vkGetFenceStatus`** over the ring in a relax-backoff loop
-/// until the fence reads signalled (`vn_GetFenceStatus` → `vn_call_vkGetFenceStatus`). So what releases
-/// the application to read its readback buffer `res6` is the ring `head` advancing past the
-/// `vkGetFenceStatus` poll whose reply is `VK_SUCCESS` — and that poll only succeeds *after* S's GPU has
-/// finished the readback copy, i.e. after S's own `res6` already holds the new frame.
+/// # The completion barrier and the ordering (the (c)2 return-path fix, 2026-07-21)
+/// With fence feedback disabled the application releases itself by polling `vkGetFenceStatus` until the
+/// reply reads `VK_SUCCESS` (see [`Applier::reply_arena_fence_signaled`]). That reply is the moment the
+/// application's submit — its readback copy included — is complete on S's GPU, so `res6` is a whole frame.
+/// The stale-frame residual was S shipping the head-advance (and that `VK_SUCCESS` reply) **before** the
+/// `res6` bytes: C released the application, which read its own local `res6` before S's `BlobData` for it
+/// landed — the whole previous frame.
 ///
-/// The stale-frame residual was S shipping that releasing head-advance (and the `VK_SUCCESS` reply)
-/// **before** the `res6` bytes: C released the application, which then read its own local `res6` before
-/// S's `BlobData` for it had landed — the whole previous frame. The fix is a strict per-poll ordering:
-/// if `res6` changed since we last shipped it, ship the readback `BlobData` **first**, then the reply
-/// arena, then the head-advance. Because the GPU writes `res6` strictly before the host answers a poll
-/// `VK_SUCCESS`, S observes the change no later than the poll carrying the releasing head-advance, so the
-/// pixels are always on the wire ahead of the release.
+/// So on each poll, when the reply delta reports a fence signalled, S ships the readback `BlobData`
+/// **first** — via [`Applier::take_app_blob_writes`], which is non-empty only for a readback-bearing
+/// (draw) submit and, because `VK_SUCCESS` proves the copy done, carries complete (never torn) bytes —
+/// then the reply arena, then the head-advance. C therefore always has the finished frame before it is
+/// released onto it. An upload-copy submit also signals a fence but leaves `res6` unchanged, so
+/// `take_app_blob_writes` is empty and nothing is shipped for it, exactly as required.
 ///
-/// # Why a cheap fingerprint gates the diff (the Heisenbug guard)
-/// Running the full ~1 MiB `res6` diff on every 200 µs poll would starve the message thread that feeds
-/// the ring — the measurement Heisenbug this project has already been bitten by. So a cheap strided
-/// fingerprint ([`Applier::readback_probe`], microseconds) gates it: the authoritative
-/// [`Applier::take_app_blob_writes`] runs only when the fingerprint moved, i.e. about once per frame.
-///
-/// # Lock discipline
-/// The applier lock is held only for the short reads (`readback_probe`, `take_*_blob_writes`,
-/// `take_ring_progress`) and never across a `ship`. Nothing here enters the engine, so no cycle can form
-/// between this thread, the message thread, and the actor.
+/// # Lock discipline, and why the reply/head shipping stays old-style
+/// The applier lock is held only for the short reads (`take_ring_progress`, `take_*_blob_writes`) and
+/// never across a `ship`. The reply arena and head-advance are shipped **only when the ring moved**, venus
+/// before progress — the same lockstep the working gate used, which initialization depends on (a wholesale
+/// rewrite of this cadence broke device init; see `docs/DIARY.md`, 2026-07-21). Nothing here enters the
+/// engine, so no cycle can form between this thread, the message thread, and the actor.
 fn progress_thread(applier: Arc<Mutex<Applier>>, tx: Arc<Mutex<QuicSend>>) {
-    // The strided fingerprint of the readback buffer S last shipped; `None` before the first frame. A
-    // change means S's GPU has landed a new readback frame that must go on the wire before the next
-    // head-advance that would release the application onto it.
-    let mut last_shipped_fp: Option<u64> = None;
     loop {
-        // Read the readback fingerprint and the ring-progress in **one snapshot**, so a frame's `res6`
-        // change and the head-advance that would release the application onto it are decided together. If
-        // this poll carries the releasing head-advance, `res6` is already changed in the same snapshot and
-        // ships first (below), ahead of the head. Two separate locks let the two race across the gap,
-        // which left a residual stale frame. The fingerprint is a strided sample (microseconds), so it is
-        // safe under the lock on every 200 µs poll — a full diff here would starve the message thread;
-        // `readback_probe` reads live bytes without touching the diff shadow.
-        let (probe, progress) = {
+        // The head-advance that releases the application's synchronous calls, taken first. Shipped
+        // old-style below (only when the ring moved, venus before progress) so init's reply/head lockstep
+        // is exactly the working gate's — that lockstep is load-bearing for initialization.
+        let progress = {
             let mut session = applier.lock().expect("the applier lock is never poisoned");
-            (session.readback_probe(), session.take_ring_progress())
+            session.take_ring_progress()
         };
-        let res6_changed = probe.is_some_and(|(_, _, fp)| last_shipped_fp != Some(fp));
-
-        if res6_changed {
-            // A new readback frame exists. Take the authoritative diff and ship it BEFORE the reply
-            // arena and head-advance below, so C applies the pixels before it releases the application
-            // onto them. `take_app_blob_writes` adopts the bytes into the shadow, so a frame ships once.
-            let app = {
+        if !progress.is_empty() {
+            // The reply arena for the commands that just retired, plus a check of whether the arena now
+            // shows a `vkGetFenceStatus` reply reading `VK_SUCCESS` — read from the **live** arena, in the
+            // same lock, because `take_venus_blob_writes` fragments the reply into per-changed-byte runs
+            // and the contiguous `[38][0]` is not visible in them (see `Applier::reply_arena_fence_signaled`).
+            let (venus, signaled) = {
                 let mut session = applier.lock().expect("the applier lock is never poisoned");
-                session.take_app_blob_writes()
+                (session.take_venus_blob_writes(), session.reply_arena_fence_signaled())
             };
-            if !app.is_empty() {
-                if std::env::var_os("RAYLAND_C2_SHIPDBG").is_some() {
-                    for m in &app {
-                        if let rayland_relay::S2C::BlobData { res_id, offset, bytes } = m {
-                            eprintln!("shipdbg: app BlobData res={res_id} off={offset} len={}", bytes.len());
-                        }
-                    }
-                }
-                if ship(&tx, &app).is_err() {
+            if signaled {
+                // A fence just signalled: the application's submit and its readback copy are complete on
+                // S's GPU, so `res6` is a *whole* frame (the empty-submit context fence never guaranteed
+                // this — it retired before the DMA). Ship the readback pixels BEFORE the reply arena (which
+                // carries the `VK_SUCCESS` that ends the application's poll loop) and the head-advance, so C
+                // applies the finished frame before it releases the application onto it. `take_app_blob_writes`
+                // is non-empty only for a readback-bearing (draw) submit — an upload copy leaves `res6`
+                // unchanged — and, because completion is proven, the bytes are complete (no tear).
+                let app = {
+                    let mut session = applier.lock().expect("the applier lock is never poisoned");
+                    session.take_app_blob_writes()
+                };
+                if !app.is_empty() && ship(&tx, &app).is_err() {
                     return;
                 }
-                // Remember what we shipped so an unchanged `res6` is not re-shipped every poll.
-                last_shipped_fp = probe.map(|(_, _, fp)| fp);
             }
-        }
-
-        // Then the reply arena and the head-advance that releases the application's synchronous calls,
-        // shipped (venus before progress) only when the ring moved — so init's reply/head lockstep is
-        // exactly as it was in the working gate. Any readback pixels for this poll already went out above.
-        if !progress.is_empty() {
-            let venus = {
-                let mut session = applier.lock().expect("the applier lock is never poisoned");
-                session.take_venus_blob_writes()
-            };
             if ship(&tx, &venus).is_err() {
                 return;
             }

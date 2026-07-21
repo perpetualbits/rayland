@@ -353,3 +353,43 @@ The barrier is the one the earlier gate result already handed us — the `vkGetF
 signals and the copy is complete. That is G': couple the res6 ship to that reply. It costs a reply-arena
 decode, but it is the first candidate that satisfies both constraints at once. Reporting up before
 building it, since G-lite was the agreed cheap-first bet and it has now been settled.
+
+### 2026-07-21 — It works: the readback residual is gone, and the signal was the app's own poll
+
+Zero stale frames across twenty real-network runs. After a session that went through three dead ends,
+the (c)2 readback return path is finally clean — and the thing that fixed it is almost funny in
+hindsight, because it was the application telling us, on every frame, exactly when its frame was done. We
+just had to read the right memory.
+
+The chain of wrongness is worth keeping whole, because each link taught the next. The empty-submit fence
+retired before the DMA (measured, pervasive). The wait-drain idea rested on the app sending a blocking
+`vkWaitForFences` — it does not; with feedback off Mesa *polls* `vkGetFenceStatus`, and the Task-1 gate
+caught that before a line of it was built. G-lite shipped the pixels first, which killed the whole-previous
+staleness completely — and traded it for torn frames, because "ship when the buffer changed" fires in the
+middle of the copy. Every one of those was a real attempt that failed for a real, different reason, and
+the last one drew the target precisely: we needed the ordering *and* a completion barrier, together.
+
+The barrier was hiding in plain sight. With feedback off the application releases itself by polling
+`vkGetFenceStatus` until the reply reads `VK_SUCCESS`; virglrenderer writes that reply into the reply
+arena as `[38][0]`. That byte pattern *is* "the fence signalled, the copy is done, res6 is whole." Two
+false starts even here. Scanning the *shipped* reply bytes never matched — the diff fragments the reply
+into one run per changed byte, and the result byte usually doesn't change, so the contiguous pattern is
+invisible in what crosses the wire; res6 never shipped and all 120 frames came back identical. The fix was
+to scan the *live* arena instead. And the subtle worry — that a previous frame's success lingers in the
+arena and false-triggers mid-DMA — turns out not to bite, precisely because the application is *polling*:
+while a fence is still in flight it is reading `VK_NOT_READY` (`[38][1]`) over and over, which overwrites
+the arena, so a live `[38][0]` genuinely means a fence just signalled. The application's own busy-wait is
+what makes the signal trustworthy.
+
+So S now ships the readback the instant that reply appears, ahead of the head-advance that releases the
+app, and gates it on `take_app_blob_writes` being non-empty — which is true only for a draw that actually
+produced pixels, so an upload copy ships nothing and a stale success re-ships nothing. No S-issued fence,
+no timing heuristic, no content-stability guess. The progress thread stopped touching the engine entirely.
+
+Two honest caveats, recorded so they are not forgotten. This is the *feedback-off* path — the only one
+that renders over a real network anyway; the old feedback-on "buy-back" was loopback-only and is
+superseded, and the loopback test now runs feedback-off so it guards the path we actually ship. And the
+readback still fragments into thousands of one-byte messages per frame — the runs are visibly slow — which
+is a real bandwidth problem for another day, not a correctness one. But correctness is the thing (c)2 was
+stuck on for the whole arc, and it is, at last, done: an unmodified Vulkan application renders on a remote
+GPU and reads its pixels back, frame-perfect, across a real network.

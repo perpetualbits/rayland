@@ -1263,6 +1263,50 @@ impl Applier {
         self.emit_blob_writes(&ids)
     }
 
+    /// **(c)2 completion barrier:** does the reply arena currently show a `vkGetFenceStatus` reply reading
+    /// `VK_SUCCESS`?
+    ///
+    /// With fence feedback off the application implements `vkWaitForFences` by polling `vkGetFenceStatus`
+    /// (Mesa `vn_queue.c`); virglrenderer writes each reply into the reply arena (a Venus-internal blob) as
+    /// `[VkCommandTypeEXT][VkResult]`. A live `[38][0]` — type `vkGetFenceStatus`, result `VK_SUCCESS` —
+    /// means the polled fence has signalled, i.e. the application's submit and its readback copy have
+    /// completed on S's GPU, so `res6` holds a whole, finished frame.
+    ///
+    /// # Why the **live** bytes, not the shipped diff
+    /// [`Self::take_venus_blob_writes`] fragments the reply into one run per *changed* byte (the result
+    /// byte often does not change from the previous reply), so the contiguous `[38][0]` pattern is not
+    /// visible in what S ships. The live arena holds the whole reply. Scanning it is safe against a
+    /// *lingering* previous success because the application polls `[38][1]` (`VK_NOT_READY`) continuously
+    /// while a fence is still in flight — so during a copy's DMA the arena reads `[38][1]`, not `[38][0]`.
+    /// The caller further gates on [`Self::take_app_blob_writes`] being non-empty, which is true only when
+    /// `res6` actually advanced, so a stale success cannot re-ship a frame.
+    ///
+    /// # Inputs / outputs
+    /// - Takes `&self`; scans the live bytes of every Venus-internal, non-ring blob. Returns `true` on the
+    ///   first `[38u32][0u32]` little-endian match (aligned scan — Venus encodes 4-byte aligned).
+    pub fn reply_arena_fence_signaled(&self) -> bool {
+        // `vkGetFenceStatus`'s command type and the result it reports once the fence has signalled.
+        const GET_FENCE_STATUS: u32 = 38;
+        const VK_SUCCESS: u32 = 0;
+        for (&res_id, blob) in &self.blobs {
+            // The reply arena is Venus-internal; the ring is not it, and app blobs are not either.
+            if self.rings.contains_key(&res_id) || !self.venus_internal.contains(&res_id) {
+                continue;
+            }
+            let b = blob.bytes();
+            let mut o = 0;
+            while o + 8 <= b.len() {
+                let ty = u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+                let res = u32::from_le_bytes(b[o + 4..o + 8].try_into().unwrap());
+                if ty == GET_FENCE_STATUS && res == VK_SUCCESS {
+                    return true;
+                }
+                o += 4;
+            }
+        }
+        false
+    }
+
     /// **Return path, post-fence half:** the application's own blob writes — the readback buffer and
     /// the feedback word — **largest blob first**, so the megabyte-scale readback ships ahead of the
     /// tiny feedback word, and the feedback word (which releases the application onto the picture)
@@ -1295,66 +1339,6 @@ impl Applier {
         ids.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         let ids: Vec<u32> = ids.into_iter().map(|(id, _)| id).collect();
         self.emit_blob_writes(&ids)
-    }
-
-    /// **(c)2 return-path change-detector:** read-only fingerprint of the **readback buffer**, i.e. the
-    /// largest non-ring, non-Venus-internal blob — the exact blob [`Self::take_app_blob_writes`] ships
-    /// first. Distinct from that method in two load-bearing ways: it takes `&self` and **never touches
-    /// the shadow**, so calling it does not consume/adopt any pending write, and it returns the raw
-    /// current content fingerprint rather than a diff.
-    ///
-    /// # Why it exists
-    /// The progress thread must ship a finished readback frame *before* the head-advance that releases
-    /// the application onto it (see `progress_thread`'s docs). To decide *whether* a new frame exists on
-    /// each 200 µs poll without paying the full ~1 MiB diff every time — which would starve the message
-    /// thread — it calls this cheap strided fingerprint and runs the authoritative
-    /// [`Self::take_app_blob_writes`] only when the fingerprint moved. The strided sample can in
-    /// principle miss a change that lands entirely between its samples, so it is a *gate* on the diff,
-    /// never a substitute for it; for a frame-scale change (a spinning object over a mostly-constant
-    /// background) ~4096 samples detect every frame in practice.
-    ///
-    /// # Inputs / outputs
-    /// - Returns `Some((res_id, size, fingerprint))` for the largest such blob, or `None` if the session
-    ///   has no application blob yet (before the first `vkMapMemory`). The fingerprint is the same
-    ///   strided [`rayland_relay::trace::fingerprint`] the T5 baseline uses, so it is cheap
-    ///   (microseconds) and directly comparable to those traces.
-    pub fn readback_probe(&self) -> Option<(u32, u64, u64)> {
-        // Same selection as `take_app_blob_writes`: exclude rings (C's command bytes / S's `head`) and
-        // Venus-internal blobs (the tiny feedback/reply arena), leaving the application's own buffers.
-        self.blobs
-            .iter()
-            .filter(|(id, _)| !self.rings.contains_key(id) && !self.venus_internal.contains(id))
-            // Largest is the readback buffer (megabytes) — the feedback word, were it not already
-            // excluded, is bytes; the uniform/vertex blobs are far smaller than a frame.
-            .max_by_key(|(_, blob)| blob.size())
-            .map(|(&id, blob)| (id, blob.size(), Self::sampled_fp(blob.bytes())))
-    }
-
-    /// **(c)2 return-path change-detector helper:** a near-zero-cost content fingerprint that reads
-    /// ~4096 evenly-spaced 8-byte words rather than one byte per cache line. It exists so
-    /// [`Self::readback_probe`] can run under the applier lock on every 200 µs poll **without perturbing
-    /// the return-path timing** — the full `trace::fingerprint` (16k iterations over a 1 MiB blob, ~25 µs
-    /// under the lock) starves the message thread (the classic Heisenbug this project has been bitten
-    /// by). A whole-frame `N` vs `N−1` readback differs across essentially every pixel, so a few thousand
-    /// samples detect the change reliably; this is a change-detector, not a hash against adversarial
-    /// collisions.
-    fn sampled_fp(bytes: &[u8]) -> u64 {
-        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-        // ~4096 word-samples regardless of size: dense enough to catch a small spinning object on a
-        // mostly-constant background (64 samples missed it — most of a 1 MiB frame is background), yet
-        // ~4× cheaper than the full one-byte-per-cache-line fingerprint that starved the message thread.
-        let step = (bytes.len() / 4096).max(8);
-        let mut hash = FNV_OFFSET;
-        let mut i = 0;
-        while i + 8 <= bytes.len() {
-            // Mix an 8-byte word each step — more entropy per sample than one byte, still ~64 reads.
-            let w = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
-            hash = (hash ^ w).wrapping_mul(FNV_PRIME);
-            i += step;
-        }
-        // Fold the length so a resize that aligns with the stride still changes the fingerprint.
-        (hash ^ bytes.len() as u64).wrapping_mul(FNV_PRIME)
     }
 
     /// **(c)1 Task 9 Probe A support**: fingerprint every blob S has ever written, cheaply.
