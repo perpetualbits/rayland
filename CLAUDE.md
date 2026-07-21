@@ -288,15 +288,26 @@ Venus/virglrenderer capture/replay engine, so *unmodified* applications run.**
   (`scripts/c2-icosa-two-machine.sh`) this took 11 runs from *most runs losing 1–4 frames* to **10/11
   runs fully clean**. Design + plan:
   [`docs/design/2026-07-19-c2-readback-completion-gate.md`](docs/design/2026-07-19-c2-readback-completion-gate.md).
-  **A ~1/11 residual of the same `N == N−1` signature remains, and it is *located by reasoning*, not an
-  S-side gate hole:** it is the **C-side release race** the design's §9 anticipated. With all Venus
-  feedback disabled the application's `vkWaitForFences` is released by the `RingProgress` head-advance
-  (`vn_ring_wait_seqno`), and `progress_thread` ships that head-advance *before* the gated readback
-  delivery — so the app can occasionally read its own local `res6` on C after `RingProgress` applies but
-  before the frame's readback `BlobData` applies. The next (c)2 step is ordering the head-advance that
-  releases a readback-bearing draw *after* that frame's readback pixels, without stalling the frame's
-  other synchronous calls — the harder half of the return path (c)1 handed over. Also still open:
-  multi-queue support (the two-submits-per-frame structure is central to this bug, not an aside).
+  **That ~1/11 `N == N−1` residual is now FIXED — 0 stale across 20 real-network runs** (2026-07-21).
+  The fix (`docs/design/2026-07-21-c2-getfencestatus-completion.md`) is the **G'** approach, reached
+  after three recorded dead ends: the empty-submit context fence retires before the readback DMA
+  (`T2 < T4`, pervasive — `docs/design/2026-07-20-c2-fence-empty-submit-finding.md`); a "wait-drain"
+  design rested on a false premise (with feedback off Mesa does **not** send `vkWaitForFences`, it
+  **polls `vkGetFenceStatus`** — the spike gate caught it before it was built); and a fingerprint-gated
+  res6-first ordering ("G-lite") killed the `N−1` staleness but tore, having no completion barrier. **The
+  signal that worked:** with feedback off the application releases itself by polling `vkGetFenceStatus`
+  until the reply reads `VK_SUCCESS`; virglrenderer writes that reply into the reply arena as `[38][0]`,
+  which means the app's submit *and its readback copy* are complete on S's GPU. `Applier::reply_arena_fence_signaled`
+  scans the **live** arena for it (the shipped diff fragments the reply into per-changed-byte runs, so the
+  contiguous pattern is invisible there); it is safe against a lingering prior success because the app
+  polls `VK_NOT_READY` (`[38][1]`) *during* a copy's DMA, so a live `[38][0]` means a fence just signalled.
+  `progress_thread` then ships the readback (gated on `take_app_blob_writes` non-empty — a draw's fresh,
+  complete `res6`) **before** the reply arena and the head-advance that release the app. No S-issued fence,
+  no timing heuristic; the progress thread no longer touches the engine. **Scope:** feedback-OFF only (the
+  only config that renders over a real network; the feedback-on "buy-back" was loopback-only and is
+  superseded — the loopback icosa e2e now runs feedback-off to guard the shipping path). **Still open:**
+  the readback fragments into ~5000 one-byte `BlobData`/frame (a bandwidth follow-up, not correctness), and
+  multi-queue support.
 - **(c)3 — content-addressed assets.**
 - **(c)4 — real/complex applications; GL via Zink.**
 
