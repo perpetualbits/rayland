@@ -49,8 +49,21 @@ today). `0` must be exactly inert (merge nothing), so the venus path is provably
 - **Unit (the diff still adopts correctly):** a coalesced `take_bytes_s_wrote` ships one run spanning the
   gap and adopting it, so a subsequent unchanged poll yields no runs.
 - **Regression (correctness unchanged):** loopback `icosa_cpu` + `refapp` e2e still bit-identical;
-  two-machine `icosa_cpu` still **0 stale** — and measurably **faster** (message count per frame drops
-  from thousands to single digits).
+  two-machine `icosa_cpu` still **0 stale**.
+
+## Result (measured, 2026-07-21)
+
+Readback `BlobData` per frame dropped from **~5000 to ~180** (~28×) at `GAP = 256`, correctness
+preserved (0 stale / 5 runs). The ~180 remaining runs are the frame's genuinely distinct changed
+clusters (the icosa's edges + fractal), separated by gaps larger than 256 — coalescing collapsed the
+fine within-cluster fragmentation but keeps the clusters split, which is the point: it buys the 28×
+with almost no redundant bytes. A larger gap would cut the count further but merge the large
+inter-cluster gaps, trading a lot of bandwidth for it.
+
+**Wall-clock is unchanged**, and that is informative: the two-machine run is bound by per-frame
+**round-trip latency** (the application's `vkGetFenceStatus` polling), not by the one-directional
+readback message volume. So this reduces network and C-side message-processing load 28×, but the
+per-frame round-trip count — a separate concern — is what gates wall-clock.
 
 ## Out of scope
 

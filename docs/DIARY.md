@@ -393,3 +393,28 @@ readback still fragments into thousands of one-byte messages per frame — the r
 is a real bandwidth problem for another day, not a correctness one. But correctness is the thing (c)2 was
 stuck on for the whole arc, and it is, at last, done: an unmodified Vulkan application renders on a remote
 GPU and reads its pixels back, frame-perfect, across a real network.
+
+### 2026-07-21 — Coalescing the readback, and what it revealed about where the time goes
+
+The G' fix was correct but the runs were slow, and the reason was ugly: the readback shipped as ~5000
+one-byte `BlobData` messages per frame. `changed_byte_ranges` emits one run per maximal run of
+*consecutive* changed bytes, and between two frames the changed bytes are sprinkled through unchanged
+ones, so a frame shatters. The fix is small and local: merge runs separated by ≤256 unchanged bytes for
+the readback path only, re-shipping the tiny gaps. It is safe precisely there because `res6` is written
+by S's GPU and only *read* on C — a re-shipped unchanged byte equals what C already holds. The fine
+byte-grain stays everywhere it is load-bearing (the reply arena, where shipping a byte S did not write
+could clobber the app's own); the coalescing is `gap = 0` (inert) on every other path.
+
+It worked — ~5000 down to ~180 messages per frame, still bit-identical, still zero stale. But the honest
+and more interesting result is that the **wall-clock did not move**. Twenty-eight times fewer readback
+messages, and the two-machine run takes the same minutes. That is a finding, not a disappointment: it
+says the return path's wall-clock is bound by per-frame *round-trip latency* — the application's
+`vkGetFenceStatus` polling, each poll a network round-trip — not by the one-directional volume of
+readback bytes. The readback fragmentation was a real load problem (network and C-side message
+processing, both now 28× lighter) but it was never the thing making the clock slow. The ~180 remaining
+runs are the frame's genuinely distinct changed clusters, and pushing further would trade a lot of
+bandwidth to merge the large gaps between them for no wall-clock gain, so 256 is where it rests.
+
+The next latency lever, when it matters, is the round-trip count itself — adaptive polling, or batching
+the reply path — not the readback. Recorded so the next person does not coalesce harder expecting the
+clock to move.

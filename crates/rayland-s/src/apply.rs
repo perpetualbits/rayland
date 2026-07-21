@@ -589,7 +589,7 @@ impl Applier {
                     .blobs
                     .get_mut(&res_id)
                     .expect("the blob was just inserted");
-                let initial_runs = created.take_bytes_s_wrote();
+                let initial_runs = created.take_bytes_s_wrote(0);
                 // **(c)1 Task 9 diagnostic.** A blob born with contents is one S has "written" (the
                 // GPU rendered into it before Mesa's lazy `vkMapMemory` made it a blob), so it joins
                 // the S-written set Probe A watches — this is the very first readback buffer, whose
@@ -1143,7 +1143,7 @@ impl Applier {
                 *res_id,
             )
         });
-        self.emit_blob_writes(&res_ids)
+        self.emit_blob_writes(&res_ids, 0)
     }
 
     /// Emit one `S2C::BlobData` per run of bytes S wrote, for the blobs named by `res_ids`, in the
@@ -1168,7 +1168,7 @@ impl Applier {
     ///   panic would take out the only thing that ever releases the application's waits.
     /// - Returns one [`S2C::BlobData`] per run of bytes S wrote, across the named blobs, in the order
     ///   given. Empty if none of them had anything to say.
-    fn emit_blob_writes(&mut self, res_ids: &[u32]) -> Vec<S2C> {
+    fn emit_blob_writes(&mut self, res_ids: &[u32], coalesce_gap: usize) -> Vec<S2C> {
         let mut out = Vec::new();
         // **(c)1 Task 9 diagnostic.** The res_ids that produced a run on *this* call, folded into
         // `self.s_written` after the loop rather than during it — inserting mid-loop would need a
@@ -1191,7 +1191,7 @@ impl Applier {
             let Some(blob) = self.blobs.get_mut(&res_id) else {
                 continue;
             };
-            let runs = blob.take_bytes_s_wrote();
+            let runs = blob.take_bytes_s_wrote(coalesce_gap);
             if runs.is_empty() {
                 continue;
             }
@@ -1260,7 +1260,9 @@ impl Applier {
             .copied()
             .filter(|id| !self.rings.contains_key(id) && self.venus_internal.contains(id))
             .collect();
-        self.emit_blob_writes(&ids)
+        // The reply arena keeps the fine byte grain (gap 0): it is small, and shipping a byte
+        // S did not write there could clobber the application's — the grain's whole reason to exist.
+        self.emit_blob_writes(&ids, 0)
     }
 
     /// **(c)2 completion barrier:** does the reply arena currently show a `vkGetFenceStatus` reply reading
@@ -1352,6 +1354,11 @@ impl Applier {
     ///   reproducible order — nothing depends on it). Empty when S has written none of them since the
     ///   last call.
     pub fn take_app_blob_writes(&mut self) -> Vec<S2C> {
+        // How near two changed runs must be for the readback path to merge them (re-shipping the
+        // unchanged bytes between). 256 collapses the readback's dense small-gap fragmentation to a
+        // handful of runs while bounding the redundant bytes. See `blob::coalesce_ranges` for why this
+        // is safe here (and only here): `res6` is S-written and C-read-only.
+        const READBACK_COALESCE_GAP: usize = 256;
         // `(res_id, size)` pairs so the sort below can order by size without a second map lookup.
         let mut ids: Vec<(u32, u64)> = self
             .blobs
@@ -1364,7 +1371,10 @@ impl Applier {
         // by id purely so the order is reproducible rather than hash-ordered.
         ids.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         let ids: Vec<u32> = ids.into_iter().map(|(id, _)| id).collect();
-        self.emit_blob_writes(&ids)
+        // Coalesce the readback's fragmented runs (gap 256): `res6` is S-written and C-read-only,
+        // so re-shipping an unchanged gap byte is idempotent, and it collapses the ~5000 one-byte
+        // messages/frame the return path is rate-bound on. See `blob::coalesce_ranges`.
+        self.emit_blob_writes(&ids, READBACK_COALESCE_GAP)
     }
 
     /// **(c)1 Task 9 Probe A support**: fingerprint every blob S has ever written, cheaply.

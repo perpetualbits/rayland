@@ -299,11 +299,16 @@ impl HostBlob {
     /// widening any single run past bytes S actually wrote. The cost is left visible and measurable
     /// here, which is what spec §6 and §8 ask of v1, and Task 9 measures it against this section's
     /// numbers.
-    pub fn take_bytes_s_wrote(&mut self) -> Vec<WrittenRun> {
+    pub fn take_bytes_s_wrote(&mut self, coalesce_gap: usize) -> Vec<WrittenRun> {
         // Two phases, because they need different borrows of `self` — and because doing the
         // comparison against a baseline that a copy in the same pass had already begun to overwrite
         // would compare each byte against the wrong thing.
-        let ranges = self.changed_byte_ranges();
+        //
+        // `coalesce_gap` merges runs separated by up to that many unchanged bytes (re-shipping them),
+        // trading a bounded number of redundant bytes for far fewer `S2C::BlobData` messages. It is 0
+        // — inert — for every path but the readback, where the grain is not load-bearing (S alone
+        // writes `res6`, C only reads it). See [`coalesce_ranges`].
+        let ranges = coalesce_ranges(self.changed_byte_ranges(), coalesce_gap);
 
         let mut runs = Vec::with_capacity(ranges.len());
         for (start, end) in ranges {
@@ -484,6 +489,40 @@ impl HostBlob {
     }
 }
 
+/// Merge `(start, end)` ranges separated by no more than `gap` unchanged bytes into single ranges,
+/// re-including the gap bytes.
+///
+/// [`HostBlob::changed_byte_ranges`]' byte grain exists to avoid shipping bytes S did not write (which
+/// would clobber the application's own writes — see [`HostBlob::take_bytes_s_wrote`]). This widens it
+/// back **only** for a blob where that grain is not load-bearing: the readback buffer, which S's GPU
+/// alone writes and C only reads, so a re-shipped unchanged byte equals what C already holds
+/// (idempotent). The trade is a bounded number of re-shipped unchanged bytes for far fewer
+/// `S2C::BlobData` messages — the return path is message-rate-bound, not bandwidth-bound (a readback
+/// frame otherwise shatters into thousands of one-byte runs).
+///
+/// # Inputs / outputs
+/// - `ranges`: ascending, non-overlapping half-open ranges, as [`HostBlob::changed_byte_ranges`]
+///   returns.
+/// - `gap`: merge a range into the previous one when its start is within `gap` bytes of that range's
+///   end. `gap == 0` is **inert** — `changed_byte_ranges` never returns adjacent ranges, so nothing
+///   merges and the output equals the input (the property the venus/reply path relies on).
+/// - Returns the coalesced ranges, ascending and non-overlapping.
+fn coalesce_ranges(ranges: Vec<(usize, usize)>, gap: usize) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        // Extend the open run if this range begins within `gap` unchanged bytes of its end; otherwise
+        // start a fresh run. `start - last.1` cannot underflow — inputs are ascending and disjoint.
+        if let Some(last) = out.last_mut() {
+            if start - last.1 <= gap {
+                last.1 = end;
+                continue;
+            }
+        }
+        out.push((start, end));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,6 +531,65 @@ mod tests {
     // ring-findings §2.1), so these tests map exactly what production maps.
     use rayland_vtest::transport::create_memfd;
     use std::os::fd::AsFd;
+
+    #[test]
+    fn coalesce_ranges_merges_ranges_within_the_gap() {
+        // [0,3) then [5,8): a 2-byte unchanged gap (3..5). With a threshold of 2 they merge, so the
+        // gap bytes ride along in one run instead of splitting into two messages.
+        assert_eq!(coalesce_ranges(vec![(0, 3), (5, 8)], 2), vec![(0, 8)]);
+    }
+
+    #[test]
+    fn coalesce_ranges_keeps_ranges_farther_apart_than_the_gap_split() {
+        // Same 2-byte gap, but the threshold is 1: it exceeds the threshold, so the runs stay split
+        // and no unchanged bytes are re-shipped.
+        assert_eq!(coalesce_ranges(vec![(0, 3), (5, 8)], 1), vec![(0, 3), (5, 8)]);
+    }
+
+    #[test]
+    fn coalesce_ranges_with_zero_gap_merges_nothing() {
+        // Gap 0 is the inert case the venus path relies on: `changed_byte_ranges` never returns
+        // adjacent ranges, so nothing merges and the output equals the input.
+        assert_eq!(coalesce_ranges(vec![(0, 3), (4, 8)], 0), vec![(0, 3), (4, 8)]);
+    }
+
+    #[test]
+    fn coalesce_ranges_chains_several_small_gaps_into_one() {
+        // The readback's real pattern: many tiny runs separated by tiny gaps collapse to one run.
+        assert_eq!(
+            coalesce_ranges(vec![(3, 4), (7, 8), (11, 12)], 256),
+            vec![(3, 12)]
+        );
+    }
+
+    #[test]
+    fn coalesce_ranges_empty_and_single_are_unchanged() {
+        assert_eq!(coalesce_ranges(Vec::new(), 256), Vec::<(usize, usize)>::new());
+        assert_eq!(coalesce_ranges(vec![(2, 9)], 256), vec![(2, 9)]);
+    }
+
+    #[test]
+    fn take_bytes_s_wrote_coalesces_runs_within_the_gap() {
+        let mut blob = a_blob(16);
+        // Two S writes with a 2-byte unchanged gap between them (bytes 1..3 stay zero).
+        s_engine_writes(&blob, 0, 0x11, 1);
+        s_engine_writes(&blob, 3, 0x11, 1);
+        // Gap 2 >= the 2-byte hole: one run ships, the unchanged gap bytes riding along.
+        let runs = blob.take_bytes_s_wrote(2);
+        assert_eq!(runs.len(), 1, "the 2-byte gap is within the threshold, so one run ships");
+        assert_eq!(runs[0].offset, 0);
+        assert_eq!(runs[0].bytes, vec![0x11, 0x00, 0x00, 0x11]);
+    }
+
+    #[test]
+    fn take_bytes_s_wrote_with_zero_gap_keeps_runs_fine() {
+        let mut blob = a_blob(16);
+        s_engine_writes(&blob, 0, 0x11, 1);
+        s_engine_writes(&blob, 3, 0x11, 1);
+        // Gap 0 is the venus/reply path's setting: no coalescing, the fine grain is preserved.
+        let runs = blob.take_bytes_s_wrote(0);
+        assert_eq!(runs.len(), 2, "gap 0 = no coalescing = the fine grain the reply path relies on");
+    }
 
     /// A blob of `size` bytes, mapped exactly as [`crate::apply::Applier`] maps one.
     fn a_blob(size: u64) -> HostBlob {
@@ -529,7 +627,7 @@ mod tests {
     #[test]
     fn a_blob_nobody_wrote_has_no_runs() {
         let mut blob = a_blob(8192);
-        assert_eq!(blob.take_bytes_s_wrote(), Vec::new());
+        assert_eq!(blob.take_bytes_s_wrote(0), Vec::new());
     }
 
     /// **The regression test for (c)1 Task 6's blank-picture finding.** Bytes that were already in
@@ -568,7 +666,7 @@ mod tests {
         let mut blob = HostBlob::map(fd.as_fd(), 64).expect("mapping it");
 
         assert_eq!(
-            blob.take_bytes_s_wrote(),
+            blob.take_bytes_s_wrote(0),
             vec![WrittenRun {
                 offset: 0,
                 bytes: vec![0xee; 64],
@@ -580,7 +678,7 @@ mod tests {
              own untouched zeros."
         );
         assert_eq!(
-            blob.take_bytes_s_wrote(),
+            blob.take_bytes_s_wrote(0),
             Vec::new(),
             "and once shipped they are the baseline: C has them now, so they are not news twice"
         );
@@ -596,7 +694,7 @@ mod tests {
         let mut blob = a_blob(64);
         s_engine_writes(&blob, 8, 0xc3, 8);
 
-        let runs = blob.take_bytes_s_wrote();
+        let runs = blob.take_bytes_s_wrote(0);
 
         assert_eq!(
             runs,
@@ -622,7 +720,7 @@ mod tests {
         // a page-grain run would visibly differ (it would start at the page boundary, 4096).
         s_engine_writes(&blob, A_PAGE + 4, 0x7f, 6);
 
-        let runs = blob.take_bytes_s_wrote();
+        let runs = blob.take_bytes_s_wrote(0);
 
         assert_eq!(
             runs,
@@ -659,7 +757,7 @@ mod tests {
             s_engine_writes(&blob, pixel * 4 + 2, 0xff, 2);
         }
 
-        let runs = blob.take_bytes_s_wrote();
+        let runs = blob.take_bytes_s_wrote(0);
 
         assert_eq!(
             runs.len(),
@@ -710,7 +808,7 @@ mod tests {
         for pixel in 0..4096 {
             s_engine_writes(&blob, pixel * 4 + 2, 0xff, 2);
         }
-        let frame_1_runs = blob.take_bytes_s_wrote();
+        let frame_1_runs = blob.take_bytes_s_wrote(0);
         assert_eq!(
             frame_1_runs.len(),
             4096,
@@ -725,7 +823,7 @@ mod tests {
             s_engine_writes(&blob, pixel * 4 + 2, 0x00, 1); // B: 0xff -> 0x00
         }
 
-        let frame_2_runs = blob.take_bytes_s_wrote();
+        let frame_2_runs = blob.take_bytes_s_wrote(0);
 
         assert_eq!(
             frame_2_runs.len(),
@@ -758,12 +856,12 @@ mod tests {
         s_engine_writes(&blob, 0, 0x11, 8192);
 
         assert_eq!(
-            blob.take_bytes_s_wrote().len(),
+            blob.take_bytes_s_wrote(0).len(),
             1,
             "the first take ships it"
         );
         assert_eq!(
-            blob.take_bytes_s_wrote(),
+            blob.take_bytes_s_wrote(0),
             Vec::new(),
             "S has written nothing since, so it has nothing more to say"
         );
@@ -783,7 +881,7 @@ mod tests {
         // C's own bytes land in the first page.
         blob.copy_in(0, &[0x33; 8]).expect("an in-range write");
 
-        let runs = blob.take_bytes_s_wrote();
+        let runs = blob.take_bytes_s_wrote(0);
 
         assert_eq!(
             runs,
@@ -807,7 +905,7 @@ mod tests {
             .expect_err("a write past the end must be refused");
 
         assert_eq!(
-            blob.take_bytes_s_wrote(),
+            blob.take_bytes_s_wrote(0),
             vec![WrittenRun {
                 offset: 0,
                 bytes: vec![0x5a; 64]
