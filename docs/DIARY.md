@@ -505,3 +505,29 @@ surface's id arriving as a translated `NewId`. The sink is deliberately a trait 
 behind it; the real link to S is Task 4's job, and keeping it abstract let the whole forward path be
 proven without standing up S at all. What's left of the crux is the fd→token interception itself — the
 one request, `create_immed`, that the whole sub-project exists to intercept.
+
+And then the crux itself — the one request the whole sub-project exists to intercept. `create_immed` is
+where a plain vkcube dies, because it hands the compositor a memfd dressed as a dma-buf and a real
+compositor refuses it. The proxy's job is to make sure a real compositor never sees that fd at all. What
+made this the interesting sub-step is that the token can't be built in one place: the dma-buf fd and its
+DRM modifier arrive on `params.add`, but the width, height, and format only arrive on the later
+`create_immed`. So the proxy accumulates state per params object — resolve the fd's memfd inode to an
+S-side resource id at `add` (the same inode `rayland-c`'s `shm.rs` allocated, which is the whole
+buffer-by-token insight from the Task-1 spike), stash it with the modifier, and only when `create_immed`
+supplies the geometry assemble the full `BufferToken` and forward it, the fd dropped on the floor. The
+proof drives the real sequence through the proxy with a real dmabuf client and a stub resolver, and checks
+two things: the token is fully and correctly populated (resource id, dimensions, format, modifier), and —
+the line that matters most — `create_immed` raises no protocol error. The abort that stopped vkcube is
+gone, because the memfd never left C. Both halves were watched failing first (starve the resolver and the
+token never forms; swap width for height and the dimensions come back wrong), which is the only way to
+trust the green.
+
+That completes the C-side proxy for WP0: it stands up, advertises the globals, forwards the app's requests,
+and turns the swapchain fd into a token — all proven against stubs standing in for S. What's deliberately
+still stubbed is exactly what Task 4 is: the real link carrying these messages to S, an `shm.rs`-backed
+resolver instead of a fixed map, the object-id translation between the app's id space and S's client's, and
+an actual Wayland client on S replaying the session against the real compositor and resolving each token
+back to a real dma-buf. The proxy has no caller yet either — wiring it into the daemon behind
+`RAYLAND_C1_WAYLAND_DISPLAY` is part of standing S up. But the risky core the plan front-loaded is done,
+and it is done the way SP0 did its risky core: end-to-end on the one path that matters, ugly edges left for
+later, the hard thing proven before the plumbing around it.

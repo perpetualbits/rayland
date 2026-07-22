@@ -14,20 +14,23 @@
 //! plumbing; the proxy owns forwarding, the object-id bookkeeping, and the single fd→token interception.
 //! See `docs/design/2026-07-22-wp0-wayland-proxy-first-light.md` §3 "Forwarding model".
 //!
-//! **Status: request forwarding (WP0 Task 3b, sub-step 3).** The backend stands up, advertises the minimal
-//! set of globals vkcube binds (§6 of the spec), accepts the application, and **forwards each request** to
-//! a [`WaylandSink`] after translating it (`Argument` → [`WaylandArg`]) with [`translate_message`]. The one
-//! remaining special case is the fd→token interception (sub-step 4): a request bearing the swapchain memfd
-//! (`zwp_linux_buffer_params_v1.add`) currently fails translation with [`TranslateError::UnresolvedFd`] and
-//! is dropped rather than forwarded, until the token resolution lands. The sink is a stub collector in
-//! tests; Task 4 replaces it with the real link to S.
+//! **Status: fd→token (WP0 Task 3b, sub-step 4 — the crux, complete).** The backend stands up, advertises
+//! the minimal globals vkcube binds (§6 of the spec), accepts the application, **forwards each request** to
+//! a [`WaylandSink`] after translating it (`Argument` → [`WaylandArg`]), and — the special case the whole
+//! sub-project exists for — **intercepts buffer creation**: `create_params`/`add`/`create_immed` on the
+//! `zwp_linux_dmabuf` path are consumed by [`try_intercept_buffer`], which resolves the passed dma-buf fd's
+//! memfd inode to an S-side resource id (via [`ResourceResolver`]) and forwards a [`BufferToken`] in place
+//! of the fd — no fd, no pixels crossing. Both the sink and the resolver are stubs in tests (a recorder and
+//! a fixed inode map); Task 4 replaces them with the real link to S and the `shm.rs`-backed registry, and
+//! adds the `app_id ↔ s_id` object-id mapping so S can replay the session against its real compositor.
 
-use std::os::fd::OwnedFd;
+use std::collections::HashMap;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rayland_relay::{WaylandArg, WaylandMessage};
+use rayland_relay::{BufferToken, WaylandArg, WaylandMessage};
 use wayland_server::Resource; // brings `interface()` into scope for the generated object types
 use wayland_server::backend::protocol::{Argument, Message};
 use wayland_server::backend::{
@@ -126,12 +129,221 @@ pub trait WaylandSink: Send + Sync {
     fn forward_request(&self, msg: WaylandMessage);
 }
 
+/// Resolves a passed file descriptor's memfd identity to the S-side resource it names.
+///
+/// This is the buffer-by-token correlation key, spiked in WP0 Task 1: the swapchain image's dma-buf fd is
+/// the exact `memfd:rayland-blob` `rayland-c` allocated in `shm.rs`, so its inode (`st_dev`+`st_ino`) —
+/// which `rayland-c` already owns — identifies the resource. It is a trait for the same reason as
+/// [`WaylandSink`]: the proxy can be proven end-to-end against a stub mapping (a test that registers a
+/// known inode) before the real, `shm.rs`-backed registry is wired in when the proxy joins the daemon.
+///
+/// Must be `Send + Sync`: it lives inside the backend's dispatch state.
+pub trait ResourceResolver: Send + Sync {
+    /// Given a memfd's device and inode numbers, return the S-side resource id that memfd backs, or `None`
+    /// if this inode is not a tracked resource (a foreign fd the proxy must not turn into a buffer token).
+    fn resolve_inode(&self, dev: u64, ino: u64) -> Option<u32>;
+}
+
+/// Buffer-creation state accumulated across one `zwp_linux_buffer_params_v1` object's request sequence.
+///
+/// The token the proxy must emit needs facts split across two requests: the resource id and modifier come
+/// from `params.add` (which carries the swapchain memfd and the DRM modifier), while width, height, and
+/// format come from the later `params.create_immed`. This holds the `add`-time facts until `create_immed`
+/// supplies the rest and the full [`BufferToken`] can be assembled.
+#[derive(Default)]
+struct PendingParams {
+    /// The S-side resource id the passed memfd resolved to (`None` until a successful `add`, or if the fd
+    /// did not correspond to a tracked resource).
+    resource_id: Option<u32>,
+    /// The DRM format modifier assembled from `add`'s `modifier_hi`/`modifier_lo` (`hi << 32 | lo`).
+    modifier: u64,
+}
+
 /// The dispatch state the backend threads through every callback (`ObjectData::request`,
-/// `GlobalHandler::bind`). It holds the [`WaylandSink`] the proxy forwards requests to; it will grow to
-/// also hold the resource→memfd correlation used at buffer creation and the `app_id ↔ s_id` bookkeeping.
+/// `GlobalHandler::bind`). It holds the [`WaylandSink`] requests are forwarded to, the
+/// [`ResourceResolver`] that turns a passed memfd into a resource id, and the per-`params`-object buffer
+/// state accumulated between `add` and `create_immed`. It will grow to also hold the `app_id ↔ s_id`
+/// bookkeeping (Task 4).
 struct ProxyState {
     /// Where translated requests go (a collector in tests, the real link to S in Task 4).
     sink: Arc<dyn WaylandSink>,
+    /// Turns a `params.add` fd into the S-side resource id it names (a stub in tests, `shm.rs` in Task 4).
+    resolver: Arc<dyn ResourceResolver>,
+    /// In-flight buffer state, keyed by the `zwp_linux_buffer_params_v1` object's id (the app's id space).
+    pending: HashMap<u32, PendingParams>,
+}
+
+// The interface names and request opcodes the fd→token interception keys on. Opcodes are the request's
+// index in its interface (document order in `linux-dmabuf-v1.xml`), which is how the Wayland wire numbers
+// them. Named here so the match on `(interface, opcode)` reads in domain terms, not magic numbers.
+/// The `zwp_linux_dmabuf_v1` global's interface name.
+const IFACE_DMABUF: &str = "zwp_linux_dmabuf_v1";
+/// The `zwp_linux_buffer_params_v1` object's interface name.
+const IFACE_PARAMS: &str = "zwp_linux_buffer_params_v1";
+/// `zwp_linux_dmabuf_v1.create_params` — makes a new params object (opcode 1).
+const OP_CREATE_PARAMS: u16 = 1;
+/// `zwp_linux_buffer_params_v1.add` — supplies the dma-buf fd + modifier for one plane (opcode 1).
+const OP_PARAMS_ADD: u16 = 1;
+/// `zwp_linux_buffer_params_v1.create_immed` — creates the `wl_buffer` synchronously (opcode 3).
+const OP_PARAMS_CREATE_IMMED: u16 = 3;
+
+/// Read a passed fd's memfd identity (`st_dev`, `st_ino`) via `fstat`, for resource correlation.
+///
+/// Returns `None` if `fstat` fails (e.g. the fd was already closed). Uses `libc::fstat` directly because
+/// `std` exposes no stable `st_dev`/`st_ino` accessor on a bare fd without going through a `File` that
+/// would take ownership.
+fn fd_inode(fd: &OwnedFd) -> Option<(u64, u64)> {
+    // SAFETY: a zeroed `stat` is a valid initialization target; `fstat` fully populates it on success and
+    // we only read fields after checking the return code. The fd is valid for the borrow's duration.
+    unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::fstat(fd.as_raw_fd(), &mut st) == 0 {
+            Some((st.st_dev as u64, st.st_ino as u64))
+        } else {
+            None
+        }
+    }
+}
+
+/// The first `NewId` argument's id (in the app's id space), or `None` if the request creates no object.
+/// The dmabuf requests the proxy intercepts each carry exactly one `new_id` (the params object, or the
+/// buffer), so "first" is unambiguous for them.
+fn first_new_id(msg: &Message<ObjectId, OwnedFd>) -> Option<u32> {
+    msg.args.iter().find_map(|arg| match arg {
+        Argument::NewId(id) => Some(id.protocol_id()),
+        _ => None,
+    })
+}
+
+/// Reassemble the 64-bit DRM modifier from a `params.add` request's `modifier_hi`/`modifier_lo` args.
+///
+/// Per `linux-dmabuf-v1.xml`, `add`'s args are `[fd, plane_idx, offset, stride, modifier_hi, modifier_lo]`,
+/// so the modifier halves are args 4 and 5. Returns 0 (the LINEAR/implicit modifier's neighbour, and a
+/// safe default) if the shape is unexpected.
+fn params_modifier(msg: &Message<ObjectId, OwnedFd>) -> u64 {
+    // Read one Uint arg at `idx`, or 0 if it is missing or not a Uint.
+    let uint_at = |idx: usize| match msg.args.get(idx) {
+        Some(Argument::Uint(v)) => *v as u64,
+        _ => 0,
+    };
+    (uint_at(4) << 32) | uint_at(5)
+}
+
+/// Extract `(width, height, drm_format)` from a `params.create_immed` request.
+///
+/// Per the protocol, `create_immed`'s args are `[buffer_id(new_id), width(int), height(int), format(uint),
+/// flags(uint)]`, so geometry is args 1–3. Width/height are protocol `int`s but never negative for a real
+/// buffer, so they are carried as `u32`. Returns zeros for any arg with an unexpected shape.
+fn immed_geometry(msg: &Message<ObjectId, OwnedFd>) -> (u32, u32, u32) {
+    let width = match msg.args.get(1) {
+        Some(Argument::Int(v)) => *v as u32,
+        _ => 0,
+    };
+    let height = match msg.args.get(2) {
+        Some(Argument::Int(v)) => *v as u32,
+        _ => 0,
+    };
+    let format = match msg.args.get(3) {
+        Some(Argument::Uint(v)) => *v,
+        _ => 0,
+    };
+    (width, height, format)
+}
+
+/// The buffer-by-token interception — the crux of WP0.
+///
+/// Handles the three `zwp_linux_dmabuf` requests that create a buffer, keeping their state and, at
+/// `create_immed`, forwarding a [`BufferToken`] instead of the passed dma-buf fd. Returns `true` when it
+/// consumed the request (so the caller must **not** run the generic translate-and-forward path — a raw fd
+/// must never cross), `false` for any other request (which the caller forwards generically).
+///
+/// # The sequence (Mesa's Venus WSI, `wsi_common_wayland`)
+/// 1. `zwp_linux_dmabuf_v1.create_params` → a new `params` object. Recorded; **not** forwarded — S builds
+///    its own params object from the token in Task 4, so the app's is purely local bookkeeping here.
+/// 2. `params.add(fd, …, modifier_hi, modifier_lo)` → the swapchain memfd and its modifier. The fd is
+///    `fstat`ed, its inode resolved to an S-side resource id, and both stashed in [`PendingParams`]. The
+///    fd is **dropped** — it never crosses the network.
+/// 3. `params.create_immed(buffer_id, width, height, format, flags)` → the app names the `wl_buffer`. Now
+///    all the token's facts are in hand: it is assembled and forwarded as the message
+///    `{ object_id: params, opcode: create_immed, args: [NewId(buffer_id), Buffer(token)] }`, which names
+///    the buffer and the resource it denotes without any pixels or fd crossing.
+///
+/// A `create_immed` whose fd never resolved (no matching resource, or a missing `add`) forwards nothing and
+/// logs — the app still gets its `wl_buffer` object locally (the backend created it from the `NewId`), but
+/// S is not told to present a resource it cannot identify.
+fn try_intercept_buffer(data: &mut ProxyState, msg: &Message<ObjectId, OwnedFd>) -> bool {
+    let iface = msg.sender_id.interface().name;
+    // The params/buffer objects live in the app's id space, keyed by the sending object's protocol id.
+    let obj = msg.sender_id.protocol_id();
+    match (iface, msg.opcode) {
+        // Step 1: a new params object. Start tracking it; do not forward.
+        (IFACE_DMABUF, OP_CREATE_PARAMS) => {
+            if let Some(params_id) = first_new_id(msg) {
+                data.pending.insert(params_id, PendingParams::default());
+                wp_log(&format!("intercept create_params -> params {params_id}"));
+            }
+            true
+        }
+        // Step 2: the dma-buf fd + modifier for this params object. Resolve and stash; drop the fd.
+        (IFACE_PARAMS, OP_PARAMS_ADD) => {
+            // The fd is add's first argument; resolve its memfd inode to an S-side resource id.
+            let resource_id = match msg.args.first() {
+                Some(Argument::Fd(fd)) => {
+                    fd_inode(fd).and_then(|(dev, ino)| data.resolver.resolve_inode(dev, ino))
+                }
+                _ => None,
+            };
+            let modifier = params_modifier(msg);
+            // Record against this params object; `create_immed` will complete the token.
+            let entry = data.pending.entry(obj).or_default();
+            entry.resource_id = resource_id;
+            entry.modifier = modifier;
+            wp_log(&format!(
+                "intercept params {obj}.add -> resource {resource_id:?}, modifier {modifier:#x} (fd dropped)"
+            ));
+            true
+        }
+        // Step 3: name the wl_buffer. Assemble and forward the token; the fd never crossed.
+        (IFACE_PARAMS, OP_PARAMS_CREATE_IMMED) => {
+            let buffer_id = first_new_id(msg);
+            let (width, height, drm_format) = immed_geometry(msg);
+            // Consume the accumulated state for this params object.
+            let pending = data.pending.remove(&obj).unwrap_or_default();
+            match (buffer_id, pending.resource_id) {
+                (Some(buffer_id), Some(resource_id)) => {
+                    let token = BufferToken {
+                        resource_id,
+                        width,
+                        height,
+                        drm_format,
+                        modifier: pending.modifier,
+                    };
+                    // The proxy-internal encoding of create_immed: the buffer's app-side id and the token
+                    // that names its S-side resource. S resolves the token to a real dma-buf (Task 4).
+                    let wire = WaylandMessage {
+                        object_id: obj,
+                        opcode: msg.opcode,
+                        args: vec![WaylandArg::NewId(buffer_id), WaylandArg::Buffer(token)],
+                    };
+                    wp_log(&format!(
+                        "intercept params {obj}.create_immed -> buffer {buffer_id} = resource {resource_id} ({width}x{height} fmt {drm_format:#x})"
+                    ));
+                    data.sink.forward_request(wire);
+                }
+                _ => {
+                    // No resolved resource (a missing/foreign fd): the app keeps its local buffer, but S
+                    // is told nothing — a buffer it cannot identify must not be presented.
+                    wp_log(&format!(
+                        "intercept params {obj}.create_immed -> UNRESOLVED (buffer {buffer_id:?}, resource {:?}); not forwarded",
+                        pending.resource_id
+                    ));
+                }
+            }
+            true
+        }
+        // Anything else is not a buffer-creation request; the caller forwards it generically.
+        _ => false,
+    }
 }
 
 /// Per-connection state the backend holds for the application's client. Empty for now — WP0 has exactly
@@ -204,26 +416,31 @@ impl ObjectData<ProxyState> for ProxyObjectData {
             .args
             .iter()
             .any(|arg| matches!(arg, Argument::NewId(_)));
-        // Translate the request to its wire form and forward it to S. An unresolved fd (the swapchain
-        // memfd at `params.add`) is expected until the fd→token sub-step lands; log and drop it rather
-        // than forward a raw fd or panic.
-        match translate_message(&msg) {
-            Ok(wire_msg) => {
-                wp_log(&format!(
-                    "forward obj {} opcode {} ({} args)",
-                    wire_msg.object_id,
-                    wire_msg.opcode,
-                    wire_msg.args.len()
-                ));
-                data.sink.forward_request(wire_msg);
-            }
-            Err(TranslateError::UnresolvedFd) => {
-                // The fd→token interception (sub-step 4) handles this request; for now it is not forwarded.
-                wp_log(&format!(
-                    "SKIP (unresolved fd) obj {} opcode {} — fd->token not yet wired",
-                    msg.sender_id.protocol_id(),
-                    msg.opcode
-                ));
+        // The one special case first: buffer-by-token interception on the dmabuf path. If it consumed the
+        // request (a `create_params`/`add`/`create_immed`), the generic path must not also run — a raw fd
+        // must never be forwarded.
+        if !try_intercept_buffer(data, &msg) {
+            // Generic path: translate the request to its wire form and forward it to S. A stray unresolved
+            // fd outside the intercepted dmabuf path is not expected in WP0; log and drop rather than
+            // forward a raw fd or panic.
+            match translate_message(&msg) {
+                Ok(wire_msg) => {
+                    wp_log(&format!(
+                        "forward obj {} opcode {} ({} args)",
+                        wire_msg.object_id,
+                        wire_msg.opcode,
+                        wire_msg.args.len()
+                    ));
+                    data.sink.forward_request(wire_msg);
+                }
+                Err(TranslateError::UnresolvedFd) => {
+                    // An fd on a non-dmabuf request: unhandled in WP0, dropped rather than forwarded raw.
+                    wp_log(&format!(
+                        "SKIP (unresolved fd) obj {} opcode {} — no token path for this request",
+                        msg.sender_id.protocol_id(),
+                        msg.opcode
+                    ));
+                }
             }
         }
         // Honour the contract: return handler data exactly when a new object was created, so it too
@@ -260,8 +477,13 @@ impl ObjectData<ProxyState> for ProxyObjectData {
 /// - `poll(2)` fails other than by interruption (`EINTR`, which is retried) — surfaced as an `io::Error`.
 ///
 /// `sink` is where the app's translated requests are forwarded — a collector in tests, the real link to
-/// S in Task 4.
-pub fn run(socket_path: PathBuf, sink: Arc<dyn WaylandSink>) -> anyhow::Result<()> {
+/// S in Task 4. `resolver` turns a passed `params.add` dma-buf fd into the S-side resource id it names — a
+/// stub map in tests, the `shm.rs`-backed registry in Task 4.
+pub fn run(
+    socket_path: PathBuf,
+    sink: Arc<dyn WaylandSink>,
+    resolver: Arc<dyn ResourceResolver>,
+) -> anyhow::Result<()> {
     // A stale socket file left by a crashed run would make `bind` fail; remove it (ignore "not found").
     let _ = std::fs::remove_file(&socket_path);
     // The pure-Rust Wayland server backend. `ProxyState` is the dispatch state it threads to callbacks.
@@ -277,7 +499,11 @@ pub fn run(socket_path: PathBuf, sink: Arc<dyn WaylandSink>) -> anyhow::Result<(
     // Where the application dials in. WP0 serves exactly one such socket.
     let listener = UnixListener::bind(&socket_path)?;
     // The dispatch loop owns this state; it is threaded to every callback by the backend.
-    let mut state = ProxyState { sink };
+    let mut state = ProxyState {
+        sink,
+        resolver,
+        pending: HashMap::new(),
+    };
     wp_log(&format!("proxy listening at {}", socket_path.display()));
     serve(&mut backend, &listener, &mut state)
 }

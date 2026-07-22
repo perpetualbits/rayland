@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rayland_c::wayland_proxy::WaylandSink;
+use rayland_c::wayland_proxy::{ResourceResolver, WaylandSink};
 use rayland_relay::WaylandMessage;
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
 use wayland_client::protocol::wl_registry::WlRegistry;
@@ -31,6 +31,15 @@ use wayland_client::{Connection, Dispatch};
 struct NullSink;
 impl WaylandSink for NullSink {
     fn forward_request(&self, _msg: WaylandMessage) {}
+}
+
+/// A resolver that recognises no inode. This test creates no buffers, so it is never consulted; it only
+/// satisfies `run`'s signature.
+struct NullResolver;
+impl ResourceResolver for NullResolver {
+    fn resolve_inode(&self, _dev: u64, _ino: u64) -> Option<u32> {
+        None
+    }
 }
 
 /// The client-side dispatch state. It carries nothing: `registry_queue_init` performs the initial global
@@ -73,7 +82,9 @@ fn app_connects_and_sees_wp0_globals() {
     let proxy_path = socket_path.clone();
     std::thread::spawn(move || {
         // If the proxy errors, surface it on stderr; the test will then fail at connect/roundtrip below.
-        if let Err(e) = rayland_c::wayland_proxy::run(proxy_path, Arc::new(NullSink)) {
+        if let Err(e) =
+            rayland_c::wayland_proxy::run(proxy_path, Arc::new(NullSink), Arc::new(NullResolver))
+        {
             eprintln!("proxy exited with error: {e:#}");
         }
     });

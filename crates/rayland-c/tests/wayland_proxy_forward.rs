@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use rayland_c::wayland_proxy::WaylandSink;
+use rayland_c::wayland_proxy::{ResourceResolver, WaylandSink};
 use rayland_relay::{WaylandArg, WaylandMessage};
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
 use wayland_client::protocol::wl_compositor::WlCompositor;
@@ -39,6 +39,15 @@ impl WaylandSink for Collector {
     /// Record one forwarded request for the test to assert on.
     fn forward_request(&self, msg: WaylandMessage) {
         self.messages.lock().unwrap().push(msg);
+    }
+}
+
+/// A resolver that recognises no inode — this test forwards only `create_surface`, never a buffer, so the
+/// resolver is never consulted; it only satisfies `run`'s signature.
+struct NullResolver;
+impl ResourceResolver for NullResolver {
+    fn resolve_inode(&self, _dev: u64, _ino: u64) -> Option<u32> {
+        None
     }
 }
 
@@ -96,7 +105,9 @@ fn create_surface_is_forwarded_with_a_translated_new_id() {
     let proxy_path = socket_path.clone();
     let proxy_sink = collector.clone();
     std::thread::spawn(move || {
-        if let Err(e) = rayland_c::wayland_proxy::run(proxy_path, proxy_sink) {
+        if let Err(e) =
+            rayland_c::wayland_proxy::run(proxy_path, proxy_sink, Arc::new(NullResolver))
+        {
             eprintln!("proxy exited with error: {e:#}");
         }
     });
