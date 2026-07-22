@@ -80,6 +80,12 @@ pub const SUPPORTED_VTEST_PROTOCOL_VERSION: u32 = 4;
 /// use it.
 #[derive(Debug, thiserror::Error)]
 pub enum ApplyError {
+    /// A WP0 Wayland-proxy message reached the vtest `apply` path. The session router must split the
+    /// Wayland channel off to the S-side Wayland client *before* `apply`; one arriving here is an
+    /// internal routing bug, surfaced loudly rather than silently mis-decoded as a vtest message.
+    #[error("a Wayland-proxy message reached the vtest apply path; the session router failed to split it")]
+    WaylandMessageOnVtestPath,
+
     /// C negotiated a vtest protocol version S does not implement.
     #[error(
         "C negotiated vtest protocol version {got} with Mesa, but S implements \
@@ -206,6 +212,9 @@ fn message_is_solicited(msg: &C2S) -> bool {
         | C2S::SubmitCmd { .. }
         | C2S::NotifyRing { .. }
         | C2S::UnrefResource { .. } => false,
+        // WP0 Wayland-proxy messages never travel this vtest reply path — the session router splits
+        // them off to the S-side Wayland client before `apply` — so they are not solicited replies.
+        C2S::WaylandData { .. } | C2S::WaylandBuffer { .. } => false,
     }
 }
 
@@ -817,6 +826,11 @@ impl Applier {
                 // exists to prevent. Cheap to drop; invisible and sporadic if not.
                 self.venus_internal.remove(&res_id);
                 Ok(Vec::new())
+            }
+            // WP0 Wayland-proxy messages must never reach the vtest apply path — the session router
+            // splits them off to the S-side Wayland client. One here is an internal routing bug.
+            C2S::WaylandData { .. } | C2S::WaylandBuffer { .. } => {
+                Err(ApplyError::WaylandMessageOnVtestPath)
             }
         }
     }

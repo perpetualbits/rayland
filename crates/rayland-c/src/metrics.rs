@@ -130,6 +130,10 @@ impl Channel {
             | C2S::GetCapset { .. }
             | C2S::CreateBlob { .. }
             | C2S::UnrefResource { .. } => Channel::Control,
+            // WP0 Wayland-proxy traffic. Counted as `Control` for now — a dedicated Wayland metrics
+            // channel (its own line and counter slot) is deferred to a later WP; this is a conscious
+            // classification, not the silent `_ =>` the exhaustiveness here exists to prevent.
+            C2S::WaylandData { .. } | C2S::WaylandBuffer { .. } => Channel::Control,
         }
     }
 
@@ -146,6 +150,8 @@ impl Channel {
             | S2C::BlobCreated { .. }
             | S2C::RingProgress { .. }
             | S2C::Error { .. } => Channel::Replies,
+            // WP0 Wayland-proxy traffic — counted as `Control` for now (see the C2S arm above).
+            S2C::WaylandData { .. } => Channel::Control,
         }
     }
 
