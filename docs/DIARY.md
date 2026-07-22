@@ -531,3 +531,22 @@ back to a real dma-buf. The proxy has no caller yet either — wiring it into th
 `RAYLAND_C1_WAYLAND_DISPLAY` is part of standing S up. But the risky core the plan front-loaded is done,
 and it is done the way SP0 did its risky core: end-to-end on the one path that matters, ugly edges left for
 later, the hard thing proven before the plumbing around it.
+
+A review of the whole proxy followed, and it did the most useful thing a review can: it confirmed the
+scary parts were actually sound (no path forwards a raw fd; the state machine keys consistently and never
+fabricates a token from a missing `add`; the poll loop can't spin because wayland-backend deregisters a
+dead client itself; the opcodes match the protocol xml) and then named the thing the celebratory commit
+message had glossed. "The crux, complete" is true of the fd→token *mechanism*, but a real vkcube would
+never reach `create_immed` through this proxy yet, because there is no path to deliver compositor events
+back to the app — and Mesa's WSI blocks on an `xdg_surface.configure` and on dmabuf format/feedback events
+*before* it ever creates a swapchain image. The buffer-token test drives the buffer sequence by hand
+precisely because that earlier handshake isn't there to carry a real client to that point. That is
+genuinely Task 4's job (there is no S to originate those events yet), but it's an important correction to
+the story: the proxy's send path is unbuilt, and standing up S will have to include making those events
+happen, quite possibly by synthesising a configure locally rather than waiting on the real compositor.
+Two smaller gaps got fixed on the spot — the asynchronous `params.create` (the sibling of `create_immed`
+that returns its buffer via an event) was falling through to the generic forward, which would ship
+geometry-with-no-token to S and quietly pretend an unsupported request was handled; it is now refused
+cleanly and tested. And params state that never reached `create_immed` was leaking, so teardown now
+releases it. Neither was a crash, but both are the kind of honest edge the walking skeleton is allowed to
+have only if they're named.

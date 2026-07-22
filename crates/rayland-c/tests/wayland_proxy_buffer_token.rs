@@ -170,6 +170,63 @@ fn create_immed_emits_a_correct_buffer_token_and_never_asserts() {
     assert!(named_buffer, "the token message did not name the wl_buffer id");
 }
 
+/// The asynchronous `params.create` path (opcode 2) is unsupported in WP0 and must be refused cleanly:
+/// no token is forwarded, and no protocol error is raised (the request is consumed, not mis-forwarded).
+#[test]
+fn async_create_is_refused_without_forwarding_a_token() {
+    let socket_path: PathBuf = std::env::temp_dir()
+        .join(format!("rayland-wp-proxy-async-{}.sock", std::process::id()));
+
+    let memfd = make_memfd();
+    let (dev, ino) = fd_inode(&memfd).expect("fstat the test memfd");
+
+    let collector = Arc::new(Collector::default());
+    let proxy_path = socket_path.clone();
+    let proxy_sink = collector.clone();
+    let resolver = Arc::new(FixedResolver { dev, ino });
+    std::thread::spawn(move || {
+        if let Err(e) = rayland_c::wayland_proxy::run(proxy_path, proxy_sink, resolver) {
+            eprintln!("proxy exited with error: {e:#}");
+        }
+    });
+
+    let stream = connect_with_retry(&socket_path, Duration::from_secs(2))
+        .expect("connect to the proxy socket within the timeout");
+    let conn = match Connection::from_socket(stream) {
+        Ok(conn) => conn,
+        Err(e) => {
+            eprintln!("skipping: cannot init wayland-client backend (libwayland absent?): {e}");
+            return;
+        }
+    };
+
+    let (globals, mut queue) =
+        registry_queue_init::<AppData>(&conn).expect("registry round-trips against the proxy");
+    let qh = queue.handle();
+    let dmabuf: ZwpLinuxDmabufV1 = globals
+        .bind(&qh, 3..=3, ())
+        .expect("proxy lets the client bind zwp_linux_dmabuf_v1");
+
+    let params: ZwpLinuxBufferParamsV1 = dmabuf.create_params(&qh, ());
+    params.add(memfd.as_fd(), 0, 0, (WIDTH as u32) * 4, MODIFIER_HI, MODIFIER_LO);
+    // The async variant: no new_id in the request; the wl_buffer would arrive via a `created` event.
+    params.create(WIDTH, HEIGHT, DRM_FORMAT_ARGB8888, Flags::empty());
+
+    // Must not raise a protocol error — the proxy consumes the request cleanly.
+    queue
+        .roundtrip(&mut AppData)
+        .expect("round-trip after async create — no protocol error");
+
+    // Nothing at all should have been forwarded: create_params, add, and the async create are each
+    // consumed by the interception. In particular the async create must not fall through to the generic
+    // forward path (which would ship geometry-with-no-token to S, misrepresenting an unsupported request).
+    let messages = collector.messages.lock().unwrap();
+    assert!(
+        messages.is_empty(),
+        "async create path forwarded something (expected nothing); messages: {messages:?}"
+    );
+}
+
 /// Create an anonymous in-memory file (memfd) to stand in for a swapchain image's blob memfd.
 fn make_memfd() -> OwnedFd {
     use std::ffi::CString;

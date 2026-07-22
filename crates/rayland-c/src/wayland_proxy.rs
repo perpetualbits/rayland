@@ -184,6 +184,11 @@ const IFACE_PARAMS: &str = "zwp_linux_buffer_params_v1";
 const OP_CREATE_PARAMS: u16 = 1;
 /// `zwp_linux_buffer_params_v1.add` — supplies the dma-buf fd + modifier for one plane (opcode 1).
 const OP_PARAMS_ADD: u16 = 1;
+/// `zwp_linux_buffer_params_v1.create` — the *asynchronous* buffer-creation request (opcode 2). The
+/// `wl_buffer` id is returned later via a `created`/`failed` event rather than in the request itself. WP0
+/// does not support this path (it has no event-return channel yet); it is recognised only to be refused
+/// cleanly rather than mis-forwarded — see [`try_intercept_buffer`].
+const OP_PARAMS_CREATE: u16 = 2;
 /// `zwp_linux_buffer_params_v1.create_immed` — creates the `wl_buffer` synchronously (opcode 3).
 const OP_PARAMS_CREATE_IMMED: u16 = 3;
 
@@ -252,10 +257,15 @@ fn immed_geometry(msg: &Message<ObjectId, OwnedFd>) -> (u32, u32, u32) {
 
 /// The buffer-by-token interception — the crux of WP0.
 ///
-/// Handles the three `zwp_linux_dmabuf` requests that create a buffer, keeping their state and, at
+/// Handles the `zwp_linux_dmabuf` requests that create a buffer, keeping their state and, at
 /// `create_immed`, forwarding a [`BufferToken`] instead of the passed dma-buf fd. Returns `true` when it
 /// consumed the request (so the caller must **not** run the generic translate-and-forward path — a raw fd
 /// must never cross), `false` for any other request (which the caller forwards generically).
+///
+/// The buffer-creation family has a **fourth** request, `params.create` (opcode 2) — the asynchronous
+/// counterpart of `create_immed`, which returns the `wl_buffer` id via a later `created`/`failed` event.
+/// WP0 has no event-return channel yet, so that path is recognised and refused cleanly rather than
+/// mis-forwarded; only `create_immed` actually produces a token. See the `OP_PARAMS_CREATE` arm.
 ///
 /// # The sequence (Mesa's Venus WSI, `wsi_common_wayland`)
 /// 1. `zwp_linux_dmabuf_v1.create_params` → a new `params` object. Recorded; **not** forwarded — S builds
@@ -339,6 +349,18 @@ fn try_intercept_buffer(data: &mut ProxyState, msg: &Message<ObjectId, OwnedFd>)
                     ));
                 }
             }
+            true
+        }
+        // The asynchronous sibling of create_immed. WP0 has no event-return channel yet (the `created`/
+        // `failed` event that carries the buffer id back cannot be delivered — that is Task 4's S side), so
+        // this path cannot complete. Consume and log it rather than let it fall through to the generic
+        // forward, which would ship geometry with no token to S and silently misrepresent an unsupported
+        // request as handled. The `pending` entry is cleared so it does not leak.
+        (IFACE_PARAMS, OP_PARAMS_CREATE) => {
+            data.pending.remove(&obj);
+            wp_log(&format!(
+                "intercept params {obj}.create (async) -> UNSUPPORTED in WP0 (no event-return channel); not forwarded"
+            ));
             true
         }
         // Anything else is not a buffer-creation request; the caller forwards it generically.
@@ -448,15 +470,22 @@ impl ObjectData<ProxyState> for ProxyObjectData {
         makes_new_object.then(|| Arc::new(ProxyObjectData) as Arc<dyn ObjectData<ProxyState>>)
     }
 
-    /// The object was destroyed. Nothing to release yet (no per-object state); a later sub-step drops the
-    /// object from the `app_id ↔ s_id` map here.
+    /// The object was destroyed. Release any per-object buffer state so it cannot leak.
+    ///
+    /// If the destroyed object was a `zwp_linux_buffer_params_v1` that never reached `create_immed` (it was
+    /// abandoned, or completed via the unsupported async `create` path), its [`PendingParams`] entry would
+    /// otherwise linger for the process's life. Removing by the object's id is a cheap no-op for every other
+    /// object (a surface, a toplevel), so it is done unconditionally. A later sub-step also drops the object
+    /// from the `app_id ↔ s_id` map here.
     fn destroyed(
         self: Arc<Self>,
         _handle: &Handle,
-        _data: &mut ProxyState,
+        data: &mut ProxyState,
         _client_id: ClientId,
-        _object_id: ObjectId,
+        object_id: ObjectId,
     ) {
+        // Drop any accumulated buffer state keyed by this object's id (no-op unless it was a params object).
+        data.pending.remove(&object_id.protocol_id());
     }
 }
 
