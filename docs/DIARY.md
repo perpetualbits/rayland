@@ -583,3 +583,36 @@ readable (the fallback re-enters the exact (c)2 readback-of-a-GPU-image wall). S
 spike gate — can S export a real swapchain resource as a dma-buf the compositor imports? — before any of the
 S client gets built, exactly as Task 3b front-loaded its correlation spike. Which of the two paths to aim
 the walking skeleton at first is the next thing to settle, because it changes what gets built.
+
+### 2026-07-22 — The spike gate fired: zero-copy is structurally impossible, and that's the useful kind of no
+
+The dma-buf export spike was the right call, because it returned a hard, decisive no — and told us exactly
+why, in virglrenderer's own source rather than by guesswork. The question was whether S could re-export a
+swapchain image's resource as a compositor-importable dma-buf. The answer: virglrenderer fixes a resource's
+fd type at *creation*, not at export. Rayland's swapchain image memory is a **guest blob**
+(`VIRGL_RENDERER_BLOB_MEM_GUEST` — the `memfd:rayland-blob` the whole buffer-by-token correlation rests on),
+and a guest blob is created as pure guest iovecs with no host fd at all: `virgl_resource_export_fd` returns
+`FD_INVALID`, and `virgl_renderer_resource_export_blob` returns `-EINVAL`. Not a dma-buf, not even an SHM fd
+— nothing. Dma-buf export is real and unstubbed, but it lives on the *host*-allocated (`HOST3D`) path, which
+requires the guest to have allocated the memory with `VkExportMemoryAllocateInfo{DMA_BUF}` — and Rayland's
+guest-blob resources structurally never go through that path.
+
+So the design doc's §4 promise — "S re-exports the resource as a dma-buf, rayland-s already does this" — is
+not merely unimplemented, it is **unreachable** without changing what kind of memory the swapchain image is
+made of (guest blob → HOST3D blob). That is a deep change to the resource model, well outside WP0, and worth
+its own investigation later (it's the real road to zero-copy, and it may not even be free: HOST3D memory is
+host-allocated, which changes who owns the swapchain pixels and reopens the mapped-memory questions (c)2
+exists for). This is exactly the wall "expect walls" predicted, found before a line of the S client was
+written to rest on the false assumption.
+
+Where that leaves WP0: the readback→`wl_shm` fallback, which the presentation-path question already blessed
+as acceptable because it keeps the real invariant — no pixels cross the *network*; S reads the rendered
+pixels from its own local mirror of the guest memfd (the resource the `BufferToken` names) and presents them
+via `wl_shm` on its own screen. And this is not a sad consolation prize: it lands almost exactly on
+machinery that already exists and is proven. The swapchain image is a linear, guest-memfd-backed render
+target (Venus negotiates LINEAR for wlroots/cosmic-style compositors), so after the app's submit completes,
+S's mirror of that memfd holds the finished pixels — the same completion-gated readback the (c)2 return path
+already solved (the G' `vkGetFenceStatus` signal). WP0's S side becomes: drive a persistent surface from the
+app's relayed attach/commit, and on each commit read the token's resource bytes (completion-gated) into a
+`wl_shm` buffer and present. Zero-copy is deferred to a future HOST3D-resource investigation; the walking
+skeleton walks on the copy path first, exactly as the skeleton philosophy intends.
