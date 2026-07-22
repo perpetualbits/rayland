@@ -616,3 +616,34 @@ already solved (the G' `vkGetFenceStatus` signal). WP0's S side becomes: drive a
 app's relayed attach/commit, and on each commit read the token's resource bytes (completion-gated) into a
 `wl_shm` buffer and present. Zero-copy is deferred to a future HOST3D-resource investigation; the walking
 skeleton walks on the copy path first, exactly as the skeleton philosophy intends.
+
+### 2026-07-22 — Overturned by measurement: the swapchain images export as dma-bufs after all
+
+The Task 4.0 spike said zero-copy was structurally impossible. It was wrong, and the way it was wrong is
+worth being precise about because the correction is the whole game. That spike read virglrenderer's source
+and correctly concluded a **guest blob** can never export as a dma-buf. Its error was one of identification:
+it took "the swapchain image is the `memfd:rayland-blob` rayland-c allocated" — true of **C's local
+placeholder fd** — and assumed the *S-side resource* was therefore a guest blob too. Two more source reads
+(Mesa's Venus WSI, and Rayland's own blob plumbing) said otherwise: Mesa's vtest backend requests the
+swapchain image's memory as `VCMD_BLOB_TYPE_HOST3D` with `VkExportMemoryAllocateInfo{DMA_BUF}`
+**unconditionally** (`vn_renderer_vtest.c`), never maps it on the guest, and rayland-s already honors
+`blob_mem` end-to-end — so the resource S actually creates for a swapchain image is a **HOST3D** resource,
+not a guest blob. C's memfd and S's resource are two different objects; the spike conflated them.
+
+So we measured, instead of reasoning a third time. A throwaway `RAYLAND_EXPORT_SPIKE` logged the `fd_type`
+virglrenderer returns from every HOST3D export, and vkcube was run through a loopback relay on dop561 (a real
+GPU, a real NVIDIA A500). The answer was unambiguous: resources 1–3 exported as `fd_type=3` (SHM — the ring,
+the reply arena, staging), and resources **4, 5, 6, 7 exported as `fd_type=1` — DMABUF**. Four of them,
+exactly a swapchain's worth of images, each a real, compositor-importable dma-buf, sitting on S. The
+resource the `BufferToken` names *is* directly presentable, zero-copy, with no readback and no local copy.
+
+This vindicates the design's original thesis and the instinct to investigate HOST3D before settling for the
+`wl_shm` fallback. It also changes WP0's endpoint back to what the design always wanted: S resolves the
+token to its HOST3D resource's dma-buf and hands *that* to its compositor. A few real details fall out of the
+measurement and are noted for the build: the export already happens once, at blob creation (that is what the
+spike observed), and virglrenderer guards against a second export — so S must **retain** the creation-time
+dma-buf rather than re-export on demand; and the compositor also needs stride/offset/modifier, which for the
+LINEAR swapchain images here are trivial (offset 0, stride = width·bpp) or already carried on the token. The
+Task 4.0 "impossible" entry stays in the diary above, wrong, as the record of a conclusion measurement
+reversed — which is exactly the kind of honesty this diary exists to keep. Zero-copy is back on, and now
+it's not a hope, it's a logged fact.

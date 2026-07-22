@@ -312,3 +312,39 @@ that memfd holds the finished pixels** — read out completion-gated exactly as 
   `S2C::WaylandEvent`, delivering `xdg_surface.configure` (possibly synthesised) and the frame callbacks a
   real app needs to keep drawing.
 - **4.5 — end-to-end.** vkcube's spinning cube in a `wl_shm` window on S, animating.
+
+### Task 4.0-bis OUTCOME (2026-07-22): zero-copy IS viable — measurement overturned the earlier spike
+
+The "zero-copy impossible" conclusion above (Task 4.0) was **wrong**, and is left in place per the diary's
+honesty rule. It conflated C's local placeholder memfd with the *S-side* resource. Two source reads plus an
+empirical run corrected it:
+
+- **Mesa** (`vn_renderer_vtest.c:760-761`, `wsi_common_drm.c:759-798`, `vn_device_memory.c:285-318`):
+  Venus's vtest backend requests the swapchain image's memory as `VCMD_BLOB_TYPE_HOST3D` with
+  `VkExportMemoryAllocateInfo{DMA_BUF_BIT_EXT}` **unconditionally**, DEVICE_LOCAL, and **never CPU-maps it**.
+- **Rayland** (`virgl.rs:690-758`, `apply.rs:515`): `blob_mem` is honored end-to-end; S creates a real
+  HOST3D resource (no iovecs) and calls `export_blob_fd` for it. So the S-side swapchain resource is HOST3D,
+  not a guest blob.
+- **Empirical** (`RAYLAND_EXPORT_SPIKE` + vkcube over loopback on dop561, NVIDIA A500): resources 1–3
+  exported `fd_type=3` (SHM); resources **4–7 exported `fd_type=1` (DMABUF)** — a swapchain's worth of real,
+  compositor-importable dma-bufs on S.
+
+**WP0 presentation returns to zero-copy dma-buf** (the design's thesis). Build notes from the measurement:
+- The dma-buf export **already happens once at blob creation** (that is what the spike observed), and
+  virglrenderer's `mem->exported` guard forbids a second export — so S must **retain** the creation-time
+  dma-buf fd for the resource rather than re-export on demand. `create_blob_resource` currently hands that
+  fd onward as the "client fd"; on S there is no local vtest client, so the fd must be kept, keyed by
+  `resource_id`, for presentation.
+- The compositor needs stride/offset/modifier alongside the fd. For the LINEAR swapchain images here these
+  are trivial (offset 0, stride = width·bpp) or already carried on the `BufferToken`.
+
+**Revised decomposition (zero-copy):**
+- **4.1 — C-side wiring.** (unchanged) link-backed sink, inode→res_id resolver, proxy as 4th thread, env.
+- **4.2 — S router + persistent Wayland client** against the real compositor; `app_id ↔ s_id` map.
+- **4.3 — token → wl_buffer (zero-copy).** Retain each HOST3D resource's creation-time dma-buf fd keyed by
+  `resource_id`; on the app's relayed `attach`+`commit`, resolve `BufferToken.resource_id` → that dma-buf,
+  build a `wl_buffer` via S's compositor's `zwp_linux_dmabuf` (reuse `rayland-present`'s dmabuf mechanics),
+  attach+commit. Gate the commit on the frame's completion (the existing (c)2 G' signal).
+- **4.4 — event return path.** eventfd wakeup + `send_event` + `S2C::WaylandEvent`, incl. `xdg_surface.configure`
+  and the dmabuf format/modifier feedback Mesa needs to pick the native (HOST3D-export) WSI path.
+- **4.5 — end-to-end.** vkcube's spinning cube on S, zero-copy, animating.
