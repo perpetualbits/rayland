@@ -70,6 +70,21 @@ The flow WP0 builds:
    gated on the frame's completion so the compositor never composites a half-rendered image (WP0 reuses
    the existing return-path completion signal; precise fence/`drm-syncobj` integration is WP3).
 
+### Spike outcome (2026-07-22) — the correlation key is a memfd inode `rayland-c` already owns
+
+The Task-1 spike confirmed the mechanism and sharpened one detail. The swapchain image's `VkDeviceMemory`
+is not a real dma-buf — it is a **`memfd:rayland-blob`**, the exact memfd `rayland-c` allocates
+(`crates/rayland-c/src/shm.rs`) for that resource id and hands the app over vtest. Mesa's WSI reuses that
+same fd at `zwp_linux_buffer_params.add`. So the correlation key is the resource **memfd's identity**
+(`st_dev` + `st_ino`), which `rayland-c` already holds — no fstat guessing against unknown fds, and no need
+to decode `vkSetReplyCommandStreamMESA`-style host state. This also explains why a plain vkcube run aborts
+(`create_immed failed / invalid wl_buffer`): a *real* compositor rejects a memfd presented as a dma-buf.
+The proxy dissolves that: the app connects to the *proxy*, which intercepts `create_params`/`create_immed`,
+correlates the memfd to a resource id → token, and **never forwards the memfd to a real compositor** — S
+supplies the real dma-buf. Legs (a) correlation and (c) render-on-S are confirmed; leg (b) — S re-exporting
+the resource as a dma-buf S's compositor accepts, including format/modifier — is confirmed concretely in
+Task 4.
+
 ## 5. Why this is the right shape
 
 - **No pixel path for presentation** — pixels are rendered on S and shown on S; the network carries
