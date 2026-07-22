@@ -32,6 +32,10 @@ rayland-transport = { path = "../rayland-transport" } # SP2's QUIC: the network 
 rayland-present = { path = "../rayland-present" }
 anyhow = { workspace = true }                    # ergonomic top-level errors for the daemon binary
 thiserror = { workspace = true }                 # typed, precise refusals of remote input
+# WP0: S replays the app's relayed Wayland session against S's *real* compositor as a client. We use the
+# low-level `wayland_client::backend` (structured `Message`s via `send_request`), the mirror of the
+# `wayland-server` backend the C-side proxy uses — so the replay is transparent, not per-interface code.
+wayland-client = { workspace = true }            # the client backend for the S-side session replay
 
 [dev-dependencies]
 # `tests/loopback_e2e.rs` decodes the two PNGs the reference app writes (native, and rendered across

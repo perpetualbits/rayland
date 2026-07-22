@@ -66,6 +66,7 @@ use rayland_engine::{EngineClient, spawn_engine, virgl_available};
 use rayland_relay::{C2S, S2C, read_msg, write_msg};
 // The message applier: everything this daemon actually knows how to do.
 use rayland_s::apply::Applier;
+use rayland_s::wayland_client::WaylandReplay;
 // Presentation: finding the application's readback buffer among S's blobs, and putting it on S's
 // screen. See that module's docs for why finding it is the one guess (c)1 has to make.
 use rayland_s::present::{ENV_NO_PRESENT, FrameCapture, frame_size_from_env, present_frame};
@@ -317,6 +318,7 @@ fn serve(
     applier: Arc<Mutex<Applier>>,
     engine: &mut EngineClient,
     capture: &mut FrameCapture,
+    wl_replay: &mut WaylandReplay,
 ) -> Result<()> {
     loop {
         // The framed byte count `read_msg` now returns is C's measurement seam (Task 9); S keeps its
@@ -328,6 +330,18 @@ fn serve(
                 eprintln!("rayland-s: link from C ended: {e}");
                 return Ok(());
             }
+        };
+
+        // **WP0 router.** A Wayland-proxy request is replayed against S's real compositor by
+        // `wl_replay`, not applied to the vtest engine — `Applier::apply` refuses it by design (it is
+        // not a vtest/ring message). Split it off here, before the apply path; everything else falls
+        // through, rebound to `msg`.
+        let msg = match msg {
+            C2S::WaylandRequest { message } => {
+                wl_replay.handle_request(message);
+                continue;
+            }
+            other => other,
         };
 
         // **The applier lock is held across `apply` *and* the replies it produced.** Both halves
@@ -485,7 +499,11 @@ fn main() -> Result<()> {
     // `serve` needs `&mut` to call the `RenderEngine` trait methods through the client; the message
     // thread keeps this original `engine`, the progress thread got a clone above.
     let mut engine = engine;
-    serve(rx, tx, applier, &mut engine, &mut capture)?;
+    // WP0: the S-side replay of the app's Wayland session. Unconnected until the first relayed request,
+    // so an offscreen session never touches a compositor. Owned by the message thread, which is the only
+    // thing that dispatches relayed Wayland requests.
+    let mut wl_replay = WaylandReplay::new();
+    serve(rx, tx, applier, &mut engine, &mut capture, &mut wl_replay)?;
     eprintln!("rayland-s: session ended");
 
     // Now that the session is over, put the frame on screen — and keep it there until a human closes

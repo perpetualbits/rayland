@@ -666,3 +666,25 @@ are untouched, which is the property that let this land without holding its brea
 up clean: the daemon binds the Wayland socket beside the vtest one and tears down without a leak. What 4.1
 deliberately does *not* prove yet is a request actually reaching S — S still refuses `WaylandRequest` on the
 vtest path by design, so the end-to-end forward is 4.2's to demonstrate, once S has somewhere to route it.
+
+### 2026-07-22 — Task 4.2a: the S side hears the app for the first time
+
+The router landed, and with it the first sign of the app's Wayland session reaching S. The change on S is
+small and deliberately so: the message loop now splits a `C2S::WaylandRequest` off before the vtest apply
+path — which refuses it by design, because it is not a ring message — and hands it to a new `WaylandReplay`
+that opens a connection to S's *real* compositor on first use and, for now, logs each request. The lazy
+connect matters: an offscreen fixture sends no Wayland requests, so it never touches a compositor, and the
+whole existing test suite is untouched. Pointing vkcube's WSI at the proxy socket (while its rendering still
+goes to rayland-c over Venus) lit the path up: S reported "WP0 replay connected to S's compositor" and then
+eleven relayed requests streamed in — the surface, the xdg role objects, the commits — with not one refusal.
+The forward half of the Wayland tunnel works end to end.
+
+vkcube then aborted, and exactly where the earlier review predicted it would: `pick_surface_format` asserts
+`count >= 1`. The proxy advertises `zwp_linux_dmabuf` but sends no `format`/`modifier` events back to the
+app, so Mesa's WSI sees zero supported formats and cannot choose one. That is the event-return path (Task
+4.4), not a router bug — and it is good to have the wall show up as a clean assertion at the exact spot the
+map said it would, rather than as a mystery. What 4.2a proves is narrow and real: requests cross, S receives
+them in order, and S can reach its compositor. What it does not yet do is *replay* them — reconstructing each
+message and submitting it via the client backend, with the object-id translation and the reconstruction of
+the globals the app bound (which, being backend built-ins on C, never crossed) — is 4.2b, and it is where
+the object graph gets genuinely rebuilt on S.
