@@ -169,6 +169,84 @@ pub enum C2S {
         /// The S-side resource id to release.
         res_id: u32,
     },
+
+    /// Opaque Wayland wire bytes read off the application's socket — the C-side proxy's
+    /// raw forward path for the WP0 Wayland channel (docs/design/2026-07-22-wp0-wayland-
+    /// proxy-first-light.md §3). This carries **every** request the app makes except
+    /// buffer creation: `wl_surface::commit`, `wl_surface::attach`, `xdg_surface::ack_configure`,
+    /// and so on all cross this way, verbatim, for S's Wayland client to replay against the
+    /// real compositor.
+    ///
+    /// # Why file descriptors never appear here
+    /// A Wayland wire message can carry an fd out-of-band (`SCM_RIGHTS`), and this variant
+    /// cannot carry one — an fd names a resource local to C's kernel and is meaningless once
+    /// it crosses a network socket, exactly as C0/(c)1 already found for the Venus ring's
+    /// shared-memory blobs. The one request that *would* need to carry an fd —
+    /// `zwp_linux_buffer_params_v1`'s buffer-creation request, whose payload is a dma-buf fd
+    /// — is therefore never sent as `WaylandData` at all; it is intercepted by the C-side
+    /// proxy and sent as [`C2S::WaylandBuffer`] instead, which names the S-side resource by
+    /// token rather than by fd.
+    WaylandData {
+        /// The Wayland wire bytes exactly as the application wrote them, opaque to this
+        /// crate — decoding the protocol is the proxy's job, not the relay's.
+        bytes: Vec<u8>,
+    },
+
+    /// A `zwp_linux_buffer_params_v1` buffer-creation request the C-side proxy intercepted
+    /// instead of forwarding as [`C2S::WaylandData`], per the buffer-by-token invariant
+    /// (docs/design/2026-07-22-wp0-wayland-proxy-first-light.md §2/§4): **the app's
+    /// `wl_buffer` must denote the same pixels as the S-side resource the command relay
+    /// already renders into, and no dma-buf fd or pixel data ever crosses the network to
+    /// make that true** — only this small typed side-band does.
+    WaylandBuffer {
+        /// The application's Wayland object id for the `zwp_linux_buffer_params_v1` request
+        /// being answered. S's Wayland client needs this only insofar as the C-side proxy
+        /// uses it to correlate the eventual result back to the app's own object; it does
+        /// not name anything on S.
+        params_id: u32,
+        /// Names the S-side resource that IS the buffer, plus the geometry S's Wayland
+        /// client needs to build a real `wl_buffer` from its own dma-buf export of that
+        /// resource. See [`BufferToken`] for the full invariant.
+        token: BufferToken,
+    },
+}
+
+/// Buffer-by-token: names the S-side resource that a Wayland `wl_buffer` denotes, plus the
+/// geometry the compositor needs to build a `wl_buffer` from S's own dma-buf export of that
+/// resource. No dma-buf fd or pixels cross — the frame is rendered on S and shown on S (see
+/// docs/design/2026-07-22-wp0-wayland-proxy-first-light.md §2, §4).
+///
+/// This is the crux of the WP0 Wayland channel: the mechanism it stands in for is
+/// `wsi_common_wayland` wrapping a swapchain image's dma-buf as a `wl_buffer` via
+/// `zwp_linux_dmabuf.create_immed`, passing the fd plus this same geometry over the app's
+/// Wayland socket. C intercepts that request, correlates the dma-buf fd to the Venus
+/// resource id the vtest/ring relay already tracks (the same resource that crossed as a
+/// [`C2S::CreateBlob`] and that S already holds a copy of), and sends this struct instead
+/// of the fd. S then re-exports its own copy of that resource as a dma-buf and builds a real
+/// `wl_buffer` from it — so the frame's pixels never cross the network at all, only the
+/// *name* of where they already are.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BufferToken {
+    /// The S-side virglrenderer resource id — the swapchain image the command relay renders
+    /// into. This is the same id space [`C2S::BlobData`] and [`S2C::BlobCreated`] use for
+    /// the vtest/ring relay's other resources; a Wayland buffer is not a new kind of thing
+    /// to S, just an existing resource being shown.
+    pub resource_id: u32,
+    /// Buffer width in pixels, as the app's `zwp_linux_buffer_params_v1::create_immed` request
+    /// specified it. S's Wayland client needs this to describe the `wl_buffer` correctly to
+    /// the real compositor; it cannot infer it from the resource id alone.
+    pub width: u32,
+    /// Buffer height in pixels, alongside `width`.
+    pub height: u32,
+    /// The DRM fourcc format code (e.g. `DRM_FORMAT_ARGB8888`) the app's request specified.
+    /// S's dma-buf re-export must advertise the same format or the real compositor will
+    /// reject or misinterpret the buffer.
+    pub drm_format: u32,
+    /// The DRM format modifier (tiling/compression layout) the app's request specified. Like
+    /// `drm_format`, this must match on S's re-export: a modifier mismatch is a class of bug
+    /// that produces corrupted or garbled pixels rather than a clean failure, because the
+    /// consumer decodes the same bytes under the wrong layout.
+    pub modifier: u64,
 }
 
 /// A contiguous run of bytes at an offset within a blob.
@@ -316,6 +394,22 @@ pub enum S2C {
         /// reply channel; see this variant's docs for the permanent desynchronization that causes.
         solicited: bool,
     },
+
+    /// Opaque Wayland wire bytes — S's Wayland client's raw return path for the WP0 Wayland
+    /// channel. This is how the app on C ever learns anything the real compositor said:
+    /// `wl_buffer::release`, `xdg_toplevel::configure`, `wl_surface::enter`, and every other
+    /// compositor event cross this way, verbatim, for the C-side proxy to hand back to the
+    /// app on its own Wayland socket exactly as the app would have received them from a local
+    /// compositor.
+    ///
+    /// Like [`C2S::WaylandData`], this never carries a file descriptor — none of the events a
+    /// minimal WSI-driving client needs to relay (per docs/design/2026-07-22-wp0-wayland-
+    /// proxy-first-light.md §3) carry one on the wire in the direction compositor → client.
+    WaylandData {
+        /// The Wayland wire bytes exactly as S's Wayland client received them from the real
+        /// compositor, opaque to this crate.
+        bytes: Vec<u8>,
+    },
 }
 
 #[cfg(test)]
@@ -366,6 +460,46 @@ mod tests {
         let original = S2C::RingProgress {
             ring_res_id: 1,
             consumed_tail: 4024,
+        };
+        assert_eq!(round_trip(&original), original);
+    }
+
+    #[test]
+    fn wayland_data_c2s_round_trips() {
+        // A representative C2S::WaylandData: opaque bytes off the app's Wayland socket,
+        // e.g. a wl_surface::commit request, forwarded verbatim toward S's compositor
+        // client.
+        let original = C2S::WaylandData {
+            bytes: vec![1, 2, 3, 4, 5, 6, 7, 8],
+        };
+        assert_eq!(round_trip(&original), original);
+    }
+
+    #[test]
+    fn wayland_buffer_round_trips() {
+        // A representative C2S::WaylandBuffer: the proxy intercepted a
+        // zwp_linux_buffer_params_v1 and is naming the S-side resource that IS the buffer
+        // (buffer-by-token) instead of relaying the app's dma-buf fd, which cannot cross
+        // the network at all.
+        let original = C2S::WaylandBuffer {
+            params_id: 42,
+            token: BufferToken {
+                resource_id: 7,
+                width: 1920,
+                height: 1080,
+                drm_format: 0x3432_3241, // DRM_FORMAT_AR24, little-endian fourcc bytes 'A','R','2','4'
+                modifier: 0x00ff_ffff_ffff_ffff, // DRM_FORMAT_MOD_INVALID, a representative modifier value
+            },
+        };
+        assert_eq!(round_trip(&original), original);
+    }
+
+    #[test]
+    fn wayland_data_s2c_round_trips() {
+        // A representative S2C::WaylandData: opaque compositor-event bytes (e.g. a
+        // wl_buffer::release or xdg_toplevel::configure) to deliver back to the app.
+        let original = S2C::WaylandData {
+            bytes: vec![9, 8, 7, 6, 5],
         };
         assert_eq!(round_trip(&original), original);
     }
