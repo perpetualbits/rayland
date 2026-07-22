@@ -214,7 +214,7 @@ fn message_is_solicited(msg: &C2S) -> bool {
         | C2S::UnrefResource { .. } => false,
         // WP0 Wayland-proxy messages never travel this vtest reply path — the session router splits
         // them off to the S-side Wayland client before `apply` — so they are not solicited replies.
-        C2S::WaylandData { .. } | C2S::WaylandBuffer { .. } => false,
+        C2S::WaylandRequest { .. } => false,
     }
 }
 
@@ -829,9 +829,7 @@ impl Applier {
             }
             // WP0 Wayland-proxy messages must never reach the vtest apply path — the session router
             // splits them off to the S-side Wayland client. One here is an internal routing bug.
-            C2S::WaylandData { .. } | C2S::WaylandBuffer { .. } => {
-                Err(ApplyError::WaylandMessageOnVtestPath)
-            }
+            C2S::WaylandRequest { .. } => Err(ApplyError::WaylandMessageOnVtestPath),
         }
     }
 
