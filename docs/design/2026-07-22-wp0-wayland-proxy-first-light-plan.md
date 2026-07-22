@@ -198,3 +198,76 @@ lookup); the connect-and-bind is the integration proof.
 **Risk note:** Task 3b is integration-heavy (new library + threading + correlation). Given a prior subagent
 stalled on a simpler task, the controller should drive this directly or brief a subagent in small sub-steps
 (deps+skeleton; globals+connect; request-forward+translate; fd→token) each independently checkable.
+
+---
+
+## Task 4 — PREPARED (2026-07-22): the S side, and a reshaping finding
+
+Two investigations mapped the C and S code before decomposing Task 4. The C side is straightforward; the
+S side is **larger and riskier than §4 of the spec implied**, because one load-bearing sentence in the
+spec is aspirational rather than true.
+
+### The reshaping finding: S does NOT already re-export resources as compositor dma-bufs
+
+Spec §4 leg (b) says "S re-exports the resource as a dma-buf (`rayland-s` already does this for presentation
+— `virgl_renderer_resource_export_blob`)". Investigation shows this is **not** how the code works today:
+
+- `virgl_renderer_resource_export_blob` exists (`crates/rayland-engine/src/ffi.rs:431`) with a **private,
+  SHM-oriented** wrapper `export_blob_fd` (`crates/rayland-engine/src/virgl.rs:1037`), called in exactly
+  one place — at blob *creation* for the `HOST3D` path, to hand the client an mmap fd. There is **no public
+  `resource_id → dma-buf` re-export API** callable at present time.
+- Live Venus blobs come back as `fd_type = SHM (3)` (used for the CPU readback mapping —
+  `crates/rayland-s/src/blob.rs:11,530`), **not** as a `DMABUF (1)` for zero-copy display.
+- `rayland-present` is `wl_shm`-only in practice: `rayland-s`'s `BlobFrameSource::supports_dmabuf()` returns
+  `false` structurally (`crates/rayland-s/src/present.rs:403`), and `present()` is a **one-static-frame,
+  own-the-loop, blocks-until-window-closed** shape (`crates/rayland-present/src/window.rs:689,250-253`) that
+  runs *after* the session ends — it cannot drive a persistent, app-animated surface.
+
+So **whether S can turn a `BufferToken.resource_id` into a `wl_buffer` the real compositor displays is
+unproven**, and the spec itself deferred confirming it "to Task 4". This is a decision-gate, not a detail:
+the swapchain image may export cleanly as a dma-buf, or it may be SHM-only / tiled / DEVICE_LOCAL-invisible
+(the (c)2 readback wall), in which case presentation must fall back to a **local readback → `wl_shm`**
+present on S. Note **either path keeps WP0's network invariant** (§2, §5): no pixels cross the *network*
+either way — the fallback reads back and presents locally on S.
+
+### C-side wiring (low risk — the seams already exist)
+
+- **Sink → link.** Hand the proxy a clone of `Arc<Mutex<QuicSendLink>>` (`main.rs:953`); a `WaylandSink`
+  impl does `tx.lock().send(&C2S::WaylandRequest { message })` (`link.rs:101`). `C2S::WaylandRequest` exists.
+- **Resolver → inode side-table.** No `(st_dev,st_ino) → res_id` map exists. Build one: `fstat` the memfd
+  at `LocalBlob::create` (`shm.rs:116`, the fd is live there and not retained afterward), record
+  `(dev,ino) → res_id` in a new `Arc<Mutex<HashMap<(u64,u64),u32>>>` beside the `BlobTable`
+  (`relay_engine.rs:66`), and back `ResourceResolver::resolve_inode` with it.
+- **Wire the proxy into the daemon.** Spawn a 4th thread (`rayland-c-wayland`) beside the reader/watcher
+  spawns (`main.rs:987-1006`); add a `RAYLAND_C1_WAYLAND_DISPLAY` env (none exists yet) via the `env_or`
+  pattern (`main.rs:901`). The proxy's `run` is itself a blocking loop, so it wants its own thread.
+- **Inbound events.** `reader_thread` (`main.rs:497`) owns `rx.recv()`; add an `S2C::WaylandEvent` arm that
+  injects into the proxy. The proxy's poll loop (`serve`, `wayland_proxy.rs:564`) needs a **wakeup fd**
+  (eventfd) added so events can be delivered from another thread and flushed to the app via
+  `Handle::send_event`. (This is the review's HIGH finding — without it a real vkcube blocks on
+  `xdg_surface.configure`.)
+
+### S-side (the new subsystem — `crates/rayland-s/src/wayland_client.rs`)
+
+- **Router.** Split `C2S::WaylandRequest { message }` in the `serve` loop **before** `session.apply(...)`
+  (`main.rs:363`) — `apply.rs` deliberately refuses it (`apply.rs:832`). Dispatch into the new client.
+- **The client.** A live `wayland-client` connection to S's real compositor holding a **persistent** surface
+  + xdg_surface + xdg_toplevel, an `app_id ↔ s_id` object-id map, replaying relayed requests with repeated
+  attach/commit, and sending compositor events back as `S2C::WaylandEvent`. Written **fresh** — `present()`'s
+  one-shot shape is not reusable, though its dmabuf `create_params`/`add`/`create_immed` mechanics are a
+  reference.
+- **Token → wl_buffer.** The spike-gated crux (above): resolve `resource_id` → a real `wl_buffer`, either
+  via a new public engine dma-buf re-export (zero-copy) or via local readback → `wl_shm` (fallback).
+- **Format/modifier.** Present's negotiation is hard-coded XRGB8888+LINEAR at dmabuf v3
+  (`window.rs:608,797`); vkcube's real swapchain format/modifier need generalizing or a LINEAR fallback.
+
+### Decomposition (spike-gated)
+
+- **4.0 — dma-buf export spike (GATE).** Can S export a real swapchain-style resource as a `DMABUF` fd the
+  compositor imports and shows? Decides zero-copy vs `wl_shm`-readback. Front-loaded, like Task 1's spike.
+- **4.1 — C-side wiring.** Link-backed sink + inode→res_id resolver + proxy-as-4th-thread + env var.
+  Testable: `C2S::WaylandRequest` reaches S's router (stub).
+- **4.2 — S router + object-id map + session replay** against the real compositor (surface/toplevel).
+- **4.3 — token → wl_buffer** by the spike's chosen path; attach/commit.
+- **4.4 — event return path** (eventfd wakeup + `send_event` + `S2C::WaylandEvent`), incl. `configure`.
+- **4.5 — end-to-end:** vkcube's cube on S's screen (Task 5's success criterion folded in).

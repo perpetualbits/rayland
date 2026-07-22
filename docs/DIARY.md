@@ -550,3 +550,36 @@ geometry-with-no-token to S and quietly pretend an unsupported request was handl
 cleanly and tested. And params state that never reached `create_immed` was leaking, so teardown now
 releases it. Neither was a crash, but both are the kind of honest edge the walking skeleton is allowed to
 have only if they're named.
+
+### 2026-07-22 — Mapping the S side, and finding the spec had promised something the code doesn't do
+
+Before building Task 4 — the S side, which turns the tokens the proxy now emits into an actual window on
+S's screen — two readers went through the C and S code so the plan would rest on what's there rather than
+what the spec hoped was there. The C side came back clean and boringly wireable: the QUIC send half already
+lives behind an `Arc<Mutex<QuicSendLink>>` that two producers share, so the proxy's sink is a third
+producer sending `C2S::WaylandRequest` over the same lock; the blob table is keyed by resource id; and
+slotting the proxy in as a fourth daemon thread with its own socket env is a page of glue. Good.
+
+The S side came back with a genuine correction. The spec's §4 says, as if it were settled, that "rayland-s
+already re-exports the resource as a dma-buf for presentation." It does not. The one function that could —
+`virgl_renderer_resource_export_blob` — is wrapped privately, is oriented at SHM (the CPU readback path),
+and is only ever called at blob *creation*, never to re-export a finished frame for display. Live Venus
+blobs come back typed SHM, not DMABUF. And `rayland-present`, which the spec leans on, turns out to be a
+one-frame, own-the-event-loop, block-until-the-window-closes shape that runs *after* a session ends — it
+cannot drive a surface that an app animates. So the sentence the whole zero-copy presentation story hangs
+on is aspirational, and whether S can actually turn a `BufferToken`'s resource id into a `wl_buffer` a real
+compositor will show is **unproven** — the spec even admitted it was deferring that proof "to Task 4"
+without flagging how load-bearing it is.
+
+This is not a disaster; it's the kind of thing the diary exists to catch honestly. It has two consequences.
+First, Task 4 is bigger than "write an S client": it needs a new public dma-buf re-export on the engine (or
+a fallback), a persistent-surface Wayland client written fresh, an object-id map, format/modifier
+negotiation past the hard-coded XRGB8888+LINEAR that present assumes, and the event-return path the earlier
+review already flagged. Second, and more importantly, there's a real fork in *what presentation even is*:
+the design's intended zero-copy dma-buf path, or a local readback→`wl_shm` present on S. Both keep WP0's
+actual invariant — no pixels cross the *network* — because the fallback reads back and presents locally on
+S; the difference is zero-copy versus a local copy, and whether the swapchain image is even exportable or
+readable (the fallback re-enters the exact (c)2 readback-of-a-GPU-image wall). So the plan now front-loads a
+spike gate — can S export a real swapchain resource as a dma-buf the compositor imports? — before any of the
+S client gets built, exactly as Task 3b front-loaded its correlation spike. Which of the two paths to aim
+the walking skeleton at first is the next thing to settle, because it changes what gets built.
