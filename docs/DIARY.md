@@ -418,3 +418,34 @@ bandwidth to merge the large gaps between them for no wall-clock gain, so 256 is
 The next latency lever, when it matters, is the round-trip count itself — adaptive polling, or batching
 the reply path — not the readback. Recorded so the next person does not coalesce harder expecting the
 clock to move.
+
+### 2026-07-21 — The first real app, and the first real wall: WSI
+
+With the readback loop finally solid for the fixtures, the honest next question was whether the central
+bet generalises to an app nobody hand-built for it. Pointed vkcube — the standard spinning-cube demo —
+at the relay. It is the truest test so far, and it found a wall exactly where "expect walls" said one
+would be, and precisely enough to name it.
+
+vkcube got *far*. Mesa connected, the command stream flowed (~32 KB of ring vs the fixtures' ~200 bytes
+of init), it selected the Wayland WSI platform, enumerated the GPU ("Virtio-GPU Venus (NVIDIA RTX A500)"),
+created a device, and began allocating swapchain images — we watched their blob fds get passed over the
+vtest socket while it also talked to the host compositor. Then it aborted in `demo_prepare_swapchain`:
+`create_immed failed and produced an invalid wl_buffer`.
+
+That is the whole finding in one line. Venus's **Wayland WSI** turns each swapchain image into a
+`wl_buffer` for the compositor via `zwp_linux_dmabuf`'s `create_immed`, from the image's dma-buf. In a
+real VM that dma-buf is a virtio-gpu resource the host compositor can import through the virtio-gpu
+display path. **Rayland has no virtio-gpu and no such path — it is a command relay** — so the dma-buf the
+guest exports is meaningless to the compositor, `create_immed` yields an invalid `wl_buffer`, and
+swapchain preparation asserts out. (The retry we saw as a device create→destroy→recreate in S's log is
+vkcube tearing the device down and trying once more before giving up.)
+
+This is not a bug to patch; it is a *missing subsystem*, and the fixtures deliberately dodged it: they
+render **offscreen** and read the pixels back, so they never touch WSI. A real presenting app cannot dodge
+it. The right model for Rayland is not to let the guest's WSI reach for a virtio-gpu display that is not
+there, but to **intercept the swapchain** — so `vkQueuePresentKHR` hands the finished image to S for
+display, the way the readback path already hands S the readback buffer — which is what waypipe and
+Sommelier do for Wayland clients. `rayland-present` already puts pixels on S's screen; what is missing is
+the swapchain interception and the present-forwarding between it and the engine. That is a sub-project,
+and it is now concretely scoped rather than hypothetical. The bet still stands; the next missing ecosystem
+piece just has a name.
