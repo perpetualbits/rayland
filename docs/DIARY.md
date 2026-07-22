@@ -491,3 +491,17 @@ recording: the build's `/tmp` target tripped a per-user tmpfs quota and the link
 — nothing to do with the code, everything to do with a 6 GB target dir on a 31 GB shared tmpfs. Moved the
 target onto the home filesystem and it built clean. Noted here only so the next person who sees `collect2:
 ld terminated with signal 7` on this box looks at `df` before they look at their diff.
+
+Later the same day the first of those risky halves landed: request forwarding. The proxy now translates
+each `wayland-backend` `Argument` to the wire `WaylandArg` and forwards the request to a sink. The
+translation is a dull 1:1 remap with two spots that actually needed a test — `Str` (drop the wire NUL,
+keep null-vs-present distinct) and the deliberate refusal to forward a raw fd (every fd must become a
+token, so `Argument::Fd` translates to an error, not a value). Both are unit-tested, and both tests were
+watched failing first: breaking `Str` to keep the NUL made them go red, which is the only way to know a
+green test was ever load-bearing. The id-carrying cases (`Object`/`NewId`) can't be unit-tested because a
+real `ObjectId` only comes from the backend, so those are pinned by an end-to-end test instead — a real
+client binds `wl_compositor`, calls `create_surface`, and the collector on the far side shows the new
+surface's id arriving as a translated `NewId`. The sink is deliberately a trait with a recording stub
+behind it; the real link to S is Task 4's job, and keeping it abstract let the whole forward path be
+proven without standing up S at all. What's left of the crux is the fd→token interception itself — the
+one request, `create_immed`, that the whole sub-project exists to intercept.

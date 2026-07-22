@@ -17,11 +17,21 @@
 
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use rayland_c::wayland_proxy::WaylandSink;
+use rayland_relay::WaylandMessage;
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::{Connection, Dispatch};
+
+/// A sink that discards every forwarded request. This test only checks that globals are advertised, so it
+/// does not care what the app forwards — the forwarding path itself is proven in the sibling forward test.
+struct NullSink;
+impl WaylandSink for NullSink {
+    fn forward_request(&self, _msg: WaylandMessage) {}
+}
 
 /// The client-side dispatch state. It carries nothing: `registry_queue_init` performs the initial global
 /// dump internally, and the test reads the resulting list — no runtime registry events are handled.
@@ -63,7 +73,7 @@ fn app_connects_and_sees_wp0_globals() {
     let proxy_path = socket_path.clone();
     std::thread::spawn(move || {
         // If the proxy errors, surface it on stderr; the test will then fail at connect/roundtrip below.
-        if let Err(e) = rayland_c::wayland_proxy::run(proxy_path) {
+        if let Err(e) = rayland_c::wayland_proxy::run(proxy_path, Arc::new(NullSink)) {
             eprintln!("proxy exited with error: {e:#}");
         }
     });

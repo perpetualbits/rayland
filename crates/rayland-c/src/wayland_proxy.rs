@@ -14,21 +14,94 @@
 //! plumbing; the proxy owns forwarding, the object-id bookkeeping, and the single fd→token interception.
 //! See `docs/design/2026-07-22-wp0-wayland-proxy-first-light.md` §3 "Forwarding model".
 //!
-//! **Status: globals + connect (WP0 Task 3b, sub-step 2).** This stands up the backend, advertises the
-//! minimal set of globals vkcube binds (§6 of the spec), and runs the accept-and-dispatch loop so the
-//! application can connect and bind them. Request forwarding to S and the fd→token interception are the
-//! following sub-steps; until then each bound object carries an inert [`ProxyObjectData`] that only tracks
-//! the new-object bookkeeping the backend contract requires.
+//! **Status: request forwarding (WP0 Task 3b, sub-step 3).** The backend stands up, advertises the minimal
+//! set of globals vkcube binds (§6 of the spec), accepts the application, and **forwards each request** to
+//! a [`WaylandSink`] after translating it (`Argument` → [`WaylandArg`]) with [`translate_message`]. The one
+//! remaining special case is the fd→token interception (sub-step 4): a request bearing the swapchain memfd
+//! (`zwp_linux_buffer_params_v1.add`) currently fails translation with [`TranslateError::UnresolvedFd`] and
+//! is dropped rather than forwarded, until the token resolution lands. The sink is a stub collector in
+//! tests; Task 4 replaces it with the real link to S.
 
+use std::os::fd::OwnedFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use rayland_relay::{WaylandArg, WaylandMessage};
 use wayland_server::Resource; // brings `interface()` into scope for the generated object types
 use wayland_server::backend::protocol::{Argument, Message};
 use wayland_server::backend::{
     Backend, ClientData, ClientId, GlobalHandler, GlobalId, Handle, ObjectData, ObjectId,
 };
+
+/// Why a Wayland `Message` argument could not be translated to a [`WaylandArg`] for forwarding to S.
+///
+/// The structured tunnel maps `wayland-backend`'s `Argument` cases 1:1 to [`WaylandArg`], with one
+/// exception: a file descriptor never crosses the network. Every `Argument::Fd` must become a
+/// [`rayland_relay::BufferToken`] naming the S-side resource — but that resolution needs the
+/// resource→memfd correlation and the buffer geometry gathered across the `create_params`/`add`/
+/// `create_immed` sequence, which is the *next* sub-step (fd→token). Until it lands, encountering an fd is
+/// a defined, distinguishable outcome rather than a silent drop or a panic.
+#[derive(Debug, PartialEq, Eq)]
+enum TranslateError {
+    /// An `Argument::Fd` was seen but the fd→token resolution is not yet wired (WP0 Task 3b sub-step 4).
+    /// vkcube emits no fd until `zwp_linux_buffer_params_v1.add`, so the fd-free requests it sends before
+    /// that forward cleanly; this marks the point where the token path must take over.
+    UnresolvedFd,
+}
+
+/// Translate one `wayland-backend` request argument into the wire-forwardable [`WaylandArg`].
+///
+/// # Mapping
+/// The scalar cases are a direct, lossless remap: `Int`/`Uint`/`Fixed` carry their raw values (`Fixed`
+/// stays raw `wl_fixed_t` bits so re-encoding on S is bit-exact); `Array` is copied verbatim. `Str` carries
+/// the string's bytes **without** the wire's trailing NUL (`CString::as_bytes` already excludes it), and
+/// preserves the null-vs-present distinction (`None` is the wire's absent string, distinct from an empty
+/// one). `Object`/`NewId` carry the object's id in the *sender's* id space via `ObjectId::protocol_id`;
+/// this crate does not translate ids across the `app_id ↔ s_id` map — that is the S client's job (Task 4).
+///
+/// # Failure modes
+/// - `Argument::Fd` returns [`TranslateError::UnresolvedFd`]: an fd must become a [`rayland_relay::BufferToken`],
+///   which is the fd→token sub-step. This function never forwards a raw fd.
+fn translate_arg(arg: &Argument<ObjectId, OwnedFd>) -> Result<WaylandArg, TranslateError> {
+    match arg {
+        // Direct scalar remaps — same value, wire-forwardable type.
+        Argument::Int(v) => Ok(WaylandArg::Int(*v)),
+        Argument::Uint(v) => Ok(WaylandArg::Uint(*v)),
+        // Keep the raw fixed-point bits so S re-encodes the exact same wl_fixed_t.
+        Argument::Fixed(v) => Ok(WaylandArg::Fixed(*v)),
+        // Bytes without the trailing NUL; `None` stays the wire's absent-string case.
+        Argument::Str(s) => Ok(WaylandArg::Str(
+            s.as_ref().map(|cstr| cstr.as_bytes().to_vec()),
+        )),
+        // Object references carry the sender-space id; the S client remaps it against the id map.
+        Argument::Object(id) => Ok(WaylandArg::Object(id.protocol_id())),
+        Argument::NewId(id) => Ok(WaylandArg::NewId(id.protocol_id())),
+        // Opaque array copied through unchanged.
+        Argument::Array(bytes) => Ok(WaylandArg::Array((**bytes).clone())),
+        // The one thing that cannot cross a network: resolved to a token in the fd→token sub-step.
+        Argument::Fd(_) => Err(TranslateError::UnresolvedFd),
+    }
+}
+
+/// Translate a whole `wayland-backend` request into the [`WaylandMessage`] forwarded to S.
+///
+/// Carries the sender object's id in the app's id space (`sender_id.protocol_id()`), the opcode verbatim,
+/// and each argument via [`translate_arg`]. Fails with the first argument that cannot be translated (an
+/// unresolved fd), so a request bearing an fd is never partially forwarded.
+fn translate_message(msg: &Message<ObjectId, OwnedFd>) -> Result<WaylandMessage, TranslateError> {
+    // Every argument in wire order; the first failure aborts the whole message (no partial forward).
+    let args = msg
+        .args
+        .iter()
+        .map(translate_arg)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(WaylandMessage {
+        object_id: msg.sender_id.protocol_id(),
+        opcode: msg.opcode,
+        args,
+    })
+}
 
 // The generated interface descriptors for the globals WP0 advertises. Each is only used to name the
 // interface (its `&'static Interface`) when creating the global; the proxy never builds typed objects.
@@ -37,11 +110,29 @@ use wayland_protocols::xdg::shell::server::xdg_wm_base::XdgWmBase;
 use wayland_server::protocol::wl_compositor::WlCompositor;
 use wayland_server::protocol::wl_seat::WlSeat;
 
+/// Where the proxy sends the application's translated Wayland requests.
+///
+/// This is the seam between the proxy and S. In WP0 Task 3b it is satisfied by a **stub collector** (the
+/// integration test's recorder); Task 4 replaces it with the real link that carries `C2S::WaylandRequest`
+/// over the existing QUIC connection to S's Wayland client. Keeping it a trait lets the proxy be proven
+/// end-to-end against a recorder without standing up the whole S side.
+///
+/// Must be `Send + Sync`: the proxy holds it inside the backend's dispatch state, which the backend may
+/// touch from its own threads, and the future real link is shared with the network layer.
+pub trait WaylandSink: Send + Sync {
+    /// Forward one translated request to S. The proxy has already mapped the `wayland-backend` `Message`
+    /// to a wire [`WaylandMessage`]; the sink's job is only to deliver it (record it, or send it over the
+    /// link). Delivery is fire-and-forget here — WP0 does not yet acknowledge individual requests.
+    fn forward_request(&self, msg: WaylandMessage);
+}
+
 /// The dispatch state the backend threads through every callback (`ObjectData::request`,
-/// `GlobalHandler::bind`). It will grow to hold the link to S (to forward `C2S::WaylandRequest`), the
-/// resource→memfd correlation used at buffer creation, and the `app_id ↔ s_id` bookkeeping. Empty in the
-/// globals+connect sub-step: nothing is forwarded yet, so there is no shared state to thread.
-struct ProxyState;
+/// `GlobalHandler::bind`). It holds the [`WaylandSink`] the proxy forwards requests to; it will grow to
+/// also hold the resource→memfd correlation used at buffer creation and the `app_id ↔ s_id` bookkeeping.
+struct ProxyState {
+    /// Where translated requests go (a collector in tests, the real link to S in Task 4).
+    sink: Arc<dyn WaylandSink>,
+}
 
 /// Per-connection state the backend holds for the application's client. Empty for now — WP0 has exactly
 /// one client (the app) and needs no per-client bookkeeping beyond the object map a later sub-step adds.
@@ -103,23 +194,40 @@ impl ObjectData<ProxyState> for ProxyObjectData {
     fn request(
         self: Arc<Self>,
         _handle: &Handle,
-        _data: &mut ProxyState,
+        data: &mut ProxyState,
         _client_id: ClientId,
-        msg: Message<ObjectId, std::os::fd::OwnedFd>,
+        msg: Message<ObjectId, OwnedFd>,
     ) -> Option<Arc<dyn ObjectData<ProxyState>>> {
-        // Does this request create a new object? The backend needs data for it if so.
+        // Does this request create a new object? The backend needs data for it if so — decided *before*
+        // `msg` is consumed by translation below.
         let makes_new_object = msg
             .args
             .iter()
             .any(|arg| matches!(arg, Argument::NewId(_)));
-        wp_log(&format!(
-            "request obj {} opcode {} ({} args){}",
-            msg.sender_id.protocol_id(),
-            msg.opcode,
-            msg.args.len(),
-            if makes_new_object { " [new-id]" } else { "" }
-        ));
-        // Honour the contract: return handler data exactly when a new object was created.
+        // Translate the request to its wire form and forward it to S. An unresolved fd (the swapchain
+        // memfd at `params.add`) is expected until the fd→token sub-step lands; log and drop it rather
+        // than forward a raw fd or panic.
+        match translate_message(&msg) {
+            Ok(wire_msg) => {
+                wp_log(&format!(
+                    "forward obj {} opcode {} ({} args)",
+                    wire_msg.object_id,
+                    wire_msg.opcode,
+                    wire_msg.args.len()
+                ));
+                data.sink.forward_request(wire_msg);
+            }
+            Err(TranslateError::UnresolvedFd) => {
+                // The fd→token interception (sub-step 4) handles this request; for now it is not forwarded.
+                wp_log(&format!(
+                    "SKIP (unresolved fd) obj {} opcode {} — fd->token not yet wired",
+                    msg.sender_id.protocol_id(),
+                    msg.opcode
+                ));
+            }
+        }
+        // Honour the contract: return handler data exactly when a new object was created, so it too
+        // forwards its future requests.
         makes_new_object.then(|| Arc::new(ProxyObjectData) as Arc<dyn ObjectData<ProxyState>>)
     }
 
@@ -150,7 +258,10 @@ impl ObjectData<ProxyState> for ProxyObjectData {
 /// - The socket cannot be bound (path unwritable, or a live listener already owns it) — surfaced as an
 ///   `io::Error`.
 /// - `poll(2)` fails other than by interruption (`EINTR`, which is retried) — surfaced as an `io::Error`.
-pub fn run(socket_path: PathBuf) -> anyhow::Result<()> {
+///
+/// `sink` is where the app's translated requests are forwarded — a collector in tests, the real link to
+/// S in Task 4.
+pub fn run(socket_path: PathBuf, sink: Arc<dyn WaylandSink>) -> anyhow::Result<()> {
     // A stale socket file left by a crashed run would make `bind` fail; remove it (ignore "not found").
     let _ = std::fs::remove_file(&socket_path);
     // The pure-Rust Wayland server backend. `ProxyState` is the dispatch state it threads to callbacks.
@@ -166,7 +277,7 @@ pub fn run(socket_path: PathBuf) -> anyhow::Result<()> {
     // Where the application dials in. WP0 serves exactly one such socket.
     let listener = UnixListener::bind(&socket_path)?;
     // The dispatch loop owns this state; it is threaded to every callback by the backend.
-    let mut state = ProxyState;
+    let mut state = ProxyState { sink };
     wp_log(&format!("proxy listening at {}", socket_path.display()));
     serve(&mut backend, &listener, &mut state)
 }
@@ -266,5 +377,79 @@ fn wp_log(msg: &str) {
     // Only speak when explicitly asked, so the proxy is quiet in production and loud during bring-up.
     if std::env::var_os("RAYLAND_WP_LOG").is_some() {
         eprintln!("[wp-proxy] {msg}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Pure translation tests for the scalar argument cases.
+    //!
+    //! `Object`/`NewId`/`Fd` need a real `ObjectId`/`OwnedFd`, which only the backend mints, so they are
+    //! covered by the integration forward test (a real client sends real objects). The cases here are the
+    //! ones with actual mapping logic worth pinning: the value scalars, and — the subtle one — `Str`'s
+    //! NUL handling and its null-vs-present distinction.
+    use super::*;
+    use std::ffi::CString;
+
+    #[test]
+    fn scalar_args_map_one_to_one() {
+        // Int/Uint/Fixed carry their raw values unchanged; Fixed stays raw wl_fixed_t bits.
+        assert_eq!(
+            translate_arg(&Argument::<ObjectId, OwnedFd>::Int(-7)),
+            Ok(WaylandArg::Int(-7))
+        );
+        assert_eq!(
+            translate_arg(&Argument::<ObjectId, OwnedFd>::Uint(42)),
+            Ok(WaylandArg::Uint(42))
+        );
+        assert_eq!(
+            translate_arg(&Argument::<ObjectId, OwnedFd>::Fixed(256)),
+            Ok(WaylandArg::Fixed(256))
+        );
+    }
+
+    #[test]
+    fn array_arg_is_copied_verbatim() {
+        let bytes = vec![0u8, 1, 2, 250, 255];
+        assert_eq!(
+            translate_arg(&Argument::<ObjectId, OwnedFd>::Array(Box::new(bytes.clone()))),
+            Ok(WaylandArg::Array(bytes))
+        );
+    }
+
+    #[test]
+    fn str_arg_drops_the_trailing_nul_and_keeps_the_bytes() {
+        // The CString holds "wl_compositor\0"; the translated form must be the 13 content bytes, no NUL.
+        let cstr = CString::new("wl_compositor").unwrap();
+        assert_eq!(
+            translate_arg(&Argument::<ObjectId, OwnedFd>::Str(Some(Box::new(cstr)))),
+            Ok(WaylandArg::Str(Some(b"wl_compositor".to_vec())))
+        );
+    }
+
+    #[test]
+    fn str_arg_preserves_the_null_vs_empty_distinction() {
+        // A null string (wire's absent case) is None...
+        assert_eq!(
+            translate_arg(&Argument::<ObjectId, OwnedFd>::Str(None)),
+            Ok(WaylandArg::Str(None))
+        );
+        // ...distinct from a present-but-empty string, which is Some(empty).
+        let empty = CString::new("").unwrap();
+        assert_eq!(
+            translate_arg(&Argument::<ObjectId, OwnedFd>::Str(Some(Box::new(empty)))),
+            Ok(WaylandArg::Str(Some(Vec::new())))
+        );
+    }
+
+    #[test]
+    fn fd_arg_is_not_translatable_without_the_token_resolution() {
+        // A borrowed-then-owned fd for the test: dup stdin so the OwnedFd is real and safely closeable.
+        use std::os::fd::{AsFd, OwnedFd};
+        let fd: OwnedFd = std::io::stdin().as_fd().try_clone_to_owned().unwrap();
+        assert_eq!(
+            translate_arg(&Argument::<ObjectId, OwnedFd>::Fd(fd)),
+            Err(TranslateError::UnresolvedFd)
+        );
     }
 }
