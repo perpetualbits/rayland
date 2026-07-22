@@ -147,3 +147,54 @@ code is written once Task 1 fixes the correlation key and the exact request flow
 - **Naming consistency:** `C2S::WaylandData`, `S2C::WaylandData`, `BufferToken { resource_id, width,
   height, format, modifier }`, `wayland_proxy.rs`, `wayland_client.rs`, `RAYLAND_C1_WAYLAND_DISPLAY`,
   `RAYLAND_WP0_SPIKE` — used identically across tasks.
+
+---
+
+## Task 3b — PREPARED (2026-07-22): the wayland-backend C-side proxy
+
+Investigation of `wayland-backend 0.3.x` (already a transitive workspace dep via `rayland-present`/smithay)
+pins the concrete shape. Task 3b builds `crates/rayland-c/src/wayland_proxy.rs`.
+
+**Dependencies to add to `rayland-c`:** `wayland-backend` (server feature), `wayland-server` (core interface
+descriptors: `wl_compositor`, `wl_surface`, `wl_buffer`, `wl_callback`, `wl_seat`, `wl_registry`), and
+`wayland-protocols` (`xdg_shell` → `xdg_wm_base`/`xdg_surface`/`xdg_toplevel`; `unstable`/`staging`
+`linux_dmabuf` → `zwp_linux_dmabuf_v1`/`zwp_linux_buffer_params_v1`). The Interface descriptors are needed
+both to advertise globals and so the backend can parse each interface's request signatures.
+
+**Server API (verified in the crate source):**
+- `let backend = wayland_backend::server::Backend::<D>::new()?;` → `let handle = backend.handle();`.
+- Advertise a global: `handle.create_global(&WlCompositor::interface(), version, Arc::new(ProxyGlobal))`
+  for each of the WP0 interfaces; `GlobalHandler::bind(...) -> Arc<dyn ObjectData<D>>` mints the object.
+- Accept the app: a `UnixListener` at `RAYLAND_C1_WAYLAND_DISPLAY`; on connect,
+  `handle.insert_client(stream, Arc::new(ProxyClientData))`.
+- The forward hook: `ObjectData::request(self, handle, data: &mut D, client, msg: Message<ObjectId,OwnedFd>)
+  -> Option<Arc<dyn ObjectData<D>>>`. For each request: translate `msg` → `WaylandMessage` (the
+  `Argument<ObjectId,OwnedFd>` cases map 1:1 to `WaylandArg`; `Object(id)`/`NewId(id)` carry
+  `id.protocol_id()`), forward `C2S::WaylandRequest` to S via the link, and return a fresh
+  `Arc<ProxyObjectData>` for the request's `NewId` (so the new object also forwards). **The one special
+  case:** an `Argument::Fd` on `zwp_linux_buffer_params_v1.add` — do not forward the fd; `fstat` it
+  (`st_dev`+`st_ino`), look the inode up in the resource→memfd map `rayland-c` holds (`shm.rs` owns each
+  resource's memfd), and emit `WaylandArg::Buffer(BufferToken{ resource_id, width, height, drm_format,
+  modifier })` (the geometry comes from the other `add`/`create_immed` args).
+- Deliver S's events: on `S2C::WaylandEvent`, `handle.send_event(Message<ObjectId,RawFd>{..})`.
+- Driving loop (a new thread): `poll(handle... backend.poll_fd())` → `backend.dispatch_all_clients(&mut d)`
+  → `backend.flush(None)`; wake on either the app socket (poll_fd) or an inbound `S2C::WaylandEvent`.
+
+**Correlation state:** the resource→memfd inode map. `rayland-c` creates each resource's memfd in
+`shm.rs`; expose an inode→resource_id lookup (behind the existing send-side mutex or a small shared map) so
+the proxy thread can resolve a `params.add` fd. This is the buffer-by-token key confirmed by the Task-1
+spike (memfd inode).
+
+**Deferred to Task 4 (S side):** the `app_id ↔ s_id` object-id mapping — Task 3b forwards the app's object
+ids as-is against a **stubbed S** (a collector that records the forwarded `WaylandMessage`s + `BufferToken`);
+Task 4's S client is what maps them to compositor ids and replays.
+
+**Task 3b deliverable / proof:** vkcube launched against `RAYLAND_C1_WAYLAND_DISPLAY` connects, binds the
+WP0 globals, and reaches `create_immed` — with the stub collector showing a correct `BufferToken`
+(non-zero `resource_id`, right dimensions) and **no `create_immed` assert** (the proxy consumed the memfd;
+no real compositor saw it). Pure pieces get unit tests (Argument↔WaylandArg translation; inode→resource
+lookup); the connect-and-bind is the integration proof.
+
+**Risk note:** Task 3b is integration-heavy (new library + threading + correlation). Given a prior subagent
+stalled on a simpler task, the controller should drive this directly or brief a subagent in small sub-steps
+(deps+skeleton; globals+connect; request-forward+translate; fd→token) each independently checkable.

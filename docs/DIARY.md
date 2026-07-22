@@ -449,3 +449,45 @@ Sommelier do for Wayland clients. `rayland-present` already puts pixels on S's s
 the swapchain interception and the present-forwarding between it and the engine. That is a sub-project,
 and it is now concretely scoped rather than hypothetical. The bet still stands; the next missing ecosystem
 piece just has a name.
+
+### 2026-07-22 — Building the swapchain interceptor: the proxy answers its first client
+
+The WSI wall named the missing piece — intercept the swapchain instead of letting the guest's WSI reach
+for a virtio-gpu display that isn't there — and this stretch of days turned that name into a build. The
+shape settled quickly and, pleasingly, without much second-guessing, because waypipe and Sommelier already
+prove the shape is tractable: the app connects to a **proxy** we run on C (its `WAYLAND_DISPLAY` names our
+socket, not the real compositor), the proxy forwards the app's Wayland protocol to S where a client
+replays it against S's *real* compositor, and the one thing that cannot cross a network — the swapchain
+buffer's dma-buf fd — is replaced by a **token** naming the S-side resource the command relay already
+rendered. No pixels cross for presentation; only protocol and tokens. That is the design doc's
+buffer-by-token, finally being built rather than sketched.
+
+Two things had to be pinned before plumbing, and both were, by spiking rather than reasoning. First, the
+correlation key — *how* the proxy recognises the swapchain fd it must not forward. The spike answered it
+more cleanly than the design feared: the swapchain image's memory is not some opaque dma-buf we'd have to
+fingerprint, it is the exact `memfd:rayland-blob` `rayland-c` itself allocated in `shm.rs` and handed the
+app over vtest. So the key is just the memfd's inode (`st_dev`+`st_ino`), which C already owns — no
+guessing. That is also, satisfyingly, *why* a plain vkcube aborts: a real compositor rejects a memfd
+presented as a dma-buf, and the proxy dissolves the problem by never letting the memfd reach a real
+compositor at all. Second, the forwarding model. We chose to forward at the **structured-message layer**
+via `wayland-backend` (wayland-rs's low level), not raw byte-tunnelling and not the high-level typed
+`Dispatch`. The library owns all wire serialization and fd plumbing; each request arrives as a typed
+`Message { sender_id, opcode, args }`, and the proxy's whole job shrinks to three concerns — forward,
+translate the object ids across two independent id spaces, and the single fd→token interception. This
+eliminates an entire class of wire-format bugs by making the library the wire authority. The relay message
+became a structured `WaylandMessage` mirroring `wayland-backend`'s `Argument`, with the `Fd` case replaced
+by `BufferToken`.
+
+Today the proxy stood up and answered its first client. It advertises the minimal global set vkcube binds
+— `wl_compositor`, `xdg_wm_base`, `zwp_linux_dmabuf_v1`, and `wl_seat` (inert; input is a later WP) — over
+a real accept-and-dispatch loop, and an integration test playing the app's opening move (connect,
+`get_registry`, read the advertised globals) sees all four. It is a small milestone and worth not
+overselling: the *risky* halves are still ahead — forwarding the app's requests to S, and the
+`create_immed` fd→token interception that is the whole point — each with its own proof still to come
+(the argument-translation unit tests, and ultimately vkcube's cube actually turning up on S's screen). But
+the library choice is paying off already: the backend handled the registry dance for free, and standing up
+four globals plus a poll loop was a page of code, not a protocol implementation. One incidental scar worth
+recording: the build's `/tmp` target tripped a per-user tmpfs quota and the linker died with a bare SIGBUS
+— nothing to do with the code, everything to do with a 6 GB target dir on a 31 GB shared tmpfs. Moved the
+target onto the home filesystem and it built clean. Noted here only so the next person who sees `collect2:
+ld terminated with signal 7` on this box looks at `df` before they look at their diff.
