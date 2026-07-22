@@ -44,7 +44,25 @@
 
 // The blob's client-facing descriptor, and the borrow `ShmMapping::map` takes (it keeps its own
 // reference to the underlying object, so the fd may be closed afterwards).
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+
+/// Read a descriptor's `(st_dev, st_ino)` via `fstat`, for the buffer-by-token correlation key.
+///
+/// Returns `(0, 0)` if `fstat` fails — a value that can never match a real fd's inode, so a failure
+/// degrades to "not correlatable" rather than a wrong match. For the fresh memfd this is called on,
+/// `fstat` does not fail in practice.
+fn fd_inode(fd: &OwnedFd) -> (u64, u64) {
+    // SAFETY: a zeroed `stat` is a valid initialization target; `fstat` fully populates it on success
+    // (return 0), and its fields are read only after that check. The fd is valid for the borrow.
+    unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::fstat(fd.as_raw_fd(), &mut st) == 0 {
+            (st.st_dev as u64, st.st_ino as u64)
+        } else {
+            (0, 0)
+        }
+    }
+}
 
 // Task 1 made these `pub` for exactly this caller. `create_memfd` allocates and sizes the anonymous
 // shared memory; `ShmMapping` owns our `MAP_SHARED` view of it and `munmap`s on drop.
@@ -88,6 +106,14 @@ pub struct LocalBlob {
     /// exactly that: see [`LocalBlob::is_application_memory`]. It is recorded at creation because it
     /// is never recoverable afterwards — nothing else on the wire or in the pages carries it.
     blob_id: u64,
+    /// The memfd's identity as `(st_dev, st_ino)`, captured at creation.
+    ///
+    /// This is the **buffer-by-token correlation key** (WP0). The descriptor this memfd backs is the
+    /// exact fd Mesa's WSI later hands the Wayland compositor at `zwp_linux_buffer_params_v1.add` for
+    /// a swapchain image; the C-side proxy `fstat`s that fd and matches its inode here to recover the
+    /// resource id. Captured at creation because the fd is only briefly in hand — it is handed to Mesa
+    /// and dropped — but the inode is stable for the memfd's whole life, which is this blob's life.
+    inode: (u64, u64),
 }
 
 impl LocalBlob {
@@ -117,6 +143,9 @@ impl LocalBlob {
         // Anonymous, path-less, self-cleaning shared memory: the object lives exactly as long as
         // some fd or mapping refers to it, which is precisely the lifetime we want.
         let fd = create_memfd(size)?;
+        // Capture the memfd's inode now, while the fd is in hand — it is the buffer-by-token key and
+        // the fd is dropped immediately after this call. See the `inode` field.
+        let inode = fd_inode(&fd);
         // `MAP_SHARED` is the entire point. A `MAP_PRIVATE` mapping would copy-on-write, so Mesa's
         // writes into its own mapping of the same memfd would never be visible here and the ring
         // would read stale zeros forever — a failure that looks like "the application produced no
@@ -127,9 +156,21 @@ impl LocalBlob {
                 mapping,
                 size,
                 blob_id,
+                inode,
             },
             fd,
         ))
+    }
+
+    /// This blob's memfd identity `(st_dev, st_ino)`, the buffer-by-token correlation key.
+    ///
+    /// The C-side Wayland proxy `fstat`s the swapchain fd Mesa passes at `params.add` and matches its
+    /// inode against this to recover the resource id (see the `inode` field). Returns `(0, 0)` only if
+    /// the creation-time `fstat` failed, which for a fresh memfd does not happen in practice; such a
+    /// value simply never matches a real fd, so it degrades to "not a tracked resource" rather than a
+    /// false correlation.
+    pub fn inode(&self) -> (u64, u64) {
+        self.inode
     }
 
     /// The blob's size in bytes, as Mesa requested it.
@@ -206,6 +247,27 @@ mod tests {
     use super::*;
     // Mapping the same memfd a second time, to play the part of Mesa.
     use std::os::fd::AsFd;
+
+    /// The blob records the memfd's real inode, and it is the same inode a second `fstat` of the
+    /// descriptor reports — the property the buffer-by-token proxy relies on. If the recorded inode
+    /// drifted from the fd's, the proxy would fail to correlate the swapchain fd Mesa passes at
+    /// `params.add` back to its resource, and every buffer token would be unresolved.
+    #[test]
+    fn the_blob_records_the_memfds_real_inode() {
+        const SIZE: u64 = 4096;
+        let (blob, fd) = LocalBlob::create(0, SIZE).expect("a local blob");
+
+        // `fstat` the descriptor independently and compare against what the blob captured at create.
+        // SAFETY: zeroed stat is a valid target; fstat populates it on success, read only after.
+        let (dev, ino) = unsafe {
+            let mut st: libc::stat = std::mem::zeroed();
+            assert_eq!(libc::fstat(fd.as_fd().as_raw_fd(), &mut st), 0, "fstat the memfd");
+            (st.st_dev as u64, st.st_ino as u64)
+        };
+
+        assert_eq!(blob.inode(), (dev, ino), "captured inode must match the fd's");
+        assert_ne!(blob.inode(), (0, 0), "a real memfd has a nonzero inode");
+    }
 
     /// **The inherited invariant, made a test rather than a doc comment.**
     ///

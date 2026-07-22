@@ -61,3 +61,5 @@ pub mod link;
 pub mod metrics;
 /// WP0 Wayland proxy: `rayland-c` as a Wayland server to the app, forwarding to S (buffer-by-token).
 pub mod wayland_proxy;
+/// WP0 Task 4.1: real `WaylandSink`/`ResourceResolver` impls wiring the proxy to the daemon's link and blobs.
+pub mod proxy_link;

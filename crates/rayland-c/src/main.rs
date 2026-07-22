@@ -94,6 +94,14 @@ const DEFAULT_VTEST_SOCKET: &str = "/tmp/rl-c1.sock";
 /// Environment variable overriding [`DEFAULT_VTEST_SOCKET`].
 const ENV_VTEST_SOCKET: &str = "RAYLAND_C1_SOCKET";
 
+/// Environment variable naming the **Wayland proxy** socket the application connects to (WP0).
+///
+/// When set, the daemon runs a Wayland server at this path (the app's `WAYLAND_DISPLAY` names it) and
+/// forwards the app's Wayland protocol to S, turning each swapchain fd into a buffer token — see
+/// [`rayland_c::wayland_proxy`]. When **unset**, no proxy runs and the daemon behaves exactly as it did
+/// before WP0: the offscreen fixtures and the whole test suite neither set it nor are affected by it.
+const ENV_WAYLAND_DISPLAY: &str = "RAYLAND_C1_WAYLAND_DISPLAY";
+
 /// Environment variable naming S's address, as `host:port`.
 ///
 /// # The transport is QUIC (SP2's), as of (c)1 Task 6
@@ -1004,6 +1012,35 @@ fn main() -> Result<()> {
             move || ring_watcher_thread(ring_slot, blobs, tx, progress, stall_timeout)
         })
         .context("spawning the ring watcher thread")?;
+
+    // --- The Wayland proxy (WP0), only when a socket is configured. The application connects here
+    // instead of a real compositor; the proxy forwards its Wayland protocol to S over this same link
+    // and turns each swapchain fd into a buffer token (see `wayland_proxy`/`proxy_link`). Gated on the
+    // env var so offscreen sessions and the whole test suite — which never set it — are untouched. The
+    // proxy's own accept-and-dispatch loop blocks, so it gets its own thread, alongside the app's vtest
+    // session on the main thread.
+    if let Some(wl_socket) = std::env::var_os(ENV_WAYLAND_DISPLAY) {
+        // The sink forwards Wayland requests over the shared send link; the resolver turns a swapchain
+        // fd's inode into the resource id, by scanning the blob table. Both are clones of the same
+        // shared state the reader thread and ring watcher already use.
+        let sink = Arc::new(rayland_c::proxy_link::LinkSink::new(Arc::clone(&tx)));
+        let resolver = Arc::new(rayland_c::proxy_link::BlobInodeResolver::new(Arc::clone(&blobs)));
+        let wl_path = std::path::PathBuf::from(wl_socket);
+        eprintln!(
+            "rayland-c: Wayland proxy listening at {}; point the app at it with WAYLAND_DISPLAY",
+            wl_path.display()
+        );
+        std::thread::Builder::new()
+            .name("rayland-c-wayland".into())
+            .spawn(move || {
+                // A proxy failure is logged, not fatal to the vtest session: the forward/ring path is
+                // independent, and WP0 keeps the two channels loosely coupled.
+                if let Err(e) = rayland_c::wayland_proxy::run(wl_path, sink, resolver) {
+                    eprintln!("rayland-c: the Wayland proxy exited with an error: {e:#}");
+                }
+            })
+            .context("spawning the Wayland proxy thread")?;
+    }
 
     // --- Listen for Mesa. A stale socket from a previous run would make `bind` fail with
     // EADDRINUSE even though nothing is listening, so clear it first. This is safe for the intended

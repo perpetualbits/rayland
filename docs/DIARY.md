@@ -647,3 +647,22 @@ LINEAR swapchain images here are trivial (offset 0, stride = width·bpp) or alre
 Task 4.0 "impossible" entry stays in the diary above, wrong, as the record of a conclusion measurement
 reversed — which is exactly the kind of honesty this diary exists to keep. Zero-copy is back on, and now
 it's not a hope, it's a logged fact.
+
+### 2026-07-22 — Task 4.1: wiring the proxy into the daemon, and a correlation that needed no new table
+
+With zero-copy confirmed, the build restarted at the C side, which the earlier map had already shown was the
+easy half. Three pieces. The blob shadow now records its memfd's inode at creation — the one moment the fd
+is in hand before it's handed to Mesa and dropped — because that inode is the buffer-by-token key: the
+swapchain fd Mesa later passes the compositor is the very same memfd, and the proxy recovers the resource by
+matching it. The nice surprise was that the resolver needs no second data structure at all: the blob table
+is already keyed by resource id and now each blob carries its inode, so "which resource is this fd?" is just
+a scan of that table for the matching inode. A linear scan is exactly right here — a few dozen blobs, and
+`params.add` fires once per swapchain image — so an index would be more bookkeeping than the cost it saves.
+The sink is the mirror image: it closes over the same `Arc<Mutex<QuicSendLink>>` the ring watcher and vtest
+thread already send through, so a Wayland request rides the one connection alongside the ring and blob
+traffic, wrapped as `C2S::WaylandRequest`. And the proxy now spawns as a fourth daemon thread, but only when
+`RAYLAND_C1_WAYLAND_DISPLAY` is set — the offscreen fixtures and the whole test suite never set it, so they
+are untouched, which is the property that let this land without holding its breath over regressions. It came
+up clean: the daemon binds the Wayland socket beside the vtest one and tears down without a leak. What 4.1
+deliberately does *not* prove yet is a request actually reaching S — S still refuses `WaylandRequest` on the
+vtest path by design, so the end-to-end forward is 4.2's to demonstrate, once S has somewhere to route it.
