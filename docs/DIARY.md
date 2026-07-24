@@ -1041,3 +1041,33 @@ downstream effect of 4.3 being unfinished — no `wl_buffer` on S means no prese
 never released and the frame's fence chain never closes. That is the next thread to pull, and it is squarely
 (c)2 fence-completion, not WP0 and not the C relay. Full numeric evidence and the tool (`/proc` wchan dumps +
 C-side Ack/head/tail logging) are in the SDD ledger.
+
+### 2026-07-24 — The vkcube "hang" is the latency trap, not a deadlock — and the RingBarrier is the tell
+
+Went looking for the unsignalled semaphore, and found there is no deadlock at all. Decoded the ring command
+stream C relays (the venus_ring decoder reports the first unsizeable opcode, which is the app's real command),
+and every command at the stall is **device/pipeline setup** — `vkGetPhysicalDeviceFormatProperties2`,
+`vkCreateImage`, `vkGetImageDrmFormatModifierProperties`, `vkAllocateMemory`, `vkCreateDescriptorSetLayout`,
+`vkGetFenceStatus`. No render submit is even reached; the app is still building its pipeline.
+
+And it is **making progress**, just catastrophically slowly. Under a 90-second timeout it relayed **95 deltas**
+and still aborted — roughly *one synchronous command per second* by the end. That is not a hung ring; it is
+the **X11-over-network latency trap** ring-findings §7 named as (c)1's central weakness: every one of
+vkcube's *hundreds* of synchronous setup calls is a full C→S→execute→C round-trip, and vkcube's setup is
+synchronous-call-dense in a way the offscreen refapp and icosa never were (they render in ~1 s because they
+make comparatively few waited-on calls).
+
+The `RingBarrier` is the concrete tell. It logs three timeouts, each the same shape: `has not shipped tail
+21564 within 1s (it stands at 21484)` — an **80-byte gap**, i.e. exactly one small ring command the watcher
+has not relayed, and the inline path waits the full `FLUSH_TIMEOUT` (1 s) before giving up and letting the
+command cross. So on top of the general round-trip latency, a handful of inline commands each eat a dead
+second waiting on an 80-byte tail the watcher is slow to ship — a park/relay lag on C's watcher for the last
+small write, symmetric to the doorbell problem but on the forward path.
+
+So the conclusion, after the whole chain: this is **not a WP0 bug, not the C relay's correctness, not a
+doorbell/park race, not an unsignalled fence** — it is (c)1's synchronous-reply **latency**, exposed by the
+first application whose setup is round-trip-heavy, plus a 1-second `RingBarrier` stall on a slow last-delta
+ship. The lever is the one the ledger already names — a bigger ring and pipelining to cut the number of
+waited-on round-trips, not a point fix — and it is a (c)1/(c)2 performance investigation, cleanly separate
+from WP0. WP0's own forward+event tunnel (4.1–4.4) is done and correct; 4.3 (the buffer token) and any live
+vkcube proof sit behind this latency work. The full opcode trail and the barrier evidence are in the ledger.
