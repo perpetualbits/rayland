@@ -982,3 +982,33 @@ and deep enough to deserve its own focused session rather than being chased furt
 turn. Recorded in full — the confirmed facts, the two dead ends, and the current best hypothesis — so it can
 be picked up cold. The diagnostic that got here (dump `/proc/<pid>/task/*/wchan` for vkcube, rayland-s, and
 the render-server child during a live hang; no ptrace needed) is the tool to keep using.
+
+### 2026-07-24 — head vs applied_tail: the ring executes fine; the stall is a lost release on the return path
+
+Ran the head-vs-applied_tail check, and it decides the question — and overturns both standing hypotheses.
+Instrumented S's ring mirror to log `head` (what virglrenderer's ring thread has consumed) against
+`applied_tail` (what S has written) through a live hang.
+
+**The ring is not the problem.** head tracks applied_tail the whole way up — `0 → 760 → 8932 (a brief
+376-byte gap) → 10400 → 18812 → 19508`, gap returning to 0 — so virglrenderer's ring thread is consuming and
+executing vkcube's commands fine. That kills the doorbell/park-race hypothesis outright, and it is not a
+ring-consumption stall either. The `vkr-ring-1` threads being parked was a red herring: they were parked
+because they had *caught up*, not because they were starved.
+
+**The stall is a lost release on the return path.** Two counters — `take_ring_progress` calls and per-ring
+polls — both freeze at ~5000 while `rings == 1` throughout, so it is not the ring mirror being dropped; the
+progress thread simply stops advancing once the ring catches up (head = applied_tail = 19508). And the
+steady state of the hang is **fully quiescent**: vkcube spins in `vn_ring_wait_seqno`, while S's progress and
+message threads and C's reader are all parked on futexes and C's ring watcher is asleep. Everything has gone
+idle. S executed everything the app submitted and reported it, and the app was still never released.
+
+So the app is waiting for a ring `head`/seqno that S has, on its side, already reached — and the release is
+not getting back to it. That points the last question squarely at the C-side head-advance: does C actually
+advance the *application's local ring head* to the `consumed_tail` S reported (19508), and is the seqno the
+app awaits within it? The suspects are a `RingProgress` that C's `note_consumed` rejects (its frontier
+bookkeeping), a final delta C's watcher never relayed (a park lost-wakeup on C, symmetric to the one S's
+doorbell fixes), or the app awaiting a seqno tied to the device it destroyed and recreated — the (c)2 gate
+retired the readback gate for `ring_idx=1` on that `vkDestroyDevice`, and the new device's queue may leave
+the release in a state the head-advance no longer satisfies. That is the clean next step, and it is a C-side
+/ (c)2-release question, not a ring-execution one. The whole trail — the two dead ends and this decisive
+turn — is in the SDD ledger for a cold pickup.
