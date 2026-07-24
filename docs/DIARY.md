@@ -751,3 +751,16 @@ the request-replay path is proven separately, by an integration test that feeds 
 bind and a `create_surface` directly and watches both objects appear on the real compositor. The forward
 direction of the Wayland tunnel is now complete end to end; what stands between here and a cube on screen is
 the return direction — events (4.4) and the buffer token (4.3).
+
+### 2026-07-24 — Pausing WP0 mid-Task-4; a handoff for the next session
+
+Closing this session with Task 4.2 complete — the forward direction of the Wayland tunnel works end to end,
+app to S's real compositor — and the return direction (4.3 token→wl_buffer, 4.4 events) still ahead. Wrote a
+self-contained handoff, `docs/design/2026-07-24-wp0-task4-next-session-prompt.md`, so a fresh session can
+pick up without this context: it points at the spec/plan/ledger, states exactly what's done and what's next,
+carries the load-bearing findings (zero-copy is viable and S must retain the creation-time dma-buf;
+`wl_registry.bind`'s explicit-args signature; `send_request` panics so replay is `catch_unwind`-guarded),
+and records the build/run gotchas (the `/tmp` tmpfs-quota SIGBUS, the loopback vkcube recipe, the
+never-pkill discipline). The recommendation to the next session is 4.4 before 4.3: the event return path is
+what unblocks vkcube's `pick_surface_format` abort, so doing it first lets the app drive further and show
+what comes next on its own.
