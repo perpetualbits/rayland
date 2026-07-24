@@ -950,3 +950,35 @@ virglrenderer's parked ring thread (`rayland_vtest::venus_ring::doorbell`), and 
 open. 4.4 did not cause this — it is what let the app get far enough to expose it. Recorded here and handed to
 the owner as a decision point: fixing it is a (c)1/(c)2 ring-execution investigation, distinct from WP0's own
 remaining work (4.3, the buffer token), and worth scoping deliberately rather than folding into WP0.
+
+### 2026-07-24 — The ring-stall, narrowed to the render-server's parked ring thread — and it is (c)2's ground
+
+Kept pulling the ring-stall thread on the owner's say-so, and it narrows to a precise, deep place — no longer
+"somewhere in the relay" but a specific mechanism, and squarely (c)2's, not WP0's.
+
+The dead ends first, because they matter. **The missing crutch flags were not it.** The passing e2e tests set
+`VN_PERF=no_multi_ring,no_fence_feedback,no_semaphore_feedback,no_event_feedback,no_query_feedback` and my
+vkcube smoke set none — a real harness gap, so I fixed it. But with the full crutch table set, vkcube still
+hangs (deterministically now, which is itself progress). So the stall is not the feedback pages and not a
+second ring.
+
+**One ring, doorbell rung, thread still parked.** Instrumented the ring latch and the doorbell: exactly one
+`vkCreateRingMESA` is seen and latched, and the "no doorbell rung" branch never fires — so S rings the single
+ring's doorbell after every applied delta, exactly as designed. Yet dumping the **render-server subprocess**
+(`virgl-1-gpu_ren`, where virglrenderer actually runs the Venus ring thread — it forks a render server, C0
+Task 1) shows `vkr-ring-1` and `vkr-queue-1` **parked on a futex**, its main thread waiting for more socket
+packets, and rayland-s's own engine actor idle. So the doorbell reaches the render server but the ring thread
+does not advance far enough to retire what the app waits on.
+
+And the app's shape is the tell. S's log shows it **create a device, `vkDestroyDevice`, then create another
+device** before the stall, and with feedback off it releases its synchronous calls by polling
+`vkGetFenceStatus` (the (c)2 G' path). So the most likely mechanism is not the doorbell at all but the
+**completion/fence path**: the app polls a fence that never signals because the underlying swapchain GPU work
+is not retiring on S — the (c)2 readback-gate/fence lifecycle meeting a real WSI+present workload with a
+device recreation in the middle, where the single-frame refapp and offscreen icosa never went.
+
+This is a (c)2 ring-execution / fence-completion investigation, distinct from WP0's own remaining work (4.3),
+and deep enough to deserve its own focused session rather than being chased further at the tail of a long WP0
+turn. Recorded in full — the confirmed facts, the two dead ends, and the current best hypothesis — so it can
+be picked up cold. The diagnostic that got here (dump `/proc/<pid>/task/*/wchan` for vkcube, rayland-s, and
+the render-server child during a live hang; no ptrace needed) is the tool to keep using.
