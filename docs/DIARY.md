@@ -919,3 +919,34 @@ ceiling in the relay under this load. It gates 4.3's live validation (the app ha
 *reliably* to exercise the token path), and the honest reading of systematic-debugging here is that this is
 possibly architectural and worth a decision before a big change, not another guess. Pausing 4.3 at this
 boundary with the finding written down.
+
+### 2026-07-24 — Root-causing the vkcube stall: it is S's ring execution, not WP0
+
+Chased the intermittent vkcube stall the disciplined way, and it narrows cleanly — away from WP0 and into
+the (c)1/(c)2 relay's ring-execution path.
+
+First, what it *is*, from `/proc/<pid>/task/*/wchan` during a live hang (no ptrace needed, so no fighting
+yama): vkcube's main thread sits in `hrtimer_nanosleep` — the `vn_relax` busy-wait of `vn_ring_wait_seqno`.
+So it is unambiguously a **ring stall**: a synchronous Vulkan call spinning for a ring seqno reply that never
+retires. Not a Wayland dispatch wait (that would be `poll`/`ppoll` on the display fd), not a fatal, not a
+C-side stall (C logs "session ended cleanly", so its 30 s timeout never fires — Mesa's own ~3.5 s ALIVE
+watchdog gets there first, which is the abort variant; the hang variant is the same stall with ALIVE kept
+alive by chance).
+
+Then, where it *is not*. Timed S's message thread (throwaway instrumentation, since removed): every
+`handle_request`/`handle_bind` and every `apply` returned in under 5 ms. So the message thread is **not**
+blocked by the Wayland replay — the leading hypothesis, refuted. The dump of S's own threads during the hang
+tells the rest: the message thread is parked in `futex` reading the link (the app is stalled, so it sends
+nothing to apply); the engine actor is parked in `futex` (idle, no engine call pending); the progress thread
+is *running* (`wchan=0`) but finding nothing to ship; virglrenderer's render-server threads are idle. So the
+ring simply **is not advancing on S** — virglrenderer's ring thread is not executing vkcube's queued commands,
+and the progress thread therefore has no head advance to return.
+
+That is the (c)1 doorbell / (c)2 multi-queue machinery meeting its first real interactive workload. vkcube
+creates a swapchain of large HOST3D images and submits on the application queue (S already logs
+`ring_idx=1`), where the single-frame refapp and offscreen icosa that validated (c)1/(c)2 never went. The
+prime suspects are the two things the ledger already flags as (c)1/(c)2 seams: the doorbell that must wake
+virglrenderer's parked ring thread (`rayland_vtest::venus_ring::doorbell`), and multi-queue support, still
+open. 4.4 did not cause this — it is what let the app get far enough to expose it. Recorded here and handed to
+the owner as a decision point: fixing it is a (c)1/(c)2 ring-execution investigation, distinct from WP0's own
+remaining work (4.3, the buffer token), and worth scoping deliberately rather than folding into WP0.
