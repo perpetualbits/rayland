@@ -87,6 +87,24 @@ entry in and give the overturning its own entry — never quietly edit the histo
 allowed to be wrong in places; it may never be dishonest about it. Read `docs/DIARY.md`'s own
 preface and "How this diary continues" for the full spirit before writing in it.
 
+## The project map (keep it current, every turn)
+
+The repository root holds an **interactive project map**: [`project-map.js`](project-map.js) (the data —
+`window.PROJECT_MAP`: nodes, layers, statuses, dependency edges, and the roadmap) and
+[`project-map.html`](project-map.html) (a project-agnostic renderer that reads that data and draws a
+layered dependency graph, opened directly from disk via `file://`). It exists so a human — the owner
+included — can see at a glance what is shipped, what is in flight, what is an open seam, and what is
+planned, and drill into any crate or capability for its sub-parts, files, and specs.
+
+**The binding rule, analogous to the diary's:** on **every working turn**, check the map against the
+work you just did, and if anything it depicts has changed — a node's status, a new sub-part landing, a
+new crate, a dependency, a roadmap item advancing — **update `project-map.js` in the same turn** and bump
+`project.updated` to that day's date. Never invent status: derive it from this file's roadmap, the SDD
+ledger, the diary, and what actually exists in the tree. The renderer is project-agnostic and normally
+needs no edits; the *data* is what tracks reality. A turn that changed no status leaves the map alone (do
+not churn the `updated` date for nothing) — but you must have *looked*. Every new session learns of the
+map's existence and this rule by reading this file.
+
 ## Repository status and layout
 
 A Cargo workspace of seventeen crates. Each declares its own license per the policy below

@@ -764,3 +764,125 @@ and records the build/run gotchas (the `/tmp` tmpfs-quota SIGBUS, the loopback v
 never-pkill discipline). The recommendation to the next session is 4.4 before 4.3: the event return path is
 what unblocks vkcube's `pick_surface_format` abort, so doing it first lets the app drive further and show
 what comes next on its own.
+
+### 2026-07-24 — Resuming Task 4.4: the format roundtrip is answered locally, so formats must be too
+
+Picked up the WP0 handoff and started on the event-return path (4.4), recommended first because it is what
+unblocks vkcube's `pick_surface_format` abort. Reproduced that abort with my own eyes on the loopback smoke,
+and the daemon logs said more than the handoff predicted: the app binds `zwp_linux_dmabuf_v1` at **v4** and
+its very first request is opcode 2 — `get_default_feedback`. So Mesa is on the **v4 feedback path**, not the
+v3 `format`/`modifier` path. Read Mesa's WSI (`wsi_common_wayland.c`) to see what that path needs, and the
+answer is decisive: feedback delivers formats through a `format_table` **file descriptor** the client
+`mmap`s (`:917-928`), and `tranche_formats` bails to zero formats if that table was never mapped
+(`:957-979`). **An fd cannot cross a network.** But the same read showed the escape: Mesa only *opts into*
+feedback when the bound dmabuf version is `>= 4` (`:1661`); bind it at **v3** and it falls back to the plain
+`modifier(format, hi, lo)` event, which is three integers and no fd. v3 is a complete path in this Mesa, not
+a deprecated stub. So the first move is to **cap the proxy's dmabuf advertisement at v3**.
+
+Then the subtler finding, and the one that changes the handoff's plan. The handoff said 4.4 would *relay*
+the dmabuf format events back from S. Reading the wayland-backend server the proxy is built on
+(`server_impl/client.rs:431-456`), `wl_display.sync` is answered **locally and immediately** — the backend
+sends `wl_callback.done(0)` inline during request dispatch, and it never crosses to S. Mesa's format
+discovery is a *bounded* roundtrip (`wsi_common_wayland.c:1688`): sync, then read whatever formats arrived,
+and if that is zero it aborts. So relaying the `modifier` events from S would be racing them against a sync
+callback the proxy answers with no knowledge of S at all — they would win on loopback (microsecond relay)
+and lose on a real network, which is precisely the heisenbug shape (c)1 and (c)2 kept getting burned by.
+Format/modifier advertisement is a *capability handshake*, and a proxy must answer a capability handshake
+from known truth — the same way this backend already answers the registry locally — not by round-tripping it
+per app. So the proxy will **synthesize** the `modifier` events itself, the instant the app binds dmabuf,
+for LINEAR `XRGB8888`/`ARGB8888` (modifier 0) — the format the LINEAR HOST3D swapchain export uses anyway
+(4.0-bis). Delivered inside the bind handler, they are on the wire before any later sync callback, so the
+roundtrip cannot see zero.
+
+The general relay path (eventfd wakeup + `send_event` + `S2C::WaylandEvent` + S's reverse id map) is still
+needed — but for the *stateful* events the app waits on **unboundedly**: `xdg_surface.configure` (vkcube's
+own toplevel handshake blocks on the first one) and `wl_buffer.release` (image recycling). Those tolerate
+relay latency because the app blocks reading its socket until the specific event shows up; the format
+roundtrip does not, because it does not wait for a *specific* event, only for "whatever arrived by now". So
+4.4 splits cleanly in two: local capability synthesis for formats, and a genuine relay tunnel for state.
+This is a refinement of the handoff's "forward the format events", reached the way 4.0-bis was — by reading
+the source rather than trusting the plan — and left here so the reasoning is visible if it later proves
+wrong.
+
+### 2026-07-24 — Task 4.4a landed: formats advertised, and the app walks straight into the configure wall
+
+Built 4.4a — cap `zwp_linux_dmabuf_v1` at v3, and synthesize `modifier` events locally on bind — and it does
+exactly what the source predicted. The loopback smoke now logs `bound global zwp_linux_dmabuf_v1 v3` and
+`advertised 2 LINEAR dmabuf format(s)`, and vkcube no longer aborts at `pick_surface_format`: it sails past
+format selection and drives 59 inline Venus batches (up from 43), i.e. deeper into device and swapchain
+setup. The integration test (`wayland_proxy_dmabuf_formats.rs`) pins both halves — the v3 cap and a non-empty
+LINEAR format set — and both were teeth-checked (the cap assert caught the descriptor's real v5; suppressing
+the advertise left the format assert to catch the empty set).
+
+Then the next wall, and it took some digging because it wears a disguise. vkcube now either hangs to the
+timeout or, on a startup race, aborts inside `libvulkan_virtio.so` with no message. The silence was a
+red herring: the abort is Venus's `vn_ring_wait_seqno` → `vn_relax` path, whose diagnostics go through
+`vn_log` at `MESA_LOG_DEBUG` level, which Mesa filters by default — so "stuck in ... wait" and "aborting"
+were being printed to nowhere. And the abort-vs-hang split is just the ALIVE watchdog: `rayland-c` keeps
+re-arming ALIVE from ring progress, so the app usually spins forever rather than aborting; only when the
+re-arm loses a startup race does the watchdog fire.
+
+The proxy log is what named the wall. After formats are advertised the app loops: bind `zwp_linux_dmabuf_v1`
+→ (proxy advertises formats) → `destroy` it → repeat, dozens of times, ending on a fresh object id. That is
+Mesa's WSI standing up a transient `wsi_wl_display` for each `vkGetPhysicalDeviceSurface*` query, and vkcube
+polling those queries in its wait loop — it is waiting for the window to be **configured**. A Wayland
+surface has no valid extent until the compositor sends `xdg_surface.configure`, and nothing returns that
+event to the app yet: the whole compositor→app direction is still dark. So the app is stuck exactly where
+the handoff said it would be — "a real client blocks on the first configure before presenting." That is the
+event return path, 4.4b: the eventfd wakeup and `send_event` on C, the `S2C::WaylandEvent` relay, and S
+actively dispatching its compositor connection and translating each event's ids back to the app's id space.
+Building it next.
+
+### 2026-07-24 — Task 4.4b, C-side delivery — and a self-inflicted wound worth recording
+
+The C half of the event return path is built and tested: an `eventfd` gives the proxy's `poll` loop a third
+pollable fd, a `WaylandEventPoster`/`WaylandEventInbox` pair bridges the daemon's link reader thread to the
+serve loop, the proxy keeps an app-id → `ObjectId` map (filled as globals bind and requests create objects,
+emptied on destroy), and `deliver_event` resolves an inbound event's ids against that map and hands it to the
+app with `Handle::send_event`. An integration test posts an `xdg_wm_base.ping` as the reader thread would and
+watches a real `wayland-client` receive it; teeth-checked by suppressing the eventfd wake, which correctly
+made the ping never arrive.
+
+The wound: teeth-checking that test, I reverted it with `git checkout crates/rayland-c/src/wayland_proxy.rs`
+— and that file had **all of 4.4a and 4.4b's uncommitted work in it**, not just the one-line teeth-check.
+`git checkout <path>` discards working-tree changes to the last commit, so it erased the v3 cap, the format
+synthesis, and the entire event-delivery path in one command. It is left recorded here because the diary's
+job is to show the work honestly, mistakes included, and because the lesson is concrete: **never `git
+checkout` a file that holds uncommitted work to undo a temporary edit** — reverse the edit instead. Recovery
+was clean only because every change was in the session transcript and could be replayed in order; the two
+test files and the other crates were untouched. All six proxy tests are green again on the reconstructed
+file. The next move is unchanged: the S side (translate real compositor events S→app, and dispatch S's
+compositor connection so they arrive) and the daemon wiring.
+
+### 2026-07-24 — Task 4.4 done: the event tunnel works, vkcube gets configured, and the wall moves to 4.3
+
+The S side of the return path landed, and with it the whole event tunnel closes. `WaylandReplay` now keeps a
+reverse `s_id → app_id` map beside the forward one, `ReplayObjectData::event` translates each compositor
+event back into the app's id space and emits it through a new `EventSink`, and — the piece that makes events
+actually arrive — a dedicated **compositor-reader thread** dispatches S's compositor connection, because
+events turn up while the app is idle waiting and S's message thread only ever writes to that connection. On
+C, the daemon builds an eventfd-backed channel, the link reader routes each `S2C::WaylandEvent` to the
+proxy's poster, and the proxy delivers it with `send_event`. Proven at both ends: a real compositor's
+`wl_seat.capabilities` is translated and emitted on S (teeth-checked by suppressing the emit), and a posted
+`xdg_wm_base.ping` reaches a real client on C.
+
+Then the smoke said the thing worth saying. vkcube, run over the loopback relay, now receives its compositor
+events — `wl_seat.capabilities`, **`xdg_surface.configure`, `xdg_toplevel.configure`** — and, decisively,
+**sends `xdg_surface.ack_configure` back**. The configure handshake it was stuck on for the last two tasks
+completes, and the app drives on: it creates its swapchain buffers via `create_params`/`add`/`create_immed`.
+That is exactly the wall the handoff said 4.4 would remove, removed — the app could not ack a configure it
+never received, and now it does.
+
+It stops at the next wall, and the next wall is precisely Task 4.3. The `params.add` interception fires but
+`resolve_inode` returns `None` — the swapchain image's memfd does not correlate to a resource id — so no
+`BufferToken` is built, `create_immed` is not forwarded, and S skips the unmapped buffer. Turning that token
+into a real `wl_buffer` on S (retaining the HOST3D dma-buf, resolving the inode, building the buffer via S's
+`zwp_linux_dmabuf`) is 4.3's whole job, and why the inode resolves to nothing for a HOST3D swapchain image is
+the first thing 4.3 has to answer. The handoff called this too: "4.3 makes the pixels actually appear once
+the app reaches attach." It reaches attach now.
+
+One honest wart to carry forward: S relays its *real* compositor's dmabuf `modifier` events back to the app
+(~30 per bind × ~10 transient probe binds = ~480 events), on top of the two LINEAR modifiers the proxy
+synthesizes locally. Harmless for correctness — Mesa just accumulates format entries — but noisy, and the
+synthesized set is the authoritative one. A later pass should filter S's dmabuf `modifier`/`format` events
+out of the return path, since the proxy answers that capability itself.

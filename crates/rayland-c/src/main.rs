@@ -508,6 +508,7 @@ fn reader_thread(
     blobs: BlobTable,
     progress: Arc<Mutex<Progress>>,
     pending: PendingBlob,
+    wl_events: Option<rayland_c::wayland_proxy::WaylandEventPoster>,
 ) {
     loop {
         let msg = match rx.recv() {
@@ -576,6 +577,21 @@ fn reader_thread(
                      rayland-c: nothing on C was waiting for this, so it is reported here rather \
                      than answered. The session is likely now producing a stream S cannot replay."
                 );
+            }
+            // A compositor event from S's Wayland client, bound for the app. **WP0 event return path.**
+            // Hand it to the proxy thread via the poster, which queues it and wakes the proxy's poll loop
+            // so it delivers the event to the app with `send_event`. If no proxy is running (the env var was
+            // unset, so `wl_events` is `None`), there is no app to deliver to — the event is dropped. This
+            // is how `xdg_surface.configure`, `wl_buffer.release`, and the dmabuf/state events reach the app.
+            S2C::WaylandEvent { message } => {
+                if let Some(poster) = &wl_events {
+                    poster.post(message);
+                } else {
+                    eprintln!(
+                        "rayland-c: received a Wayland event for object {} but no proxy is running; dropped",
+                        message.object_id
+                    );
+                }
             }
             // Solicited (`Capset`, `BlobCreated`, and an `Error` that genuinely answers a request):
             // queue it for whoever asked. The channel is unbounded and its receiver lives inside the
@@ -990,6 +1006,20 @@ fn main() -> Result<()> {
         progress: Arc::clone(&progress),
     }));
 
+    // --- WP0 event return path. If the Wayland proxy is enabled (its socket env var is set), build the
+    // event channel now, *before* the reader thread that feeds it: the poster goes to the reader (which
+    // `post`s each `S2C::WaylandEvent`), the inbox to the proxy thread (which drains and delivers). When the
+    // proxy is disabled, both are `None` and the reader drops any stray event.
+    let wl_socket = std::env::var_os(ENV_WAYLAND_DISPLAY);
+    let (wl_poster, wl_inbox) = match &wl_socket {
+        Some(_) => {
+            let (poster, inbox) = rayland_c::wayland_proxy::wayland_event_channel()
+                .context("creating the WP0 Wayland event-return channel")?;
+            (Some(poster), Some(inbox))
+        }
+        None => (None, None),
+    };
+
     // --- The reader: the only thing that may `recv`. See the module docs for why a design without
     // it deadlocks.
     std::thread::Builder::new()
@@ -998,7 +1028,7 @@ fn main() -> Result<()> {
             let blobs = Arc::clone(&blobs);
             let progress = Arc::clone(&progress);
             let pending = engine.pending();
-            move || reader_thread(rx, reply_tx, blobs, progress, pending)
+            move || reader_thread(rx, reply_tx, blobs, progress, pending, wl_poster)
         })
         .context("spawning the reader thread")?;
 
@@ -1019,13 +1049,15 @@ fn main() -> Result<()> {
     // env var so offscreen sessions and the whole test suite — which never set it — are untouched. The
     // proxy's own accept-and-dispatch loop blocks, so it gets its own thread, alongside the app's vtest
     // session on the main thread.
-    if let Some(wl_socket) = std::env::var_os(ENV_WAYLAND_DISPLAY) {
+    if let Some(wl_socket) = wl_socket {
         // The sink forwards Wayland requests over the shared send link; the resolver turns a swapchain
         // fd's inode into the resource id, by scanning the blob table. Both are clones of the same
         // shared state the reader thread and ring watcher already use.
         let sink = Arc::new(rayland_c::proxy_link::LinkSink::new(Arc::clone(&tx)));
         let resolver = Arc::new(rayland_c::proxy_link::BlobInodeResolver::new(Arc::clone(&blobs)));
         let wl_path = std::path::PathBuf::from(wl_socket);
+        // The inbox was created above alongside the poster the reader holds; both exist iff the socket does.
+        let inbox = wl_inbox.expect("the event inbox is created whenever the proxy socket is set");
         eprintln!(
             "rayland-c: Wayland proxy listening at {}; point the app at it with WAYLAND_DISPLAY",
             wl_path.display()
@@ -1034,8 +1066,11 @@ fn main() -> Result<()> {
             .name("rayland-c-wayland".into())
             .spawn(move || {
                 // A proxy failure is logged, not fatal to the vtest session: the forward/ring path is
-                // independent, and WP0 keeps the two channels loosely coupled.
-                if let Err(e) = rayland_c::wayland_proxy::run(wl_path, sink, resolver) {
+                // independent, and WP0 keeps the two channels loosely coupled. `run_with_events` wires the
+                // compositor-event return path (the inbox); requests still forward over `sink`.
+                if let Err(e) =
+                    rayland_c::wayland_proxy::run_with_events(wl_path, sink, resolver, inbox)
+                {
                     eprintln!("rayland-c: the Wayland proxy exited with an error: {e:#}");
                 }
             })

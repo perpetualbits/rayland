@@ -25,10 +25,12 @@
 //! adds the `app_id ↔ s_id` object-id mapping so S can replay the session against its real compositor.
 
 use std::collections::HashMap;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::ffi::CString;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender, channel};
 
 use rayland_relay::{BufferToken, WaylandArg, WaylandMessage};
 use wayland_server::Resource; // brings `interface()` into scope for the generated object types
@@ -36,6 +38,95 @@ use wayland_server::backend::protocol::{Argument, Message};
 use wayland_server::backend::{
     Backend, ClientData, ClientId, GlobalHandler, GlobalId, Handle, ObjectData, ObjectId,
 };
+
+/// The write end of the compositor-event return path: the daemon's link **reader thread** hands S's
+/// events to the proxy through this, from a *different* thread than the proxy's serve loop.
+///
+/// # Why an eventfd, not just a channel
+/// The proxy's serve loop blocks in `poll(2)` on the listener and the backend fd (see [`serve`]). A channel
+/// alone cannot wake that `poll`, so a third pollable fd — an `eventfd` — is the wakeup: [`post`](Self::post)
+/// queues the message and then writes to the eventfd, which makes the proxy's `poll` return so it can drain
+/// and deliver. This is the standard "self-pipe / eventfd" trick for waking a `poll` from another thread.
+pub struct WaylandEventPoster {
+    /// The queue the proxy drains on wakeup. Unbounded: compositor events are low-rate (configures, buffer
+    /// releases), and dropping the reader (proxy gone) is handled by [`post`](Self::post) silently.
+    tx: Sender<WaylandMessage>,
+    /// The eventfd the proxy polls; writing 8 bytes makes it readable. A `dup` of the read end's fd, so both
+    /// refer to the same kernel eventfd object.
+    wake: OwnedFd,
+}
+
+impl WaylandEventPoster {
+    /// Hand one compositor event to the proxy: queue it, then wake the proxy's `poll`.
+    ///
+    /// Fire-and-forget. If the proxy has gone (the channel's receiver is dropped), the send fails and this
+    /// returns without waking — there is nothing to deliver to. An `EAGAIN` on the eventfd write means the
+    /// counter is already non-zero, i.e. the proxy is already scheduled to wake, which is fine.
+    pub fn post(&self, msg: WaylandMessage) {
+        // Queue first, so the message is visible before the wakeup the proxy reacts to.
+        if self.tx.send(msg).is_err() {
+            return; // the proxy thread is gone; nothing to deliver to.
+        }
+        // Increment the eventfd counter by one to make it readable and return the proxy's `poll`.
+        let one: u64 = 1;
+        // SAFETY: writing 8 bytes of a `u64` to an eventfd is the eventfd write contract; the fd is valid
+        // for the borrow, and a short/EAGAIN write only means "already signalled", which needs no retry.
+        unsafe {
+            libc::write(
+                self.wake.as_raw_fd(),
+                &one as *const u64 as *const libc::c_void,
+                8,
+            );
+        }
+    }
+}
+
+/// The read end of the compositor-event return path, owned by the proxy's serve loop: the queue it drains
+/// and the eventfd it polls. Constructed by [`wayland_event_channel`] together with its [`WaylandEventPoster`].
+pub struct WaylandEventInbox {
+    /// The queue of events posted by the reader thread, drained on each eventfd wakeup.
+    rx: Receiver<WaylandMessage>,
+    /// The eventfd the serve loop polls; readable (counter > 0) exactly when events are queued.
+    wake: OwnedFd,
+}
+
+/// Create a linked [`WaylandEventPoster`] / [`WaylandEventInbox`] pair over one shared eventfd.
+///
+/// The poster goes to the daemon's link reader thread (which turns each `S2C::WaylandEvent` into a
+/// [`WaylandEventPoster::post`]); the inbox goes to [`run_with_events`]. Both ends hold their own `OwnedFd`
+/// duped from the same underlying eventfd, so a write on the poster's side is seen by a poll on the inbox's.
+///
+/// # Failure modes
+/// Returns an `io::Error` if `eventfd(2)` or the `dup(2)` of it fails (fd exhaustion) — surfaced so the
+/// daemon fails at wiring time rather than silently losing every compositor event.
+pub fn wayland_event_channel() -> std::io::Result<(WaylandEventPoster, WaylandEventInbox)> {
+    let (tx, rx) = channel();
+    // The eventfd: counter starts at 0 (not readable), non-blocking so the drain read never blocks, and
+    // close-on-exec so it is not leaked into any child (the daemon spawns none, but this is the safe default).
+    // SAFETY: `eventfd` returns a fresh fd or -1; we check and take ownership via `OwnedFd`.
+    let read_raw = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    if read_raw < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `read_raw` is a valid, freshly-owned fd we have not otherwise registered.
+    let read_fd = unsafe { OwnedFd::from_raw_fd(read_raw) };
+    // The write end is a dup of the same eventfd — one kernel object, two owned fds, so each side drops
+    // cleanly and neither closes the other's.
+    // SAFETY: `dup` of a valid fd returns a fresh fd or -1; checked, then owned.
+    let write_raw = unsafe { libc::dup(read_raw) };
+    if write_raw < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `write_raw` is a valid, freshly-owned fd.
+    let write_fd = unsafe { OwnedFd::from_raw_fd(write_raw) };
+    Ok((
+        WaylandEventPoster {
+            tx,
+            wake: write_fd,
+        },
+        WaylandEventInbox { rx, wake: read_fd },
+    ))
+}
 
 /// Why a Wayland `Message` argument could not be translated to a [`WaylandArg`] for forwarding to S.
 ///
@@ -221,6 +312,12 @@ struct ProxyState {
     resolver: Arc<dyn ResourceResolver>,
     /// In-flight buffer state, keyed by the `zwp_linux_buffer_params_v1` object's id (the app's id space).
     pending: HashMap<u32, PendingParams>,
+    /// Every object the app has created, mapping its protocol id (the app's id space) to the live
+    /// [`ObjectId`]. Populated as globals are bound and requests create objects; entries removed on
+    /// `destroyed`. This is what the **event return path** (Task 4.4) resolves an inbound `S2C::WaylandEvent`
+    /// against: the event arrives keyed by the app-side id (S translated it back from its own id space), and
+    /// [`deliver_event`] looks the id up here to name the `send_event` sender and any object arguments.
+    objects: HashMap<u32, ObjectId>,
 }
 
 // The interface names and request opcodes the fd→token interception keys on. Opcodes are the request's
@@ -241,6 +338,39 @@ const OP_PARAMS_ADD: u16 = 1;
 const OP_PARAMS_CREATE: u16 = 2;
 /// `zwp_linux_buffer_params_v1.create_immed` — creates the `wl_buffer` synchronously (opcode 3).
 const OP_PARAMS_CREATE_IMMED: u16 = 3;
+
+/// The version the proxy advertises `zwp_linux_dmabuf_v1` at — **capped at 3 on purpose**.
+///
+/// # Why the cap is load-bearing (WP0 Task 4.4)
+/// The interface descriptor supports higher versions, but Mesa's Venus WSI opts into the **v4 feedback**
+/// path (`get_default_feedback`) whenever the bound version is `>= 4`, and that path delivers its supported
+/// formats through a `format_table` **file descriptor** the client `mmap`s (`wsi_common_wayland.c:917-928`).
+/// A file descriptor cannot cross a network. At v3 Mesa falls back to the plain `modifier` event
+/// (`:830-852`), which is three integers and no fd — a complete path in this Mesa. So the proxy advertises
+/// exactly v3, forcing the fd-free path, and answers the format query itself (see [`advertise_dmabuf_formats`]).
+const DMABUF_MAX_VERSION: u32 = 3;
+
+/// `zwp_linux_dmabuf_v1.modifier` **event** opcode (event index 1). Wire signature
+/// `[format: uint, modifier_hi: uint, modifier_lo: uint]`, valid since interface v3. This is the event the
+/// proxy synthesizes to advertise a supported format to the app.
+const EV_DMABUF_MODIFIER: u16 = 1;
+
+/// The DRM format modifier the proxy advertises: `DRM_FORMAT_MOD_LINEAR` = 0. WP0's swapchain images are
+/// LINEAR HOST3D resources (offset 0, stride = width·bpp — see the 4.0-bis measurement), so LINEAR is the
+/// layout the app's buffer will actually have on S.
+const MOD_LINEAR: u64 = 0;
+
+/// DRM fourcc `XR24` (`DRM_FORMAT_XRGB8888`) — the standard opaque 32-bit swapchain format.
+const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
+/// DRM fourcc `AR24` (`DRM_FORMAT_ARGB8888`) — the standard 32-bit swapchain format with alpha.
+const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241;
+
+/// The `(format, modifier)` pairs the proxy advertises to the app on a dmabuf bind. Kept minimal and
+/// LINEAR: these are what a Venus WSI swapchain negotiates and what the HOST3D dma-buf on S exports, so the
+/// app never picks a format S cannot present. Mesa's `pick_surface_format` needs only that this set is
+/// non-empty (`count >= 1`); one pair would do, and both opaque and alpha are offered for completeness.
+const ADVERTISED_FORMATS: [(u32, u64); 2] =
+    [(DRM_FORMAT_XRGB8888, MOD_LINEAR), (DRM_FORMAT_ARGB8888, MOD_LINEAR)];
 
 /// Read a passed fd's memfd identity (`st_dev`, `st_ino`) via `fstat`, for resource correlation.
 ///
@@ -427,6 +557,53 @@ fn try_intercept_buffer(data: &mut ProxyState, msg: &Message<ObjectId, OwnedFd>)
     }
 }
 
+/// Answer the dmabuf format capability locally, by emitting a `modifier` event per advertised format on the
+/// just-bound `zwp_linux_dmabuf_v1` object.
+///
+/// # Why this is synthesized here rather than relayed from S
+/// Mesa's WSI discovers formats with a **bounded** roundtrip (`wl_display.sync`, then read whatever formats
+/// arrived — abort if none). The proxy's `wayland-backend` server answers `sync` **locally and immediately**
+/// (`server_impl/client.rs`), with no knowledge of S, so a `modifier` event relayed from S's compositor
+/// would race that sync callback and lose it over a real network (winning only on loopback timing). Format
+/// advertisement is a capability handshake, and the proxy answers it from known truth — the LINEAR
+/// XRGB8888/ARGB8888 the HOST3D swapchain export uses (see [`ADVERTISED_FORMATS`]).
+///
+/// # Inputs / failure modes
+/// - `handle`: the backend handle, for `send_event`.
+/// - `dmabuf`: the bound object's id, in the app's id space — the event's sender.
+/// - A `send_event` failure (an `InvalidId`, i.e. the client vanished mid-bind) is logged and skipped; it is
+///   not fatal, and the next event or the client's disconnect handles the teardown.
+fn advertise_dmabuf_formats(handle: &Handle, dmabuf: &ObjectId) {
+    for (format, modifier) in ADVERTISED_FORMATS {
+        // Split the 64-bit modifier into the wire's hi/lo halves, as `add`/`modifier` both carry it.
+        let modifier_hi = (modifier >> 32) as u32;
+        let modifier_lo = modifier as u32;
+        // The modifier event: `[format, modifier_hi, modifier_lo]` on the dmabuf object (event opcode 1).
+        let event = Message {
+            sender_id: dmabuf.clone(),
+            opcode: EV_DMABUF_MODIFIER,
+            args: [
+                Argument::Uint(format),
+                Argument::Uint(modifier_hi),
+                Argument::Uint(modifier_lo),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        if let Err(e) = handle.send_event(event) {
+            wp_log(&format!(
+                "failed to advertise dmabuf format {format:#x} to the app: {e:?}"
+            ));
+            return;
+        }
+    }
+    wp_log(&format!(
+        "advertised {} LINEAR dmabuf format(s) to the app on object {}",
+        ADVERTISED_FORMATS.len(),
+        dmabuf.protocol_id()
+    ));
+}
+
 /// Per-connection state the backend holds for the application's client. Empty for now — WP0 has exactly
 /// one client (the app) and needs no per-client bookkeeping beyond the object map a later sub-step adds.
 /// The `initialized`/`disconnected` notifications are left at their trait defaults.
@@ -473,6 +650,19 @@ impl GlobalHandler<ProxyState> for ProxyGlobal {
         // against this object (the app's `wl_registry.bind` itself never crosses — see `WaylandSink`).
         data.sink
             .forward_bind(self.iface_name, version, object_id.protocol_id());
+        // WP0 Task 4.4: answer the dmabuf format capability locally, right here on bind. Mesa's WSI queries
+        // supported formats with a bounded roundtrip the proxy's backend answers itself (see
+        // `advertise_dmabuf_formats`), so the `modifier` events must be synthesized now rather than relayed
+        // from S. Guarded on the bound version being >= 3, since the `modifier` event exists only from v3
+        // (the proxy caps the advertisement at exactly v3, so a real client always binds v3 here).
+        if self.iface_name == IFACE_DMABUF && version >= 3 {
+            advertise_dmabuf_formats(handle, &object_id);
+        }
+        // Record the bound global in the app-id → ObjectId map so a compositor event targeting it (e.g. a
+        // `wl_seat.capabilities`, or an `xdg_wm_base.ping` on a descendant) can be delivered back — see
+        // [`deliver_event`] and [`ProxyState::objects`].
+        data.objects
+            .insert(object_id.protocol_id(), object_id.clone());
         // The bound object forwards its requests through the same inert data as any other object.
         Arc::new(ProxyObjectData)
     }
@@ -507,6 +697,15 @@ impl ObjectData<ProxyState> for ProxyObjectData {
             .args
             .iter()
             .any(|arg| matches!(arg, Argument::NewId(_)));
+        // Record every object this request creates in the app-id → ObjectId map, so a later compositor event
+        // targeting it (an `xdg_surface.configure`, a `wl_buffer.release`) can be delivered back — see
+        // [`deliver_event`]. The new object's `ObjectId` is carried in the request itself as an
+        // `Argument::NewId`, so this needs no separate lookup and covers the intercepted buffer path too.
+        for arg in &msg.args {
+            if let Argument::NewId(id) = arg {
+                data.objects.insert(id.protocol_id(), id.clone());
+            }
+        }
         // The one special case first: buffer-by-token interception on the dmabuf path. If it consumed the
         // request (a `create_params`/`add`/`create_immed`), the generic path must not also run — a raw fd
         // must never be forwarded.
@@ -564,6 +763,9 @@ impl ObjectData<ProxyState> for ProxyObjectData {
     ) {
         // Drop any accumulated buffer state keyed by this object's id (no-op unless it was a params object).
         data.pending.remove(&object_id.protocol_id());
+        // Drop the object from the event-delivery map: its `ObjectId` is now invalid, and a stale entry
+        // would make [`deliver_event`] try to `send_event` on a destroyed object.
+        data.objects.remove(&object_id.protocol_id());
     }
 }
 
@@ -586,10 +788,34 @@ impl ObjectData<ProxyState> for ProxyObjectData {
 /// `sink` is where the app's translated requests are forwarded — a collector in tests, the real link to
 /// S in Task 4. `resolver` turns a passed `params.add` dma-buf fd into the S-side resource id it names — a
 /// stub map in tests, the `shm.rs`-backed registry in Task 4.
+///
+/// This is the no-return-path form: it runs with an [`WaylandEventInbox`] whose poster is dropped, so no
+/// compositor events are ever delivered back to the app. The daemon uses [`run_with_events`] to wire the
+/// real return path; this convenience keeps the many proxy tests that do not exercise events unchanged.
 pub fn run(
     socket_path: PathBuf,
     sink: Arc<dyn WaylandSink>,
     resolver: Arc<dyn ResourceResolver>,
+) -> anyhow::Result<()> {
+    // A never-firing inbox: its poster is dropped immediately, so the eventfd is never written and the
+    // serve loop only ever wakes for the listener and the backend.
+    let (_poster, inbox) = wayland_event_channel()?;
+    drop(_poster);
+    run_with_events(socket_path, sink, resolver, inbox)
+}
+
+/// Run the Wayland proxy with a compositor-event return path (WP0 Task 4.4).
+///
+/// Identical to [`run`], but the `inbox` is fed by a [`WaylandEventPoster`] the daemon hands to its link
+/// reader thread: each `S2C::WaylandEvent` from S is `post`ed, waking this loop, which translates the event's
+/// ids back into the app's object graph and delivers it with `Handle::send_event` (see [`deliver_event`]).
+/// This is how `xdg_surface.configure`, `wl_buffer.release`, and every other compositor event reaches the
+/// application.
+pub fn run_with_events(
+    socket_path: PathBuf,
+    sink: Arc<dyn WaylandSink>,
+    resolver: Arc<dyn ResourceResolver>,
+    inbox: WaylandEventInbox,
 ) -> anyhow::Result<()> {
     // A stale socket file left by a crashed run would make `bind` fail; remove it (ignore "not found").
     let _ = std::fs::remove_file(&socket_path);
@@ -597,12 +823,15 @@ pub fn run(
     let mut backend = Backend::<ProxyState>::new()?;
     // Advertise every global vkcube binds (spec §6). `wl_display`/`wl_registry` are backend built-ins; we
     // add only the application-visible globals. Each is advertised at the full version the interface
-    // descriptor knows — WP0 negotiates no version subset yet.
+    // descriptor knows — except dmabuf, capped at v3 (see [`DMABUF_MAX_VERSION`]).
     let handle = backend.handle();
-    create_global::<WlCompositor>(&handle);
-    create_global::<XdgWmBase>(&handle);
-    create_global::<ZwpLinuxDmabufV1>(&handle);
-    create_global::<WlSeat>(&handle);
+    // Advertise each global at the descriptor's max version (`u32::MAX` is clamped down to it), *except*
+    // `zwp_linux_dmabuf_v1`, which is capped at v3 so Mesa takes the fd-free format path — see
+    // [`DMABUF_MAX_VERSION`].
+    create_global::<WlCompositor>(&handle, u32::MAX);
+    create_global::<XdgWmBase>(&handle, u32::MAX);
+    create_global::<ZwpLinuxDmabufV1>(&handle, DMABUF_MAX_VERSION);
+    create_global::<WlSeat>(&handle, u32::MAX);
     // Where the application dials in. WP0 serves exactly one such socket.
     let listener = UnixListener::bind(&socket_path)?;
     // The dispatch loop owns this state; it is threaded to every callback by the backend.
@@ -610,21 +839,26 @@ pub fn run(
         sink,
         resolver,
         pending: HashMap::new(),
+        objects: HashMap::new(),
     };
     wp_log(&format!("proxy listening at {}", socket_path.display()));
-    serve(&mut backend, &listener, &mut state)
+    serve(&mut backend, &listener, &mut state, &inbox)
 }
 
-/// Advertise one global for interface `R`, wiring it to a fresh [`ProxyGlobal`] handler.
+/// Advertise one global for interface `R` at version `min(max_version, descriptor max)`, wiring it to a
+/// fresh [`ProxyGlobal`] handler.
 ///
 /// `R` is a generated object type (`WlCompositor`, `XdgWmBase`, …); `R::interface()` yields the
-/// `&'static Interface` the backend needs, and its `.version` is the maximum version the descriptor
-/// supports, which is what we advertise.
-fn create_global<R: Resource>(handle: &Handle) -> GlobalId {
+/// `&'static Interface` the backend needs, and its `.version` is the maximum the descriptor supports.
+/// `max_version` caps the advertisement below that — pass `u32::MAX` to advertise the full descriptor
+/// version, or a specific cap (as WP0 does for `zwp_linux_dmabuf_v1`; see [`DMABUF_MAX_VERSION`]). The
+/// `.min` guarantees the proxy never advertises a version the descriptor cannot actually serve.
+fn create_global<R: Resource>(handle: &Handle, max_version: u32) -> GlobalId {
     let iface = R::interface();
+    let version = max_version.min(iface.version);
     handle.create_global::<ProxyState>(
         iface,
-        iface.version,
+        version,
         Arc::new(ProxyGlobal {
             iface_name: iface.name,
         }),
@@ -633,9 +867,10 @@ fn create_global<R: Resource>(handle: &Handle) -> GlobalId {
 
 /// The accept-and-dispatch loop.
 ///
-/// Polls two sources: the listening socket (a new application connecting) and the backend's own poll fd
-/// (a connected client has pending requests). On a connection, insert the client into the backend; on
-/// backend readiness, dispatch all pending client requests and flush any queued events back. Runs until an
+/// Polls three sources: the listening socket (a new application connecting), the backend's own poll fd
+/// (a connected client has pending requests), and the event inbox's eventfd (S sent a compositor event to
+/// deliver back). On a connection, insert the client; on backend readiness, dispatch and flush; on an
+/// inbox wakeup, drain the queued events, deliver each with `send_event`, and flush. Runs until an
 /// unrecoverable error.
 ///
 /// `EINTR` from `poll` is retried rather than surfaced — a signal is not a failure of the loop.
@@ -643,10 +878,12 @@ fn serve(
     backend: &mut Backend<ProxyState>,
     listener: &UnixListener,
     state: &mut ProxyState,
+    inbox: &WaylandEventInbox,
 ) -> anyhow::Result<()> {
     use std::os::fd::{AsFd, AsRawFd};
     loop {
-        // Two fds to watch: index 0 the listener, index 1 the backend. `poll` fills `revents` in place.
+        // Three fds to watch: 0 the listener, 1 the backend, 2 the event inbox's eventfd. `poll` fills
+        // `revents` in place.
         let mut fds = [
             libc::pollfd {
                 fd: listener.as_raw_fd(),
@@ -658,8 +895,13 @@ fn serve(
                 events: libc::POLLIN,
                 revents: 0,
             },
+            libc::pollfd {
+                fd: inbox.wake.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
-        // SAFETY: `fds` is a valid, initialized array of 2 pollfds for the duration of the call; a negative
+        // SAFETY: `fds` is a valid, initialized array of 3 pollfds for the duration of the call; a negative
         // timeout blocks until an fd is ready. `poll` only writes the `revents` fields.
         let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
         if rc < 0 {
@@ -679,6 +921,139 @@ fn serve(
             backend.dispatch_all_clients(state)?;
             backend.flush(None)?;
         }
+        // S sent one or more compositor events to deliver back to the app.
+        if fds[2].revents & libc::POLLIN != 0 {
+            drain_events(backend, state, inbox)?;
+        }
+    }
+}
+
+/// Drain the event inbox and deliver every queued compositor event to the app, then flush.
+///
+/// Called when the inbox's eventfd polled readable. It first reads the eventfd to reset its counter (so the
+/// next `poll` blocks until the *next* `post`), then drains the channel non-blocking and delivers each
+/// event via [`deliver_event`]. A single wakeup can carry several events — the eventfd counts posts but the
+/// channel holds them — so it drains until empty rather than one per wakeup.
+fn drain_events(
+    backend: &mut Backend<ProxyState>,
+    state: &mut ProxyState,
+    inbox: &WaylandEventInbox,
+) -> anyhow::Result<()> {
+    // Reset the eventfd counter: read the 8-byte counter value (discarded). `EFD_NONBLOCK` means a spurious
+    // wakeup with the counter already 0 returns `EAGAIN`, which is not an error here.
+    let mut buf = [0u8; 8];
+    // SAFETY: reading 8 bytes into a valid local buffer from the eventfd; the return value is ignored
+    // because any outcome (counter read, or EAGAIN) leaves us correctly proceeding to drain the channel.
+    unsafe {
+        libc::read(
+            inbox.wake.as_raw_fd(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            8,
+        );
+    }
+    let handle = backend.handle();
+    // Drain everything queued. `try_recv` returns `Empty` when drained and `Disconnected` if the poster is
+    // gone; both end the drain.
+    while let Ok(msg) = inbox.rx.try_recv() {
+        deliver_event(&handle, state, msg);
+    }
+    // Flush so the delivered events reach the app's socket promptly rather than on the next dispatch.
+    backend.flush(None)?;
+    Ok(())
+}
+
+/// Deliver one compositor event, arriving in the **app's** id space, to the application via `send_event`.
+///
+/// # Id translation
+/// The event has already been translated S→app on S's side (the reverse of the request path's app→S map),
+/// so `msg.object_id` and any `Object` argument name objects in the app's own id space. This function
+/// resolves those numeric ids to live [`ObjectId`]s via [`ProxyState::objects`] and rebuilds the backend
+/// `Message` `send_event` needs.
+///
+/// # What it forwards, and what it drops
+/// Scalars (`Int`/`Uint`/`Fixed`/`Str`/`Array`) map straight across. An `Object` argument is resolved
+/// through the map (dropping the event if unknown — a defensive branch, not a live one for WP0). A `NewId`
+/// argument (a compositor *creating* an object for the app — e.g. a data offer) is **not** supported by
+/// WP0's return path and drops the whole event with a log, as does an unexpected `Buffer` token (which is a
+/// request-direction concern only). None of the events a minimal WSI client relies on
+/// (`xdg_surface.configure`, `xdg_toplevel.configure`, `wl_buffer.release`, `xdg_wm_base.ping`,
+/// `wl_callback.done`) carry either, so this covers the walking skeleton.
+///
+/// # Failure modes
+/// An unknown target object (destroyed, or never created) drops the event with a log. A `send_event`
+/// failure (the client vanished) is logged; it is not fatal to the proxy.
+fn deliver_event(handle: &Handle, state: &ProxyState, msg: WaylandMessage) {
+    // The event's target object, in the app's id space, must be one the proxy created and still holds.
+    let Some(sender) = state.objects.get(&msg.object_id).cloned() else {
+        wp_log(&format!(
+            "drop event for unknown object {} (opcode {}): no live proxy object",
+            msg.object_id, msg.opcode
+        ));
+        return;
+    };
+    // Rebuild the argument list in the backend's `send_event` form (`Argument<ObjectId, RawFd>`).
+    let mut args: Vec<Argument<ObjectId, RawFd>> = Vec::with_capacity(msg.args.len());
+    for arg in &msg.args {
+        match arg {
+            WaylandArg::Int(v) => args.push(Argument::Int(*v)),
+            WaylandArg::Uint(v) => args.push(Argument::Uint(*v)),
+            WaylandArg::Fixed(v) => args.push(Argument::Fixed(*v)),
+            // Re-add the wire NUL the tunnel stripped; a wayland string has no interior NUL.
+            WaylandArg::Str(s) => args.push(Argument::Str(
+                s.as_ref()
+                    .and_then(|b| CString::new(b.clone()).ok())
+                    .map(Box::new),
+            )),
+            WaylandArg::Array(b) => args.push(Argument::Array(Box::new(b.clone()))),
+            // An object reference: resolve through the map. If the app never learned of the referenced
+            // object, dropping the whole event is safer than delivering a dangling reference — but the WP0
+            // event set carries no `Object` args, so this is a defensive branch, not a live one.
+            WaylandArg::Object(id) => match state.objects.get(id).cloned() {
+                Some(obj) => args.push(Argument::Object(obj)),
+                None => {
+                    wp_log(&format!(
+                        "drop event (obj {} opcode {}): references unknown object {id}",
+                        msg.object_id, msg.opcode
+                    ));
+                    return;
+                }
+            },
+            // A compositor-created object: unsupported in WP0's return path; drop the whole event.
+            WaylandArg::NewId { id, interface, .. } => {
+                wp_log(&format!(
+                    "drop event (obj {} opcode {}): carries a NewId ({interface} {id}) which WP0 does not \
+                     deliver back yet",
+                    msg.object_id, msg.opcode
+                ));
+                return;
+            }
+            // A buffer token in a compositor→app event is never expected; drop rather than mis-deliver.
+            WaylandArg::Buffer(_) => {
+                wp_log(&format!(
+                    "drop event (obj {} opcode {}): unexpected Buffer token in an event",
+                    msg.object_id, msg.opcode
+                ));
+                return;
+            }
+        }
+    }
+    let event = Message {
+        sender_id: sender,
+        opcode: msg.opcode,
+        args: args.into_iter().collect(),
+    };
+    if let Err(e) = handle.send_event(event) {
+        wp_log(&format!(
+            "send_event for object {} opcode {} failed: {e:?}",
+            msg.object_id, msg.opcode
+        ));
+    } else {
+        wp_log(&format!(
+            "delivered event to app object {} opcode {} ({} args)",
+            msg.object_id,
+            msg.opcode,
+            msg.args.len()
+        ));
     }
 }
 

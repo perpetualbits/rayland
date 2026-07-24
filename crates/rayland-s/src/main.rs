@@ -63,10 +63,10 @@
 // not an S-issued fence), so only `apply` needs the client, as `&mut dyn RenderEngine`.
 use rayland_engine::{EngineClient, spawn_engine, virgl_available};
 // The relay protocol and its framing.
-use rayland_relay::{C2S, S2C, read_msg, write_msg};
+use rayland_relay::{C2S, S2C, WaylandMessage, read_msg, write_msg};
 // The message applier: everything this daemon actually knows how to do.
 use rayland_s::apply::Applier;
-use rayland_s::wayland_client::WaylandReplay;
+use rayland_s::wayland_client::{EventSink, WaylandReplay};
 // Presentation: finding the application's readback buffer among S's blobs, and putting it on S's
 // screen. See that module's docs for why finding it is the one guess (c)1 has to make.
 use rayland_s::present::{ENV_NO_PRESENT, FrameCapture, frame_size_from_env, present_frame};
@@ -223,6 +223,26 @@ fn ship(tx: &Arc<Mutex<QuicSend>>, msgs: &[S2C]) -> Result<(), ()> {
         }
     }
     Ok(())
+}
+
+/// The WP0 event-return sink: ships each translated compositor event to C as an [`S2C::WaylandEvent`].
+///
+/// The S-side replay ([`WaylandReplay`]) translates a compositor event into the app's id space and hands it
+/// here; this puts it on the same link C's proxy reads, where the reader thread `post`s it to the proxy and
+/// the app receives it. It shares the one send link with the message and progress threads (the mutex inside
+/// [`ship`] serializes the three). Delivery is fire-and-forget: a failed ship is logged by `ship` and
+/// dropped, because an undeliverable event must not stall the compositor-reader thread.
+struct LinkEventSink {
+    /// The shared link to C, locked per message by [`ship`].
+    tx: Arc<Mutex<QuicSend>>,
+}
+
+impl EventSink for LinkEventSink {
+    /// Ship one app-space compositor event to C. Errors are swallowed (logged inside `ship`): the event
+    /// return path is best-effort and independent of the ring/blob path's own error handling.
+    fn emit(&self, event: WaylandMessage) {
+        let _ = ship(&self.tx, &[S2C::WaylandEvent { message: event }]);
+    }
 }
 
 /// The return path: ship each finished readback frame **ahead of** the ring-progress that releases the
@@ -509,8 +529,11 @@ fn main() -> Result<()> {
     let mut engine = engine;
     // WP0: the S-side replay of the app's Wayland session. Unconnected until the first relayed request,
     // so an offscreen session never touches a compositor. Owned by the message thread, which is the only
-    // thing that dispatches relayed Wayland requests.
-    let mut wl_replay = WaylandReplay::new();
+    // thing that dispatches relayed Wayland requests. Its event sink ships compositor events back to C over
+    // the shared link, so the app receives `xdg_surface.configure`, `wl_buffer.release`, and the rest.
+    let mut wl_replay = WaylandReplay::new(Arc::new(LinkEventSink {
+        tx: Arc::clone(&tx),
+    }));
     serve(rx, tx, applier, &mut engine, &mut capture, &mut wl_replay)?;
     eprintln!("rayland-s: session ended");
 
