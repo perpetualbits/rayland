@@ -886,3 +886,36 @@ One honest wart to carry forward: S relays its *real* compositor's dmabuf `modif
 synthesizes locally. Harmless for correctness — Mesa just accumulates format entries — but noisy, and the
 synthesized set is the authoritative one. A later pass should filter S's dmabuf `modifier`/`format` events
 out of the return path, since the proxy answers that capability itself.
+
+### 2026-07-24 — Starting 4.3: fixed the modifier flood, and met the wall behind the wall
+
+Began Task 4.3 (buffer-by-token → wl_buffer) the way systematic-debugging asks — root-cause the
+`resolve_inode → None` before touching anything — and two things came out of it, one fixed and one that
+needs a decision.
+
+Fixed: the modifier flood. S was relaying its *real* compositor's dmabuf `format`/`modifier` events back to
+the app — ~30 per bind, and the app stands up ~10 transient `wsi_wl_display`s while probing surface support,
+so ~480 events per run crossed the link, duplicating the two LINEAR modifiers the proxy already synthesizes
+locally (4.4a). `translate_and_emit` now drops any event whose sender is a `zwp_linux_dmabuf_v1` object at
+opcode `format`/`modifier`: the proxy owns that capability, S stays out of it. Deliveries dropped from ~482 to
+3 (the three that matter — seat capabilities and both configures). Tests still green.
+
+The wall behind the wall: a nondeterministic abort I could not have seen before 4.4, because before 4.4 the
+app died deterministically at `pick_surface_format`. Now it gets past formats *and* configure — the logs show
+`xdg_surface.configure` and `xdg_toplevel.configure` delivered and acked — and then, building its swapchain,
+it aborts intermittently inside `vn_ring_wait_seqno`. Characterized, not guessed: S's log shows **no** engine
+error, no context destroy, no fatal; C's log says **"session ended cleanly, 59 batches"** — no stall detector
+firing. So it is neither a virglrenderer fatal nor a C-detected ring stall. It is Mesa's own ~3.5 s ALIVE
+watchdog firing during swapchain setup: a synchronous Vulkan call waits on a ring reply that does not arrive
+inside the window, and the app aborts before C's 30 s stall timeout ever would. This is the (c)1 relay meeting
+its first real interactive workload — vkcube creates a swapchain of large HOST3D images and renders
+continuously, orders of magnitude more ring/blob traffic than the single-frame refapp or the offscreen icosa
+that validated (c)1/(c)2. The flood fix did not remove it (deliveries are down to 3 and it still aborts), so
+it is not return-link congestion.
+
+The open question is whether the cause is S's *shared message thread* — which now serves both the ring apply
+and the Wayland replay, so a burst of relayed Wayland requests can delay ring apply — or a rawer throughput
+ceiling in the relay under this load. It gates 4.3's live validation (the app has to reach `attach`
+*reliably* to exercise the token path), and the honest reading of systematic-debugging here is that this is
+possibly architectural and worth a decision before a big change, not another guess. Pausing 4.3 at this
+boundary with the finding written down.

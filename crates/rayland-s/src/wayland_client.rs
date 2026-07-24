@@ -223,6 +223,16 @@ fn translate_and_emit(
     sink: &Arc<dyn EventSink>,
     msg: &Message<ObjectId, OwnedFd>,
 ) {
+    // **Do not relay S's own dmabuf format/modifier events.** The C-side proxy answers the dmabuf format
+    // capability *locally* (WP0 Task 4.4a synthesizes the `modifier` events on bind), so S's compositor's
+    // `format` (opcode 0) / `modifier` (opcode 1) events are duplicates — and, sent across the app's many
+    // transient probe binds, they arrive in the hundreds and congest the return link the ring's replies
+    // share, which can stall the command ring. The proxy owns this capability; S stays out of it.
+    if msg.sender_id.interface().name == ZwpLinuxDmabufV1::interface().name
+        && (msg.opcode == 0 || msg.opcode == 1)
+    {
+        return;
+    }
     // Build the app-space message under the lock; emit it after releasing the lock.
     let app_msg = {
         let maps = maps.lock().expect("the WP0 id maps lock is never poisoned");
