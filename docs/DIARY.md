@@ -1101,3 +1101,31 @@ to cut the *number* of waited-on round-trips, or transport tuning to cut the *co
 separate from WP0. It is not a small fix, and pretending otherwise by shipping an untested transport change
 would be the wrong kind of green. WP0's own tunnel (4.1–4.4) remains done and correct; this latency is what
 sits between it and a live vkcube.
+
+### 2026-07-25 — Delayed ACK is refuted: the vkcube slowness is a blob-sync bandwidth explosion
+
+Tested the delayed-ACK hypothesis directly — enabled quinn's ACK-frequency extension asking the peer to
+acknowledge *every* packet within 1 ms (`ack_eliciting_threshold(0)`, `max_ack_delay(1 ms)`) — and it changed
+nothing: sends still 20–50 ms, still a **2.9-second** spike. So delayed ACK is not it. But the same run,
+instrumented to sum payload bytes, named the real cause outright.
+
+The send is **data-volume-bound, not latency-bound.** Per ring delta the watcher ships not just the ~100-byte
+command delta but a whole-blob `BlobData` for every application blob, and those bytes grow as vkcube builds
+its pipeline: **264 KB, then 1.27 MB, then 2.28 MB per delta** — the 2.28 MB one is the send that took 2.9 s.
+The metrics are unambiguous: `c2s_blob_sync_bytes = 16,574,464` against `c2s_ring_bytes = 22,955` — **99.9%
+of everything C sends is blob resends**, 720× the actual command traffic, across 109 messages re-shipping the
+same growing blobs.
+
+This is (c)1's own deferred debt, not a transport bug. Spec §7 chose the dumb-but-correct v1 strategy — *ship
+the entire blob on every sync, no dirty-range tracking* — because Venus gives no API signal for which bytes
+changed (the ring-findings §5.1 "no seam to hook"). The offscreen refapp and icosa have one small mapped blob
+each, so re-shipping it whole is cheap and the strategy held. vkcube has many large blobs — staging pools,
+swapchain images, textures — so re-shipping *all of them whole on every one of ~100 setup deltas* is
+O(total blob size × deltas), and it buries the link: 16.5 MB to move ~23 KB of commands. That is the ~40 ms
+send, the 2.9 s spike, the RingBarrier timeout, and the "hang" — all one thing.
+
+So both transport levers were the wrong tree: not `initial_rtt`, not delayed ACK. The real lever is the one
+the ledger flagged as (c)1's bandwidth follow-up — **ship only what changed** (dirty tracking, or shipping
+only the blobs a delta's commands actually read, or content-addressing so an unchanged blob crosses once).
+That is a real (c)1 design task with a clear shape, and it is what stands between the correct WP0 tunnel
+(4.1–4.4, unchanged) and a live vkcube. Reverted both throwaway transport experiments; nothing shipped.
