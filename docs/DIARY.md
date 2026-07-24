@@ -717,3 +717,37 @@ forward test now proves the `wl_compositor` bind crosses and that `create_surfac
 `wl_surface`, both teeth-checked. What it does not do yet is *consume* any of it — S still only logs. Making
 S bind its own globals, build the object-id map, and actually submit the reconstructed requests to its
 compositor is 4.2b-ii, and that is the half that needs the real compositor to prove.
+
+### 2026-07-24 — Task 4.2b-ii: S replays the session, and the compositor accepts it
+
+The other half of the replay landed: S now *consumes* the forwarded binds and requests and reconstructs the
+app's object graph on its own real compositor. The shape mirrors the C proxy exactly, one level down — the
+proxy is a `wayland-backend` server to the app, this is a `wayland-backend` client to S's compositor, and in
+between is the `app_id ↔ s_id` map. On a bind, S looks up the global its own compositor advertises by
+interface name (never by the app's registry number, which is C's and meaningless here), binds it, and maps
+the app's object id to the S-side one. On a request, S translates the sender and every object argument
+through the map, turns each `NewId` into a null id plus the `child_spec` C stamped on the wire, submits it,
+and maps the returned object back. It leans entirely on the structured tunnel: no per-interface code, just a
+name→descriptor table for the eleven interfaces WP0 touches.
+
+Two things were worth the trouble. The first was a real find, caught the honest way — by watching it panic.
+`wl_registry.bind` is the one request whose child interface is *dynamic*, and its wire signature spells the
+generic new_id out in full: `[name, interface_string, version, new_id]`. The naive code passed `[name,
+new_id]` and expected the backend to inject the interface and version from `child_spec` — and the backend
+asserted the signature mismatch and aborted. The fix is that for `bind`, and only `bind`, those two fields
+are explicit arguments; `child_spec` is for the object the backend creates, not for the wire. Every other
+request has a statically-typed new_id and does rely on `child_spec` alone. The second was defensive:
+`send_request` *panics* on any protocol violation, and the replay runs on the same thread that serves the
+vtest/ring session. A translation bug must not take the GPU relay down with it, so the submit is wrapped in
+`catch_unwind` — a bad request is logged and dropped, the session continues. The teeth-check for this fed a
+deliberately invalid opcode and confirmed the panic is caught and the object left unmapped, exactly as
+intended.
+
+vkcube drove the binds all the way onto S's compositor — `zwp_linux_dmabuf_v1`, `wl_compositor`,
+`xdg_wm_base`, `wl_seat`, each bound for real, no protocol error. But it still can't reach `create_surface`:
+it aborts one step earlier, at `pick_surface_format`, because it queries the swapchain's supported formats
+and the proxy returns none — the compositor's dmabuf format events are not yet routed back to the app. So
+the request-replay path is proven separately, by an integration test that feeds the replay a `wl_compositor`
+bind and a `create_surface` directly and watches both objects appear on the real compositor. The forward
+direction of the Wayland tunnel is now complete end to end; what stands between here and a cube on screen is
+the return direction — events (4.4) and the buffer token (4.3).

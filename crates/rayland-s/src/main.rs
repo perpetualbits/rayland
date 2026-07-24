@@ -332,13 +332,21 @@ fn serve(
             }
         };
 
-        // **WP0 router.** A Wayland-proxy request is replayed against S's real compositor by
-        // `wl_replay`, not applied to the vtest engine — `Applier::apply` refuses it by design (it is
-        // not a vtest/ring message). Split it off here, before the apply path; everything else falls
-        // through, rebound to `msg`.
+        // **WP0 router.** The Wayland-proxy messages are replayed against S's real compositor by
+        // `wl_replay`, not applied to the vtest engine — `Applier::apply` refuses them by design (they
+        // are not vtest/ring messages). Split them off here, before the apply path; everything else
+        // falls through, rebound to `msg`.
         let msg = match msg {
             C2S::WaylandRequest { message } => {
                 wl_replay.handle_request(message);
+                continue;
+            }
+            C2S::WaylandBind {
+                interface,
+                version,
+                app_object_id,
+            } => {
+                wl_replay.handle_bind(interface, version, app_object_id);
                 continue;
             }
             other => other,

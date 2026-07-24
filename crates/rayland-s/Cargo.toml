@@ -36,6 +36,7 @@ thiserror = { workspace = true }                 # typed, precise refusals of re
 # low-level `wayland_client::backend` (structured `Message`s via `send_request`), the mirror of the
 # `wayland-server` backend the C-side proxy uses — so the replay is transparent, not per-interface code.
 wayland-client = { workspace = true }            # the client backend for the S-side session replay
+wayland-protocols = { workspace = true }         # xdg-shell + linux-dmabuf client descriptors for the replay's interface registry
 
 [dev-dependencies]
 # `tests/loopback_e2e.rs` decodes the two PNGs the reference app writes (native, and rendered across
