@@ -1012,3 +1012,32 @@ retired the readback gate for `ring_idx=1` on that `vkDestroyDevice`, and the ne
 the release in a state the head-advance no longer satisfies. That is the clean next step, and it is a C-side
 / (c)2-release question, not a ring-execution one. The whole trail — the two dead ends and this decisive
 turn — is in the SDD ledger for a cold pickup.
+
+### 2026-07-24 — C-side note_consumed check: C is innocent; the app polls a fence that never signals
+
+Instrumented C's release path — every `RingProgress`'s `note_consumed` Ack, the head C publishes, and Mesa's
+actual ring tail — and it clears C completely and, in doing so, corrects yesterday's "lost release" reading.
+
+**C is not the problem.** Every Ack is `Advanced` — no `Stale`, no `PastFrontier`. C relays everything Mesa
+writes (`relayed == mesa_tail`), S consumes and reports all of it, and C publishes the app's ring `head` all
+the way to Mesa's tail (`published head=21564 mesa_tail=21564`). The frontier bookkeeping does exactly its
+job. Both C-side suspects — a rejected `RingProgress` and an unrelayed final delta — are dead.
+
+**And the ring is not stalled — it is *flowing*.** `mesa_tail` keeps *growing* (…21084 → 21256 → 21368 →
+21564) with `head` tracking it. That is the tell: the application is **actively polling `vkGetFenceStatus`**
+— writing a fresh poll command each iteration (tail grows), S executing it (head keeps up), the app reading
+the reply and, finding **`VK_NOT_READY`**, polling again. Forever. Yesterday's "fully quiescent" snapshot was
+just a between-polls instant — `vn_relax` sleeps between polls, so at any given millisecond everything looks
+idle, but across polls the ring is moving.
+
+**So the real cause is an S-side fence that never signals.** vkcube submits its swapchain render, creates a
+fence, and polls it; on S the poll executes fine but never reads `VK_SUCCESS`, because the submitted GPU work
+never *completes* on S's side. This is (c)2 fence / GPU-completion ground, and specifically for a **present**
+(non-readback) submit — a shape the offscreen refapp/icosa never produced. The likely mechanisms, in order:
+the render submit waits on the swapchain **acquire semaphore** that never signals over the relay (with
+`no_semaphore_feedback`, semaphore signalling rides the ring, and the WSI acquire's signal may not be
+propagating); the (c)2 readback-completion machinery mis-serving a submit that has no readback; or a
+downstream effect of 4.3 being unfinished — no `wl_buffer` on S means no present, so the swapchain image is
+never released and the frame's fence chain never closes. That is the next thread to pull, and it is squarely
+(c)2 fence-completion, not WP0 and not the C relay. Full numeric evidence and the tool (`/proc` wchan dumps +
+C-side Ack/head/tail logging) are in the SDD ledger.
