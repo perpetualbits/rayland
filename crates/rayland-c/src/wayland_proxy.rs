@@ -51,6 +51,10 @@ enum TranslateError {
     /// vkcube emits no fd until `zwp_linux_buffer_params_v1.add`, so the fd-free requests it sends before
     /// that forward cleanly; this marks the point where the token path must take over.
     UnresolvedFd,
+    /// An `Argument::NewId` reached [`translate_arg`], which cannot translate it (it needs the backend
+    /// `Handle` for the object's version). [`translate_message`] handles `NewId` before delegating, so
+    /// this is only reachable as an internal error and never in normal operation.
+    UnexpectedNewId,
 }
 
 /// Translate one `wayland-backend` request argument into the wire-forwardable [`WaylandArg`].
@@ -66,6 +70,9 @@ enum TranslateError {
 /// # Failure modes
 /// - `Argument::Fd` returns [`TranslateError::UnresolvedFd`]: an fd must become a [`rayland_relay::BufferToken`],
 ///   which is the fd→token sub-step. This function never forwards a raw fd.
+/// - `Argument::NewId` is **not** handled here — it needs the backend `Handle` to read the new object's
+///   version, so [`translate_message`] handles it directly via [`translate_new_id`]. A `NewId` reaching
+///   this function is an internal error and returns [`TranslateError::UnexpectedNewId`].
 fn translate_arg(arg: &Argument<ObjectId, OwnedFd>) -> Result<WaylandArg, TranslateError> {
     match arg {
         // Direct scalar remaps — same value, wire-forwardable type.
@@ -79,7 +86,8 @@ fn translate_arg(arg: &Argument<ObjectId, OwnedFd>) -> Result<WaylandArg, Transl
         )),
         // Object references carry the sender-space id; the S client remaps it against the id map.
         Argument::Object(id) => Ok(WaylandArg::Object(id.protocol_id())),
-        Argument::NewId(id) => Ok(WaylandArg::NewId(id.protocol_id())),
+        // NewId needs the backend handle for the new object's version; handled by translate_message.
+        Argument::NewId(_) => Err(TranslateError::UnexpectedNewId),
         // Opaque array copied through unchanged.
         Argument::Array(bytes) => Ok(WaylandArg::Array((**bytes).clone())),
         // The one thing that cannot cross a network: resolved to a token in the fd→token sub-step.
@@ -87,18 +95,50 @@ fn translate_arg(arg: &Argument<ObjectId, OwnedFd>) -> Result<WaylandArg, Transl
     }
 }
 
+/// Translate a `NewId` argument into a wire [`WaylandArg::NewId`] carrying the new object's interface
+/// and version, so S can create the corresponding object with the right `child_spec`.
+///
+/// The interface comes from the `ObjectId` itself — the server backend stamped the child object with its
+/// statically-known interface before delivering the request (see the module note on why the one request
+/// with a *dynamic* child interface, `wl_registry.bind`, never reaches this path). The version comes from
+/// the backend's object info; if that lookup somehow fails, it falls back to the interface's maximum
+/// version, which is the most permissive safe choice for S's `send_request`.
+fn translate_new_id(handle: &Handle, id: &ObjectId) -> WaylandArg {
+    // The interface the backend assigned the new object — authoritative, no protocol table needed.
+    let iface = id.interface();
+    // The object's actual version (its parent's, which Wayland children inherit); fall back to the
+    // interface's max version if the info lookup fails (it should not, for a just-created object).
+    let version = handle
+        .object_info(id.clone())
+        .map(|info| info.version)
+        .unwrap_or(iface.version);
+    WaylandArg::NewId {
+        id: id.protocol_id(),
+        interface: iface.name.to_string(),
+        version,
+    }
+}
+
 /// Translate a whole `wayland-backend` request into the [`WaylandMessage`] forwarded to S.
 ///
 /// Carries the sender object's id in the app's id space (`sender_id.protocol_id()`), the opcode verbatim,
-/// and each argument via [`translate_arg`]. Fails with the first argument that cannot be translated (an
-/// unresolved fd), so a request bearing an fd is never partially forwarded.
-fn translate_message(msg: &Message<ObjectId, OwnedFd>) -> Result<WaylandMessage, TranslateError> {
+/// and each argument: scalars and object refs via [`translate_arg`], and each `NewId` via
+/// [`translate_new_id`] (which needs `handle` for the new object's version). Fails with the first argument
+/// that cannot be translated (an unresolved fd), so a request bearing an fd is never partially forwarded.
+fn translate_message(
+    handle: &Handle,
+    msg: &Message<ObjectId, OwnedFd>,
+) -> Result<WaylandMessage, TranslateError> {
     // Every argument in wire order; the first failure aborts the whole message (no partial forward).
-    let args = msg
-        .args
-        .iter()
-        .map(translate_arg)
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut args = Vec::with_capacity(msg.args.len());
+    for arg in &msg.args {
+        // NewId needs the handle for the object's version; every other case is handle-free.
+        let translated = match arg {
+            Argument::NewId(id) => translate_new_id(handle, id),
+            other => translate_arg(other)?,
+        };
+        args.push(translated);
+    }
     Ok(WaylandMessage {
         object_id: msg.sender_id.protocol_id(),
         opcode: msg.opcode,
@@ -127,6 +167,16 @@ pub trait WaylandSink: Send + Sync {
     /// to a wire [`WaylandMessage`]; the sink's job is only to deliver it (record it, or send it over the
     /// link). Delivery is fire-and-forget here — WP0 does not yet acknowledge individual requests.
     fn forward_request(&self, msg: WaylandMessage);
+
+    /// Forward a global **bind** to S: the app bound `interface` at `version`, creating the object
+    /// `app_object_id` in its own id space.
+    ///
+    /// A bind never arrives as a request (C's backend handles `wl_registry.bind` as a built-in and routes
+    /// it to the global's handler), so it cannot ride [`Self::forward_request`]. Yet S must learn of it to
+    /// reconstruct the object graph — every later request targets an object descended from a bound global.
+    /// The real sink sends this as a [`rayland_relay::C2S::WaylandBind`]; a test collector records it. See
+    /// the design doc §3, "Object-id mapping".
+    fn forward_bind(&self, interface: &str, version: u32, app_object_id: u32);
 }
 
 /// Resolves a passed file descriptor's memfd identity to the S-side resource it names.
@@ -330,10 +380,19 @@ fn try_intercept_buffer(data: &mut ProxyState, msg: &Message<ObjectId, OwnedFd>)
                     };
                     // The proxy-internal encoding of create_immed: the buffer's app-side id and the token
                     // that names its S-side resource. S resolves the token to a real dma-buf (Task 4).
+                    // The NewId names `wl_buffer` (version 1 — the interface has never had another), so S
+                    // creates the right kind of object for the token.
                     let wire = WaylandMessage {
                         object_id: obj,
                         opcode: msg.opcode,
-                        args: vec![WaylandArg::NewId(buffer_id), WaylandArg::Buffer(token)],
+                        args: vec![
+                            WaylandArg::NewId {
+                                id: buffer_id,
+                                interface: "wl_buffer".to_string(),
+                                version: 1,
+                            },
+                            WaylandArg::Buffer(token),
+                        ],
                     };
                     wp_log(&format!(
                         "intercept params {obj}.create_immed -> buffer {buffer_id} = resource {resource_id} ({width}x{height} fmt {drm_format:#x})"
@@ -391,20 +450,30 @@ impl GlobalHandler<ProxyState> for ProxyGlobal {
     /// bookkeeping the backend contract requires but forwards nothing.
     fn bind(
         self: Arc<Self>,
-        _handle: &Handle,
-        _data: &mut ProxyState,
+        handle: &Handle,
+        data: &mut ProxyState,
         _client_id: ClientId,
         _global_id: GlobalId,
         object_id: ObjectId,
     ) -> Arc<dyn ObjectData<ProxyState>> {
-        // Record the bind so bring-up can confirm vkcube reaches every WP0 global. Gated so a normal run
-        // is silent; `RAYLAND_WP_LOG=1` turns it on.
+        // The version the app bound this global at, which S must bind at too so the object's request/event
+        // set matches. The child object carries it; fall back to the interface's max version if the info
+        // lookup fails (it should not, for a just-bound object).
+        let version = handle
+            .object_info(object_id.clone())
+            .map(|info| info.version)
+            .unwrap_or(object_id.interface().version);
         wp_log(&format!(
-            "bound global {} -> object {}",
+            "bound global {} v{version} -> object {}; forwarding bind to S",
             self.iface_name,
             object_id.protocol_id()
         ));
-        // The bound object forwards its requests through the same inert data as any other object for now.
+        // Forward the bind to S so it can reconstruct this global on its own compositor connection and map
+        // the app's object id to the S-side one. Without this, S cannot replay any request the app makes
+        // against this object (the app's `wl_registry.bind` itself never crosses — see `WaylandSink`).
+        data.sink
+            .forward_bind(self.iface_name, version, object_id.protocol_id());
+        // The bound object forwards its requests through the same inert data as any other object.
         Arc::new(ProxyObjectData)
     }
 }
@@ -427,7 +496,7 @@ impl ObjectData<ProxyState> for ProxyObjectData {
     /// are the next sub-step; here the request is observed (optionally logged) and dropped.
     fn request(
         self: Arc<Self>,
-        _handle: &Handle,
+        handle: &Handle,
         data: &mut ProxyState,
         _client_id: ClientId,
         msg: Message<ObjectId, OwnedFd>,
@@ -445,7 +514,7 @@ impl ObjectData<ProxyState> for ProxyObjectData {
             // Generic path: translate the request to its wire form and forward it to S. A stray unresolved
             // fd outside the intercepted dmabuf path is not expected in WP0; log and drop rather than
             // forward a raw fd or panic.
-            match translate_message(&msg) {
+            match translate_message(handle, &msg) {
                 Ok(wire_msg) => {
                     wp_log(&format!(
                         "forward obj {} opcode {} ({} args)",
@@ -454,6 +523,15 @@ impl ObjectData<ProxyState> for ProxyObjectData {
                         wire_msg.args.len()
                     ));
                     data.sink.forward_request(wire_msg);
+                }
+                // A NewId reaching translate_arg is an internal bug (translate_message handles it); log
+                // and drop rather than panic, treating it like the other untranslatable case.
+                Err(TranslateError::UnexpectedNewId) => {
+                    wp_log(&format!(
+                        "BUG obj {} opcode {} — NewId reached translate_arg; request dropped",
+                        msg.sender_id.protocol_id(),
+                        msg.opcode
+                    ));
                 }
                 Err(TranslateError::UnresolvedFd) => {
                     // An fd on a non-dmabuf request: unhandled in WP0, dropped rather than forwarded raw.

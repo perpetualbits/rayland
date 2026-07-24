@@ -31,6 +31,7 @@ use wayland_client::{Connection, Dispatch};
 struct NullSink;
 impl WaylandSink for NullSink {
     fn forward_request(&self, _msg: WaylandMessage) {}
+    fn forward_bind(&self, _interface: &str, _version: u32, _app_object_id: u32) {}
 }
 
 /// A resolver that recognises no inode. This test creates no buffers, so it is never consulted; it only

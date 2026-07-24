@@ -133,7 +133,7 @@ impl Channel {
             // WP0 Wayland-proxy traffic. Counted as `Control` for now — a dedicated Wayland metrics
             // channel (its own line and counter slot) is deferred to a later WP; this is a conscious
             // classification, not the silent `_ =>` the exhaustiveness here exists to prevent.
-            C2S::WaylandRequest { .. } => Channel::Control,
+            C2S::WaylandRequest { .. } | C2S::WaylandBind { .. } => Channel::Control,
         }
     }
 

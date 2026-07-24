@@ -48,6 +48,8 @@ impl WaylandSink for Collector {
     fn forward_request(&self, msg: WaylandMessage) {
         self.messages.lock().unwrap().push(msg);
     }
+    // This test asserts on the forwarded token, not on binds; record nothing for a bind.
+    fn forward_bind(&self, _interface: &str, _version: u32, _app_object_id: u32) {}
 }
 
 /// A resolver that maps exactly one memfd identity (the test's) to [`RESOURCE_ID`], mirroring the real
@@ -163,10 +165,13 @@ fn create_immed_emits_a_correct_buffer_token_and_never_asserts() {
     assert_eq!(token.drm_format, DRM_FORMAT_ARGB8888, "wrong format in token");
     assert_eq!(token.modifier, MODIFIER, "wrong modifier in token");
 
-    // And the message must also name the new wl_buffer (its app-side id) so S can bind it.
-    let named_buffer = messages
-        .iter()
-        .any(|m| m.args.iter().any(|a| matches!(a, WaylandArg::NewId(_))));
+    // And the message must also name the new wl_buffer (its app-side id, interface `wl_buffer`) so S can
+    // create the buffer object for the token.
+    let named_buffer = messages.iter().any(|m| {
+        m.args
+            .iter()
+            .any(|a| matches!(a, WaylandArg::NewId { interface, .. } if interface == "wl_buffer"))
+    });
     assert!(named_buffer, "the token message did not name the wl_buffer id");
 }
 

@@ -688,3 +688,32 @@ them in order, and S can reach its compositor. What it does not yet do is *repla
 message and submitting it via the client backend, with the object-id translation and the reconstruction of
 the globals the app bound (which, being backend built-ins on C, never crossed) — is 4.2b, and it is where
 the object graph gets genuinely rebuilt on S.
+
+### 2026-07-24 — Task 4.2b-i: teaching the wire to carry what S needs to rebuild the graph
+
+Replaying the app's Wayland session on S turns out to hinge on a problem that is easy to miss until you try
+it: the app never tells S what it bound. The app binds `wl_compositor`, `xdg_wm_base`, and so on with
+`wl_registry.bind`, but on C that request never reaches the proxy's forward path — C runs a real
+`wayland-backend` server, which handles `wl_display` and `wl_registry` as built-ins and routes a bind to the
+global's handler instead. So the forward stream is full of requests against objects (3, 5, 7, 11…) whose
+*interface* S has no way to know. Two gaps, both on the wire, both fixed this turn.
+
+The first: binds must cross explicitly. Added `C2S::WaylandBind { interface, version, app_object_id }`, sent
+from the proxy's `GlobalHandler::bind`. It deliberately does not carry the registry's numeric `name` — that
+is C's registry's numbering and is meaningless on S, which has its own registry with its own numbers; S will
+bind by *interface name* against the globals its own compositor advertises. The second gap is subtler: when
+S replays a request that creates a child object, the client backend's `send_request` needs a `child_spec` —
+the new object's interface and version. S could reconstruct that from a hand-built `(interface, opcode) →
+child interface` table, but that is exactly the per-interface knowledge the structured-tunnel design set out
+to avoid. The cleaner answer is that C already knows it authoritatively: the server backend stamps every new
+object with its statically-known interface before delivering the request (the one request whose child
+interface is *dynamic*, `wl_registry.bind`, is the very one that never crosses). So `WaylandArg::NewId`
+grew from a bare id into `{ id, interface, version }`, and the proxy reads the interface straight off the
+new object's `ObjectId`. S will map the name to its own linked `&'static Interface` and hand it to
+`send_request` — no protocol table, C is the authority.
+
+This is all C-side and fully testable without a compositor, which is why it is its own increment: the
+forward test now proves the `wl_compositor` bind crosses and that `create_surface`'s new id arrives stamped
+`wl_surface`, both teeth-checked. What it does not do yet is *consume* any of it — S still only logs. Making
+S bind its own globals, build the object-id map, and actually submit the reconstructed requests to its
+compositor is 4.2b-ii, and that is the half that needs the real compositor to prove.

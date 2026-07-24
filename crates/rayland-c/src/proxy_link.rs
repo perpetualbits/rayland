@@ -51,6 +51,23 @@ impl WaylandSink for LinkSink {
             eprintln!("rayland-c: forwarding a Wayland request to S failed: {e}");
         }
     }
+
+    /// Forward a global bind to S as a [`C2S::WaylandBind`], on the same link and with the same
+    /// fire-and-forget discipline as [`Self::forward_request`]. It must reach S **before** any request
+    /// naming the bound object; the proxy's single dispatch thread calls this synchronously from
+    /// `GlobalHandler::bind`, before the object's first request, and the link preserves order — so the
+    /// causal ordering (bind, then requests) is maintained.
+    fn forward_bind(&self, interface: &str, version: u32, app_object_id: u32) {
+        let mut link = self.tx.lock().expect("the send-link mutex is never poisoned");
+        let bind = C2S::WaylandBind {
+            interface: interface.to_string(),
+            version,
+            app_object_id,
+        };
+        if let Err(e) = link.send(&bind) {
+            eprintln!("rayland-c: forwarding a Wayland bind to S failed: {e}");
+        }
+    }
 }
 
 /// A [`ResourceResolver`] that maps a passed fd's memfd inode to the S-side resource id, by scanning

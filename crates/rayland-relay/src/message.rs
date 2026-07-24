@@ -183,6 +183,34 @@ pub enum C2S {
         /// object's interface, and its typed arguments.
         message: WaylandMessage,
     },
+
+    /// The application bound a Wayland **global**, creating a top-level protocol object.
+    ///
+    /// # Why a bind needs its own message rather than crossing as a [`WaylandRequest`]
+    /// The app binds a global with `wl_registry.bind`, but that request never reaches the C-side
+    /// proxy's request path: C runs a real `wayland-backend` server, which handles `wl_display` and
+    /// `wl_registry` as **built-ins** and routes a bind to the global's handler instead. So the bind
+    /// is invisible to the forward path — yet S *must* learn about it, because every later request the
+    /// app makes targets an object descended from a bound global, and S cannot replay a request against
+    /// an object it never created.
+    ///
+    /// This message carries exactly what S needs to reconstruct the object on its own compositor
+    /// connection: the interface to bind, the version, and the app-side id to map the S-side object
+    /// back to. S looks the interface up in its own registry's advertised globals, binds it, and
+    /// records `app_object_id ↔ (the S-side object)`. The `name` (the registry's numeric global id) is
+    /// deliberately **not** carried: it is C's registry's numbering, meaningless on S, which has its
+    /// own. See docs/design/2026-07-22-wp0-wayland-proxy-first-light.md §3, "Object-id mapping".
+    WaylandBind {
+        /// The interface name the app bound (e.g. `"wl_compositor"`), as C's protocol descriptor
+        /// names it. S matches this against the globals its own compositor advertises.
+        interface: String,
+        /// The version the app bound the global at. S binds at the same version so the object's
+        /// available requests and events match what the app expects.
+        version: u32,
+        /// The app-side object id of the bound global, for the `app_id ↔ s_id` map. Every later
+        /// request naming this object arrives as a [`WaylandRequest`] whose `object_id` is this value.
+        app_object_id: u32,
+    },
 }
 
 /// Buffer-by-token: names the S-side resource that a Wayland `wl_buffer` denotes, plus the
@@ -434,8 +462,28 @@ pub enum WaylandArg {
     /// A reference to an existing object, by id in the sending side's id space (see
     /// [`WaylandMessage::object_id`] on why this crate does not translate it).
     Object(u32),
-    /// A newly-created object's id, in the sending side's id space.
-    NewId(u32),
+    /// A newly-created object: its id in the sending side's id space, **plus the interface and
+    /// version of the object being created**.
+    ///
+    /// # Why the interface and version travel with the id
+    /// The receiving side replays the request against a *different* Wayland connection (S's real
+    /// compositor), where creating a child object requires naming its interface and version — the
+    /// client backend's `send_request` takes a `child_spec: (interface, version)`. On C, the server
+    /// backend knows each new object's interface authoritatively (the protocol descriptor fixes it,
+    /// and the app's `wl_registry.bind` — the one request whose child interface is *dynamic* — never
+    /// crosses, being handled by C's backend as a built-in). So C stamps the interface here rather
+    /// than making S reconstruct it from a hand-built `(interface, opcode) → child interface` table.
+    /// The `version` is the created object's version (its parent's, which Wayland children inherit).
+    NewId {
+        /// The new object's id, in the sending side's id space.
+        id: u32,
+        /// The interface name of the object being created (e.g. `"wl_surface"`), as the sending
+        /// side's protocol descriptor names it. The receiving side maps this to its own linked
+        /// `&'static Interface` for `send_request`'s `child_spec`.
+        interface: String,
+        /// The version the new object is created at.
+        version: u32,
+    },
     /// An opaque byte-array argument, carried verbatim.
     Array(Vec<u8>),
     /// A file-descriptor argument, replaced by buffer-by-token (see [`BufferToken`] for
@@ -514,7 +562,11 @@ mod tests {
                     WaylandArg::Str(Some(b"wl_surface".to_vec())),
                     WaylandArg::Str(None), // the nullable-empty string case
                     WaylandArg::Object(9),
-                    WaylandArg::NewId(10),
+                    WaylandArg::NewId {
+                        id: 10,
+                        interface: "wl_surface".to_string(),
+                        version: 6,
+                    },
                     WaylandArg::Array(vec![0xde, 0xad, 0xbe, 0xef]),
                     WaylandArg::Buffer(BufferToken {
                         resource_id: 7,
@@ -525,6 +577,19 @@ mod tests {
                     }),
                 ],
             },
+        };
+        assert_eq!(round_trip(&original), original);
+    }
+
+    #[test]
+    fn wayland_bind_round_trips() {
+        // A representative C2S::WaylandBind: the app bound wl_compositor v4 as its object 3.
+        // This is the message S needs to reconstruct a global on its own compositor connection,
+        // since the app's wl_registry.bind never crosses (C's backend handles it as a built-in).
+        let original = C2S::WaylandBind {
+            interface: "wl_compositor".to_string(),
+            version: 4,
+            app_object_id: 3,
         };
         assert_eq!(round_trip(&original), original);
     }

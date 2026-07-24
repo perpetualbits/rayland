@@ -34,11 +34,20 @@ struct Collector {
     /// Every [`WaylandMessage`] the proxy forwarded, in arrival order, behind a mutex (the proxy forwards
     /// from its own dispatch thread; the test reads from the main thread).
     messages: Mutex<Vec<WaylandMessage>>,
+    /// Every global bind the proxy forwarded, as `(interface, version, app_object_id)`.
+    binds: Mutex<Vec<(String, u32, u32)>>,
 }
 impl WaylandSink for Collector {
     /// Record one forwarded request for the test to assert on.
     fn forward_request(&self, msg: WaylandMessage) {
         self.messages.lock().unwrap().push(msg);
+    }
+    /// Record one forwarded bind for the test to assert on.
+    fn forward_bind(&self, interface: &str, version: u32, app_object_id: u32) {
+        self.binds
+            .lock()
+            .unwrap()
+            .push((interface.to_string(), version, app_object_id));
     }
 }
 
@@ -140,19 +149,31 @@ fn create_surface_is_forwarded_with_a_translated_new_id() {
         .roundtrip(&mut AppData)
         .expect("round-trip after create_surface");
 
-    // Assert: at least one forwarded message carries a translated NewId — the surface's id crossed as an
-    // id, proving the Object/NewId translation and the forward path end to end.
+    // Assert: the wl_compositor bind crossed as a forwarded bind — S needs it to reconstruct the object
+    // the create_surface below targets (the app's wl_registry.bind itself never reaches the proxy).
+    let binds = collector.binds.lock().unwrap();
+    assert!(
+        binds.iter().any(|(iface, _v, _id)| iface == "wl_compositor"),
+        "the proxy did not forward the wl_compositor bind; binds were: {binds:?}"
+    );
+
+    // Assert: at least one forwarded message carries a translated NewId that names its interface — the
+    // surface's id crossed as an id *with* its interface (`wl_surface`), which is what lets S create the
+    // right child object via send_request's child_spec. This proves the Object/NewId translation, the
+    // interface stamping, and the forward path end to end.
     let messages = collector.messages.lock().unwrap();
     assert!(
         !messages.is_empty(),
         "the proxy forwarded nothing; expected at least the create_surface request"
     );
-    let saw_new_id = messages
-        .iter()
-        .any(|m| m.args.iter().any(|a| matches!(a, WaylandArg::NewId(_))));
+    let saw_typed_new_id = messages.iter().any(|m| {
+        m.args.iter().any(|a| {
+            matches!(a, WaylandArg::NewId { interface, .. } if interface == "wl_surface")
+        })
+    });
     assert!(
-        saw_new_id,
-        "no forwarded message carried a NewId; forwarded messages were: {messages:?}"
+        saw_typed_new_id,
+        "no forwarded message carried a wl_surface NewId; forwarded messages were: {messages:?}"
     );
 }
 
