@@ -1071,3 +1071,33 @@ ship. The lever is the one the ledger already names — a bigger ring and pipeli
 waited-on round-trips, not a point fix — and it is a (c)1/(c)2 performance investigation, cleanly separate
 from WP0. WP0's own forward+event tunnel (4.1–4.4) is done and correct; 4.3 (the buffer token) and any live
 vkcube proof sit behind this latency work. The full opcode trail and the barrier evidence are in the ledger.
+
+### 2026-07-24 — The 80-byte gap is a ~40 ms QUIC send, not a watcher bug — and initial_rtt did not fix it
+
+Set out to fix the RingBarrier's 1-second stall on a trailing 80-byte delta, and it dissolved into the same
+latency wall, one layer down. The chain of evidence, each step instrumented and then reverted:
+
+- The watcher is **not** drained-but-not-shipped: in the no-delta path `last_tail == shipped` always.
+- At a barrier timeout, a **fresh** re-read of `current_tail` confirms Mesa's tail really is the target
+  (21564), while the watcher's `shipped_tail` sits at 21484 for the full second and then jumps — so the
+  watcher fell **>1 s behind** on one delta, not permanently, not stuck.
+- Timing the relay pins where: `lock_wait` on the send mutex is **~1–3 µs** (no contention), but the QUIC
+  send itself takes **20–45 ms per delta**. On a loopback link that should be sub-millisecond. That is the
+  whole story: each ring delta costs tens of milliseconds to put on the wire, vkcube's setup ships hundreds,
+  and once in a while one lands slow enough that the 1-second barrier gives up.
+
+So the "80-byte-gap watcher lag" is not a watcher bug at all — it is the relay's **per-message QUIC latency**,
+the same synchronous-round-trip wall from every angle. I tried the obvious transport fix — quinn's
+`initial_rtt` defaults to a wild **333 ms**, so I seeded it at 1 ms — and it made **no difference**
+(still 7–9 slow sends per run, still ~40 ms each). So the cost is not RTT-timer-driven; the leading remaining
+suspect is quinn's **delayed ACK (25 ms default) throttling the congestion window** during a burst, but the
+linked quinn rejects `max_ack_delay` (a version-skew), and confirming/curing that is a real transport tuning
+task, not a knob to flip blind. I reverted the `initial_rtt` change rather than leave an unproven tweak in
+the tree.
+
+Honest conclusion: the 80-byte gap, like the whole vkcube stall, is **(c)1's synchronous-reply latency**
+surfacing at ~40 ms per QUIC message — a transport/relay performance investigation (bigger ring + pipelining
+to cut the *number* of waited-on round-trips, or transport tuning to cut the *cost* of each), cleanly
+separate from WP0. It is not a small fix, and pretending otherwise by shipping an untested transport change
+would be the wrong kind of green. WP0's own tunnel (4.1–4.4) remains done and correct; this latency is what
+sits between it and a live vkcube.
