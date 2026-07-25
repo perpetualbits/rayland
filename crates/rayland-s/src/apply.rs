@@ -1561,9 +1561,10 @@ fn reply_log_commands(tail: u32, bytes: &[u8]) {
         .map(|c| format!("type={}", c.command_type))
         .collect();
     eprintln!(
-        "[s-reply] delta tail={} bytes={} decoded=[{}] stop={:?}",
+        "[s-reply] delta tail={} len={} fnv={:016x} decoded=[{}] stop={:?}",
         tail,
         bytes.len(),
+        fnv1a(bytes),
         named.join(","),
         stop
     );
@@ -1852,4 +1853,35 @@ fn reply_log_arena_writes(messages: &[S2C]) {
             head.join(" ")
         );
     }
+}
+
+/// FNV-1a over a byte slice — the S-side half of the ring-delta fingerprint.
+///
+/// # Why this exists
+/// virglrenderer refuses the application's `vkQueueSubmit` here with a "CS error", which is a
+/// *decode* failure rather than a GPU one. Either the delta arrived corrupted or truncated, or it
+/// arrived perfectly and the submit refers to bytes that never cross in the ring at all — Venus's
+/// staging pool, which `rayland-c`'s `blob_sync` declines to publish by design. Those two have
+/// opposite fixes. Hashing each delta on **both** sides and joining on `tail` decides it in one run,
+/// which is why this deliberately duplicates `rayland-c`'s `fnv1a` rather than sharing it: the whole
+/// point is that the two sides compute the digest independently, from their own copy of the bytes.
+/// A shared helper would still prove they agree, but a reader would have to check that it was fed
+/// the two different buffers — this way the independence is structural. See `docs/DIARY.md`,
+/// 2026-07-26.
+///
+/// # Inputs / outputs
+/// - `bytes`: the delta exactly as S received and applied it.
+/// - Returns the 64-bit hash. Pure; no allocation, no failure mode.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    // The standard 64-bit FNV offset basis and prime; must match `rayland-c`'s constants exactly or
+    // the comparison this exists for is meaningless.
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for &b in bytes {
+        // XOR then multiply: FNV-1a, not FNV-1. The orders give different digests.
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
 }

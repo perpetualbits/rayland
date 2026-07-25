@@ -2082,3 +2082,49 @@ which is at fault.**
 reachable — the application constructs the buffers and the fd->token correlation resolves all three to real
 S-side resources. 4.3 is no longer blocked behind an unreachable code path; it is blocked behind a submit
 that does not decode. That is a much better place to be than this morning.
+
+### 2026-07-26 — The ring relay is byte-exact: 253 deltas, 253 identical fingerprints — so the submit failure is about what it *references*
+
+The question the last entry left was whether S's "CS error" on `vkQueueSubmit` came from bytes damaged in
+transit or from bytes that never travel at all. Both sides now fingerprint every ring delta independently —
+FNV-1a computed on C from what it relays, and on S from what it applies, joined on `tail`. The two
+implementations are deliberately **duplicated rather than shared**, so that agreement means two separate
+computations over two separate buffers rather than one helper called twice.
+
+**Result: 253 deltas on C, 253 on S, and not a single mismatch** — same `tail`, same length, same digest,
+every time. **The ring relay is byte-exact.** Whatever S fails to decode, it is decoding exactly the bytes
+the application wrote. That eliminates corruption, truncation, reordering and loss in one measurement, and it
+means the fault lies in what the submit *refers to* rather than in the submit itself.
+
+**And the failure turns out to be intermittent, which is new information.** This run produced **no CS error at
+all** — zero messages from `virgl_render_server`, where the previous run emitted the whole cascade. The
+application instead ran 253 deltas (against 102 before), polled `vkGetFenceStatus` **142 times**, and **hung
+until the 90-second timeout** (`vkcube exit: 124`) without aborting. So there are now two observed failure
+modes downstream of the same point:
+
+- **CS error** — virglrenderer cannot decode the submit, goes to a fatal decoder state, destroys the context.
+- **Unsignalled fence** — no error anywhere; the submit simply never completes, and the application polls
+  forever.
+
+A structurally-missing staging pool would fail identically every time, so **the intermittency is evidence
+against the simplest form of that hypothesis** and evidence for a race — something the submit needs is
+sometimes present and sometimes not. That fits the shape of a dependency that arrives on a *different*
+message than the delta referencing it, which is precisely the hazard `blob_sync`'s
+BlobData-before-RingDelta ordering exists to prevent — but that ordering covers only the blobs C knows to
+be application memory, and the swapchain images here are resources S built from **buffer tokens**, on the WP0
+path, not from the blob-sync path at all.
+
+**Two candidates, neither yet measured, and no fix until one is:**
+1. The submit references the token-built swapchain images (`res=8/9/10`), and S's versions are not in the
+   state the submit assumes — the WP0 buffer path and the (c)1 blob path never having been reconciled.
+2. Venus places some part of the submit in the staging pool, which C declines to publish; the intermittency
+   would then come from how much of the recorded stream happens to fit inline in the ring.
+
+The instrument for both is the same and follows the one that just worked: fingerprint the *blobs* on both
+sides, not just the ring, and see which resource S's copy disagrees with C's at the moment of the submit. The
+ring took one run to clear; there is no reason the blobs should take longer.
+
+**Worth stating plainly, because it is easy to lose in the detail:** the relay's core — the mechanism this
+whole project rests on, shipping an unmodified application's command stream across a network — is now
+*measured* byte-exact under a real application's load, 253 deltas in a row. That is not a small thing to be
+able to say.

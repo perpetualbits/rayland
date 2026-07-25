@@ -768,8 +768,10 @@ fn ring_watcher_thread(
                         })
                         .collect();
                     eprintln!(
-                        "[ring-cmds] tail={} {} cmd(s) stop={:?}: {}",
+                        "[ring-cmds] tail={} len={} fnv={:016x} {} cmd(s) stop={:?}: {}",
                         pending.tail,
+                        pending.bytes.len(),
+                        fnv1a(&pending.bytes),
                         commands.len(),
                         stop,
                         named.join(" | ")
@@ -1418,4 +1420,38 @@ mod tests {
             .checked_sub(ago)
             .expect("the test clock must be able to reach into the past")
     }
+}
+
+/// FNV-1a over a byte slice — a **diagnostic** fingerprint of one ring delta.
+///
+/// # Why this exists
+/// `rayland-s` refuses the application's `vkQueueSubmit` with a virglrenderer "CS error", which is a
+/// *decode* failure: the bytes S parsed were not the bytes it needed. There are two ways that
+/// happens, and they call for completely different fixes — either the ring relay corrupted or
+/// truncated the delta on its way across, or the relay is faithful and the submit refers to bytes
+/// that never travel in the ring at all (Venus's staging pool, which `crate::blob_sync` declines to
+/// publish by design). Hashing the same delta on both sides and comparing per `tail` separates those
+/// two with one run. See `docs/DIARY.md`, 2026-07-26.
+///
+/// # Why FNV-1a rather than anything stronger
+/// This compares two byte strings that are either identical or badly different; it is not defending
+/// against an adversary choosing collisions. FNV-1a is a dozen lines, has no dependency, and runs at
+/// memory speed — which matters because this sits on the relay's hot path, and an instrument that
+/// slows the thing it measures is how the last wall was misread for two days.
+///
+/// # Inputs / outputs
+/// - `bytes`: the delta exactly as relayed.
+/// - Returns the 64-bit hash. Pure; no allocation, no failure mode.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    // The standard 64-bit FNV offset basis and prime.
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for &b in bytes {
+        // XOR *then* multiply — that ordering is what makes this FNV-1a rather than FNV-1, and the
+        // two give different digests, so a reader comparing against another implementation needs it.
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
 }
