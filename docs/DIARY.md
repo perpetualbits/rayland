@@ -418,3 +418,19 @@ bandwidth to merge the large gaps between them for no wall-clock gain, so 256 is
 The next latency lever, when it matters, is the round-trip count itself — adaptive polling, or batching
 the reply path — not the readback. Recorded so the next person does not coalesce harder expecting the
 clock to move.
+
+### 2026-07-25 — A fresh pair of eyes, and CLAUDE.md had drifted twice
+
+A new session's first job was simply to *read* the project cold, and that turned out to be a small test
+the repository partly failed: two statements in `CLAUDE.md` were no longer true. The G' commit removed
+the `delivery` module but left `CLAUDE.md` pointing at `crates/rayland-s/src/delivery.rs` as where the
+readback-completion gate lives; and the coalescing commit fixed the ~5000-messages-per-frame
+fragmentation while `CLAUDE.md` went on listing it as open. Both changes violated the file's own first
+rule — "if a change makes any statement here false, update this file in the same change" — and both
+slipped through in the same busy 2026-07-21 session that landed the project's biggest win. That is worth
+recording honestly: the discipline holds least well exactly when the work is going best, because the
+excitement of a green result crowds out the bookkeeping. Fixed both today, keeping the historical
+narrative intact (the gate paragraph now says where the logic went, rather than pretending it was always
+there). The mild lesson for future sessions: a cold read by someone without the previous session's
+context is cheap and catches precisely the staleness the previous session cannot see — its author still
+remembers what the words *meant*, so they read as true.
