@@ -1879,3 +1879,63 @@ two observable points on a path with several steps between them.
 Six days of this bug and six refuted readings; every one died to a measurement, and this reframing came from
 moving one existing log from an event-driven cadence to a periodic one. The lesson that keeps recurring: an
 instrument that samples only when the system is healthy cannot see the system fail.
+
+### 2026-07-26 — Both of S's threads freeze together: the wall is a deadlock inside `rayland-s`, not in Mesa or virglrenderer
+
+Logging every message S reads and writes — the seam that never existed, because "C sent" and "S applied" were
+the only two observable points on a path with several steps between them — located the failure precisely, and
+it is not where any of the last week's work was looking.
+
+**Writes are not the problem.** Bracketing each write *and its flush* separately: **4676 `w>` and 4676 `w<`,
+perfectly matched.** No send was left incomplete, which kills the hypothesis that C's counted-but-unflushed
+message was stuck in a buffer.
+
+**S receives the delta it never applies.** The last line of S's log is:
+
+```
+[s-link] r< RingDelta ring=1 tail=22900 len=80
+```
+
+That is the delta carrying `vkGetImageDrmFormatModifierPropertiesEXT` — the command the application is
+blocked awaiting. S **reads** it. S never applies it. And then:
+
+- no `[s-reply] delta` line, so the message thread never reached `apply_delta`;
+- **zero** further periodic `[s-ringctl]` samples, though they run four times a second and the stall lasts
+  ~4 s — so the *progress* thread stopped at the same moment;
+- no further `w>` of any kind.
+
+**Two independent threads stopping at the same instant is a deadlock, and both threads are ours.** This was
+never a Mesa problem or a virglrenderer problem. Every reading of the last week — the parked ring thread, the
+missing doorbell, the fatal context, the reply-decode overrun — was looking across the wire at a peer that,
+it now turns out, was healthy and simply had nothing more to do.
+
+**The candidate, and the comment that argues it away.** The message thread's own lock discipline says:
+
+```rust
+// No deadlock: the progress thread takes `applier` and releases it **before** taking `tx`,
+// so it never holds both, and this is the only path that holds them together.
+let mut session = applier.lock()...;
+let out = session.apply(engine, msg);   // engine calls, holding the applier lock
+for reply in &out { let mut stream = tx.lock()...; send(...)?; }
+```
+
+That reasoning is sound for the two-lock cycle it considers. But there is a **third** participant, and the
+comment names its own dependence on it: *"`apply`'s engine calls block only on the actor, which services them
+promptly even while a readback fence is in flight, so this can no longer deadlock the doorbell."* **"Services
+them promptly" is an assumption, not an invariant.** If the actor is ever slow or blocked, the message thread
+holds `applier` while waiting on it, and the progress thread — which needs `applier` on every poll — stops
+dead behind it. That is precisely the observed signature.
+
+**Two honest caveats, because this diary has been wrong six times this week.** First, the message thread
+stopped *before* `apply_delta`, which does not touch the engine — so if it is blocked on the applier lock
+itself, the holder must be the progress thread, and the cycle runs the other way round from the sketch above.
+Distinguishing those is one measurement, not an argument. Second, **the periodic sampler added earlier today
+runs inside `take_ring_progress`, with the applier lock held**, so the possibility that the instrument
+contributes to the freeze cannot be dismissed from the armchair — even though the underlying hang predates
+all of this instrumentation (A/B-confirmed identical at `3a7fc39`, before any of it existed).
+
+**Next, and it needs no debugger:** make lock acquisition observable. A `try_lock` with a bounded retry that
+logs when either thread waits more than a beat for `applier` or `tx` names the holder and the waiter
+directly, and a run with the periodic sampler disabled says whether the instrument is a participant. Both are
+small, both are ptrace-free, and between them they turn "a deadlock, probably here" into "this thread holds
+this lock and is blocked on that".

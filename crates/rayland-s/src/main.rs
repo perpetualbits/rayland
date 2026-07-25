@@ -191,8 +191,89 @@ fn present_the_frame(capture: FrameCapture) -> Result<()> {
 /// a request/reply waiting for exactly it — so the application stalls on a reply that was computed
 /// and then sat in a buffer.
 fn send(stream: &mut QuicSend, msg: &S2C) -> Result<()> {
+    // DIAGNOSTIC (`RAYLAND_S_REPLY_LOG`): bracket the write *and the flush* separately. `write_msg`
+    // returning is not delivery — `rayland-c`'s own `record_send` counts after the write and before
+    // its flush, which is why "C sent 91, S applied 90" cannot currently distinguish a message that
+    // was never flushed from one that was never read. A `w>` with no matching `w<` is a send that
+    // did not complete, and that is exactly the shape this is looking for.
+    link_log("w>", &s2c_kind(msg));
     write_msg(stream, msg).with_context(|| format!("writing {msg:?} to C"))?;
-    stream.flush().context("flushing the link to C")
+    let flushed = stream.flush().context("flushing the link to C");
+    link_log("w<", &s2c_kind(msg));
+    flushed
+}
+
+/// Whether the link diagnostic is on, read from `RAYLAND_S_REPLY_LOG` — the same switch as the
+/// applier's instrumentation, so one variable turns the whole investigation's logging on.
+fn link_log_enabled() -> bool {
+    std::env::var_os("RAYLAND_S_REPLY_LOG").is_some()
+}
+
+/// Emit one link-traffic line: a direction marker and a compact message description.
+///
+/// # Inputs / outputs
+/// - `marker`: `r<` for a message read from C, `w>` / `w<` for the start and end of a write to C.
+///   The paired write markers are what make an incomplete send visible.
+/// - `what`: the message description from [`c2s_kind`] or [`s2c_kind`].
+/// - Prints one line to stderr. **No-op unless `RAYLAND_S_REPLY_LOG` is set.**
+fn link_log(marker: &str, what: &str) {
+    if !link_log_enabled() {
+        return;
+    }
+    eprintln!("[s-link] {marker} {what}");
+}
+
+/// Describe a `C2S` in one short line — **never** its payload.
+///
+/// # Why not `{:?}`
+/// A `BlobData` can carry a megabyte, and a `RingDelta` a full ring's worth of commands; debug-
+/// formatting either would produce a log line longer than the rest of the session's output combined
+/// and bury the very sequence this is meant to reveal. Only the identifying fields are printed —
+/// which for the stall means `RingDelta`'s `tail`, the key every other log in this investigation is
+/// already joined on.
+fn c2s_kind(m: &C2S) -> String {
+    match m {
+        C2S::Hello { .. } => "Hello".to_string(),
+        C2S::CreateContext { .. } => "CreateContext".to_string(),
+        C2S::GetCapset { .. } => "GetCapset".to_string(),
+        C2S::CreateBlob { blob_id, size, .. } => format!("CreateBlob blob_id={blob_id} size={size}"),
+        C2S::BlobData {
+            res_id,
+            offset,
+            bytes,
+        } => format!("BlobData res={res_id} off={offset} len={}", bytes.len()),
+        C2S::RingDelta {
+            ring_res_id,
+            tail,
+            bytes,
+        } => format!("RingDelta ring={ring_res_id} tail={tail} len={}", bytes.len()),
+        C2S::SubmitCmd { .. } => "SubmitCmd".to_string(),
+        C2S::NotifyRing { .. } => "NotifyRing".to_string(),
+        C2S::UnrefResource { res_id } => format!("UnrefResource res={res_id}"),
+        C2S::WaylandRequest { .. } => "WaylandRequest".to_string(),
+        C2S::WaylandBind { .. } => "WaylandBind".to_string(),
+    }
+}
+
+/// Describe an `S2C` in one short line — **never** its payload. See [`c2s_kind`] for why.
+fn s2c_kind(m: &S2C) -> String {
+    match m {
+        S2C::Capset { bytes } => format!("Capset len={}", bytes.len()),
+        S2C::BlobCreated { res_id, initial } => {
+            format!("BlobCreated res={res_id} runs={}", initial.len())
+        }
+        S2C::BlobData {
+            res_id,
+            offset,
+            bytes,
+        } => format!("BlobData res={res_id} off={offset} len={}", bytes.len()),
+        S2C::RingProgress {
+            ring_res_id,
+            consumed_tail,
+        } => format!("RingProgress ring={ring_res_id} consumed_tail={consumed_tail}"),
+        S2C::Error { .. } => "Error".to_string(),
+        S2C::WaylandEvent { .. } => "WaylandEvent".to_string(),
+    }
 }
 
 /// Ship a batch of messages to C, stamping the T6 trace point for each `BlobData`.
@@ -344,7 +425,14 @@ fn serve(
         // The framed byte count `read_msg` now returns is C's measurement seam (Task 9); S keeps its
         // own accounting out of this path, so it is discarded here rather than plumbed through.
         let msg: C2S = match read_msg(&mut rx) {
-            Ok((m, _framed_bytes)) => m,
+            Ok((m, _framed_bytes)) => {
+                // DIAGNOSTIC (`RAYLAND_S_REPLY_LOG`): the first observable point on S. C reports
+                // sending 91 ring messages while S applies 90, and until now "sent" and "applied"
+                // were the only two points on that path — so a message lost in the link and a message
+                // read but not applied were indistinguishable. This is the read seam.
+                link_log("r<", &c2s_kind(&m));
+                m
+            }
             Err(e) => {
                 // Not necessarily an error: a clean shutdown ends here too.
                 eprintln!("rayland-s: link from C ended: {e}");
