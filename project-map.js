@@ -132,7 +132,7 @@ window.PROJECT_MAP = {
         { label: "fd → token intercept", status: "done", desc: "The swapchain dma-buf fd is correlated to a resource id and never crosses." },
         { label: "Event return path (4.4)", status: "done", desc: "Local dmabuf-format synthesis + a relay tunnel (eventfd + send_event, S→app id translation) — vkcube now receives and acks xdg configure." },
         { label: "Token → wl_buffer (4.3)", status: "planned", desc: "Resolve the swapchain token to S's retained HOST3D dma-buf and present zero-copy. Not yet reachable: vkcube never calls create_params, so the Buffer-token arm is never entered." },
-        { label: "Reply-decode abort (the current wall)", status: "active", desc: "vkcube dies in Venus's silent vn_cs_decoder_set_fatal — a reply read past its end — on vkGetImageDrmFormatModifierPropertiesEXT (type 187), the last call of the swapchain-image import path. Ring status never goes FATAL and S reports no error, so the two sides disagree about bytes, not semantics. Predates the blob-sync fix (A/B: identical backtrace at 3a7fc39)." }
+        { label: "Ring stall on S (the current wall)", status: "active", desc: "virglrenderer's ring thread stops consuming at head=22704 while C keeps relaying (tail reaches 22900) and S keeps applying. Mesa polls head as its reply-ready signal, so vkcube spins ~4.5s and Venus aborts it — silently, because every Venus abort logs at MESA_LOG_DEBUG, which release Mesa suppresses. Stalls on vkGetImageDrmFormatModifierPropertiesEXT (type 187), last call of the swapchain-image import path, right after a 1 MB res=9 blob is created. Predates the blob-sync fix (A/B: identical backtrace at 3a7fc39)." }
       ],
       deps: ["c", "relay", "s", "present"]
     },
