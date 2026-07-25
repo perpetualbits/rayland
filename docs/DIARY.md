@@ -1635,3 +1635,34 @@ lost-wakeup, and buried multi-ring creation. What they share is that each was bu
 then reasoned forward, and each could have been refuted immediately by evidence that was already on disk or one
 command away. The instrumentation built along the way is genuinely useful and is committed. The theories were
 not. **Next session: stack, not story.**
+
+### 2026-07-25 — Blocked on ptrace: the render-server worker cannot be attached to, and `PR_SET_PTRACER` does not reach it
+
+Getting the parked ring thread's userspace stack is the next step, and it is blocked by a machine-level
+permission rather than by anything in Rayland. Recording the dead end so nobody re-walks it.
+
+The Venus ring threads live in `virgl-1-gpu_ren`, a **grandchild** of `rayland-s` (virglrenderer forks
+`virgl_render_server`, which forks the per-context worker). This machine runs
+`/proc/sys/kernel/yama/ptrace_scope = 1`, which permits `ptrace` only from an **ancestor** of the target. A
+debugger started from a shell is not an ancestor of a grandchild of the daemon, so `gdb -p <worker>` fails with
+*"Could not attach to process … ptrace: Inappropriate ioctl for device"* — confirmed, 11 attempts, every one
+refused.
+
+**The attempted way around it, and why it failed.** `prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY)` exists exactly
+for this, and its documentation says the setting is inherited across `fork` and preserved across `execve` — so
+calling it once in `rayland-s` should have covered the render server and its worker without either knowing.
+It was added behind `RAYLAND_S_ALLOW_PTRACE`, it ran, and **`prctl` returned 0** — the log line confirms the
+grant was made. Attaching to the worker was **still refused**, identically. So on this kernel the Yama
+ptracer relation does not extend to the forked-and-exec'd grandchild, whatever the documentation implies. The
+code was reverted rather than left in: an opt-in switch that grants nothing is worse than no switch, because
+the next person would trust it.
+
+**What remains, and it is the user's call rather than this daemon's.** Either relax the setting for the
+session (`sudo sysctl -w kernel.yama.ptrace_scope=0`, restored with `=1`) — a one-line, reversible change to
+the developer machine's security posture, which is not something to do unasked — or launch `rayland-s` *under*
+gdb so the debugger is genuinely in the worker's ancestry, which works but stops inferiors on fork/exec events
+and may well perturb the very timing the stall depends on.
+
+Nothing else was learned this turn, and nothing was built. Stating that plainly rather than padding it: the
+measurement that matters has not been taken yet, and the four refuted theories from earlier today are still
+refuted.
