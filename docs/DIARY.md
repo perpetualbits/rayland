@@ -2128,3 +2128,50 @@ ring took one run to clear; there is no reason the blobs should take longer.
 whole project rests on, shipping an unmodified application's command stream across a network — is now
 *measured* byte-exact under a real application's load, 253 deltas in a row. That is not a small thing to be
 able to say.
+
+### 2026-07-26 — The blobs disagree in exactly one place: the staging pool is populated on C and empty on S
+
+The ring was cleared by fingerprinting; the same instrument one level down clears the blobs, and leaves one
+suspect standing.
+
+Both sides now hash **every** blob they hold — throttled, separately switched (`RAYLAND_C1_BLOB_FP` /
+`RAYLAND_S_BLOB_FP`), and reporting a **non-zero byte count** alongside the digest, because that second number
+distinguishes *diverged* from *never populated at all*. Comparing each resource's last sample:
+
+| resource | C non-zero | S non-zero | verdict |
+|---|---|---|---|
+| `res=4` (application, 256 KiB) | 262059 | 262059 | **identical** |
+| `res=5` (application) | 396 | 396 | **identical** |
+| `res=6` (application) | 396 | 396 | **identical** |
+| `res=7` (application, 1 MiB) | 0 | 0 | **identical** |
+| `res=1` (ring) | 5842 | 5843 | differ by one byte |
+| `res=2` (reply arena) | 20474 | 20490 | differ by sixteen |
+| **`res=3` (staging pool, 8 MiB)** | **28** | **0** | **empty on S** |
+
+**Two things follow, and the first is good news worth stating on its own.** Every application blob matches
+exactly. The incremental blob sync built at the start of this session — baseline, single-pass diff, changed
+runs, return-path fold — is **measured correct under a real application's load**, not merely e2e-green on the
+fixtures. The ring and the arena differ by a byte and by sixteen bytes respectively, which is the expected
+skew of two processes sampling continuously-written memory at different instants; both are live channels
+being written by both sides.
+
+**The staging pool is the one structural divergence.** C's copy holds content; S's is *entirely zeros* — not
+diverged, never filled. That is not a bug in the sync, it is the sync working as designed: `blob_id == 0`
+marks the pool Venus-internal, and `blob_sync` declines to publish it deliberately, because C's stale copy of
+S's arena would clobber replies the application is blocked on. The design note even anticipates the pool by
+name as something C "genuinely wrote, harmless but pure waste". **Harmless was the assumption. It is now the
+only measured difference between the two machines' state at the moment a submit fails to complete.**
+
+**What this does and does not establish.** It does not prove the failing `vkQueueSubmit` reads those bytes —
+28 non-zero bytes in 8 MiB is a very small footprint, more like a header or a descriptor than a recorded
+command buffer, and the causal link is still unmeasured. What it does establish is that after eliminating the
+ring (byte-exact, 253/253) and the application blobs (identical, 4 of 4), **the staging pool is the only
+candidate left standing in the entire resource set**, and it is empty on the side that fails.
+
+**Next, and it is a decision rather than a measurement:** the cheap experiment is to ship the pool C→S and see
+whether the submit completes. That is *not* a fix — it would ship C's copy over a region S also writes, which
+is precisely the clobber `blob_id` routing exists to prevent, and it could break the reply path in a way the
+fixtures would not catch. But as a **diagnostic** it is decisive in one run: if the submit still fails, the
+pool is exonerated and the token-built swapchain images are next; if it succeeds, the real design question
+opens — how a region both sides write gets synchronised without either clobbering the other, which is the
+same shape as the (c)2 problem and deserves its own spec rather than a patch at the end of a long day.

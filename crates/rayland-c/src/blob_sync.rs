@@ -227,6 +227,13 @@ pub fn messages_for_delta(blobs: &BlobTable, ring_res_id: u32, delta: RingDelta)
     {
         // `iter_mut`, not `iter`: the diff re-baselines each blob it inspects.
         let mut table = blobs.lock().expect("the blob table lock is never poisoned");
+        // DIAGNOSTIC (`RAYLAND_C1_BLOB_FP`), throttled: fingerprint **every** blob C holds, including
+        // the Venus-internal ones this loop is about to skip. The ring relay is now proven byte-exact
+        // (253/253 matching digests), so S's failure to complete the application's `vkQueueSubmit`
+        // must be about state the submit *references*. This is the same instrument one level down:
+        // if S's copy of some resource disagrees with C's, this and its S-side twin say which.
+        blob_fingerprints(&table, delta.tail);
+
         for (&res_id, blob) in table.iter_mut() {
             // Venus's own shmems — the ring, the reply arena, the staging pool — are not C's to
             // publish. Ring-findings §6's `blob_id` signal is the line between the application's memory
@@ -498,4 +505,76 @@ mod tests {
             "the ring delta must still cross on every relay"
         );
     }
+}
+
+/// Fingerprint every blob C holds, for comparison against S's copy of the same resources.
+///
+/// # Why this exists
+/// The ring relay is measured byte-exact — 253 deltas, 253 matching digests — yet S either refuses
+/// the application's `vkQueueSubmit` with a decoder error or executes it into a fence that never
+/// signals, and it does so **intermittently**. Since the command bytes provably arrive intact, what
+/// the submit *references* is the remaining suspect: the swapchain images S builds from WP0 buffer
+/// tokens, and the staging pool this very module declines to publish. Fingerprinting both sides'
+/// blobs and joining on `tail` says which resource, if any, they disagree about.
+///
+/// # Inputs / outputs
+/// - `table`: C's blob shadows, already locked by the caller.
+/// - `tail`: the ring frontier of the delta being relayed — the join key against S's log, exactly as
+///   the ring fingerprints used.
+/// - Prints one line per blob per interval. **No-op unless `RAYLAND_C1_BLOB_FP` is set.**
+///
+/// # Pitfall: the two sides sample at different instants, and that is expected
+/// C and S cannot sample simultaneously, and the application writes its mapped memory continuously
+/// with no call to intercept — so a *transient* disagreement on an application blob means only that
+/// a write landed between the samples. **A persistent disagreement is the signal**, and a
+/// disagreement on a blob the application never writes is a stronger one still.
+///
+/// # Pitfall: this is deliberately its own switch
+/// It hashes several megabytes per sample, so it is throttled and gated separately from
+/// `RAYLAND_C1_METRICS` and `RAYLAND_RING_DUMP`. An instrument that changes the timing of the thing
+/// it measures is how the previous wall stayed misread for two days.
+fn blob_fingerprints(table: &std::collections::HashMap<u32, crate::shm::LocalBlob>, tail: u32) {
+    if std::env::var_os("RAYLAND_C1_BLOB_FP").is_none() {
+        return;
+    }
+    // Throttled: hashing megabytes on every relay would dominate the relay itself.
+    static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    static LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    /// Twice a second — dense enough to bracket a submit, sparse enough not to distort the relay.
+    const INTERVAL_MS: u64 = 500;
+    let now_ms = BASE
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64;
+    if now_ms < LAST_MS.load(std::sync::atomic::Ordering::Relaxed) + INTERVAL_MS {
+        return;
+    }
+    LAST_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+
+    for (&res_id, blob) in table.iter() {
+        let bytes = blob.bytes();
+        // The digest answers "are these the same bytes"; the non-zero count answers "is this blob
+        // populated at all", which distinguishes *diverged* from *never filled in* — and the latter
+        // is what a resource S built from a token but never received contents for would look like.
+        let nonzero = bytes.iter().filter(|&&b| b != 0).count();
+        eprintln!(
+            "[c-blobfp] tail={tail} res={res_id} len={} nonzero={nonzero} fnv={:016x}",
+            bytes.len(),
+            fnv1a_blob(bytes)
+        );
+    }
+}
+
+/// FNV-1a over a blob's bytes. Duplicated from the ring fingerprint on purpose — see the S-side
+/// twin's docs: agreement between two independent implementations over two independent buffers is
+/// the property being tested, and a shared helper would weaken what a match proves.
+fn fnv1a_blob(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
 }

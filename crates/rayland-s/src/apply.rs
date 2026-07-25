@@ -811,6 +811,12 @@ impl Applier {
                 // `vkr_context_set_fatal` and returns **with no log at all** when its `lookup_ring`
                 // misses, and a fatal context sets `VK_RING_STATUS_FATAL_BIT_MESA` (0x2) here.
                 reply_log_ring_control(self.blobs.get(&ring_res_id), ring_res_id, tail);
+                // DIAGNOSTIC (`RAYLAND_S_BLOB_FP`), throttled: S's half of the blob comparison,
+                // placed here rather than beside the delta log because the ring mirror's mutable
+                // borrow is still live there. The ring is proven byte-exact, so if S cannot complete
+                // the application's submit, the disagreement must be in the state that submit
+                // references. Joined against C's `[c-blobfp]` on `tail`.
+                self.reply_log_blob_fingerprints(tail);
 
                 // **No `RingProgress` here, and that is the point.** The ring thread runs
                 // asynchronously; at this instant it has almost certainly consumed nothing. Reporting
@@ -1514,6 +1520,61 @@ impl Applier {
     /// field docs for the full argument. Monotonic (modulo a `u64` wrap that no real session reaches).
     pub fn applied_ring_deltas(&self) -> u64 {
         self.applied_ring_deltas
+    }
+
+    /// Fingerprint every blob S holds, for comparison against C's copy of the same resources.
+    ///
+    /// # Why this exists
+    /// The ring relay is measured byte-exact — 253 deltas, 253 matching digests — and yet S either
+    /// refuses the application's `vkQueueSubmit` with a decoder error or executes it into a fence
+    /// that never signals, intermittently. Since the command bytes provably arrive intact, what the
+    /// submit *references* is what remains: the swapchain images S builds from WP0 buffer tokens, and
+    /// the staging pool `rayland-c`'s `blob_sync` declines to publish. This is the instrument that
+    /// cleared the ring, applied one level down.
+    ///
+    /// # Inputs / outputs
+    /// - `tail`: the frontier of the delta just applied — the join key against C's `[c-blobfp]`.
+    /// - Prints one line per blob per interval. **No-op unless `RAYLAND_S_BLOB_FP` is set.**
+    ///
+    /// # Pitfall: a transient disagreement is expected; a persistent one is the finding
+    /// The two sides cannot sample at the same instant, and the application writes its mapped memory
+    /// with no interceptable call, so an application blob may legitimately differ between samples. A
+    /// blob that stays different — or one the application never writes and that differs at all — is
+    /// the signal.
+    ///
+    /// # Pitfall: this runs with the applier lock held
+    /// Hence its own switch and the throttle. The previous wall on this path was a lock-held scan
+    /// that grew to 637 ms and starved the message thread; an instrument that reintroduces that would
+    /// manufacture the very symptom it is here to explain.
+    fn reply_log_blob_fingerprints(&self, tail: u32) {
+        if std::env::var_os("RAYLAND_S_BLOB_FP").is_none() {
+            return;
+        }
+        static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        static LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        /// Twice a second, matching C's cadence so the two logs interleave at comparable points.
+        const INTERVAL_MS: u64 = 500;
+        let now_ms = BASE
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis() as u64;
+        if now_ms < LAST_MS.load(std::sync::atomic::Ordering::Relaxed) + INTERVAL_MS {
+            return;
+        }
+        LAST_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+
+        for (&res_id, blob) in &self.blobs {
+            let bytes = blob.bytes();
+            // The digest says "same bytes or not"; the non-zero count separates *diverged* from
+            // *never populated*, and the latter is exactly what a resource S created from a token but
+            // never received contents for would look like.
+            let nonzero = bytes.iter().filter(|&&b| b != 0).count();
+            eprintln!(
+                "[s-blobfp] tail={tail} res={res_id} len={} nonzero={nonzero} fnv={:016x}",
+                bytes.len(),
+                fnv1a(bytes)
+            );
+        }
     }
 }
 
