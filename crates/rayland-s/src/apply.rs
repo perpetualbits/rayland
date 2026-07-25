@@ -676,6 +676,16 @@ impl Applier {
                         source,
                     })?;
 
+                // DIAGNOSTIC (`RAYLAND_S_REPLY_LOG`): name the commands S has just accepted, so this
+                // side's view can be joined against C's `[ring-cmds]` line for the same `tail`.
+                // vkcube stalls on `vkGetImageDrmFormatModifierPropertiesEXT` (type 187): S applies
+                // the delta — this line is the proof it does — but virglrenderer's ring thread stops
+                // consuming, so `head` freezes, Mesa spins on it, and Venus aborts the application
+                // without logging (every Venus abort logs at `MESA_LOG_DEBUG`, which release Mesa
+                // suppresses). `tail` is the only key both sides share, hence logging against it.
+                // Inert unless the variable is set.
+                reply_log_commands(tail, &bytes);
+
                 // **T0 — guest/API submission accepted** (design note §7). The application's Vulkan
                 // commands for this delta are now in the ring's memory where S's engine will find
                 // them; `tail` names the frontier. Stamped here so the offline join can measure
@@ -1276,7 +1286,13 @@ impl Applier {
             .collect();
         // The reply arena keeps the fine byte grain (gap 0): it is small, and shipping a byte
         // S did not write there could clobber the application's — the grain's whole reason to exist.
-        self.emit_blob_writes(&ids, 0)
+        let out = self.emit_blob_writes(&ids, 0);
+        // DIAGNOSTIC (`RAYLAND_S_REPLY_LOG`): these are the reply-arena bytes S is about to ship —
+        // the other half of the join described at the `RingDelta` call site. If a reply Venus later
+        // overruns never appears here, S never observed it being written; if it appears here but
+        // late, the ordering is the fault. Inert unless the variable is set.
+        reply_log_arena_writes(&out);
+        out
     }
 
     /// **(c)2 completion barrier:** does the reply arena currently show a `vkGetFenceStatus` reply reading
@@ -1455,5 +1471,103 @@ impl Applier {
     /// field docs for the full argument. Monotonic (modulo a `u64` wrap that no real session reaches).
     pub fn applied_ring_deltas(&self) -> u64 {
         self.applied_ring_deltas
+    }
+}
+
+/// Whether the reply diagnostic is switched on, read fresh from `RAYLAND_S_REPLY_LOG`.
+///
+/// The variable's *presence* is the signal, matching `RAYLAND_C1_METRICS` and `RAYLAND_RING_DUMP`:
+/// `RAYLAND_S_REPLY_LOG=0` enabling logging would be a trap, but so would inventing a parsing rule
+/// nobody remembers. Read per call rather than cached in a `OnceLock` because this is throwaway
+/// instrumentation whose cost is irrelevant beside the network and the GPU on the same path.
+fn reply_log_enabled() -> bool {
+    std::env::var_os("RAYLAND_S_REPLY_LOG").is_some()
+}
+
+/// Name the Venus commands S has just written into the ring, for the `tail` that carries them.
+///
+/// # Why this exists
+/// vkcube stalls at `vkGetImageDrmFormatModifierPropertiesEXT` (`VkCommandTypeEXT` 187): S applies
+/// the delta carrying it, but virglrenderer's ring thread stops consuming, so the ring's `head`
+/// freezes, Mesa — which polls `head` as its reply-ready signal — spins, and Venus aborts the
+/// application. **The abort names nothing**, because `vn_log` logs at `MESA_LOG_DEBUG` and a release
+/// Mesa suppresses that, so *every* Venus abort is silent and its silence carries no information.
+/// Neither process therefore names the failure, which is why this logs S's view against `tail` — the
+/// one key both sides share — to be joined against `rayland-c`'s `[ring-cmds]` line for the delta.
+///
+/// # Inputs / outputs
+/// - `tail`: the ring frontier after this delta — the join key, and the only one, because a command's
+///   position in the stream is not otherwise recoverable from either log.
+/// - `bytes`: the delta's command stream, exactly as C relayed it.
+/// - Prints one line to stderr; returns nothing. **No-op unless `RAYLAND_S_REPLY_LOG` is set.**
+///
+/// # Pitfall: the decoder stops early, and that is the useful part
+/// [`decode_commands`](rayland_vtest::venus_ring::decode::decode_commands) is deliberately
+/// conservative — it halts at the first command whose encoded size it does not know rather than
+/// guessing a stride and desynchronising everything after it. In this stream that stop is
+/// *the application's own command*, every time, because the sizes the decoder knows are Venus's
+/// framing commands. So `stop` is the interesting field, not a failure.
+fn reply_log_commands(tail: u32, bytes: &[u8]) {
+    if !reply_log_enabled() {
+        return;
+    }
+    let (commands, stop) = rayland_vtest::venus_ring::decode::decode_commands(bytes);
+    // The decoded framing commands, plus the stop — which names the application command itself.
+    let named: Vec<String> = commands
+        .iter()
+        .map(|c| format!("type={}", c.command_type))
+        .collect();
+    eprintln!(
+        "[s-reply] delta tail={} bytes={} decoded=[{}] stop={:?}",
+        tail,
+        bytes.len(),
+        named.join(","),
+        stop
+    );
+}
+
+/// Report the reply-arena bytes S is about to ship back to C.
+///
+/// # Why this exists
+/// This is the other half of the join described on [`reply_log_commands`], and it is what says
+/// whether the engine produced *anything* for the stalling command. If the arena never receives a
+/// reply for the command `head` is stuck before, the ring thread genuinely never ran it — which is
+/// the parked-consumer failure (c)1's finding #1 named. If a reply does appear here, the engine ran
+/// it and the fault is instead in what releases the application. Printing what is shipped, and when,
+/// is what tells those two apart, and they call for opposite fixes.
+///
+/// # Inputs / outputs
+/// - `messages`: the messages [`Applier::take_venus_blob_writes`] is returning. Only
+///   [`S2C::BlobData`] carries arena bytes; anything else is ignored rather than guessed at.
+/// - Prints one line per `BlobData` to stderr; returns nothing. **No-op unless
+///   `RAYLAND_S_REPLY_LOG` is set.**
+///
+/// # Pitfall: the head of the run is what identifies a reply, so print it
+/// A Venus reply begins with its own `[command_type][flags]` prologue, so the first eight bytes of a
+/// run are what say *which* reply this is. The rest is payload and would only bury the signal, hence
+/// the deliberate truncation.
+fn reply_log_arena_writes(messages: &[S2C]) {
+    if !reply_log_enabled() {
+        return;
+    }
+    for message in messages {
+        let S2C::BlobData {
+            res_id,
+            offset,
+            bytes,
+        } = message
+        else {
+            continue;
+        };
+        // The first eight bytes are the reply's `[command_type][flags]` prologue — the identifying
+        // part. Anything shorter than that is itself worth seeing, so this does not pad or skip.
+        let head: Vec<String> = bytes.iter().take(8).map(|b| format!("{b:02x}")).collect();
+        eprintln!(
+            "[s-reply] arena res={} off={} len={} head={}",
+            res_id,
+            offset,
+            bytes.len(),
+            head.join(" ")
+        );
     }
 }
