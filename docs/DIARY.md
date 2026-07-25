@@ -480,3 +480,19 @@ compositor, headless) while token-buffers arrive at its M6, so nothing about tod
 wait on it. Confidence that this pairing is good for Rayland: high. Confidence in any specific
 integration design: deliberately none yet — that is a design doc for later, written jointly against
 their M6.
+
+### 2026-07-25 — The README learns what the repository already knows
+
+Rewrote the README, because the outside review proved its cost: it still said "there is no working
+software yet" and "Rayland's job is largely to swap the transport," and a capable reviewer read both at
+face value — recommending as a next step work the project finished months ago. The new front page states
+the current truth (unmodified app, stock Venus, real network, frame-perfect readback; small workloads;
+what is still open), replaces the transport-swap line with the honest formulation ("reuses the
+command-stream machinery, but replaces its locality, trust, lifetime, and failure assumptions") and
+tells the ring story in two sentences, since it is the single most explanatory fact about why this
+project is shaped the way it is. Added a Parhelion section — sibling, reference S-side host,
+explicitly *not* a dependency — and a Building section that says out loud what was only enforced in
+tests before: the C side never links a GPU stack, and `cargo test` self-skips where hardware is absent.
+One deliberate restraint: the README claims only what the record supports (twenty clean runs, batches
+of five — not "always", not "any app"), because the surest way to lose the trust this diary is trying
+to earn is a front page that rounds up.
