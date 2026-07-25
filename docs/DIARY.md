@@ -1833,3 +1833,49 @@ were taken, not *which* resource.
 
 **One thing it does settle, though:** commands-not-pixels works over a real network, machine to machine, with
 an unmodified application. The thesis is not in question. The last mile is.
+
+### 2026-07-26 — Periodic sampling reframes the stall again: the consumer is fine, and C's **last** delta never lands on S
+
+Sampling S's ring control words on the *progress poll* rather than only when a delta is applied — the
+delta-driven log goes silent exactly when the stall starts, since C stops relaying — changed the picture
+substantially, and not in the direction the last three entries pointed.
+
+**virglrenderer is behaving.** The final samples of this run:
+
+```
+[s-doorbell] tail=22820 accepted=true
+[s-ringctl]  s_head=22704 s_tail=22820 [ALIVE]
+[s-blob]     created res=9 blob_id=39 size=1008000
+[s-ringctl]  s_head=22820 s_tail=22820 [IDLE|ALIVE]      <- head REACHED 22820
+```
+
+`head` advanced to 22820: the ring thread woke on the doorbell, consumed `vkAllocateMemory`, and re-parked
+normally. The park/notify pair works. Note this also contradicts the earlier reading that `head` froze at
+22704 — it did in earlier runs, it did not in this one, and **that variation is itself the finding**: the
+freeze point is not fixed, so it was never a property of a particular command.
+
+**The invariant that does hold across runs.** C's metrics say `c2s_ring_msgs=91`; C's decoder logged 91
+deltas; **S applied 90.** The one delta that never lands is always the **last** one C sends — here
+`tail=22900`, carrying `vkGetImageDrmFormatModifierPropertiesEXT` (type 187), the command the application is
+blocked awaiting a reply to. S's log simply ends after the `res=9` blob creation; the app spins ~4.2 s (last
+ring event `+35688 ms`, session ends `39862 ms`) and Venus aborts it.
+
+**What that rules out, and it is most of the last two days.** The consumer is not stalled, not parked
+unwoken, not fatal, not blocked in a dispatch, and not short of the blob it needed — `head` demonstrably
+moves past the allocation, and S emitted **zero** blob messages after `res=9` (its initial contents were
+genuinely empty, so the `CreateBlob` byte-granular shipping is not a flood either). The failure is not on the
+GPU side of the wire at all. **It is that the final message C sends does not get applied.**
+
+**Where it could be, stated without picking one.** `record_send` counts *after* a successful `write_msg` but
+*before* `flush` (`rayland-c/src/link.rs:100-113`), so a counted message is proof of a completed write, not
+of a completed flush, and not of delivery. Equally, S's message thread does not obviously return to reading:
+its last logged act is the `CreateBlob` for `res=9`, after which it owes C an `S2C::BlobCreated` — and if
+that write is what does not complete, S never reaches the next `read_msg` and the 91st delta sits unread on
+the link. Both hypotheses predict exactly what is observed, and they have opposite fixes, so **neither gets
+built until one is measured**. The next instrument is the obvious one and it is symmetric to what already
+exists: log every message S *reads* and every message S *writes*, so "sent" and "applied" stop being the only
+two observable points on a path with several steps between them.
+
+Six days of this bug and six refuted readings; every one died to a measurement, and this reframing came from
+moving one existing log from an event-driven cadence to a periodic one. The lesson that keeps recurring: an
+instrument that samples only when the system is healthy cannot see the system fail.

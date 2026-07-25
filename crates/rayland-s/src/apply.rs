@@ -1120,6 +1120,16 @@ impl Applier {
     ///   **Empty means the caller must do nothing else**: no retirement, so no wait to release and
     ///   nothing S can honestly claim its GPU wrote.
     pub fn take_ring_progress(&mut self) -> Vec<S2C> {
+        // DIAGNOSTIC (`RAYLAND_S_REPLY_LOG`), throttled: sample every ring's control words on the
+        // *poll* rather than only when a delta is applied. During the vkcube stall C stops relaying
+        // entirely, so delta-driven logging goes silent exactly when the interesting thing happens;
+        // this loop keeps running. `vkr_ring_thread` clears IDLE the instant it wakes from its
+        // `cnd_wait`, so IDLE's behaviour after the stall begins is the discriminator: still set
+        // means the thread never woke (the notify never reached it), cleared with `head` still
+        // frozen means it woke and declined to consume. Those need opposite fixes.
+        for &ring_res_id in self.rings.keys() {
+            reply_log_ring_control_throttled(self.blobs.get(&ring_res_id), ring_res_id);
+        }
         // Ask the rings first, before copying anything: on the overwhelming majority of polls
         // nothing moved, and shipping a blob per poll regardless would make this loop a bandwidth
         // source rather than the latency mechanism it is meant to be.
@@ -1557,6 +1567,54 @@ fn reply_log_commands(tail: u32, bytes: &[u8]) {
         named.join(","),
         stop
     );
+}
+
+/// Sample a ring's control words on the progress poll, at most a few times a second.
+///
+/// # Why a throttle, and why on the poll at all
+/// [`reply_log_ring_control`] fires when a delta is applied, which is precisely the wrong cadence
+/// for the vkcube stall: once the application blocks, C relays nothing, and the delta-driven log
+/// falls silent at the exact moment the interesting thing happens. The progress poll keeps running
+/// regardless (every 200 µs), so it can watch the stall — but at that rate it would emit thousands
+/// of lines a second and bury the signal, hence the throttle.
+///
+/// # What the sample is for
+/// `vkr_ring_thread` clears `VK_RING_STATUS_IDLE_BIT_MESA` immediately on waking from its
+/// `cnd_wait`. So after the stall begins: **IDLE still set** means the thread never woke, and the
+/// doorbell never reached `vkr_ring_notify`; **IDLE cleared while `head` stays frozen** means it woke
+/// and declined to consume. Those two call for opposite fixes, which is the whole reason to look.
+///
+/// # Inputs / outputs
+/// - `blob`: S's mapping of the ring resource, or `None`.
+/// - `res_id`: the ring's resource id.
+/// - Prints at most one line per interval; returns nothing. **No-op unless `RAYLAND_S_REPLY_LOG` is
+///   set.**
+fn reply_log_ring_control_throttled(blob: Option<&HostBlob>, res_id: u32) {
+    if !reply_log_enabled() {
+        return;
+    }
+    // A process-wide clock base, established on the first sample. `Instant` cannot be a `const`, so
+    // it is stored once and read thereafter.
+    static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    static LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    /// Roughly four samples a second: dense enough to catch a status bit flipping during the stall,
+    /// sparse enough that the log stays readable next to the doorbell lines.
+    const INTERVAL_MS: u64 = 250;
+
+    let now_ms = BASE
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64;
+    let last = LAST_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if now_ms < last + INTERVAL_MS {
+        return;
+    }
+    // A plain store, not compare-exchange: two threads racing here would at worst emit two samples
+    // in one interval, which is harmless for a diagnostic and not worth the ceremony of a CAS loop.
+    LAST_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+    // Reuse the delta-driven formatter so both cadences print the same shape and can be read
+    // together; `relayed_tail` is 0 here because no delta prompted this sample.
+    reply_log_ring_control(blob, res_id, 0);
 }
 
 /// Report **S's own** copy of a ring's control words: `head`, `tail`, and `status`.
