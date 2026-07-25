@@ -1400,3 +1400,62 @@ One loose thread worth flagging while it is in view: the proxy answers the app's
 with two synthesized LINEAR modifiers, and `vkGetImageDrmFormatModifierPropertiesEXT` is the app asking the
 **driver** what modifier the image really got. If those two answers can disagree, that is a second bug waiting
 behind this one — it would not cause a decode overrun, so it is not today's failure, but it is on the list.
+
+### 2026-07-25 — Correction: the abort is a ring **stall**, not a reply-decode overrun — and the earlier reasoning was unsound at its root
+
+Two entries above, this diary concluded that vkcube dies in Venus's `vn_cs_decoder_set_fatal` — a reply read
+past its end — and on that basis declared the 2026-07-24 "parked ring thread" diagnosis overturned. **That
+conclusion is wrong, the 2026-07-24 diagnosis was right, and the error is worth dissecting because it was a
+reasoning failure rather than a measurement failure.** Both earlier entries stay as written; this is the
+overturning.
+
+**The unsound step.** The argument was: the abort prints nothing; `vn_cs_decoder_set_fatal` is the only abort
+in the Venus ICD whose body does not call `vn_log`; therefore it is the decoder. The first premise was
+verified. The second was *read directly from the source* and is true as stated. The conclusion still does not
+follow, because the inference silently assumed that the nine `vn_log`-ing abort paths would actually **print**
+— and they do not:
+
+```c
+vn_log(struct vn_instance *instance, const char *format, ...)
+{ ... mesa_log_v(MESA_LOG_DEBUG, "MESA-VIRTIO", format, ap); ... }
+```
+
+`vn_log` logs at **`MESA_LOG_DEBUG`**, which a release Mesa suppresses. So *every* Venus abort is silent by
+default, and "silent" carries no diagnostic information whatsoever. The one fact the whole identification
+rested on was worth nothing. Setting `MESA_LOG_LEVEL=debug` did not lift it either, so the messages stayed
+invisible and the mistake stayed comfortable. **Reading a function's body and never asking what its callee
+does with the result is exactly the class of error this project keeps rediscovering** — it is the same shape
+as assuming an exported symbol implies a usable path, and it is why the convention is to read the source
+*through*, not just at.
+
+**What the evidence actually says.** Two measurements, both reproducible across runs, and both available
+before the wrong conclusion was drawn:
+
+- **`head` stops dead.** The ring's control words move in lockstep all session — tail advances, head follows —
+  until `tail` goes `0x58b0 → 0x5924` (22820) and then `0x5924 → 0x5974` (22900) with **head never
+  following**. It freezes at **0x58b0 = 22704**. Mesa polls `head` as its reply-ready signal, so an
+  application whose `head` never reaches its seqno is *blocked*, and a blocked application is not decoding
+  anything. The decode-overrun theory required the app to have been released; the ring says it never was.
+- **A 4.5-second silence.** The last ring event lands at `+51,317 ms` and the C daemon's session does not end
+  until `55,792 ms`. A decoder overrun aborts on the instruction that reads past the end — instantly. Four and
+  a half seconds of a live process and a frozen ring is a **spin**: `vn_relax` polling `head`, ending in
+  `vn_common.c`'s watchdog-expiry or iteration-bound abort. Both log; both are invisible; both fit.
+
+**So the corrected chain is:** the application writes its command; C relays the delta and S *applies* it — S's
+own instrumentation shows `[s-reply] delta tail=22820`, so the bytes really do land in the ring's memory on
+S — but **virglrenderer's ring thread never consumes them**. `head` stays at 22704, Mesa spins, Venus aborts
+it. The stall is on S, in the consumer, exactly where 2026-07-24 put it.
+
+`vkGetImageDrmFormatModifierPropertiesEXT` (type 187) is still the command in flight and the ring-command
+decoding that named it stands — it is simply the command that *stalls*, not one whose reply is malformed. The
+swapchain-image import path it belongs to (`vkAllocateMemory` → `vkGetImageMemoryRequirements2` →
+`vkBindImageMemory2` → `vkGetImageSubresourceLayout` → 187) and the `res=9` blob of 1,008,000 bytes
+(504 × 500 × 4) are both still good evidence about *where* the session is when it dies.
+
+**What is genuinely open, stated narrowly this time:** why does virglrenderer's ring thread stop consuming
+after 22704? The suspects are the ones (c)1's own finding #1 already named — the render server's ring thread
+parks after 1 ms and is woken only by `vkNotifyRingMESA`, which Mesa emits only when it reads the IDLE bit
+from **C's** status word — and the fact that a new 1 MB blob (`res=9`) is created immediately before the
+stall. The next measurement is on S: whether its ring thread is parked, and whether the doorbell that should
+wake it is rung and observed. **No fix until that is measured** — three wrong turns in one day is enough
+evidence that this ring's failure modes do not yield to inference.
