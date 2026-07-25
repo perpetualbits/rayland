@@ -1280,3 +1280,72 @@ therefore evidence the diff loses no byte on the paths it actually exercises, no
 are safe — a distinction worth being honest about rather than letting a green gate imply more than it
 showed. Added unit tests for both wirings, each teeth-checked by removing the fix and confirming the test
 fails before restoring it, so these two paths now have direct coverage the e2e was never going to provide.
+
+### 2026-07-25 — vkcube's abort is a Venus *reply-decode* failure, not bandwidth and not WSI formats — and an A/B that finally makes the blob-sync win comparable
+
+With the blob-sync fix landed, the obvious next move was WP0 Task 4.3 (token → `wl_buffer`). Before designing
+it, one question needed an answer: **how far does vkcube actually get now?** The answer moved the work
+somewhere else entirely, and overturned two things this diary had previously recorded.
+
+**vkcube never reaches `attach`, so 4.3's code path is unreachable.** The C proxy's complete per-request trace
+for a run is *thirty-six lines*. The application binds `wl_compositor`, `xdg_wm_base` and `wl_seat`, creates
+its surface, gets its `xdg_toplevel`, receives the `xdg_toplevel.configure` and `xdg_surface.configure` the
+4.4 event tunnel delivers, and **acks the configure** — so 4.4 is genuinely working, which is worth saying
+plainly. Then it binds `zwp_linux_dmabuf_v1` six times, is answered each time with the two synthesized LINEAR
+formats, and dies. It never calls `create_params`, never constructs a `BufferToken`, never attaches anything.
+The `WaylandArg::Buffer(_)` arm that Task 4.3 exists to fill is not reached even once. Designing 4.3 now would
+have been designing against an unexercised path, resting on two assumptions — that the swapchain image is a
+retained HOST3D blob, and that Mesa uses `create_immed` rather than the async `create` — that nothing has yet
+tested. This project's history is mostly a record of exactly that class of assumption being overturned by
+measurement, so the design was stopped and the wall investigated instead.
+
+**The abort is silent, and that is the diagnostic.** vkcube exits 134 with *no* message: not an assertion, not
+a Vulkan error, not a Venus log line. `VN_DEBUG=result` adds nothing. Under gdb the stack is unambiguous even
+stripped: `wl_display_dispatch_queue_pending` → libffi → **vkcube's own listener callback** → the Vulkan
+loader → nine frames deep into `libvulkan_virtio.so` → `abort()`. So the application, while dispatching
+Wayland events, calls a Vulkan entry point that aborts inside the Venus ICD. Ubuntu builds Mesa with `NDEBUG`,
+so every `assert()` in Mesa's WSI is compiled out and cannot be the source. Reading the Venus sources for the
+abort sites — the project's standing preference for source over inference — there are ten, and **nine of them
+`vn_log` a message first**: ring fatal, expired ring-alive watchdog, iteration bound, lost vtest connection,
+bad `cmsghdr`. Exactly one aborts in silence:
+
+```c
+static inline void
+vn_cs_decoder_set_fatal(const struct vn_cs_decoder *dec) { abort(); }
+```
+
+and it has exactly one trigger, in `vn_cs_decoder_peek_internal`:
+
+```c
+if (unlikely(size > dec->end - dec->cur)) { vn_cs_decoder_set_fatal(dec); ... }
+```
+
+**Venus tried to read more bytes out of a reply than that reply contained.** The failure is a short or missing
+reply on a synchronous call — a (c)1 *reply-path* defect. The dmabuf probing that immediately precedes it is a
+red herring: it is merely the last traffic on the wire before the call that fails.
+
+**Overturned belief #1: this abort was attributed to bandwidth, and it never was.** The 2026-07-24 entries and
+the ledger record vkcube's `SIGABRT` as a consequence of the whole-blob resend flood — the "latency trap", the
+"S-side ring-completion latency". An A/B settles it. The pre-blob-sync commit (`3a7fc39`) was built in a
+throwaway worktree with its own target directory and run through the identical gdb-wrapped smoke. It produces
+**thirty-six proxy trace lines, the same sixth dmabuf probe as its last act, and a backtrace identical to the
+current one byte for byte** — the same twenty-five frames at the same addresses. The application always died
+here. The resend flood made it slower to arrive, nothing more. That the blob-sync work was necessary is not in
+question; that it would move this wall was an assumption, and it was wrong.
+
+**Overturned belief #2 — in the useful direction: the bandwidth win is larger than recorded, and now cleanly
+comparable.** The entry above reports ~62× and carefully hedges it, because vkcube aborted partway through a
+60 s window and a truncated run is not comparable to a full one. That caveat can now be retired, because the
+A/B gives something better: **both builds stop at the identical application state** — same 36 proxy lines,
+same abort, same frame — so their byte counts measure the same work. Baseline `c2s_blob_sync_bytes =
+31,315,399`; current `267,069`. **A 117× reduction, like for like.** The hedge was honest when written and is
+simply superseded by a better experiment; the earlier number stays in the record rather than being edited.
+
+**What is still unknown, and it is the whole of the next step:** *which* reply comes back short, and why. The
+decoder's fatal path reports nothing — no command, no opcode, no sizes — so the answer has to come from our
+side of the wire: correlating what S writes into the reply arena against what Venus expects for the command in
+flight when the abort fires. It is worth flagging one prior belief this sits near without yet touching: the
+proxy still refuses the async `zwp_linux_buffer_params_v1.create` as "UNSUPPORTED in WP0 (no event-return
+channel)", a comment that 4.4 made false when it built that very channel. Whether that refusal is implicated
+here is not yet known — the application aborts before reaching `create_params` at all — but the comment is
+stale either way and is on the list.
