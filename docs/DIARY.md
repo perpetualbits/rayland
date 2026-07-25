@@ -1718,3 +1718,72 @@ disk). Naming that one function ends the search, because it is the thing the all
 
 **Housekeeping:** `kernel.yama.ptrace_scope` was relaxed to `0` for this session at the owner's hand and must
 be restored to `1`. It is not something to leave lying open on a development machine.
+
+### 2026-07-25 — The frames are symbolised: it is `vkr_ring_thread`'s own park, and that corrects yesterday's correction
+
+The stripped `virgl_render_server` gave up its two frames without debuginfo, and the answer overturns the
+previous entry — which had itself overturned the entry before it. Recording the method, because it is
+reusable and cost nothing.
+
+**How, with no symbols.** Ubuntu's `virgl_render_server` is stripped, `libvirglrenderer.so.1` exports **zero**
+`vkr_*` symbols (the Venus code is linked into the stripped executable), and the debuginfod download timed
+out. None of that matters, because a PIE binary preserves the low 12 bits of every address: for a
+page-aligned load base, `runtime_addr & 0xFFF == file_vaddr & 0xFFF`. The captured frames were
+`0x634e2734fd76` and `0x634e2733c4fc` — page offsets `0xd76` and `0x4fc`, separated by `0x1387A`. Frame #7 is
+a return address immediately after a call to `pthread_cond_wait`, and the binary has only **four** such call
+sites. Exactly one returns at page offset `0xd76`:
+
+```
+call@0x7dd71  ret@0x7dd76  pageoff=0xd76
+```
+
+That fixes the load base at `0x634e272d2000` (page-aligned, as required) and predicts frame #8 at `0x6a4fc` —
+and `0x7dd76 - 0x6a4fc = 0x1387A`, the observed separation, exactly. Two independent constraints agreeing on
+one answer.
+
+**What the two frames are.** Frame #8 is a thread trampoline:
+
+```asm
+6a4eb: mov 0x8(%rdi),%r12     ; argument, from a heap struct
+6a4ef: mov (%rdi),%rbx        ; function pointer
+6a4f2: call free@plt          ; free the struct
+6a4fa: call *%rbx             ; indirect call into the thread's entry function
+6a4fc: pop %rbx               ; <- frame #8
+```
+
+with `start_thread` above it — the `thrd_create` stub. So **frame #7's function is the thread's top-level
+entry function**, and it is here:
+
+```asm
+7dd61: lea 0xc30(%r12),%rdi   ; &s->cond
+7dd69: lea 0xc08(%r12),%rsi   ; &s->mutex
+7dd71: call pthread_cond_wait@plt
+7dd76: jmp 7db68              ; <- frame #7, looping back
+```
+
+`0xc30 - 0xc08 = 0x28 = sizeof(pthread_mutex_t)`, so the struct declares `mtx_t mutex; cnd_t cond;`
+adjacently — `struct vkr_ring`. The thread is **`vkr_ring_thread`, parked in its own idle `cnd_wait`**, with
+no dispatch frames between it and the trampoline.
+
+**So the previous entry was wrong, and this is the third reading of this stall.** It concluded "blocked
+inside the `vkAllocateMemory` dispatch" from S's status word showing `ALIVE` without `IDLE`. The stack
+outranks that inference: a thread inside a dispatch would have dispatch frames, and there are none. The
+`IDLE`-clear reading has a mundane explanation the previous entry did not consider — S samples the status
+*immediately after ringing the doorbell*, and `vkr_ring_thread` clears `IDLE` the moment it wakes
+(`vkr_ring_unset_status_bits` sits directly after the `cnd_wait` returns), so a sample taken then can easily
+catch the bit already cleared. A single-instant status read was never strong enough to override a call stack,
+and treating it as such was the error.
+
+**Where that leaves the failure.** The ring thread parks — legitimately, since it parks only when
+`ring->buffer.cur == vkr_ring_load_tail(ring)`, and S's own control words confirm it was genuinely caught up
+at 22704. S then applies the next delta (tail → 22820) and rings the doorbell, which virglrenderer accepts,
+whose context is not fatal, and whose ring lookup therefore succeeded. **And the thread does not consume it.**
+That is the whole remaining mystery, now stated with no speculation attached: park is legitimate, notify is
+delivered, `head` never moves.
+
+The next thing to measure is the one link never yet observed directly: whether `vkr_ring_notify` actually runs
+for that doorbell — i.e. whether `pending_notify` is set and `cnd_signal` called — versus the notify being
+consumed somewhere earlier. The ring struct's address is now known at runtime (`%r12` in frame #7), and its
+`pending_notify` flag can be read out of the same mapping S already holds, so this is an observation rather
+than another theory. **Six readings of this stall so far; the ones that survived were all measurements, and
+every one that died was an inference.**
