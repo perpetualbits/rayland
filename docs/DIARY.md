@@ -1517,3 +1517,76 @@ doorbell that wakes a thread into the same failed lookup fixes nothing. Second, 
 doorbell per blob creation is safe against the park sequence in the way the existing one is — `apply_delta`
 stores `tail` with `Release` *before* the doorbell precisely so the consumer cannot miss it, and a blob-created
 doorbell needs the equivalent argument written down before it ships, not after.
+
+### 2026-07-25 — The two checks refuted the fix, and found something bigger: `VN_PERF=no_multi_ring` does not do what (c)1 believes it does
+
+The entry above root-caused vkcube's stall to a doorbell rung on the wrong event and proposed ringing it after
+blob creation too — with two checks to run first, precisely because this ring had already produced three wrong
+turns in a day. **Both checks were worth running: the first refuted the fix, and the second found a larger
+problem underneath it.** No fix was written. That is the honest outcome and it is recorded as such.
+
+**Check 1 — does virglrenderer wait for the blob? No.** `vkr_dispatch_vkAllocateMemory`
+(`vkr_device_memory.c:246-257`, virglrenderer 1.2.0, the linked version) translates
+`VkImportMemoryResourceInfoMESA` by calling `vkr_get_fd_info_from_resource_info`, and on failure does this:
+
+```c
+if (!vkr_get_fd_info_from_resource_info(ctx, res_info, &local_import_info)) {
+   args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   return;
+}
+```
+
+It sets an error return and **returns normally** — no wait, no condition variable, no fatal. So a missing blob
+could not freeze `head`: the command would complete, `head` would advance, and Mesa would see a failed
+allocation. The premise of the previous entry's fix — a ring thread *waiting* for a blob that a doorbell could
+release — does not exist in the code. The doorbell/blob-creation interleaving that looked so convincing was a
+correlation read as a mechanism, and reading the dispatch would have refuted it at any point in the day.
+
+**Check 2 — sampling the consumer's actual state, which is what should have been done first.** Rather than
+infer again, the whole process tree under `rayland-s` was sampled every 0.4 s through a stall. The Venus
+context does not live in `rayland-s` at all: virglrenderer forks `virgl_render_server`, which forks a
+`virgl-1-gpu_ren` worker, and *that* holds the ring threads. In it:
+
+```
+tid=4085710 comm=vkr-ring-1     <- present from the start
+tid=4086533 comm=vkr-ring-1     <- appears mid-run
+tid=4086541 comm=vkr-ring-1     <- appears mid-run
+tid=4086542 comm=vkr-queue-1
+```
+
+`vkr_ring.c:248` names these `"vkr-ring-%d"` **by `ctx->ctx_id`**, so every one of them is a ring thread in
+context 1: **the session has three or four rings, not one.** And S's instrumentation shows it rang the doorbell
+for exactly **one** handle (`0x5555555bf450`) all session, and **never once logged "ignoring a second ring
+creation"** — so the additional rings were created by a path `latch_ring_handle` cannot see, since it inspects
+only the *inline* vtest batches.
+
+**The assumption that fails is spec §6's.** (c)1 pins `VN_PERF=no_multi_ring` and treats it as a guarantee of
+exactly one ring — `latch_ring_handle`'s own doc says so, and warns that without it "the extra ring will
+stall". The smoke *does* pass the flag, and the flag *is* still a valid Mesa option
+(`vn_common.c:54`, honoured at `:297`). But read what it actually gates:
+
+```c
+struct vn_ring *
+vn_tls_get_ring(struct vn_instance *instance)
+{
+   if (VN_PERF(NO_MULTI_RING))
+      return instance->ring.ring;
+   ...
+```
+
+It only changes **which ring a thread submits to**. It does not stop rings from being *created*. So (c)1 has
+been relying on a guarantee the flag never made, and the extra rings have presumably been there since C0
+without anything looking.
+
+**What this does and does not establish.** It is now measured fact that multiple rings exist, that S knows of
+only one, and that S's doorbell can therefore only ever wake one. It is *not* yet established that the extra
+rings carry any commands — if `no_multi_ring` really does funnel every submission to the instance ring, they
+may be created and idle, in which case they are a red herring and the stall is something else again. That is
+the next measurement and it decides the fix: log every ring creation and every submission's target ring, and
+find out whether the ring whose `head` freezes is the one S is ringing. **Given the day's record — three
+hypotheses refuted, two of them by evidence that was already on disk when they were formed — nothing gets
+built until that is on the screen.**
+
+The lesson worth keeping, beyond this bug: *"S reports no error"* was treated as informative all day, and it
+never was. S cannot report an error about a ring it does not know exists. Silence from a component is only
+evidence when you have first established that the component is in a position to speak.
