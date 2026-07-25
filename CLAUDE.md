@@ -39,6 +39,22 @@ fallback exists but is not the goal (in the target setup, C is the wrong place t
   trait boundary must stay clean enough that the engine could later be Rustified or
   swapped without touching the rest.
 
+## How the human works (read this before touching git)
+
+The repository owner develops with **Claude Code in a shell on their Linux laptop — that
+laptop is the primary copy.** GitHub is the **remote/backup/publishing** point, not the
+working copy. Claude.ai is used for **ideation and for crafting the prompts** that laptop
+Claude Code sessions then execute. Any session that is *not* running on the laptop (e.g.
+Claude Code on the web, in a cloud container) is the exception, and must behave as a
+guest:
+
+- **Never commit to or push `main` from a non-laptop session.** Push finished work to a
+  clearly-named side branch and leave merging to the human on the laptop.
+- Treat a cloud clone as disposable: anything worth keeping is pushed to its side branch
+  before the session ends, and nothing assumes it will still exist tomorrow.
+- If work in a non-laptop session could collide with uncommitted work on the laptop, the
+  laptop wins — leave a branch to reconcile rather than racing the primary.
+
 ## Code conventions
 
 Write code as if a human reviewer — possibly one not deeply versed in
@@ -281,7 +297,10 @@ Venus/virglrenderer capture/replay engine, so *unmodified* applications run.**
   Loopback hides it (0/120). See
   [`docs/design/2026-07-19-c2-true-remote-mapped-sync.md`](docs/design/2026-07-19-c2-true-remote-mapped-sync.md).
   **Landed (2026-07-19), and it sharply reduces but does not eliminate the defect:** the `rayland-s`
-  **readback-completion gate** (`crates/rayland-s/src/delivery.rs`, wired into `progress_thread`)
+  **readback-completion gate** (then in `crates/rayland-s/src/delivery.rs`, wired into
+  `progress_thread` — the G' fix below removed that module, and the surviving return-path logic lives
+  directly in `progress_thread` in `crates/rayland-s/src/main.rs` plus
+  `Applier::reply_arena_fence_signaled` in `crates/rayland-s/src/apply.rs`)
   completes a delivery only once `take_app_blob_writes` shows the readback blob actually advanced past
   the last delivered frame (or a 250 ms identical-frame bound expires), so a two-submits-per-frame app's
   copy submit can no longer ship the previous frame's pixels. Over the real network
@@ -305,9 +324,15 @@ Venus/virglrenderer capture/replay engine, so *unmodified* applications run.**
   complete `res6`) **before** the reply arena and the head-advance that release the app. No S-issued fence,
   no timing heuristic; the progress thread no longer touches the engine. **Scope:** feedback-OFF only (the
   only config that renders over a real network; the feedback-on "buy-back" was loopback-only and is
-  superseded — the loopback icosa e2e now runs feedback-off to guard the shipping path). **Still open:**
-  the readback fragments into ~5000 one-byte `BlobData`/frame (a bandwidth follow-up, not correctness), and
-  multi-queue support.
+  superseded — the loopback icosa e2e now runs feedback-off to guard the shipping path). The readback's
+  fragmentation into ~5000 one-byte `BlobData`/frame is since **fixed by gap-threshold coalescing**
+  (readback path only, gap ≤ 256 — safe there because `res6` is S-written and C-read-only, so re-shipped
+  gap bytes are idempotent): ~5000 → ~180 messages/frame, still bit-identical, still 0 stale
+  ([`docs/design/2026-07-21-c2-readback-coalescing.md`](docs/design/2026-07-21-c2-readback-coalescing.md)).
+  Wall-clock did **not** move, which located the return path's real bound: per-frame **round-trip
+  latency** (the app's `vkGetFenceStatus` polling), not one-directional readback volume. **Still open:**
+  that round-trip count (adaptive polling / reply batching, when latency matters), and multi-queue
+  support.
 - **(c)3 — content-addressed assets.**
 - **(c)4 — real/complex applications; GL via Zink.**
 

@@ -449,3 +449,29 @@ Sommelier do for Wayland clients. `rayland-present` already puts pixels on S's s
 the swapchain interception and the present-forwarding between it and the engine. That is a sub-project,
 and it is now concretely scoped rather than hypothetical. The bet still stands; the next missing ecosystem
 piece just has a name.
+### 2026-07-25 — A fresh pair of eyes, and CLAUDE.md had drifted twice
+
+A new session's first job was simply to *read* the project cold, and that turned out to be a small test
+the repository partly failed: two statements in `CLAUDE.md` were no longer true. The G' commit removed
+the `delivery` module but left `CLAUDE.md` pointing at `crates/rayland-s/src/delivery.rs` as where the
+readback-completion gate lives; and the coalescing commit fixed the ~5000-messages-per-frame
+fragmentation while `CLAUDE.md` went on listing it as open. Both changes violated the file's own first
+rule — "if a change makes any statement here false, update this file in the same change" — and both
+slipped through in the same busy 2026-07-21 session that landed the project's biggest win. That is worth
+recording honestly: the discipline holds least well exactly when the work is going best, because the
+excitement of a green result crowds out the bookkeeping. Fixed both today, keeping the historical
+narrative intact (the gate paragraph now says where the logic went, rather than pretending it was always
+there). The mild lesson for future sessions: a cold read by someone without the previous session's
+context is cheap and catches precisely the staleness the previous session cannot see — its author still
+remembers what the words *meant*, so they read as true.
+
+### 2026-07-25 — Writing down where the truth lives
+
+The human spelled out their working setup, and it is now a convention in `CLAUDE.md`: the Linux laptop
+running Claude Code in a shell is the **primary** copy; GitHub is remote, backup, and publishing;
+Claude.ai is where ideas become prompts for the laptop to execute. Sessions like this one — running in a
+cloud container — are guests, and guests push side branches and never touch `main`. Worth a diary line
+because it settles a question every future non-laptop session would otherwise have to guess at: when two
+copies of the repository disagree, the laptop is the one telling the truth. The same reasoning the
+project applies to its own protocol (know which side owns the ring, which side merely mirrors it)
+applies to its git topology.
