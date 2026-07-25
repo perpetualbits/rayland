@@ -2023,3 +2023,62 @@ measurement, and every one was born from an inference. The two that finally work
 rather than ideas — a watchdog holding no locks, and a timer around a critical section — and each took
 minutes to build. The rule earned here: *when two components disagree, do not reason about which is at
 fault; make each one say what it is doing.*
+
+### 2026-07-26 — The new wall, named the same day: `vkQueueSubmit` fails to decode on S
+
+With the starvation fixed, vkcube ran past every previous wall and hit a new one within hours. It is a
+different kind of failure from everything before it, and S announced it in plain words — the first time in
+this investigation that anything did.
+
+**What the application reached.** It created its swapchain buffers, which had never happened:
+
+```
+[wp-proxy] intercept params 20.create_immed -> buffer 21 = resource 8  (500x500 fmt XR24)
+[wp-proxy] intercept params 22.create_immed -> buffer 23 = resource 9
+[wp-proxy] intercept params 24.create_immed -> buffer 25 = resource 10
+```
+
+Then recorded and submitted work: the ring's tail commands are `vkResetCommandBuffer` (92), `vkCreateFence`
+(35), `vkResetCommandBuffer` (92), `vkGetFenceStatus` (38). Every one of the 102 deltas C sent was read and
+applied by S.
+
+**Where it dies.** The aborting thread is `vn_wsi[0,0]` — Mesa's WSI thread — and its abort frames `#1-#3`
+are byte-identical to the previous wall's `#5-#7`, so it is the same silent spin-abort reached from a new
+caller. It spins because it is polling `vkGetFenceStatus` for a fence that never signals. And the fence never
+signals because **virglrenderer refused the submit**:
+
+```
+vkr: vkQueueSubmit resulted in CS error
+vkr: ring_submit_cmd: vn_dispatch_command failed
+vkr: submit_cmd: early bail due to fatal decoder state
+failed to dispatch context op 5
+vkr: destroying device with valid objects
+vkr: destroying context 1 (vkcube) with a valid instance
+```
+
+**A "CS error" is a decode failure, not a GPU failure.** S could not parse the command stream of the
+application's `vkQueueSubmit`, went to a fatal decoder state, and tore the context down. So this is a
+**relay-fidelity** problem: bytes S needed were wrong, or absent.
+
+**The leading hypothesis, flagged as a hypothesis.** Venus does not necessarily encode a submit's
+command-buffer contents inline in the ring; it can place them in a separate command stream. C's blob sync
+**deliberately never ships the staging pool** — `blob_id == 0` marks it Venus-internal and `blob_sync.rs`
+declines to publish it by design, with a good reason (C's stale copy of S's arena would clobber replies). If
+a real application's recorded command buffers live in that pool, then S is decoding a submit whose body it
+was never sent, and a CS error is exactly what that looks like. It would also explain why `rayland-refapp`
+and `rayland-icosa-cpu` never met this: their command streams are small enough to ride inline in the ring.
+Against the hypothesis: C's `scan_for_out_of_line_stream` guard exists for precisely this class of hazard and
+**did not fire once**, so either the submit is not out-of-line in the sense that guard detects, or the guard's
+over-approximation has a hole. Both are checkable, and neither is checked yet.
+
+**Deliberately not fixed today.** The measurement that decides it is to dump the failing submit's bytes as S
+sees them and compare against what the application wrote — if they diverge, it is the staging pool; if they
+match, the fault is in what the submit *references* rather than in the stream itself, and the swapchain
+images S built from tokens become the suspect. After seven refuted readings of the previous wall, the rule
+earned there applies here too: **make the components say what they are doing, rather than reasoning about
+which is at fault.**
+
+**Where this leaves WP0.** The `WaylandArg::Buffer(_)` arm that Task 4.3 exists to fill is now genuinely
+reachable — the application constructs the buffers and the fd->token correlation resolves all three to real
+S-side resources. 4.3 is no longer blocked behind an unreachable code path; it is blocked behind a submit
+that does not decode. That is a much better place to be than this morning.
