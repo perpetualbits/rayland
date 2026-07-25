@@ -1129,3 +1129,27 @@ the ledger flagged as (c)1's bandwidth follow-up — **ship only what changed** 
 only the blobs a delta's commands actually read, or content-addressing so an unchanged blob crosses once).
 That is a real (c)1 design task with a clear shape, and it is what stands between the correct WP0 tunnel
 (4.1–4.4, unchanged) and a live vkcube. Reverted both throwaway transport experiments; nothing shipped.
+
+### 2026-07-25 — Scoping the fix: send only what changed, mirroring the return path
+
+With the vkcube slowness pinned to whole-blob re-shipping (16.5 MB to move 23 KB of commands), scoped the
+(c)1 fix into a design spec (`docs/design/2026-07-25-c1-incremental-blob-sync.md`). The shape was never really
+in doubt once the cause was clear, and the module's own docstring had sketched it in prose from the start:
+C keeps a baseline copy of what it last sent S for each application blob, diffs the live mapping against it on
+each relay, ships only the changed byte-runs, and ships nothing for an unchanged blob. It is the exact
+mirror of the technique S already uses for the return path (the `BlobRun` diff, Task 5b) — proven, symmetric,
+and it needs no wire change because `C2S::BlobData` already carries an offset.
+
+Two things were worth thinking through rather than assuming. First, the owner's instinct to combine a
+fingerprint with the copy: a good question with an instructive answer — because there is no change signal to
+consult, C must read the whole blob every relay regardless, and once you are reading it, comparing directly
+against the saved copy already answers both "did it change?" and "which bytes?"; a fingerprint would be a
+second pass answering only the former. So the fingerprint buys nothing *here* — its real job (spotting
+identical content across blobs or across time, so it never crosses twice) is content-addressing, which is
+(c)3, deliberately out of scope. Second, the one subtle correctness point, which the spec makes load-bearing:
+when S's own writes come back over the return path, C must fold them into the baseline as it applies them, or
+the next forward diff would ship S's bytes straight back — the symmetric twin of the last-writer-wins bug
+Task 5b fixed on the S side. The scope boundary is drawn hard: this removes re-shipping of *unchanged* blobs
+and nothing more — it is not the remote-`vkMapMemory` problem (a blob genuinely rewritten every frame still
+ships whole; that stays (c)2's), and not dedup ((c)3). It is exactly what stands between the correct WP0
+tunnel and a live vkcube.
