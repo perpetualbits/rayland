@@ -1173,3 +1173,45 @@ bandwidth debt and not a WP0 bug, and the transport dead ends (delayed ACK, init
 out and reverted. Not merging to main: the branch is mid-project (WP0 4.3 and a live vkcube still ahead, the
 blob-sync fix designed but unbuilt), so it stays a feature branch until WP0 actually lands — everything is
 committed and pushed instead. Loose ends closed to the branch, not to main.
+
+### 2026-07-25 — The blob-sync fix landed and held: e2e stayed bit-identical, C→S blob bytes fell from 16.5 MB to 267 KB
+
+Executed the three-task plan (`a0b4bd7` baseline+diff primitive, `b84fab5` ship-changed-runs-only, and this
+session's re-baseline-on-return-path call) and ran the whole thing end to end. The one line this task added
+was small on purpose: in `apply_blob_data` (`crates/rayland-c/src/main.rs`), right after S's bytes are copied
+into the mapping, `blob.note_s_wrote(start, bytes)` folds those same bytes into C's baseline. Without it, the
+fix would have been only half-symmetric: C would stop re-shipping *its own* unchanged blobs, but the moment
+S wrote a readback back, C's next diff would see the mapping (now carrying S's bytes) differ from a
+still-zero baseline and ship S's own bytes straight back to S — the C→S twin of the last-writer-wins wobble
+(c)1 Task 5b fixed on the S→C side. `rayland-c --lib` (36/36) and `no_gpu_linkage` both stayed green.
+
+**The correctness gate is the part that actually mattered, and it held clean on the first try.**
+`cargo test -p rayland-s --test loopback_e2e` — both tests passed (`test result: ok. 2 passed; 0 failed`,
+97 s): the refapp's `assert_eq!` triangle-pixel checks all held (they'd fail loudly on any dropped byte), and
+the icosa test's per-frame comparison against the native run — 120 frames, byte-for-byte — produced zero
+`FAILED` frames. This is the proof the diff-and-rebaseline scheme loses nothing: refapp exercises one
+write-once/read-back blob, icosa exercises a blob rewritten every single frame, and both routed through the
+new run-diffing/re-baselining path with no wrong pixel anywhere. Nothing here was weakened or skipped to get
+green.
+
+**The measurement** (the actual point of the whole sub-project) came from a loopback vkcube smoke
+(`rayland-s`+`rayland-c` via `setsid`, `RAYLAND_C1_METRICS=1`, the same `VN_PERF=no_multi_ring,...` flags the
+4.3 work already established). vkcube ran for ~35 s before hitting the same known SIGABRT/latency-trap wall
+the 07-24 entries already root-caused (S-side ring-completion latency under WP0's still-open items — not
+this change's scope, and not touched). In that window it relayed 454 blob-sync messages and 89 ring deltas.
+The last `C1METRICS` line before the abort: `c2s_blob_sync_bytes=267069` against the pre-change baseline of
+**16,574,464** — a **~62×** reduction, not the full "two orders of magnitude" a longer, uninterrupted run
+might show, but the same direction and the same mechanism (stop re-shipping blobs that did not change).
+`c2s_ring_bytes=23764` versus the baseline's 22,955 — essentially unchanged, as expected, since this task
+never touches ring-delta shipping. Reporting this as measured, not extrapolated: vkcube did not run to
+completion, so this is the sample the ~35 s window actually produced, not a projection of what a full run
+would show.
+
+**What is still open, stated plainly.** This does not touch remote `vkMapMemory`: a blob genuinely rewritten
+every frame (icosa's fractal texture, or vkcube's own per-frame uniforms) still diffs to nearly its whole
+size every time, because "nearly everything changed" is a true diff, not a bug — that remains (c)2's problem.
+Cross-blob and cross-time content dedup (an identical blob crossing only once, ever) is untouched and stays
+(c)3. And the vkcube abort itself is neither caused nor fixed by this change — it is the same S-side
+ring-completion latency wall the 07-24 entries already traced to (c)2 ground; this session did not chase it
+further, since the brief scoped Task 3 to the re-baseline call and the two gates (unit suites, e2e), not to
+making vkcube run to completion.

@@ -653,6 +653,13 @@ fn apply_blob_data(blobs: &BlobTable, res_id: u32, offset: u64, bytes: &[u8]) ->
     let start = offset as usize;
     blob.bytes_mut()[start..end as usize].copy_from_slice(bytes);
 
+    // **Keep C's baseline in step with what S wrote.** S owns the readback buffers and the reply
+    // arena; the bytes it just sent are now what S holds for this blob, so fold them into C's baseline.
+    // Without this, the next C→S diff would see C's mapping (now carrying S's writes) differ from a
+    // stale baseline and ship S's own bytes back to S — the last-writer-wins wobble (c)1 Task 5b fixed
+    // in the S→C direction, here in its C→S twin. See `docs/design/2026-07-25-c1-incremental-blob-sync.md`.
+    blob.note_s_wrote(start, bytes);
+
     // **T7 — packet installed on C** (design note §7): the moment S's bytes are in the pages Mesa
     // mapped. The `res`/`off` match the S-side T6 so the join can pair departure with installation
     // across the two processes' shared monotonic clock, and the whole point of the graph is whether
