@@ -71,6 +71,7 @@ use rayland_vtest::transport::{ShmMapping, create_memfd};
 // Ring-findings §6's blob_id discrimination, held once for both (c)1 daemons. See
 // `LocalBlob::is_application_memory`.
 use rayland_vtest::venus_ring::is_application_memory;
+use rayland_relay::BlobRun;
 
 /// One blob resource's **local** shared memory: the pages Mesa maps and writes, and that
 /// `rayland-c` reads in order to relay their contents to S.
@@ -114,6 +115,14 @@ pub struct LocalBlob {
     /// resource id. Captured at creation because the fd is only briefly in hand — it is handed to Mesa
     /// and dropped — but the inode is stable for the memfd's whole life, which is this blob's life.
     inode: (u64, u64),
+    /// C's copy of the bytes S currently holds for this blob — the baseline the C→S diff ships against.
+    ///
+    /// Zero-length for a Venus-internal blob (the ring, reply arena, staging pool): only the
+    /// application's own memory is shipped whole C→S, so only it needs a baseline (see
+    /// [`crate::blob_sync`]). For an application blob it is the blob's size, initialised to zeros —
+    /// which matches S's fresh, zero-filled memfd, so the first diff ships exactly the application's
+    /// initial non-zero content and the two copies agree from the first relay onward.
+    baseline: Vec<u8>,
 }
 
 impl LocalBlob {
@@ -151,12 +160,21 @@ impl LocalBlob {
         // would read stale zeros forever — a failure that looks like "the application produced no
         // commands" rather than like a mapping bug.
         let mapping = ShmMapping::map(fd.as_fd(), size)?;
+        // Only the application's own memory is shipped whole C→S and therefore needs a baseline; a
+        // Venus-internal blob (the ring, the reply arena) gets an empty one and is never diffed. Zeros
+        // match S's fresh memfd, so the first diff ships exactly the application's initial content.
+        let baseline = if is_application_memory(blob_id) {
+            vec![0u8; mapping.len()]
+        } else {
+            Vec::new()
+        };
         Ok((
             LocalBlob {
                 mapping,
                 size,
                 blob_id,
                 inode,
+                baseline,
             },
             fd,
         ))
@@ -240,6 +258,73 @@ impl LocalBlob {
             std::slice::from_raw_parts_mut(self.mapping.as_ptr() as *mut u8, self.mapping.len())
         }
     }
+
+    /// The byte-runs of this blob that differ from the baseline, re-baselining as it goes — the C→S
+    /// incremental sync. Empty for an unchanged blob, and empty for a Venus-internal blob (which has
+    /// no baseline). See `docs/design/2026-07-25-c1-incremental-blob-sync.md`.
+    ///
+    /// # Why one pass, from a single read
+    /// The application writes these pages with no call to intercept, so C must read the whole blob to
+    /// learn what changed (there is no signal). Reading it once and using those same bytes for both the
+    /// shipped run and the new baseline is what keeps C's baseline equal to what it actually sent — a
+    /// second read for the baseline could see later writes and drift. A byte that matches the baseline
+    /// ends the current run rather than being coalesced over, because coalescing would re-ship exactly
+    /// the unchanged bytes this exists to skip (spec §"fragmentation").
+    ///
+    /// # Pitfall: this read is racy against Mesa, by construction
+    /// A torn read (the application mid-write) ships a torn intermediate; it is transient and the next
+    /// relay's diff corrects it. This is the same inherent raciness [`Self::bytes`] documents and the
+    /// remote-`vkMapMemory` problem (c)2 owns — not this method's to solve.
+    pub fn take_changed_runs(&mut self) -> Vec<BlobRun> {
+        let len = self.mapping.len();
+        // Only application blobs carry a baseline sized to the mapping; a Venus-internal blob has an
+        // empty one and is never diffed.
+        if self.baseline.len() != len {
+            return Vec::new();
+        }
+        // Take a raw pointer to the mapping so the live view below borrows nothing tracked, letting us
+        // mutate `self.baseline` in the same loop. The mapping and the baseline are disjoint
+        // allocations (an mmap and a `Vec`), so this cannot alias.
+        let ptr = self.mapping.as_ptr() as *const u8;
+        // SAFETY: `ptr` addresses `len` bytes of a live `MAP_SHARED` mapping that outlives this borrow;
+        // `u8` has no invalid patterns; and `live` is disjoint from `self.baseline`, so mutating the
+        // baseline below does not alias it. The concurrent-writer race is documented above.
+        let live: &[u8] = unsafe { std::slice::from_raw_parts(ptr, len) };
+        let mut runs = Vec::new();
+        let mut i = 0;
+        while i < len {
+            // Skip bytes that already match what S has.
+            if live[i] == self.baseline[i] {
+                i += 1;
+                continue;
+            }
+            // A changed run: extend it while the bytes differ, updating the baseline to the live bytes
+            // as we go so the baseline ends equal to what this run ships.
+            let start = i;
+            while i < len && live[i] != self.baseline[i] {
+                self.baseline[i] = live[i];
+                i += 1;
+            }
+            runs.push(BlobRun {
+                offset: start as u64,
+                bytes: live[start..i].to_vec(),
+            });
+        }
+        runs
+    }
+
+    /// Fold bytes S wrote (arriving over the S→C return path) into the baseline, so the next
+    /// [`Self::take_changed_runs`] does not turn around and ship S's own bytes back to S.
+    ///
+    /// No-op for a Venus-internal blob (no baseline). The caller [`crate::main`]'s `apply_blob_data`
+    /// has already bounds-checked `offset + bytes.len()` against the blob size, and the baseline is
+    /// exactly that size, so the slice below is in range.
+    pub fn note_s_wrote(&mut self, offset: usize, bytes: &[u8]) {
+        if self.baseline.len() != self.mapping.len() {
+            return;
+        }
+        self.baseline[offset..offset + bytes.len()].copy_from_slice(bytes);
+    }
 }
 
 #[cfg(test)]
@@ -247,6 +332,11 @@ mod tests {
     use super::*;
     // Mapping the same memfd a second time, to play the part of Mesa.
     use std::os::fd::AsFd;
+
+    /// The app's vertex buffer id (ring-findings §6): a non-zero `blob_id` marks application memory.
+    const APP_BLOB_ID: u64 = 16;
+    /// A Venus-internal shmem id: `blob_id == 0` is the ring/arena/staging pool, never diffed C→S.
+    const INTERNAL_BLOB_ID: u64 = 0;
 
     /// The blob records the memfd's real inode, and it is the same inode a second `fstat` of the
     /// descriptor reports — the property the buffer-by-token proxy relies on. If the recorded inode
@@ -356,6 +446,82 @@ mod tests {
              `vn_ring_wait_seqno` is released by the ring's `head`, independently of this write, so \
              a broken shadow does not hang the application; it releases it onto stale zeros, which \
              fails whatever check the reply's real value would have passed"
+        );
+    }
+
+    #[test]
+    fn a_fresh_app_blob_diffs_its_whole_nonzero_content_as_one_run() {
+        // A fresh application blob's baseline is zeros; writing non-zero content makes every byte
+        // differ, so the first diff is exactly one run covering the whole blob.
+        let (mut blob, _fd) = LocalBlob::create(APP_BLOB_ID, 64).expect("an app blob");
+        blob.bytes_mut().fill(0x33);
+        let runs = blob.take_changed_runs();
+        assert_eq!(runs.len(), 1, "a wholly-written blob is one run");
+        assert_eq!(runs[0].offset, 0);
+        assert_eq!(runs[0].bytes, vec![0x33; 64]);
+    }
+
+    #[test]
+    fn an_unchanged_app_blob_diffs_to_nothing_after_it_was_shipped() {
+        // Once a diff has run it has re-baselined; a second diff of the untouched blob ships nothing.
+        let (mut blob, _fd) = LocalBlob::create(APP_BLOB_ID, 64).expect("an app blob");
+        blob.bytes_mut().fill(0x33);
+        let _ = blob.take_changed_runs(); // ships and re-baselines
+        assert!(
+            blob.take_changed_runs().is_empty(),
+            "an unchanged blob must ship nothing on the next relay"
+        );
+    }
+
+    #[test]
+    fn a_partial_change_diffs_only_the_changed_run() {
+        // After the baseline holds 0x33, changing bytes [10..20] yields one run at offset 10.
+        let (mut blob, _fd) = LocalBlob::create(APP_BLOB_ID, 64).expect("an app blob");
+        blob.bytes_mut().fill(0x33);
+        let _ = blob.take_changed_runs();
+        blob.bytes_mut()[10..20].fill(0x44);
+        let runs = blob.take_changed_runs();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].offset, 10);
+        assert_eq!(runs[0].bytes, vec![0x44; 10]);
+    }
+
+    #[test]
+    fn two_disjoint_changes_diff_as_two_runs() {
+        // Two separated changed regions, with unchanged bytes between them, are two runs — never one
+        // coalesced run, which would re-ship the unchanged bytes the diff exists to skip.
+        let (mut blob, _fd) = LocalBlob::create(APP_BLOB_ID, 64).expect("an app blob");
+        blob.bytes_mut().fill(0x33);
+        let _ = blob.take_changed_runs();
+        blob.bytes_mut()[5..10].fill(0x44);
+        blob.bytes_mut()[20..25].fill(0x55);
+        let runs = blob.take_changed_runs();
+        assert_eq!(runs.len(), 2, "disjoint changes must not coalesce across unchanged bytes");
+        assert_eq!((runs[0].offset, runs[0].bytes.len()), (5, 5));
+        assert_eq!((runs[1].offset, runs[1].bytes.len()), (20, 5));
+    }
+
+    #[test]
+    fn an_internal_blob_has_no_baseline_and_diffs_to_nothing() {
+        // Venus's own shmems are never shipped whole C→S; they carry no baseline and diff to nothing
+        // even when written, so `messages_for_delta` never ships them by this path.
+        let (mut blob, _fd) = LocalBlob::create(INTERNAL_BLOB_ID, 64).expect("an internal blob");
+        blob.bytes_mut().fill(0x11);
+        assert!(blob.take_changed_runs().is_empty());
+    }
+
+    #[test]
+    fn note_s_wrote_keeps_the_baseline_so_c_does_not_ship_s_bytes_back() {
+        // The return-path fold: when S writes a blob and sends it back, C applies it to the mapping AND
+        // folds it into the baseline. The next C→S diff must then see no difference and ship nothing —
+        // otherwise C would ship S's own bytes straight back to S (the last-writer-wins wobble).
+        let (mut blob, _fd) = LocalBlob::create(APP_BLOB_ID, 64).expect("an app blob");
+        // Simulate `apply_blob_data`: S's bytes land in the mapping and in the baseline together.
+        blob.bytes_mut().fill(0x77);
+        blob.note_s_wrote(0, &[0x77; 64]);
+        assert!(
+            blob.take_changed_runs().is_empty(),
+            "C must not re-ship the bytes S itself wrote"
         );
     }
 }
