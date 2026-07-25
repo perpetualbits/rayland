@@ -1666,3 +1666,55 @@ and may well perturb the very timing the stall depends on.
 Nothing else was learned this turn, and nothing was built. Stating that plainly rather than padding it: the
 measurement that matters has not been taken yet, and the four refuted theories from earlier today are still
 refuted.
+
+### 2026-07-25 — The stack, S's ring status, and a fifth correction: the consumer is blocked *inside* dispatch, not parked
+
+With `ptrace_scope` relaxed for the session, gdb finally reached the render-server worker
+(`virgl-1-gpu_ren`), and S's own ring control words were read for the first time. Together they kill two more
+theories, including one this diary asserted two entries ago.
+
+**The stack, and the end of the multi-ring red herring.** Three threads are named `vkr-ring-1`. Only one is a
+ring thread: its frames run into the `gpu_ren` binary. The other two run into
+**`libnvidia-glcore.so.595.71.05`** — they are NVIDIA driver workers that inherited the `comm` name, because
+Linux copies the creating thread's name to new threads. So there was **only ever one ring**, which is exactly
+what the protocol evidence said all along (one `vkCreateRingMESA`, at offset 0, correctly latched). Two
+independent measurements now agree, and the "extra rings" that survived one refutation are gone for good.
+
+**S's ring status, which nothing had ever read.** Every `head`/`tail`/`status` reading in this investigation
+came from **C's** copy of the ring — and C's copy cannot show a failure that happens on S, since they are
+different memory on different machines. Reading S's copy after each doorbell:
+
+```
+relayed_tail=22704  s_head=22704  s_tail=22704  status=4 [ALIVE]
+relayed_tail=22820  s_head=22704  s_tail=22820  status=4 [ALIVE]
+```
+
+**`VK_RING_STATUS_FATAL_BIT_MESA` (0x2) is never set — 0 occurrences all session.** That rules out the live
+suspect from the previous entry: `vkr_dispatch_vkNotifyRingMESA`'s `lookup_ring` miss, which calls
+`vkr_context_set_fatal` and returns with no log at all. The context is healthy. The doorbell is finding its
+ring.
+
+**And the correction.** Status `4` is `ALIVE` **without** `IDLE`. The park branch sets `IDLE` immediately
+before `cnd_wait` and clears it only on waking, so a parked ring thread reads `IDLE|ALIVE` (5) — and 52
+samples this session do. At the stall it reads **4**, with `head` frozen and 116 bytes of work sitting past
+it. So the ring thread is **not parked**; it is inside command processing and not coming out.
+
+That means the previous entry's reading of the gdb stack was wrong. Frame #6 is a plain `cnd_wait` with
+`abstime=0x0`, and it was matched to `vkr_ring_thread`'s park line because that line is a plain `cnd_wait`
+with no timeout. But virglrenderer has other `cnd_wait` sites, the frames either side are unsymbolised
+addresses in a stripped binary, and **the status bits say the park branch was not taken**. The honest reading
+is: the consumer is blocked on *some* condition variable **inside the dispatch of the command at 22704** —
+which the ring stream names as `vkAllocateMemory` — and which condvar that is remains unknown.
+
+So the shape of the failure has changed completely. It is not a lost wakeup, not a fatal context, not a
+missing blob, and not multi-ring. **The consumer entered `vkAllocateMemory` and never returned.** Every one of
+those four had a mechanism that sounded right; each died to a measurement that was cheap once someone took it.
+
+**The next step is narrow and mechanical, not another theory:** symbolise frames #7 and #8. The worker binary
+is stripped, so this needs its load base from `/proc/<pid>/maps` while it is stopped, subtracted from the
+frame addresses, and the result resolved against whatever symbols `/usr/libexec/virgl_render_server` still
+exports — or, failing that, a debug build of virglrenderer 1.2.0 (the linked version; the source is already on
+disk). Naming that one function ends the search, because it is the thing the allocation is waiting on.
+
+**Housekeeping:** `kernel.yama.ptrace_scope` was relaxed to `0` for this session at the owner's hand and must
+be restored to `1`. It is not something to leave lying open on a development machine.

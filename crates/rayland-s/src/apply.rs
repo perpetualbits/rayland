@@ -49,7 +49,8 @@ use rayland_vtest::venus_ring::decode::{
     find_destroy_device, find_get_device_queue2, find_queue_submit,
 };
 use rayland_vtest::venus_ring::{
-    RING_BUFFER_OFFSET, RingIdentity, notify_ring_command, ring_handle_from_create,
+    RING_BUFFER_OFFSET, RING_HEAD_OFFSET, RING_STATUS_OFFSET, RING_TAIL_OFFSET, RingIdentity,
+    notify_ring_command, ring_handle_from_create,
 };
 use rayland_vtest::{EngineError, RenderEngine};
 // The relay protocol.
@@ -803,6 +804,13 @@ impl Applier {
                     // indistinguishable, from C, from a slow S; it must not be silent here.
                     reply_log_doorbell(tail, self.venus_ring_handle, self.ctx_id, false);
                 }
+                // DIAGNOSTIC (`RAYLAND_S_REPLY_LOG`): read **S's own** ring control words, which no
+                // measurement so far has looked at — every `head`/`status` reading to date came from
+                // C's copy, and the two are different memory in different machines. This is the one
+                // place the silent failure would show: `vkr_dispatch_vkNotifyRingMESA` calls
+                // `vkr_context_set_fatal` and returns **with no log at all** when its `lookup_ring`
+                // misses, and a fatal context sets `VK_RING_STATUS_FATAL_BIT_MESA` (0x2) here.
+                reply_log_ring_control(self.blobs.get(&ring_res_id), ring_res_id, tail);
 
                 // **No `RingProgress` here, and that is the point.** The ring thread runs
                 // asynchronously; at this instant it has almost certainly consumed nothing. Reporting
@@ -1548,6 +1556,83 @@ fn reply_log_commands(tail: u32, bytes: &[u8]) {
         bytes.len(),
         named.join(","),
         stop
+    );
+}
+
+/// Report **S's own** copy of a ring's control words: `head`, `tail`, and `status`.
+///
+/// # Why this exists, and why it is not a duplicate of anything C logs
+/// C and S each hold their *own* memory for the ring — C's memfd that Mesa maps, and S's blob that
+/// virglrenderer's ring thread consumes. Every `head`/`tail`/`status` reading taken during this
+/// investigation came from C's copy, and **C's copy cannot show a failure that happens on S**. In
+/// particular `vkr_dispatch_vkNotifyRingMESA` (`vkr_transport.c:301-305`) does this when its ring
+/// lookup misses:
+///
+/// ```c
+/// struct vkr_ring *ring = lookup_ring(ctx, args->ring);
+/// if (!ring) {
+///    vkr_context_set_fatal(ctx);   /* no vkr_log, no message anywhere */
+///    return;
+/// }
+/// ```
+///
+/// A context killed that way announces itself **only** through `VK_RING_STATUS_FATAL_BIT_MESA`
+/// (`0x2`) in S's status word — which nothing in Rayland has ever read. The measured symptom this
+/// exists to explain is a ring thread parked indefinitely on its condition variable
+/// (`cnd_wait`, `abstime=0x0`, captured under gdb) while `head` stays frozen and work sits past it.
+///
+/// # Inputs / outputs
+/// - `blob`: S's mapping of the ring resource, or `None` if it is somehow absent — reported rather
+///   than skipped, because an absent ring blob at this point would itself be the finding.
+/// - `res_id`: the ring's resource id, for the log line.
+/// - `relayed_tail`: the `tail` C just relayed, so S's own words can be compared against what C
+///   believes it sent — a divergence there is a different bug from a fatal context.
+/// - Prints one line to stderr; returns nothing. **No-op unless `RAYLAND_S_REPLY_LOG` is set.**
+///
+/// # Pitfall: these words are written by another process, concurrently
+/// virglrenderer's ring thread stores `head` and `status` from the forked render worker with no
+/// synchronisation with this thread, so a reading is a snapshot that may be stale the instant it is
+/// taken. That is fine for the question being asked — `FATAL` is sticky once set, and a frozen
+/// `head` is frozen for seconds — but it would not be fine for anything load-bearing, and nothing
+/// load-bearing may be built on this.
+fn reply_log_ring_control(blob: Option<&HostBlob>, res_id: u32, relayed_tail: u32) {
+    if !reply_log_enabled() {
+        return;
+    }
+    let Some(blob) = blob else {
+        eprintln!("[s-ringctl] res={res_id} relayed_tail={relayed_tail} blob=ABSENT");
+        return;
+    };
+    let bytes = blob.bytes();
+    // Each control word is a little-endian `u32` at a fixed 64-byte-separated offset; a short read
+    // is reported as `None` rather than assumed, since a ring blob too small for its own control
+    // words would itself be the finding.
+    let word = |offset: usize| -> Option<u32> {
+        bytes
+            .get(offset..offset + 4)
+            .map(|w| u32::from_le_bytes(w.try_into().expect("slice is exactly four bytes")))
+    };
+    let status = word(RING_STATUS_OFFSET);
+    // Spell the bits out: `0x2` is the one that matters and is easy to miss in a raw number.
+    let flags = status.map_or_else(String::new, |s| {
+        let mut set = Vec::new();
+        if s & 0x1 != 0 {
+            set.push("IDLE");
+        }
+        if s & 0x2 != 0 {
+            set.push("FATAL");
+        }
+        if s & 0x4 != 0 {
+            set.push("ALIVE");
+        }
+        format!(" [{}]", set.join("|"))
+    });
+    eprintln!(
+        "[s-ringctl] res={res_id} relayed_tail={relayed_tail} s_head={:?} s_tail={:?} s_status={:?}{}",
+        word(RING_HEAD_OFFSET),
+        word(RING_TAIL_OFFSET),
+        status,
+        flags
     );
 }
 
