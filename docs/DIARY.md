@@ -2256,3 +2256,51 @@ That reframes the remaining work from synchronisation to reconciliation, and it 
 the swapchain images exist on S as resources, and the application's commands refer to them as images with
 assumptions — bound memory, a layout, a format — that nothing has yet been made responsible for establishing.
 Chasing bytes is finished; the next question is what S's engine believes those three resources *are*.
+
+### 2026-07-26 — What "CS error" actually means: S's decoder reads past the end of a stream whose bytes are provably intact
+
+Following the elimination to its end, the remaining question was what condition virglrenderer reports as a
+"CS error". The generated dispatcher answers it exactly:
+
+```c
+vn_decode_VkCommandTypeEXT(ctx->decoder, &cmd_type);
+vn_decode_VkFlags(ctx->decoder, &cmd_flags);
+vn_dispatch_table[cmd_type](ctx, cmd_flags);
+if (vn_cs_decoder_get_fatal(ctx->decoder))
+   vn_dispatch_debug_log(ctx, "%s resulted in CS error", vn_dispatch_command_name(cmd_type));
+```
+
+So the message means: **while dispatching `vkQueueSubmit`, the decoder's fatal flag was set.** That flag has
+exactly one trigger, the same `vn_cs_decoder_set_fatal` whose silence misled this diary two days ago — a read
+past the end of the available bytes. **S's decoder believes the submit's body is truncated.**
+
+Which is paradoxical against everything else measured today: the ring relay is byte-exact across 253 deltas,
+every blob's content agrees, and in the captured run all 102 deltas were sent *and* applied before the error.
+The bytes are intact and the decoder runs off the end of them anyway.
+
+**Two readings, and this diary is not going to pick one without evidence** — the count of theories refuted by
+measurement today stands at eight, and every one of them was plausible at the time:
+
+1. **The stream really is short at that moment.** S's ring thread dispatches at S's applied `tail`, and if
+   that tail can ever fall mid-command the decoder would read into bytes not yet relayed. Mesa stores `tail`
+   *after* writing a command, so every published tail should be a command boundary — but "should be" is
+   exactly the kind of assumption this week has been punishing, and it has not been checked. It is checkable:
+   walk the relayed stream cumulatively and confirm every relayed `tail` lands on a boundary.
+2. **The submit's body is not all in the ring.** Venus can place a recorded command stream elsewhere, and
+   `vkExecuteCommandStreamsMESA` (type 180) is how it refers to one. The scan for that opcode found nothing —
+   but the scan only ever saw each delta's *first* unknown command, because `decode_commands` halts at the
+   first size it does not know, so a 180 anywhere after that first command is invisible to it.
+
+**Both readings are blocked on the same missing capability, and that is the real next piece of work:**
+`venus_ring::decode`'s `encoded_size` table knows only a handful of command types, so the decoder cannot walk
+a full stream — it stops at the application's first real command, every time. That was a sound, deliberately
+conservative choice when the ring was opaque freight to be relayed unexamined, and it has served this whole
+investigation well as a way to *name* the command in flight. It is now the limiting factor: **the question
+"where does this stream actually end, and what is in it" cannot be asked at all.** Extending that table is not
+a diagnostic hack; it is the difference between relaying bytes and understanding them, and it would answer
+both readings above directly.
+
+That is a piece of work with a clear shape and a clear payoff, and it deserves to be started deliberately
+rather than bolted on at the end of a long day. The elimination that leads to it is complete and recorded:
+**not the transport, not the ring bytes, not any blob's content, not the doorbell, not the consumer, not the
+staging pool.** What is left is the framing of the stream itself, and Rayland currently cannot see it.
