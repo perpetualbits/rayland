@@ -131,7 +131,8 @@ window.PROJECT_MAP = {
         { label: "Forward tunnel (4.1–4.2)", status: "done", desc: "App → C proxy → link → S's real compositor, binds and requests replayed." },
         { label: "fd → token intercept", status: "done", desc: "The swapchain dma-buf fd is correlated to a resource id and never crosses." },
         { label: "Event return path (4.4)", status: "done", desc: "Local dmabuf-format synthesis + a relay tunnel (eventfd + send_event, S→app id translation) — vkcube now receives and acks xdg configure." },
-        { label: "Token → wl_buffer (4.3)", status: "active", desc: "Resolve the swapchain token to S's retained HOST3D dma-buf and present zero-copy — the wall vkcube now sits at." }
+        { label: "Token → wl_buffer (4.3)", status: "planned", desc: "Resolve the swapchain token to S's retained HOST3D dma-buf and present zero-copy. Not yet reachable: vkcube never calls create_params, so the Buffer-token arm is never entered." },
+        { label: "Reply-decode abort (the current wall)", status: "active", desc: "vkcube dies in Venus's silent vn_cs_decoder_set_fatal — a reply read past its end — on vkGetImageDrmFormatModifierPropertiesEXT (type 187), the last call of the swapchain-image import path. Ring status never goes FATAL and S reports no error, so the two sides disagree about bytes, not semantics. Predates the blob-sync fix (A/B: identical backtrace at 3a7fc39)." }
       ],
       deps: ["c", "relay", "s", "present"]
     },
