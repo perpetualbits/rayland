@@ -1349,3 +1349,54 @@ proxy still refuses the async `zwp_linux_buffer_params_v1.create` as "UNSUPPORTE
 channel)", a comment that 4.4 made false when it built that very channel. Whether that refusal is implicated
 here is not yet known — the application aborts before reaching `create_params` at all — but the comment is
 stale either way and is on the list.
+
+### 2026-07-25 — The failing call has a name: `vkGetImageDrmFormatModifierPropertiesEXT`
+
+The entry above located vkcube's abort as a Venus reply-decode overrun but could not say *which* reply. It
+can now, and the answer is specific enough to act on.
+
+Venus's fatal decode path reports nothing — no opcode, no sizes — so the command had to be recovered from
+our side of the wire, where the bytes still exist. The repository already had the instrument and had simply
+never pointed it here: `venus_ring::decode::decode_commands` walks a ring stream and returns each command's
+type and flags, and `RingCommand.command_flags` bit 0 is "the client wants a reply written back". Twenty-five
+lines in the watcher, gated behind the existing `RAYLAND_RING_DUMP`, decode every relayed delta and name its
+commands. The decoder is deliberately conservative — it stops at the first command whose encoded size it does
+not know — and that limitation turns out to be exactly the right behaviour here, because *the command it
+stops on is the application's own*, every time. Each delta reads: `vkSetReplyCommandStreamMESA` (type 178, the
+reply-arena setup that precedes a reply-bearing call), then one unknown-size command, which is the real one.
+
+The last few deltas before the abort, translated through `vn_protocol_driver_defines.h`:
+
+| type | command |
+|---|---|
+| 21 | `vkAllocateMemory` |
+| 144 | `vkGetImageMemoryRequirements2` |
+| 139 | `vkBindImageMemory2` |
+| 56 | `vkGetImageSubresourceLayout` |
+| **187** | **`vkGetImageDrmFormatModifierPropertiesEXT`** ← the last command; its reply is the one that overruns |
+
+That is the swapchain-image import path read straight off the wire, and it corroborates the other thing the
+ring dump caught moments earlier: a new blob `res=9` of **1,008,000 bytes** — 504 × 500 × 4, a 500×500
+swapchain image with its stride padded to 504. So the application really does get as far as allocating,
+binding and laying out its swapchain image; it dies asking the driver what DRM format modifier that image
+actually has.
+
+**Two things make this sharper than a guess.** First, the ring's own `status` word never sets
+`VK_RING_STATUS_FATAL_BIT_MESA` (0x2) — it moves only between IDLE (0x1) and ALIVE (0x4) — so this is not a
+ring-fatal abort and not a watchdog abort, both of which would have logged. Second, **S reports nothing at
+all**: no error, no refusal, no unsupported-command warning. S relays the bytes, virglrenderer executes them,
+and S believes the session is healthy right up to the moment C's Mesa aborts. A silent failure on one side and
+perfect health on the other is the signature of the two sides disagreeing about *bytes*, not about semantics.
+
+**The hypothesis to test next, stated before testing it:** the reply to command 187 that Venus decodes is not
+the reply S produced — either it never reaches C's reply arena, or it reaches it after the application has
+already been released to read it. The decoder overruns because it is parsing whatever the arena happens to
+hold. This is a return-path ordering question of exactly the family (c)2 spent its length on, and the
+`vkGetFenceStatus` completion gate that solved the readback case is the obvious place to look for an analogous
+hole — but that is a hypothesis, and the next step is to instrument what S writes for 187 against what C's
+arena holds when Venus reads it, not to start patching.
+
+One loose thread worth flagging while it is in view: the proxy answers the app's dmabuf format query *locally*
+with two synthesized LINEAR modifiers, and `vkGetImageDrmFormatModifierPropertiesEXT` is the app asking the
+**driver** what modifier the image really got. If those two answers can disagree, that is a second bug waiting
+behind this one — it would not cause a decode overrun, so it is not today's failure, but it is on the list.

@@ -748,6 +748,34 @@ fn ring_watcher_thread(
                 return;
             };
             let delta = watcher.take_delta(blob.bytes());
+            // DIAGNOSTIC (`RAYLAND_RING_DUMP`), throwaway: name the commands in this delta, and in
+            // particular which of them asked for a reply (`command_flags` bit 0). Venus aborts
+            // *silently* when a reply decodes past its end — `vn_cs_decoder_set_fatal` is the only
+            // abort in the ICD that logs nothing, and it reports no opcode, no sizes, nothing — so
+            // the only way to learn which command was in flight is to decode the stream on this
+            // side, where the bytes still are. Inert unless the variable is set.
+            if let Some(pending) = delta.as_ref() {
+                if std::env::var_os("RAYLAND_RING_DUMP").is_some() {
+                    let (commands, stop) =
+                        rayland_vtest::venus_ring::decode::decode_commands(&pending.bytes);
+                    // One line per delta: the reply-bearing commands are the candidates for the
+                    // abort, so mark them rather than making a reader cross-reference the flags.
+                    let named: Vec<String> = commands
+                        .iter()
+                        .map(|c| {
+                            let reply = if c.command_flags & 1 != 0 { " REPLY" } else { "" };
+                            format!("@{} type={}{}", c.offset, c.command_type, reply)
+                        })
+                        .collect();
+                    eprintln!(
+                        "[ring-cmds] tail={} {} cmd(s) stop={:?}: {}",
+                        pending.tail,
+                        commands.len(),
+                        stop,
+                        named.join(" | ")
+                    );
+                }
+            }
             // Draining bytes proves this watcher is awake, so the IDLE claim published before the
             // last park must go — and it must go *here*, before the network send below, not on some
             // later pass. Mesa tests IDLE on every submit (`vn_ring.c:475-483`) and doorbells if it
