@@ -774,6 +774,33 @@ fn ring_watcher_thread(
                         stop,
                         named.join(" | ")
                     );
+                    // **The multi-ring question.** Thread sampling on S found three `vkr-ring-1`
+                    // threads where (c)1 spec §6 assumes one, and S never saw a second *inline*
+                    // `vkCreateRingMESA` — so any extra ring must be created inside the ring stream,
+                    // which is exactly what this scans for. `decode_commands` cannot walk far enough
+                    // to find them (it halts at the first unknown-size command, which is the
+                    // application's own), so this is a direct scan of the delta's dwords for the
+                    // create/destroy/notify command types. A bare dword match can collide with
+                    // payload data, so the offset is printed and the count is what matters, not any
+                    // single hit: a real ring creation should coincide with a ring thread appearing.
+                    for off in (0..pending.bytes.len().saturating_sub(3)).step_by(4) {
+                        let word = u32::from_le_bytes([
+                            pending.bytes[off],
+                            pending.bytes[off + 1],
+                            pending.bytes[off + 2],
+                            pending.bytes[off + 3],
+                        ]);
+                        let name = match word {
+                            188 => "vkCreateRingMESA",
+                            189 => "vkDestroyRingMESA",
+                            190 => "vkNotifyRingMESA",
+                            _ => continue,
+                        };
+                        eprintln!(
+                            "[ring-life] tail={} off={off} candidate={name} ({word})",
+                            pending.tail
+                        );
+                    }
                 }
             }
             // Draining bytes proves this watcher is awake, so the IDLE claim published before the

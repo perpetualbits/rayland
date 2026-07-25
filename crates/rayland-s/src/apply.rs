@@ -821,6 +821,14 @@ impl Applier {
                 // ring its own doorbell — see `venus_ring::doorbell` for why a host on the far side
                 // of a network has to do that at all.
                 self.latch_ring_handle(&cmd);
+                // DIAGNOSTIC (`RAYLAND_S_REPLY_LOG`): `ring_handle_from_create` inspects **offset 0
+                // only**, and its own docs name the hazard — "a batch that buried a ring creation
+                // behind another command would be missed here … the ring would visibly stall". S's
+                // thread sampling found three `vkr-ring-1` threads where spec §6 assumes one, and no
+                // ring creation appears in the ring stream, so the inline batch is the remaining
+                // place they can come from. This scans the whole batch rather than its head, so a
+                // create at a non-zero offset — which the latch silently drops — becomes visible.
+                reply_log_scan_ring_creates(&cmd);
                 engine.submit(ctx_id, &cmd)?;
                 Ok(Vec::new())
             }
@@ -1541,6 +1549,54 @@ fn reply_log_commands(tail: u32, bytes: &[u8]) {
         named.join(","),
         stop
     );
+}
+
+/// Scan a whole inline batch for `vkCreateRingMESA` commands, wherever they sit in it.
+///
+/// # Why this exists
+/// [`ring_handle_from_create`](rayland_vtest::venus_ring::ring_handle_from_create) reads the command
+/// type at **offset 0 only**, and its own documentation names the consequence: *"a batch that buried
+/// a ring creation behind another command would be missed here … S would never learn the handle,
+/// never ring a doorbell, and the ring would visibly stall"*. A visibly stalled ring is exactly
+/// vkcube's symptom, and sampling the render worker's threads found three `vkr-ring-1` threads —
+/// `vkr_ring.c:248` names those by context id, so they are three rings in one context — where (c)1
+/// spec §6 assumes one. No ring creation appears anywhere in the ring stream, so the inline batch is
+/// the only remaining place they can be created. This says whether the latch is missing them.
+///
+/// # Inputs / outputs
+/// - `cmd`: one inline batch, exactly as it arrived from C.
+/// - Prints one line per candidate to stderr; returns nothing. **No-op unless
+///   `RAYLAND_S_REPLY_LOG` is set.**
+///
+/// # Pitfall: a dword match is a candidate, not a proof
+/// This scans for the command-type dword at 4-byte alignment, so a payload word that happens to
+/// equal 188 will show up too. **Offset 0 is the case that matters**: a hit there is what the latch
+/// already handles, and a hit *only* at a non-zero offset is the bug this is looking for. Judge the
+/// pattern across a run, not any single line.
+fn reply_log_scan_ring_creates(cmd: &[u8]) {
+    if !reply_log_enabled() {
+        return;
+    }
+    // The handle sits eight bytes into the command, after `[type][flags]` — the same layout
+    // `ring_handle_from_create` reads, applied at each candidate offset instead of only at zero.
+    const HANDLE_OFFSET: usize = 8;
+    for off in (0..cmd.len().saturating_sub(3)).step_by(4) {
+        let word = u32::from_le_bytes([cmd[off], cmd[off + 1], cmd[off + 2], cmd[off + 3]]);
+        if word != 188 {
+            continue;
+        }
+        // Only report a handle when the batch actually holds eight more bytes for one; a truncated
+        // tail is itself worth seeing rather than silently skipping.
+        let handle = cmd
+            .get(off + HANDLE_OFFSET..off + HANDLE_OFFSET + 8)
+            .map(|h| u64::from_le_bytes(h.try_into().expect("slice is exactly eight bytes")));
+        eprintln!(
+            "[s-ringcreate] batch_len={} off={off} latched_by_offset0={} handle={:?}",
+            cmd.len(),
+            off == 0,
+            handle.map(|h| format!("{h:#x}"))
+        );
+    }
 }
 
 /// Report a blob resource S has created and mapped.

@@ -1590,3 +1590,48 @@ built until that is on the screen.**
 The lesson worth keeping, beyond this bug: *"S reports no error"* was treated as informative all day, and it
 never was. S cannot report an error about a ring it does not know exists. Silence from a component is only
 evidence when you have first established that the component is in a position to speak.
+
+### 2026-07-25 — The measurement refuted the multi-ring theory too, and caught an error in my own instrument
+
+The previous entry proposed that extra rings were being created by a path S cannot see — most plausibly an
+inline batch with the ring creation buried behind another command, a hazard
+`ring_handle_from_create`'s own docs name in as many words: *"a batch that buried a ring creation behind
+another command would be missed here … the ring would visibly stall"*. It fit the symptom exactly. **It is
+wrong.**
+
+Scanning **every** inline batch S receives for the `vkCreateRingMESA` command type, at every 4-byte offset
+rather than only at zero, found **exactly one ring creation in the entire session**:
+
+```
+[s-ringcreate] batch_len=140 off=0 latched_by_offset0=true handle=Some("0x5555555bf450")
+```
+
+`off=0`, correctly latched, and it is the same handle every one of S's doorbells names. The latch is not
+missing anything. An earlier scan of the *ring* stream for the same command types had already returned zero
+hits, so between them: **the protocol carries exactly one ring creation, and S knows about it.**
+
+**And an error in my own instrument, which is the more useful half of this entry.** The claim that the session
+had "three or four rings" came from counting threads matching `comm=vkr-ring` — a pattern that also matches
+**`vkr-ringmon-1`**, the ring *monitor* thread, which is not a ring. The real progression is one ring thread,
+then three. So one of the two numbers behind the multi-ring theory was an artefact of a sloppy grep, and I did
+not check it before building a theory on it. Three refuted hypotheses in a day were all bad inference; this one
+was bad measurement, which is worse, because the whole point of the last several hours was to stop inferring
+and start measuring. An instrument gets verified before its output is trusted, exactly like any other claim.
+
+Three `vkr-ring-1` threads from one `vkCreateRingMESA` remains an unexplained observation rather than a
+theory. `vkr_ring.c:248` names those threads by context id, and there is one context and one worker process
+(`virgl-1-gpu_ren`), so what creates the other two is simply not yet known — and it is no longer even clear
+that it matters.
+
+**What the sampling does say, and it is worth more than any of the theories:** at every sample through the
+stall, **every one of those ring threads is parked in `futex_do_wait`** while `head` stays frozen. The
+consumer side is uniformly asleep. So the question is not "which ring is the doorbell waking" but "why does a
+delivered, accepted `vkNotifyRingMESA` leave every ring thread asleep" — and answering that needs the parked
+thread's actual stack (`gdb` on the `virgl-1-gpu_ren` worker at the moment of the stall, which the sampler can
+now identify by pid), not another dword scan.
+
+Four hypotheses have now been formed and refuted in one day: delayed ACK, reply-decode overrun, the doorbell
+lost-wakeup, and buried multi-ring creation. What they share is that each was built from a correlation and
+then reasoned forward, and each could have been refuted immediately by evidence that was already on disk or one
+command away. The instrumentation built along the way is genuinely useful and is committed. The theories were
+not. **Next session: stack, not story.**
