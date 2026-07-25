@@ -1459,3 +1459,61 @@ from **C's** status word — and the fact that a new 1 MB blob (`res=9`) is crea
 stall. The next measurement is on S: whether its ring thread is parked, and whether the doorbell that should
 wake it is rung and observed. **No fix until that is measured** — three wrong turns in one day is enough
 evidence that this ring's failure modes do not yield to inference.
+
+### 2026-07-25 — Root cause: the doorbell is rung on the wrong event, and only the *last* blob allocation loses the race
+
+The correction above narrowed vkcube's death to a ring stall on S and left one question: why does
+virglrenderer's ring thread stop consuming at `head = 22704`? Measuring the doorbell answered it, and the
+answer is a lost wakeup with a very specific shape.
+
+**First, what the measurement ruled out.** Instrumenting every doorbell (`RAYLAND_S_REPLY_LOG`) shows **91
+rung, none with a missing ring handle, none refused by the engine**, all naming one handle
+(`0x5555555bf450`) — so there is no second ring, no stale latch, and no rejected notification. The doorbell
+for the stalling delta (`tail = 22820`) was rung *and accepted*. Logging S's blob creation ruled out the other
+obvious suspect: **S creates all nine blobs**, including `res=9` (`blob_id = 39`, 1,008,000 bytes). Everything
+S is supposed to do, S does.
+
+**The delta boundaries also correct the previous entry's aim.** `head` freezes at 22704, which is exactly the
+boundary *before* the delta `[22704, 22820)`, and that delta begins at offset 0 with **`vkAllocateMemory`
+(type 21)**. So the stalling command is the allocation, not `vkGetImageDrmFormatModifierPropertiesEXT` — 187
+is simply the next command, queued behind it and never reached.
+
+**The finding is in the interleaving.** Put S's blob creations and doorbells on one timeline:
+
+```
+[s-doorbell] tail=22152
+[s-blob]     created res=8          <- blob created
+[s-doorbell] tail=22232             <- a LATER delta's doorbell wakes the ring thread
+
+[s-doorbell] tail=22820
+[s-blob]     created res=9          <- blob created
+             (nothing, ever)        <- no doorbell follows
+```
+
+The chain: virglrenderer's ring thread reaches a blob-backed `vkAllocateMemory` and **waits for the blob
+resource to exist on the host**. That blob arrives over the **inline vtest path** — a different message
+entirely — and S creates it. But **S rings the doorbell only after `apply_delta`, never after a blob
+creation**, so nothing wakes the waiting thread. And the application, now blocked in `vn_ring_wait_seqno`,
+emits no further ring traffic — so no later delta arrives to ring it by luck. `head` never moves, the app
+spins, Venus aborts it.
+
+**This is why two of three swapchain images work and the third does not.** vkcube allocates three
+(`res=7`, `res=8`, `res=9`, each 1,008,000 bytes = 504 × 500 × 4). For the first two the application still had
+commands to issue, so a subsequent delta's doorbell woke the thread incidentally and the allocation completed.
+The third is the **last** allocation before the app waits on a reply: nothing follows it, so the incidental
+wakeup never comes. The bug has been latent behind that accident the whole time, which is also why it presents
+as "vkcube hangs late in setup" rather than as an obvious protocol error.
+
+It is (c)1 finding #1 again — the doorbell rung on the wrong event — in a guise that finding did not
+anticipate. The code comment at the doorbell site says *"this doorbell is the only thing that will ever make
+these bytes execute"*, which is true and is exactly the problem: it is tied solely to `C2S::RingDelta`, while
+the ring thread can also be waiting on state that arrives by a completely different message.
+
+**The fix follows directly and is deliberately not written yet:** ring the doorbell after anything the ring
+thread may be waiting on — a blob creation at minimum — rather than only after a delta. Before building it,
+two things need checking, because this ring has already produced three wrong turns in a day. First, that
+virglrenderer really does re-check for the blob when notified rather than having latched a failure, since a
+doorbell that wakes a thread into the same failed lookup fixes nothing. Second, whether an unconditional
+doorbell per blob creation is safe against the park sequence in the way the existing one is — `apply_delta`
+stores `tail` with `Release` *before* the doorbell precisely so the consumer cannot miss it, and a blob-created
+doorbell needs the equivalent argument written down before it ships, not after.

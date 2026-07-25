@@ -548,6 +548,12 @@ impl Applier {
                     ApplyError::from(source)
                 })?;
                 self.blobs.insert(res_id, host_blob);
+                // DIAGNOSTIC (`RAYLAND_S_REPLY_LOG`): virglrenderer's Venus implementation makes a
+                // ring-side `vkAllocateMemory` **wait** for the blob resource that backs it, so a
+                // blob C creates but S never does is indistinguishable — from the ring — from a
+                // consumer that has stopped. `head` freezing exactly at a `vkAllocateMemory` boundary
+                // is precisely that ambiguity, and this line resolves it.
+                reply_log_blob_created(res_id, blob_id, size);
                 // Remember which side of the ordering split this blob falls on. `blob_id == 0` is
                 // ring-findings §6's marker for Venus's own shmems — the ring, the reply arena, the
                 // staging pool — and the reply arena is the one whose bytes release the
@@ -784,7 +790,18 @@ impl Applier {
                 // will ever make these bytes execute, so an error here is the session ending, not a
                 // missed optimization.
                 if let (Some(handle), Some(ctx_id)) = (self.venus_ring_handle, self.ctx_id) {
-                    engine.submit(ctx_id, &notify_ring_command(handle))?;
+                    let rung = engine.submit(ctx_id, &notify_ring_command(handle));
+                    // DIAGNOSTIC (`RAYLAND_S_REPLY_LOG`): the doorbell is the *only* thing that makes
+                    // these bytes execute, so "was it rung, for which ring, and did the engine accept
+                    // it" is the question a stalled `head` actually poses. Logged before the `?` so a
+                    // refusal is visible even though it also ends the session.
+                    reply_log_doorbell(tail, Some(handle), Some(ctx_id), rung.is_ok());
+                    rung?;
+                } else {
+                    // No handle or no context means **no doorbell at all** — the bytes are in the
+                    // ring's memory on S and nothing will ever wake the consumer to run them. That is
+                    // indistinguishable, from C, from a slow S; it must not be silent here.
+                    reply_log_doorbell(tail, self.venus_ring_handle, self.ctx_id, false);
                 }
 
                 // **No `RingProgress` here, and that is the point.** The ring thread runs
@@ -1523,6 +1540,67 @@ fn reply_log_commands(tail: u32, bytes: &[u8]) {
         bytes.len(),
         named.join(","),
         stop
+    );
+}
+
+/// Report a blob resource S has created and mapped.
+///
+/// # Why this exists
+/// A ring-side `vkAllocateMemory` that is backed by a blob cannot complete until that blob resource
+/// exists on the host, so if C creates a blob and S does not, virglrenderer's ring thread waits and
+/// `head` stops advancing — which is externally identical to a parked or dead consumer. vkcube
+/// stalls with `head` frozen at exactly a `vkAllocateMemory` boundary while C goes on to create a
+/// 1,008,000-byte blob (its third swapchain image), so whether that blob reached S is the difference
+/// between "the consumer is broken" and "the consumer is correctly waiting for something S never
+/// gave it".
+///
+/// # Inputs / outputs
+/// - `res_id`: the engine-assigned resource id, the same id every wire message names it by.
+/// - `blob_id`: the client-chosen blob id — ring-findings §6's application-versus-Venus signal.
+/// - `size`: the blob's size in bytes, which is what identifies a swapchain image by inspection.
+/// - Prints one line to stderr; returns nothing. **No-op unless `RAYLAND_S_REPLY_LOG` is set.**
+fn reply_log_blob_created(res_id: u32, blob_id: u64, size: u64) {
+    if !reply_log_enabled() {
+        return;
+    }
+    eprintln!("[s-blob] created res={res_id} blob_id={blob_id} size={size}");
+}
+
+/// Report whether the ring's doorbell was rung for a delta, and for which ring.
+///
+/// # Why this exists
+/// virglrenderer's ring thread parks after 1 ms and is woken **only** by `vkNotifyRingMESA`, so this
+/// doorbell is the single thing that makes a relayed delta actually execute. When `head` stops
+/// advancing while `tail` runs on — which is exactly what vkcube's stall looks like — there are only
+/// a few possibilities, and this line separates them: the doorbell was never rung (no ring handle
+/// latched, or no context), it was rung but the engine refused it, or it was rung and accepted and
+/// the consumer still did not advance. The first two are S's bug; the third moves the question into
+/// virglrenderer.
+///
+/// # Inputs / outputs
+/// - `tail`: the delta's frontier — the key that joins this to [`reply_log_commands`] and to
+///   `rayland-c`'s `[ring-cmds]` line.
+/// - `handle`: the latched `vkCreateRingMESA` handle, or `None` if none was ever latched. **`None`
+///   is the loud case**: it means no doorbell was sent at all.
+/// - `ctx_id`: the context the doorbell is submitted on, or `None` for the same reason.
+/// - `accepted`: whether the engine accepted the submission.
+/// - Prints one line to stderr; returns nothing. **No-op unless `RAYLAND_S_REPLY_LOG` is set.**
+///
+/// # Pitfall: "rung and accepted" is not "consumed"
+/// The engine accepting `vkNotifyRingMESA` says the notification reached virglrenderer, not that the
+/// ring thread woke, nor that it consumed anything. Progress is only observable through `head`, which
+/// the consumer writes asynchronously — so a run of accepted doorbells beside a frozen `head` is a
+/// real and meaningful outcome here, not a contradiction.
+fn reply_log_doorbell(tail: u32, handle: Option<u64>, ctx_id: Option<u32>, accepted: bool) {
+    if !reply_log_enabled() {
+        return;
+    }
+    eprintln!(
+        "[s-doorbell] tail={} handle={} ctx={} accepted={}",
+        tail,
+        handle.map_or("NONE".to_string(), |h| format!("{h:#x}")),
+        ctx_id.map_or("NONE".to_string(), |c| c.to_string()),
+        accepted
     );
 }
 
