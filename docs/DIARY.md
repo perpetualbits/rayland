@@ -445,3 +445,38 @@ because it settles a question every future non-laptop session would otherwise ha
 copies of the repository disagree, the laptop is the one telling the truth. The same reasoning the
 project applies to its own protocol (know which side owns the ring, which side merely mirrors it)
 applies to its git topology.
+
+### 2026-07-25 — Rayland has a sibling: reading Parhelion, and an outside review
+
+The human brought two things at once: a long outside review of Rayland (from ChatGPT, working from the
+public repos) and the existence of **Parhelion** — a companion project, started 2026-07-23/24, building a
+Wayland compositor with microkernel discipline whose VISION.md names itself "Rayland's reference S-side
+host." Read both. The strategic assessment went back to the human and the decision is theirs; what
+belongs in the diary is what we *learned*, and how confident we are.
+
+On the review: it is intelligent and worth keeping, but it reviewed the **README**, not the repository —
+and our README still says "there is no working software yet," which has been false for four sub-projects
+and two arcs. The review's headline recommendation ("build a deliberately tiny end-to-end Vulkan path,
+one captured workload, no readback initially") describes roughly where the project stood at C0 — it is
+*behind* the working tree, which has the forward path, presentation, and a frame-perfect readback return
+path over a real network. One of its suggestions (a C-side ICD we write ourselves) contradicts the
+(c)1 discovery this project considers its best: no ICD and no Mesa fork is needed, because the vtest
+host is whoever allocates the ring. The lesson is less about the reviewer than about us: an outdated
+README is not a cosmetic problem — it is the *only* interface most reviewers, human or machine, will
+ever read. Its parts that do survive contact with our reality — compatibility tiers as vocabulary, asset
+identity being more than a content hash, a constrained virtual-GPU profile over transparent exposure —
+are genuinely useful and are recorded in the assessment for (c)3/(c)4 planning.
+
+On Parhelion: it changes the *endgame*, not the current work. The design paper's growth areas ③ and ⑤ —
+buffer-by-token and compositor plumbing, the parts that required persuading the Wayland ecosystem — now
+have a first home that shares an owner with us; Parhelion's scene graph already carries the token-buffer
+seam (`TextureSource`, with `RaylandToken` reserved in a comment) and its process inventory reserves R1,
+a sandboxed replay service that is recognizably `rayland-s`'s future shape. Our crate decomposition
+(engine behind a trait and an actor; presentation split into `rayland-present`) anticipated that split
+without knowing it. Two cautions recorded while they are still cheap: Parhelion must become the first
+*consumer* of the S-side interface, never a hard dependency (the ordinary-Wayland-client presentation
+path stays, as the portable fallback and the honest benchmark); and Parhelion is at M1 (shm, CPU
+compositor, headless) while token-buffers arrive at its M6, so nothing about today's (c)2 work should
+wait on it. Confidence that this pairing is good for Rayland: high. Confidence in any specific
+integration design: deliberately none yet — that is a design doc for later, written jointly against
+their M6.
