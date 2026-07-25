@@ -14,7 +14,7 @@ window.PROJECT_MAP = {
     name: "Rayland",
     tagline: "Native remote GPU rendering for Wayland — ship the commands, not the pixels.",
     repo: "rayland",
-    updated: "2026-07-24"
+    updated: "2026-07-25"
   },
 
   // Each status is a colour band the renderer keys on. The hint is the plain-language meaning.
@@ -105,13 +105,15 @@ window.PROJECT_MAP = {
       files: ["crates/rayland-c/src/main.rs", "crates/rayland-c/src/ring.rs", "crates/rayland-c/src/relay_engine.rs"],
       specs: [
         { label: "(c)1 · The network", href: "docs/c1-the-network.md" },
-        { label: "Venus ring findings", href: "docs/design/2026-07-15-venus-ring-findings.md" }
+        { label: "Venus ring findings", href: "docs/design/2026-07-15-venus-ring-findings.md" },
+        { label: "Incremental blob sync", href: "docs/design/2026-07-25-c1-incremental-blob-sync.md" }
       ],
       parts: [
         { label: "vtest host", status: "done", desc: "Speaks the protocol Mesa's Venus ICD expects; hands out local memfds." },
         { label: "Ring watcher", status: "done", desc: "Polls the ring's tail and relays deltas — the loop the whole project exists for." },
         { label: "Reader thread", status: "done", desc: "Owns recv on the link; routes S's replies, blob data, and progress." },
-        { label: "Stall detector", status: "done", desc: "Distinguishes 'S is slow' from 'S has stopped' where Mesa's watchdog cannot." }
+        { label: "Stall detector", status: "done", desc: "Distinguishes 'S is slow' from 'S has stopped' where Mesa's watchdog cannot." },
+        { label: "Incremental blob sync", status: "done", desc: "C keeps a baseline of what S holds per application blob and ships only the byte-runs that changed — an unchanged blob crosses nothing. Replaces the v1 whole-blob resend that measured 16.5 MB of resends against 23 KB of actual commands on vkcube. Does not solve remote vkMapMemory ((c)2) or dedup ((c)3)." }
       ],
       deps: ["vtest", "relay", "transport"]
     },
