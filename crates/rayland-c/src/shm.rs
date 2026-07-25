@@ -283,6 +283,30 @@ impl LocalBlob {
     /// A torn read (the application mid-write) ships a torn intermediate; it is transient and the next
     /// relay's diff corrects it. This is the same inherent raciness [`Self::bytes`] documents and the
     /// remote-`vkMapMemory` problem (c)2 owns — not this method's to solve.
+    /// Give this blob a zero baseline if it does not have one, so [`Self::take_changed_runs`] will
+    /// diff it — used **only** by the staging-pool experiment (`RAYLAND_C1_SHIP_BLOB`).
+    ///
+    /// # Why this is not simply part of `create`
+    /// A Venus-internal blob deliberately has no baseline, because C has no business publishing S's
+    /// reply arena and the empty baseline is the backstop that makes `take_changed_runs` return
+    /// nothing for it (see [`crate::blob_sync`]). This opens that door for one named resource, on
+    /// purpose, for an experiment — and it is the *incremental* form of that experiment, which
+    /// matters: shipping the pool's contents on every relay tripled C's blob messages and slowed the
+    /// relay enough that the application never reached the submit under test, which invalidated the
+    /// first attempt entirely. Diffing against a baseline makes the steady-state cost one chunked
+    /// comparison and no traffic.
+    ///
+    /// Zero is the right initial value for the same reason it is for an application blob: S's copy is
+    /// a fresh zero-filled memfd, so the first diff ships exactly the current non-zero content.
+    ///
+    /// # Inputs / outputs
+    /// - Returns nothing; idempotent, and a no-op once a baseline of the right length exists.
+    pub fn ensure_baseline(&mut self) {
+        if self.baseline.len() != self.mapping.len() {
+            self.baseline = vec![0u8; self.mapping.len()];
+        }
+    }
+
     pub fn take_changed_runs(&mut self) -> Vec<BlobRun> {
         let len = self.mapping.len();
         // Only application blobs carry a baseline sized to the mapping; a Venus-internal blob has an

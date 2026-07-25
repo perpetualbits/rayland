@@ -255,14 +255,18 @@ pub fn messages_for_delta(blobs: &BlobTable, ring_res_id: u32, delta: RingDelta)
                 if diagnostic_ship_blob() != Some(res_id) {
                     continue;
                 }
-                // Only the non-zero runs: the pool is 8 MiB of which a handful of bytes are set, and
-                // re-shipping megabytes per relay would resurrect the bandwidth wall this session
-                // just removed and make the experiment unreadable.
-                for (start, end) in nonzero_runs(blob.bytes()) {
+                // **Incremental, not whole.** The first version of this shipped the blob's non-zero
+                // runs on *every* relay, which tripled C's blob-message count and slowed the relay
+                // enough that the application never reached the submit under test — the experiment
+                // measured nothing and its null result was worthless. Giving the blob a baseline and
+                // shipping only changed runs makes the steady state one chunked compare and no
+                // traffic, so the app runs at the speed it does without the experiment.
+                blob.ensure_baseline();
+                for run in blob.take_changed_runs() {
                     out.push(C2S::BlobData {
                         res_id,
-                        offset: start as u64,
-                        bytes: blob.bytes()[start..end].to_vec(),
+                        offset: run.offset,
+                        bytes: run.bytes,
                     });
                 }
                 continue;
@@ -593,19 +597,6 @@ fn blob_fingerprints(table: &std::collections::HashMap<u32, crate::shm::LocalBlo
     }
 }
 
-/// FNV-1a over a blob's bytes. Duplicated from the ring fingerprint on purpose — see the S-side
-/// twin's docs: agreement between two independent implementations over two independent buffers is
-/// the property being tested, and a shared helper would weaken what a match proves.
-fn fnv1a_blob(bytes: &[u8]) -> u64 {
-    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = OFFSET_BASIS;
-    for &b in bytes {
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(PRIME);
-    }
-    hash
-}
 
 /// The resource id the staging-pool experiment names, from `RAYLAND_C1_SHIP_BLOB`.
 ///
@@ -622,62 +613,6 @@ fn diagnostic_ship_blob() -> Option<u32> {
     std::env::var("RAYLAND_C1_SHIP_BLOB").ok()?.parse().ok()
 }
 
-/// The half-open ranges of every run of non-zero bytes in `bytes`.
-///
-/// # Why non-zero runs rather than the whole blob
-/// The blob this exists for is 8 MiB with a few dozen bytes set. Shipping it whole on every relay
-/// would re-create the resend flood that made vkcube look like a hang, and would swamp the very
-/// measurement the experiment is trying to read. Shipping the non-zero runs sends the same
-/// information: S's copy starts as a zero-filled memfd, so zero regions already agree.
-///
-/// # Pitfall: this is *not* a diff, and is only sound because S's copy starts empty
-/// It ships what is non-zero, not what changed, so it cannot un-set a byte S already holds. That is
-/// acceptable for a one-run experiment against a blob S never writes and never had content in, and
-/// it would **not** be acceptable as a synchronisation mechanism — another reason this path is not a
-/// candidate fix.
-///
-/// # Inputs / outputs
-/// - `bytes`: the blob's live contents.
-/// - Returns ascending, non-empty, non-adjacent `(start, end)` ranges; empty when all bytes are zero.
-fn nonzero_runs(bytes: &[u8]) -> Vec<(usize, usize)> {
-    let mut runs = Vec::new();
-    // Where the run currently being accumulated began, if one is open.
-    let mut open: Option<usize> = None;
-    // **Chunked, for the same reason the S-side diff is.** The first version of this walked all
-    // 8 MiB a byte at a time on every relay, and measurably slowed C's relay enough that the
-    // application got *less* far than without the experiment — an instrument distorting the thing it
-    // measures, which is exactly the failure this session spent two days on at the other end of the
-    // wire. Comparing a chunk against zeros with slice equality lowers to `memcmp`; the per-byte loop
-    // then runs only inside a chunk that is not all zeros. The runs produced are identical.
-    const CHUNK: usize = 64;
-    const ZEROS: [u8; CHUNK] = [0u8; CHUNK];
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let chunk_end = (i + CHUNK).min(bytes.len());
-        if bytes[i..chunk_end] == ZEROS[..chunk_end - i] {
-            // An all-zero chunk closes any open run at the chunk's start, exactly as the first zero
-            // byte would have.
-            if let Some(start) = open.take() {
-                runs.push((start, i));
-            }
-            i = chunk_end;
-            continue;
-        }
-        for j in i..chunk_end {
-            if bytes[j] != 0 {
-                open.get_or_insert(j);
-            } else if let Some(start) = open.take() {
-                runs.push((start, j));
-            }
-        }
-        i = chunk_end;
-    }
-    // A run reaching the final byte is closed by the blob's end, not by a zero after it.
-    if let Some(start) = open {
-        runs.push((start, bytes.len()));
-    }
-    runs
-}
 
 /// A blob fingerprint that skips zero regions: `(non-zero byte count, digest of the non-zero bytes)`.
 ///

@@ -2304,3 +2304,54 @@ That is a piece of work with a clear shape and a clear payoff, and it deserves t
 rather than bolted on at the end of a long day. The elimination that leads to it is complete and recorded:
 **not the transport, not the ring bytes, not any blob's content, not the doorbell, not the consumer, not the
 staging pool.** What is left is the framing of the stream itself, and Rayland currently cannot see it.
+
+### 2026-07-26 — Correcting myself: the staging-pool "exoneration" was invalid — and now, done properly, it holds
+
+Two corrections and one new measurement, in that order, because the corrections change what the measurement
+means.
+
+**First: "extend the `encoded_size` table" cannot be done as asked, and the module already says why.** Its own
+docs list `vkCreateInstance`, `vkCreateRingMESA` and `vkExecuteCommandStreamsMESA` as commands it can *name*
+but not size, with the warning that "recognising a command is not the same as being able to skip it, and
+conflating the two is how a decoder desynchronizes". Most application commands are variable-length — arrays,
+`pNext` chains, optional pointers — so no table of fixed sizes can walk a real stream. Doing it properly means
+per-command decoders, which is the several thousand generated lines Mesa ships, and that is a subsystem
+decision rather than an afternoon's work.
+
+**Second, and worse: the previous entry's "clean negative" on the staging pool was not a result at all.** In
+both of those runs the application stalled at 36 proxy-trace lines — *before* `create_immed`, and therefore
+before it ever attempted the submit under test. The experiment never reached the thing it was meant to
+falsify, and I read the absence of a difference as evidence. It was not evidence of anything. The cause was
+the same latency sensitivity measured an hour earlier: shipping the pool's runs on **every** relay tripled C's
+blob messages (454 → 1260), and this relay path does not tolerate that.
+
+**Done properly, the conclusion survives.** Giving the pool a baseline and shipping only *changed* runs makes
+the steady state one chunked comparison and no traffic. With that, the application reached the submit on the
+**first** attempt (52 proxy lines, four `create_immed`), the pool is byte-identical on both sides
+(`nonzero=212 fnv=3416b8b8656976fc` on C and on S) — **and the CS error still fires.** So the staging pool is
+now genuinely exonerated, by an experiment that actually ran the code under test.
+
+That is worth separating clearly: the earlier entry reached a right answer by an invalid route, which is not
+the same as being right. Left in place, with this correction beside it.
+
+**The new evidence, and it is the sharpest yet.** At the moment of failure S's own ring words read:
+
+```
+[s-ringctl] relayed_tail=27536  s_head=27356  s_tail=27536
+```
+
+`head` is **180 bytes** behind `tail`. So virglrenderer's decoder was given exactly those 180 bytes for the
+command beginning at 27356, and ran past the end of them. **The command's encoding requires more bytes than
+the published tail provides.**
+
+Which sharpens the paradox rather than resolving it: every byte of every resource now demonstrably agrees
+between the two machines — ring (253/253 digests), every application blob, the reply arena, and now the
+staging pool — and the decoder still overruns. The remaining possibilities are about *extent* rather than
+content: either a published `tail` can fall mid-command (Mesa stores `tail` after writing, so it should not,
+but "should not" has been wrong repeatedly this week), or the submit's body is reached through a descriptor
+whose `{resourceId, offset, size}` S resolves differently than C intends.
+
+Distinguishing those needs the stream walked, which is exactly the capability the first correction says does
+not exist. **The instrument gap and the open question are the same gap.** That is the honest state to leave
+this in: nine theories refuted, the failure narrowed to the framing of a single command, and the next step
+identified as a real piece of engineering rather than another probe.
