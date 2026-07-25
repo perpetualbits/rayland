@@ -50,8 +50,11 @@
 //! every submission boundary" is not implementable here: **`vkQueueSubmit` is invisible to us.** It
 //! is encoded *inside* the ring, and v1 relays the ring as opaque bytes without parsing them. The
 //! only boundary C can actually observe is **its own relay event** — "we are about to ship ring
-//! bytes to S". So that is the trigger, and it is deliberately over-eager: it syncs blobs that may
-//! not have changed, on relays that may contain no submit at all.
+//! bytes to S". So that is the trigger, and it is deliberately over-eager: it **inspects** every
+//! application blob on every relay, on relays that may contain no submit at all, whether or not that
+//! blob actually changed. Under the diff that over-eagerness is no longer a bandwidth cost — an
+//! unchanged blob costs one comparison pass and ships nothing — it only means the trigger cannot tell
+//! in advance which blobs are worth looking at, so it looks at all of them.
 //!
 //! # Ordering is the correctness property this module exists to guarantee
 //! **Blobs must reach S before the ring delta whose commands may read them.** The ring bytes are
@@ -151,9 +154,9 @@ use rayland_relay::C2S;
 ///   the common case — and C's reader laid them over whatever the application had written since.
 ///   This function then faithfully relayed the stale bytes back to S. Spec §7.2 retracted that rule:
 ///   **S now ships back exactly the bytes S is observed to have written**, so nothing arrives here
-///   to overwrite a blob the GPU never touched, and shipping whole blobs C→S is no longer racing
-///   anything on the return leg. The repair had to happen on S because only S can see which bytes S
-///   wrote; there was no version of this function that could have avoided it.
+///   to overwrite a blob the GPU never touched, and shipping a blob's changed runs C→S is no longer
+///   racing anything on the return leg. The repair had to happen on S because only S can see which
+///   bytes S wrote; there was no version of this function that could have avoided it.
 /// - **What remains is narrower than it once was, but it is *two* hazards, not one — an earlier draft
 ///   of this list undercounted them, and this is the correction.**
 ///   - **Tearing.** A blob the application writes *while* this copies it is torn, and nothing here
@@ -168,25 +171,36 @@ use rayland_relay::C2S;
 ///     C shipped its (stale) copy of `res=6` on *every* relay regardless of whether it had changed,
 ///     which could clobber pixels S's GPU had just written with C's zeros.
 ///
-///     **This function now lands the C-side half of the fix — the symmetric, observed-write rule
-///     `docs/design/2026-07-25-c1-incremental-blob-sync.md` describes — but the fix is only complete
-///     once its *other* half lands.** The diff means C no
-///     longer ships `res=6` on every relay unconditionally; it ships a run only when
+///     **This function lands the C-side half of the fix — the symmetric, observed-write rule
+///     `docs/design/2026-07-25-c1-incremental-blob-sync.md` describes — and the fix's other half is
+///     wired in too, at both places S's bytes enter a C mapping.** The diff means C no longer ships
+///     `res=6` on every relay unconditionally; it ships a run only when
 ///     [`LocalBlob::take_changed_runs`](crate::shm::LocalBlob::take_changed_runs) sees the live bytes
-///     differ from C's baseline. That baseline, however, is only correct if it is kept in step with S's
-///     own writes as they arrive back over the wire — and *that* half
-///     ([`LocalBlob::note_s_wrote`](crate::shm::LocalBlob::note_s_wrote) folded into
-///     `apply_blob_data` when C applies an inbound `S2C::BlobData`) is **not this module's job**; it is
-///     wired in separately. Until it is wired in, the old hazard resurfaces in a new shape: C's reader
-///     applies S's fresh `res=6` bytes into the live mapping, the stale baseline still reads zeros, and
-///     the next call to `take_changed_runs` sees those now-fresh bytes as a *change C made* and ships
-///     them straight back to S as `BlobData(res=6, ...)` — overwriting S's own authoritative pixels
-///     with a copy of what S itself just sent. The diff turns a whole-blob clobber into a
-///     same-content-that-was-already-there clobber; it does not remove the clobber on its own.
+///     differ from C's baseline. That baseline is only correct if it is kept in step with S's own
+///     writes as they arrive back over the wire, and [`LocalBlob::note_s_wrote`](crate::shm::LocalBlob::note_s_wrote)
+///     is that fold. It is **not** called from this module — this module only ever ships C→S — so it
+///     must be called everywhere S's bytes are written into a C-side mapping. There are exactly two
+///     such places today, and both call it:
+///     - `apply_blob_data` in `crates/rayland-c/src/main.rs`, on every inbound `S2C::BlobData` — the
+///       steady-state return path (readback buffers, the reply arena) for a blob already registered.
+///     - `commit_pending_blob` in `crates/rayland-c/src/relay_engine.rs`, on the `initial` runs carried
+///       inside `S2C::BlobCreated` — because a readback buffer is routinely born with the finished
+///       frame already in it (Mesa's `vkMapMemory` is lazy, so the blob comes into existence *after*
+///       S's GPU has already rendered into it), which makes creation itself a return-path event, not
+///       merely the steady state.
 ///
-///     **This is not tearing.** C's copy is whole and un-torn; the defect (while it persists) is that
-///     it is stale-relative-to-freshly-applied, which byte diffing alone cannot distinguish from a
-///     genuine application write — only folding S's writes into the baseline can.
+///     **If a third place is ever added where S's bytes land in a C mapping, it must call
+///     `note_s_wrote` too, or this hazard resurfaces there.** The mechanism of the resurfacing is
+///     mechanical and worth stating once, since it is easy to reintroduce by omission rather than by a
+///     visible bug: C's reader applies S's fresh bytes into the live mapping, the stale baseline does
+///     not reflect them, and the next call to `take_changed_runs` reads the now-fresh bytes as a
+///     *change C made* and ships them straight back to S as `BlobData` — overwriting S's own
+///     authoritative pixels with a copy of what S itself just sent. Byte diffing alone cannot tell
+///     "S just wrote this" apart from "the application just wrote this"; only folding S's writes into
+///     the baseline, at every site they arrive, can.
+///
+///     **This is not tearing.** C's copy is whole and un-torn in this scenario; the (now-closed) defect
+///     was that it could be stale-relative-to-freshly-applied in a way plain byte diffing cannot see.
 ///
 ///     **Why the reference app never triggers it, either way.** An application blocked in
 ///     `vkWaitForFences` issues no further ring traffic of its own — `vn_ring_wait_seqno` only polls
@@ -396,7 +410,10 @@ mod tests {
 
     /// Every application blob crosses, not just the first one found. The readback buffer matters as
     /// much as the vertex buffer: v1 has no way to know which of the app's blobs a given delta's
-    /// commands touch, which is exactly why the sync is conservative (spec §7).
+    /// commands touch, which is exactly why the sync is conservative (spec §7). This holds here because
+    /// both blobs are freshly filled against a zero baseline, so both are "changed"; under the diff, a
+    /// blob that had not changed since its last relay would rightly be absent, which is a different
+    /// test (`an_unchanged_blob_is_not_reshipped_on_the_next_relay`) below.
     #[test]
     fn every_application_blob_is_shipped_not_merely_one() {
         let blobs = table_of(&[

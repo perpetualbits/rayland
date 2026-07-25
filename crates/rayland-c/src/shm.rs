@@ -271,6 +271,14 @@ impl LocalBlob {
     /// ends the current run rather than being coalesced over, because coalescing would re-ship exactly
     /// the unchanged bytes this exists to skip (spec §"fragmentation").
     ///
+    /// This is also why the shipped run is copied out of **the baseline**, not out of `live`, once the
+    /// inner loop below has finished writing that range into `self.baseline`: at that point the two
+    /// hold identical bytes for `[start..i)`, but `live` is still `Mesa`'s mapping and may have moved on
+    /// by the time the run is materialised into a `Vec`. Reading `live` a second time here would be the
+    /// exact "second read" the paragraph above warns against, just moved a few lines down — the baseline
+    /// would then record bytes C never actually sent, and if the application's next write happened to
+    /// revert to that earlier value, the two copies would disagree forever with nothing to notice it.
+    ///
     /// # Pitfall: this read is racy against Mesa, by construction
     /// A torn read (the application mid-write) ships a torn intermediate; it is transient and the next
     /// relay's diff corrects it. This is the same inherent raciness [`Self::bytes`] documents and the
@@ -307,7 +315,11 @@ impl LocalBlob {
             }
             runs.push(BlobRun {
                 offset: start as u64,
-                bytes: live[start..i].to_vec(),
+                // From `self.baseline`, not `live`: the loop above just wrote `live[start..i]` into
+                // `self.baseline[start..i]`, so the two agree right now. Reading `live` again here would
+                // be a second, later look at memory Mesa may still be writing — see the doc comment
+                // above for why that reopens the exact gap this method exists to close.
+                bytes: self.baseline[start..i].to_vec(),
             });
         }
         runs
@@ -316,13 +328,33 @@ impl LocalBlob {
     /// Fold bytes S wrote (arriving over the S→C return path) into the baseline, so the next
     /// [`Self::take_changed_runs`] does not turn around and ship S's own bytes back to S.
     ///
-    /// No-op for a Venus-internal blob (no baseline). The caller [`crate::main`]'s `apply_blob_data`
-    /// has already bounds-checked `offset + bytes.len()` against the blob size, and the baseline is
-    /// exactly that size, so the slice below is in range.
+    /// No-op for a Venus-internal blob (no baseline). This has **two** call sites, both of which have
+    /// already bounds-checked `offset + bytes.len()` against the blob size before calling here:
+    /// `apply_blob_data` in `crate::main`, on the steady-state `S2C::BlobData` path, and
+    /// `commit_pending_blob` in `crate::relay_engine`, on the `initial` runs a `S2C::BlobCreated` may
+    /// carry (a readback buffer is routinely born with its finished frame already in it). Both
+    /// bounds-check before calling, so the slice below is in range in ordinary operation — the
+    /// `debug_assert!` exists as a named failure for a *third*, future call site that forgets to.
+    ///
+    /// # Panics
+    /// Panics (debug builds only) if `offset + bytes.len()` exceeds the baseline's length — i.e. if a
+    /// caller did not honour the bounds-checked-before-calling contract above. This is deliberately
+    /// `debug_assert!`, not a `Result`: it costs nothing in release, and a violation here is a caller
+    /// bug on C's own side, not remote input to be recovered from (both real callers validate remote
+    /// offsets themselves, before this call, and report a bad one as S's protocol error rather than
+    /// C's panic). Turning a silent index-out-of-range panic into one that names the contract it broke
+    /// matters because this runs on the reader thread — the one thread that delivers every reply.
     pub fn note_s_wrote(&mut self, offset: usize, bytes: &[u8]) {
         if self.baseline.len() != self.mapping.len() {
             return;
         }
+        debug_assert!(
+            offset.saturating_add(bytes.len()) <= self.baseline.len(),
+            "note_s_wrote: {offset}..{} is out of range for a {}-byte baseline; every caller must \
+             bounds-check the run against the blob's size before calling this",
+            offset.saturating_add(bytes.len()),
+            self.baseline.len()
+        );
         self.baseline[offset..offset + bytes.len()].copy_from_slice(bytes);
     }
 }
@@ -508,6 +540,22 @@ mod tests {
         let (mut blob, _fd) = LocalBlob::create(INTERNAL_BLOB_ID, 64).expect("an internal blob");
         blob.bytes_mut().fill(0x11);
         assert!(blob.take_changed_runs().is_empty());
+    }
+
+    /// `note_s_wrote` must be a documented no-op on a Venus-internal blob, not a panic — even though
+    /// the offset/length below would be out of range for a *baseline* such a blob does not have. The
+    /// internal-blob branch returns before the method's `debug_assert!` bounds check ever runs, so a
+    /// Venus-internal blob's shadow (the ring, the reply arena) can safely receive whatever offsets a
+    /// caller happens to pass without tripping it.
+    #[test]
+    fn note_s_wrote_is_a_no_op_on_a_venus_internal_blob() {
+        let (mut blob, _fd) = LocalBlob::create(INTERNAL_BLOB_ID, 64).expect("an internal blob");
+        // An offset/length pair that would be in-range for the mapping but has no baseline to land in.
+        blob.note_s_wrote(0, &[0x11; 64]);
+        assert!(
+            blob.take_changed_runs().is_empty(),
+            "an internal blob has no baseline to disturb, and must still diff to nothing"
+        );
     }
 
     #[test]

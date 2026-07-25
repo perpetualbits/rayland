@@ -76,6 +76,25 @@ Memory cost: the baseline doubles the resident size of application blob memory o
 application blobs that is +16 MB — trivial even for the weak machine, and exactly the cost S already pays for
 the symmetric return-path baseline.
 
+CPU cost, stated plainly rather than only argued by comparison to hashing: the diff is a **byte-at-a-time
+scan of the whole application working set, on every relay** — for vkcube's ~16 MB of application blobs, that
+is ~16 MB compared byte-by-byte each time C is about to ship a delta, whether or not the delta's commands
+touch any of it (the trigger is deliberately over-eager; see above). That scan runs **under the blob table's
+lock**, the same lock the reply-delivery path (the reader thread committing an inbound `BlobData` or
+`BlobCreated`) also needs, so a slow diff is not merely CPU time spent, it is CPU time spent holding a lock
+another thread is waiting on. And C is meant to be the **weak** machine in this architecture — potentially a
+different CPU architecture such as RISC-V, potentially without much CPU to spare — so "cheap enough on a
+development workstation" is not the same claim as "cheap enough on C". None of that is a reason not to ship
+this design: it is still strictly cheaper than v1's full `memcpy` of every application blob under the same
+lock, since a byte compare that finds no difference touches memory but writes none, and the common case (a
+blob written once and then only read) pays the scan without ever paying the copy. But the byte-at-a-time
+compare is not free, and a **known, deliberate follow-up** — not attempted here — would keep the win while
+cutting the cost: compare in fixed-size chunks (e.g. 32 or 64 bytes at a time, which the compiler lowers to a
+`memcmp`-shaped comparison well cheaper per byte than a scalar loop) and only descend to byte granularity
+inside a chunk that the chunked compare found to differ. This preserves byte-exact run boundaries — the
+externally visible behaviour, and the wire contract, are unchanged — while doing far less work over the
+(common) unchanged majority of a large blob.
+
 ### The diff, on each relay
 
 `messages_for_delta` (`crates/rayland-c/src/blob_sync.rs`), for each application blob, walks the live mapping
@@ -165,6 +184,22 @@ both carried over deliberately:
 - **Do not coalesce across unchanged gaps.** Merging two runs across the unchanged bytes between them would
   re-ship exactly the bytes the diff exists to skip — "the attractive fix is the hole again" (Task 5b). Ship
   the exact runs.
+
+  There is a **second, stronger reason** to leave this rule alone, and it is correctness rather than
+  bandwidth: it is tempting to "optimise" it away once someone notices that, say, a 16-byte unchanged gap
+  between two changed runs is cheaper to re-ship than to carry as a message boundary — 16 extra bytes inside
+  one run costs less than a second `BlobData` message's overhead. That reasoning silently assumes the gap
+  bytes are C's own unchanged content. They may not be: they may be bytes **S** owns and has since rewritten
+  — a readback buffer's untouched border pixels, say, sitting between two regions the application's own
+  writes changed. Coalescing over such a gap re-ships C's (stale) copy of bytes that are not C's to publish,
+  which is the whole-blob clobber in miniature, reintroduced one gap at a time. Worse, it can **suppress the
+  correction that would otherwise fix it**: `rayland-s`'s `copy_in` re-snapshots S's own shadow over exactly
+  the range it writes, so if C's coalesced run clobbers those bytes on S, S's own next diff sees its shadow
+  (already re-snapshotted to the clobbered value) agreeing with what it just received, and ships nothing back
+  to correct it. So "coalesce small gaps" is not a free bandwidth optimisation available to some future
+  reader who does the arithmetic — it reopens a correctness hole this design exists to close, and the fact
+  that it looks cheap is exactly why it is worth spelling out here rather than leaving it to be
+  independently rediscovered.
 - **Report message count and bytes separately.** The win here is overwhelmingly in *bytes*; a fragmented blob
   can trade fewer bytes for many messages. The metrics must keep the two columns distinct (they already do),
   so a future reader is never fooled into reading a bytes win as a regression in message count.

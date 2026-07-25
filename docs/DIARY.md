@@ -1207,6 +1207,17 @@ never touches ring-delta shipping. Reporting this as measured, not extrapolated:
 completion, so this is the sample the ~35 s window actually produced, not a projection of what a full run
 would show.
 
+Worth stating alongside the truncation caveat, because it *strengthens* the claim rather than only hedging
+it: the two windows being compared carried a comparable amount of actual command work, not wildly different
+amounts that a bandwidth ratio could be distorted by. The "after" run relayed 89 ring deltas totalling 23,764
+ring bytes before its abort; the original "before" measurement (the one that found 16,574,464 blob-sync
+bytes) relayed 83 ring deltas totalling 22,955 ring bytes. 89 vs. 83 deltas and 23,764 vs. 22,955 bytes are
+close enough that the ~62× blob-traffic reduction is not an artefact of one run doing dramatically less work
+than the other — it is a comparison of two runs that did essentially the same thing, one of which happened
+to carry ~62× less blob-sync bytes to do it. That is a materially better argument for "the reduction is real"
+than the truncation caveat alone would suggest, and it belongs next to that caveat rather than replacing it:
+the run still did not reach completion, so the ~62× figure is still this sample, not a settled asymptote.
+
 **What is still open, stated plainly.** This does not touch remote `vkMapMemory`: a blob genuinely rewritten
 every frame (icosa's fractal texture, or vkcube's own per-frame uniforms) still diffs to nearly its whole
 size every time, because "nearly everything changed" is a true diff, not a bug — that remains (c)2's problem.
@@ -1215,3 +1226,57 @@ Cross-blob and cross-time content dedup (an identical blob crossing only once, e
 ring-completion latency wall the 07-24 entries already traced to (c)2 ground; this session did not chase it
 further, since the brief scoped Task 3 to the re-baseline call and the two gates (unit suites, e2e), not to
 making vkcube run to completion.
+
+### 2026-07-25 — Final whole-change review found two real defects in the blob-sync fix; both fixed, neither was a regression
+
+Each of the blob-sync fix's three tasks passed its own review as it landed. A fourth, whole-change pass over
+the finished diff then found two defects the per-task reviews had not — both real, both in code the "e2e
+stayed bit-identical" claim above did not actually exercise, which is itself the finding worth recording
+honestly rather than glossing over.
+
+**The first: the design's own "single read" promise was not implemented.** The spec is explicit that
+`take_changed_runs` must diff and re-baseline **from one read** of the live mapping, precisely so the bytes
+recorded in the baseline are the same bytes shipped in the run — "reading once and using those same bytes
+for both the run and the baseline closes that gap," the design says, in so many words. The code that landed
+read `live` once to build the baseline inside the inner loop, then read `live` a **second** time to build the
+`BlobRun`'s payload. Mesa writes these pages with no synchronisation at all, so between those two reads the
+application could rewrite the bytes: the baseline would then hold what was read at t1, the wire would carry
+what was read at t2, and if the application's next write happened to revert to the t1 value, C's baseline and
+S's actual copy would disagree **permanently and silently** — S rendering from bytes the application never
+had, with nothing anywhere to notice it. The fix is one line: ship from `self.baseline[start..i]`, which the
+inner loop has already set equal to what was read, instead of from `live[start..i]` again. The instructive
+part is *where* the defect came from: the implementation plan
+(`docs/superpowers/plans/2026-07-25-c1-incremental-blob-sync.md`, Task 1 Step 6) contains this exact code
+verbatim, so it was not a slip introduced while executing the plan — the plan itself authored the bug. Fixed
+in both places, with a note in each explaining why the run is copied from the baseline rather than the
+mapping, so a future reader tempted to "simplify" it back to `live` sees why not.
+
+**The second: a missed baseline-fold site, made live by a design choice from a different task.**
+`apply_blob_data` folds S's inbound bytes into the baseline — that was Task 3's whole job. But it is not the
+only place S's bytes land in a C-side mapping: `commit_pending_blob` (`relay_engine.rs`) lays `initial` runs
+from `S2C::BlobCreated` into a blob's shadow *before* it is even registered, and never folded them into the
+baseline. This sat unnoticed because `initial` looks, at a glance, like it should usually be empty — until
+`rayland-s/src/apply.rs` is read: it *deliberately* ships `take_bytes_s_wrote(0)` at blob creation, because a
+readback buffer's blob is created lazily, at the application's first `vkMapMemory` of it, which happens
+**after** the GPU has already rendered a frame into it. So a blob is routinely born already holding S's
+pixels, and the fold was missing at exactly the site that matters most. Left as it was, the consequence
+would have been the same class of failure the design's whole return-path fold exists to prevent: C's mapping
+holding S's pixels while C's baseline still read zeros, so the very next `take_changed_runs` would read
+those pixels as an application change and ship them straight back to S — potentially clobbering a newer
+frame S had since rendered, since S's own `copy_in` re-snapshots its shadow over whatever range it writes and
+so would not correct C's stale write either. Fixed by adding the same `note_s_wrote` call at this second
+site, inside the same bounds-checked loop and skipped together with it on a bounds failure.
+
+**Neither defect was a regression against the old whole-blob behaviour** — v1 shipped every application
+blob's full contents on every relay regardless of any baseline, so there was no baseline to be wrong about.
+Both are new hazards introduced by *this* fix, in the exact two places its own correctness argument rests on:
+the single-read discipline, and the completeness of "every site S's bytes arrive." **Worth recording as a
+limit of the gate, not just a near-miss:** the loopback e2e (`rayland-s/tests/loopback_e2e.rs`) stayed
+bit-identical through both defects and would not have caught either — the race in Finding 1 needs a write
+landing between two reads of the same live memory, which loopback's tight timing does not reliably provoke,
+and Finding 2's clobber needs a readback blob whose `initial` runs are non-trivial *and* a second relay event
+after it, which the reference app's one-shot rendering never produces. That the e2e is bit-identical is
+therefore evidence the diff loses no byte on the paths it actually exercises, not evidence these two paths
+are safe — a distinction worth being honest about rather than letting a green gate imply more than it
+showed. Added unit tests for both wirings, each teeth-checked by removing the fix and confirming the test
+fails before restoring it, so these two paths now have direct coverage the e2e was never going to provide.

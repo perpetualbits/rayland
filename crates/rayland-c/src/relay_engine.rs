@@ -111,8 +111,12 @@ pub type PendingBlob = Arc<Mutex<Option<LocalBlob>>>;
 /// - `blobs`: the live shadow table.
 /// - `res_id`: the id from [`S2C::BlobCreated`].
 /// - `initial`: whatever was already in the blob on S, laid into the shadow **before** the blob is
-///   published. See [`S2C::BlobCreated`]: a readback buffer arrives with the finished frame already
-///   in it, and this reply is what lets Mesa map the pages — so the bytes must be down first.
+///   published, and folded into the baseline at the same time (see [`LocalBlob::note_s_wrote`]). See
+///   [`S2C::BlobCreated`]: a readback buffer arrives with the finished frame already in it, and this
+///   reply is what lets Mesa map the pages — so the bytes must be down first. The baseline fold matters
+///   just as much here as it does in [`crate::main`]'s `apply_blob_data`: without it, C's mapping would
+///   hold S's pixels while C's baseline still read zeros, and the very next C→S diff would mistake
+///   S's own bytes for an application write and ship them straight back.
 /// - Returns nothing. A `BlobCreated` with nothing staged is **ignored**: S answering a request C
 ///   never made is S's protocol error, and C's reader reports the ones it can attribute. Panicking
 ///   here would take out the reader thread — the one thing that delivers every reply — over a
@@ -160,6 +164,17 @@ pub fn commit_pending_blob(
             }
         };
         blob.bytes_mut()[run.offset as usize..end as usize].copy_from_slice(&run.bytes);
+        // Fold the same bytes into the baseline. `initial` is not always empty: a readback buffer is
+        // born with the finished frame already in it (Mesa's `vkMapMemory` is lazy, so the blob is
+        // created *after* S's GPU has already rendered into it — see `rayland-s/src/apply.rs`'s
+        // `take_bytes_s_wrote(0)` at creation, and `S2C::BlobCreated`'s doc comment). Without this fold
+        // the baseline would still read zeros while the mapping already holds S's pixels, so the very
+        // next `take_changed_runs` would read that as an application change and ship S's own pixels
+        // straight back to S — the same clobber `apply_blob_data`'s fold prevents for the steady state,
+        // missed here because this is a second, earlier place S's bytes enter a C mapping. Skipped
+        // together with the write above when the bounds check failed: a run that was not applied to the
+        // mapping must not be recorded as agreed-upon in the baseline either.
+        blob.note_s_wrote(run.offset as usize, &run.bytes);
     }
 
     // Keyed by **S's** id, because that is what every later message naming this resource uses.
@@ -847,6 +862,51 @@ mod tests {
         assert!(
             pending.lock().unwrap().is_none(),
             "the staging slot must be empty again, or the next blob's commit would find this one"
+        );
+    }
+
+    /// **Wiring test for the missed baseline-fold site (final-review Finding 2).** `S2C::BlobCreated`'s
+    /// `initial` runs are not always empty: a readback buffer is routinely born with its finished
+    /// frame already in it, because Mesa's `vkMapMemory` is lazy and creates the blob only after S's
+    /// GPU has already rendered into it (see `rayland-s/src/apply.rs`'s `take_bytes_s_wrote(0)` at
+    /// creation). If `commit_pending_blob` laid those bytes into the mapping without folding them into
+    /// the baseline too, the very next `take_changed_runs` would read S's own pixels as an application
+    /// change and ship them straight back to S — reintroducing the clobber `apply_blob_data`'s fold
+    /// prevents for the steady state, just one step earlier.
+    ///
+    /// Teeth-checked: commenting out the `blob.note_s_wrote(...)` line in `commit_pending_blob` makes
+    /// this test fail (`take_changed_runs` then returns the 64-byte run instead of nothing), confirming
+    /// it actually exercises the fold rather than passing vacuously.
+    #[test]
+    fn commit_pending_blob_folds_initial_bytes_into_the_baseline() {
+        let pending: PendingBlob = Arc::new(Mutex::new(None));
+        let blobs: BlobTable = Arc::new(Mutex::new(HashMap::new()));
+        // Stage a shadow exactly as `create_blob_resource` would, for an application blob (blob_id=16
+        // is non-zero, i.e. a real `VkDeviceMemory` rather than one of Venus's own shmems).
+        let (blob, _fd) = LocalBlob::create(16, 64).expect("an app blob");
+        *pending
+            .lock()
+            .expect("the pending blob lock is never poisoned") = Some(blob);
+
+        // S ships the blob "born" already holding content — e.g. a readback buffer whose frame the
+        // GPU rendered before Mesa's lazy vkMapMemory turned it into a blob.
+        commit_pending_blob(
+            &pending,
+            &blobs,
+            9,
+            &[BlobRun {
+                offset: 0,
+                bytes: vec![0x66; 64],
+            }],
+        );
+
+        let mut table = blobs.lock().expect("the blob table lock is never poisoned");
+        let blob = table.get_mut(&9).expect("the committed blob");
+        assert!(
+            blob.take_changed_runs().is_empty(),
+            "S's own born-with-content bytes must be folded into the baseline at commit time, or \
+             the next C->S diff would ship them straight back as though the application had \
+             written them"
         );
     }
 

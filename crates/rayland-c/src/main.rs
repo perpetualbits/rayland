@@ -1145,10 +1145,41 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rayland_c::shm::LocalBlob;
+    use std::collections::HashMap;
 
     /// The frontier from the live capture: 4024 bytes of ring traffic for the reference app's whole
     /// Vulkan initialization (ring-findings §2). Used throughout so the numbers are the real ones.
     const FIRST_FRONTIER: u32 = 4024;
+
+    /// **Wiring test for `apply_blob_data`'s baseline fold (final-review Finding 2's steady-state call
+    /// site).** S's inbound bytes must land in both the mapping *and* the baseline; if only the
+    /// mapping were updated, the very next C→S diff would see the mapping (now carrying S's bytes)
+    /// differ from a stale baseline and read that as an application change, shipping S's own bytes
+    /// straight back to S. `commit_pending_blob` in `rayland_c::relay_engine` has the equivalent test
+    /// for the other call site, the `S2C::BlobCreated::initial` runs a blob may be born with.
+    ///
+    /// Teeth-checked: commenting out the `blob.note_s_wrote(start, bytes)` line in `apply_blob_data`
+    /// makes this test fail (`take_changed_runs` then returns the 64-byte run instead of nothing),
+    /// confirming it actually exercises the fold rather than passing vacuously.
+    #[test]
+    fn apply_blob_data_folds_s_bytes_into_the_baseline_so_they_are_not_reshipped() {
+        // `blob_id = 16`: a real application blob, so it carries a baseline and is diffed.
+        let (blob, _fd) = LocalBlob::create(16, 64).expect("an app blob");
+        let mut table = HashMap::new();
+        table.insert(3u32, blob);
+        let blobs: BlobTable = Arc::new(Mutex::new(table));
+
+        // Stand in for S shipping back bytes it wrote — e.g. a readback buffer's finished frame.
+        apply_blob_data(&blobs, 3, 0, &[0x77; 64]).expect("S's bytes must apply cleanly");
+
+        let mut table = blobs.lock().expect("the blob table lock is never poisoned");
+        let blob = table.get_mut(&3).expect("the blob committed above");
+        assert!(
+            blob.take_changed_runs().is_empty(),
+            "C must not re-ship the bytes S itself just sent back to it"
+        );
+    }
 
     /// Nothing relayed means nothing outstanding: an idle session must never look stalled. Without
     /// this, an application that simply is not drawing would be killed by the stall timeout.

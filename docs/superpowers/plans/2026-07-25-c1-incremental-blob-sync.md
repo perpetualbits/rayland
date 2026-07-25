@@ -195,6 +195,14 @@ Add these two methods to `impl LocalBlob` in `crates/rayland-c/src/shm.rs` (afte
     /// ends the current run rather than being coalesced over, because coalescing would re-ship exactly
     /// the unchanged bytes this exists to skip (spec §"fragmentation").
     ///
+    /// This is also why the shipped run is copied out of **the baseline**, not out of `live`, once the
+    /// inner loop below has finished writing that range into `self.baseline`: at that point the two
+    /// hold identical bytes for `[start..i)`, but `live` is still `Mesa`'s mapping and may have moved on
+    /// by the time the run is materialised into a `Vec`. Reading `live` a second time here would be the
+    /// exact "second read" the paragraph above warns against, just moved a few lines down — the baseline
+    /// would then record bytes C never actually sent, and if the application's next write happened to
+    /// revert to that earlier value, the two copies would disagree forever with nothing to notice it.
+    ///
     /// # Pitfall: this read is racy against Mesa, by construction
     /// A torn read (the application mid-write) ships a torn intermediate; it is transient and the next
     /// relay's diff corrects it. This is the same inherent raciness [`Self::bytes`] documents and the
@@ -231,7 +239,11 @@ Add these two methods to `impl LocalBlob` in `crates/rayland-c/src/shm.rs` (afte
             }
             runs.push(BlobRun {
                 offset: start as u64,
-                bytes: live[start..i].to_vec(),
+                // From `self.baseline`, not `live`: the loop above just wrote `live[start..i]` into
+                // `self.baseline[start..i]`, so the two agree right now. Reading `live` again here would
+                // be a second, later look at memory Mesa may still be writing — see the doc comment
+                // above for why that reopens the exact gap this method exists to close.
+                bytes: self.baseline[start..i].to_vec(),
             });
         }
         runs
