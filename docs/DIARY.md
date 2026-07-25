@@ -1153,3 +1153,23 @@ Task 5b fixed on the S side. The scope boundary is drawn hard: this removes re-s
 and nothing more — it is not the remote-`vkMapMemory` problem (a blob genuinely rewritten every frame still
 ships whole; that stays (c)2's), and not dedup ((c)3). It is exactly what stands between the correct WP0
 tunnel and a live vkcube.
+
+### 2026-07-25 — Design and plan for the blob-sync fix; setting up to hand off
+
+Turned the confirmed cause — C re-shipping unchanged application blobs whole on every relay — into a design
+spec and an implementation plan, both committed. The approach is settled and small: C keeps a baseline copy
+of what it last sent S for each application blob, diffs the live mapping against it on each relay, ships only
+the changed byte-runs (reusing `BlobData`'s offset field, no wire change), and folds S's return-path writes
+into the baseline so it never ships S's own bytes back. It mirrors the S→C diff (Task 5b) the code's own
+docstring already pointed at. The plan is three tasks with literal code and a hard gate: the loopback e2e
+(refapp + icosa) must stay bit-identical, because a dropped run shows up as a wrong pixel there.
+
+Chose subagent-driven execution and set up its workspace, ledger, and Task 1 brief — but stopped before
+dispatching any implementer, because the session is closing and the plan carries a ~6-minute GPU gate that
+does not fit one turn. Nothing is mid-flight. Wrote a self-contained kickstart prompt
+(`docs/design/2026-07-25-c1-blob-sync-next-session-prompt.md`) so a fresh session can execute the plan cold,
+carrying the load-bearing context: WP0 4.1–4.4 are done and correct, the vkcube "hang" is this blob-sync
+bandwidth debt and not a WP0 bug, and the transport dead ends (delayed ACK, initial_rtt) are already ruled
+out and reverted. Not merging to main: the branch is mid-project (WP0 4.3 and a live vkcube still ahead, the
+blob-sync fix designed but unbuilt), so it stays a feature branch until WP0 actually lands — everything is
+committed and pushed instead. Loose ends closed to the branch, not to main.
