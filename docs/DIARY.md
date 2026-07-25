@@ -1939,3 +1939,87 @@ logs when either thread waits more than a beat for `applier` or `tx` names the h
 directly, and a run with the periodic sampler disabled says whether the instrument is a participant. Both are
 small, both are ptrace-free, and between them they turn "a deadlock, probably here" into "this thread holds
 this lock and is blocked on that".
+
+### 2026-07-26 — FIXED: it was never a deadlock, it was a 637 ms critical section — and vkcube now builds its swapchain buffers
+
+The instruments finally converged, and the answer was the fifth different shape this bug has taken. It is
+fixed, verified, and it moved vkcube materially forward.
+
+**The two measurements the last entry asked for, both answered in one run.** Gating the periodic ring sampler
+behind its own switch and running with it **off**: the failure still occurred, so the instrument was
+exonerated rather than assumed innocent. And a lock watchdog — a thread that owns nothing and only ever
+`try_lock`s, so it keeps reporting while everything else is wedged — said this, continuously:
+
+```
+[s-lockdog] applier_free=false tx_free=true
+```
+
+The applier lock is held permanently; the send lock is **not involved at all**. Meanwhile a heartbeat placed
+*outside* every lock showed the progress thread was **alive** — but looping only every **~3 seconds**, on a
+loop that polls every 200 µs.
+
+**So it was never a deadlock.** Nothing was waiting on anything circularly. It was a **critical section long
+enough to starve the other thread**, and the previous entry's confident "two threads freezing together is a
+deadlock" was wrong in the same way as its predecessors: a real observation, a plausible mechanism, no
+measurement in between. Timing each section named the culprit immediately and unambiguously — **71 slow
+sections, every one of them the same call**:
+
+```
+[s-section] take_venus_blob_writes held the applier lock 637 ms
+                                                         486 ms
+                                                         404 ms   ... 71 times
+```
+
+`take_ring_progress` and `reply_arena_fence_signaled` never even crossed the 50 ms threshold.
+
+**Why it cost that much.** `take_venus_blob_writes` byte-diffs every Venus-internal blob at gap 0 — the ring
+shadow, the 1 MiB reply arena, and the **8 MiB staging pool** — comparing a byte at a time in a zipped loop.
+That is ~9 MiB of per-byte branching per call, on a 200 µs poll. It cannot keep up, so it runs back-to-back
+holding the applier lock; the message thread never gets in; the delta that would release the application is
+never applied; Mesa's ~3.5 s stall abort fires. **That is the vkcube "hang", entire.** It also explains what
+nothing else did: why the stall always begins just after `res=9` — that is the third 1 MiB swapchain image,
+the point at which the per-poll scan finally outgrows the application's patience.
+
+**A wrong fix, caught before shipping.** The obvious move was to filter the scan by `s_written`, which
+`reply_arena_fence_signaled` already uses for exactly this purpose — its comment even says it "excludes the
+same-marker staging pool". **It would have broken the return path completely.** `s_written` is populated *by*
+`emit_blob_writes` (a blob joins the set only once the diff has detected a write), so filtering the diff's
+input on it means the reply arena — born empty, hence not in the set — would never be diffed, never detected,
+and replies would never ship. Reading how the set is filled took one grep and saved a silent, total breakage.
+
+**The fix that shipped: chunked comparison, byte-identical output.** `HostBlob::changed_byte_ranges` now
+compares 64-byte chunks with slice equality — which lowers to `memcmp`, word-at-a-time and vectorised — and
+descends to the per-byte loop *only inside a chunk that already differs*. The grain of **detection** is still
+the byte; only the skipping of the unchanged majority changed. Runs still merge across chunk boundaries, so
+the ranges emitted are exactly those the old loop emitted. This is the same technique the 2026-07-21
+coalescing entry recorded as the known follow-up, applied to the other direction.
+
+**Verified, not asserted:**
+
+| | before | after |
+|---|---|---|
+| slow lock sections | **71**, worst **637 ms** | **15**, and `take_venus_blob_writes` gone from the list |
+| deltas C sent / S read / S applied | 91 / 91 / **90** | **102 / 102 / 102** |
+| proxy trace depth | 36 lines | **52 lines** |
+
+The loopback e2e — the standing correctness gate — passes: `2 passed`, 147 s, `rayland-refapp` and the
+120-frame `rayland-icosa-cpu` both bit-identical. The chunked diff loses nothing.
+
+**And vkcube crossed into new territory.** It now builds its swapchain `wl_buffer`s:
+
+```
+[wp-proxy] intercept params 20.create_immed -> buffer 21 = resource 8  (500x500 fmt 0x34325258)
+[wp-proxy] intercept params 22.create_immed -> buffer 23 = resource 9  (500x500 fmt XR24)
+[wp-proxy] intercept params 24.create_immed -> buffer 25 = resource 10 (500x500 fmt XR24)
+```
+
+Three swapchain images, correlated to resources 8/9/10 by the fd→token intercept, at the app's real 500×500.
+**That is WP0 Task 4.3's own territory** — the `WaylandArg::Buffer(_)` arm that was unreachable this morning
+is now being reached. It still aborts, later and on a different thread, and `res=9` is no longer even the
+interesting resource. The next wall is a new one, which is the first time that has been true in a week.
+
+**The lesson this bug taught, repeatedly and expensively:** every one of the seven readings died to a
+measurement, and every one was born from an inference. The two that finally worked were both instruments
+rather than ideas — a watchdog holding no locks, and a timer around a critical section — and each took
+minutes to build. The rule earned here: *when two components disagree, do not reason about which is at
+fault; make each one say what it is doing.*

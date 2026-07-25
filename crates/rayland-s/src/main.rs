@@ -209,6 +209,57 @@ fn link_log_enabled() -> bool {
     std::env::var_os("RAYLAND_S_REPLY_LOG").is_some()
 }
 
+/// Report how long a lock-held critical section took, when it took long enough to matter.
+///
+/// # Why a threshold rather than every call
+/// This runs on a 200 µs poll loop, so logging unconditionally would emit millions of lines and
+/// change the timing it is measuring. Only sections that are slow enough to starve the message
+/// thread are interesting, and 50 ms is already two orders of magnitude past what a "handful of
+/// loads" (the applier's own description of `take_ring_progress`) should cost.
+///
+/// # Inputs / outputs
+/// - `what`: the call being timed.
+/// - `elapsed`: how long it held the applier lock.
+/// - Prints only above the threshold. **No-op unless `RAYLAND_S_REPLY_LOG` is set.**
+fn section_log(what: &str, elapsed: Duration) {
+    /// Two orders of magnitude above what any of these sections is documented to cost.
+    const REPORT_ABOVE: Duration = Duration::from_millis(50);
+    if !link_log_enabled() || elapsed < REPORT_ABOVE {
+        return;
+    }
+    eprintln!("[s-section] {what} held the applier lock {} ms", elapsed.as_millis());
+}
+
+/// A throttled "the progress thread is still looping" line, emitted while holding **no** lock.
+///
+/// # Why it must be outside the locks
+/// The ring sampler in `Applier::take_ring_progress` runs with the applier lock held — necessarily,
+/// since it reads the applier's blobs — so its silence is ambiguous: it means either "this thread
+/// stopped" or "this thread never got the lock". This heartbeat sits before any acquisition, so it
+/// separates those two, and together with the watchdog it says which thread is blocked on what.
+///
+/// Prints at most once per interval. **No-op unless `RAYLAND_S_REPLY_LOG` is set.**
+fn progress_heartbeat() {
+    if !link_log_enabled() {
+        return;
+    }
+    static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    static LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    /// Twice a second: frequent enough to bracket a ~4 s stall, sparse enough not to flood a log
+    /// that a 200 µs poll loop would otherwise fill with millions of lines.
+    const INTERVAL_MS: u64 = 500;
+
+    let now_ms = BASE
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64;
+    if now_ms < LAST_MS.load(std::sync::atomic::Ordering::Relaxed) + INTERVAL_MS {
+        return;
+    }
+    LAST_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+    eprintln!("[s-heartbeat] progress thread looping at {now_ms}ms");
+}
+
 /// Emit one link-traffic line: a direction marker and a compact message description.
 ///
 /// # Inputs / outputs
@@ -352,12 +403,24 @@ impl EventSink for LinkEventSink {
 /// engine, so no cycle can form between this thread, the message thread, and the actor.
 fn progress_thread(applier: Arc<Mutex<Applier>>, tx: Arc<Mutex<QuicSend>>) {
     loop {
+        // DIAGNOSTIC (`RAYLAND_S_REPLY_LOG`): a heartbeat taken **outside every lock**, unlike the
+        // ring sampler inside `take_ring_progress` which necessarily runs with the applier held. If
+        // this line stops while the watchdog still reports, this thread is blocked *acquiring* a
+        // lock; if it keeps going while nothing else moves, it is looping and finding nothing.
+        progress_heartbeat();
         // The head-advance that releases the application's synchronous calls, taken first. Shipped
         // old-style below (only when the ring moved, venus before progress) so init's reply/head lockstep
         // is exactly the working gate's — that lockstep is load-bearing for initialization.
         let progress = {
             let mut session = applier.lock().expect("the applier lock is never poisoned");
-            session.take_ring_progress()
+            let t = std::time::Instant::now();
+            let p = session.take_ring_progress();
+            // DIAGNOSTIC (`RAYLAND_S_REPLY_LOG`): time the critical section. The watchdog showed the
+            // applier lock held essentially continuously while this thread looped only every ~3 s,
+            // which is not a deadlock but a critical section long enough to starve the message
+            // thread past Mesa's ~3.5 s stall abort. This says which call spends it.
+            section_log("take_ring_progress", t.elapsed());
+            p
         };
         if !progress.is_empty() {
             // The reply arena for the commands that just retired, plus a check of whether the arena now
@@ -366,7 +429,15 @@ fn progress_thread(applier: Arc<Mutex<Applier>>, tx: Arc<Mutex<QuicSend>>) {
             // and the contiguous `[38][0]` is not visible in them (see `Applier::reply_arena_fence_signaled`).
             let (venus, signaled) = {
                 let mut session = applier.lock().expect("the applier lock is never poisoned");
-                (session.take_venus_blob_writes(), session.reply_arena_fence_signaled())
+                // Timed separately: these two walk every Venus-internal blob — including the 8 MiB
+                // staging pool — byte-granular at gap 0, and they do it with the lock held.
+                let t = std::time::Instant::now();
+                let v = session.take_venus_blob_writes();
+                section_log("take_venus_blob_writes", t.elapsed());
+                let t = std::time::Instant::now();
+                let s = session.reply_arena_fence_signaled();
+                section_log("reply_arena_fence_signaled", t.elapsed());
+                (v, s)
             };
             if signaled {
                 // A fence just signalled: the application's submit and its readback copy are complete on
@@ -605,6 +676,29 @@ fn main() -> Result<()> {
             move || progress_thread(applier, tx)
         })
         .context("spawning the progress thread")?;
+
+    // DIAGNOSTIC (`RAYLAND_S_REPLY_LOG`): a lock watchdog. Both of S's threads were measured stopping
+    // at the same instant after S read C's final ring delta, which is the signature of a deadlock —
+    // but "both stopped" does not say *which* lock is held or by whom, and the two threads' own logs
+    // cannot say so because a thread blocked on a lock writes nothing. This one owns no locks and
+    // only ever `try_lock`s, so it keeps reporting while the others are wedged.
+    if link_log_enabled() {
+        let applier_probe = Arc::clone(&applier);
+        let tx_probe = Arc::clone(&tx);
+        std::thread::Builder::new()
+            .name("rayland-s-lockdog".into())
+            .spawn(move || {
+                loop {
+                    // `try_lock` and immediately drop: this must never itself hold either lock, or the
+                    // instrument becomes a participant in the thing it is measuring.
+                    let applier_free = applier_probe.try_lock().is_ok();
+                    let tx_free = tx_probe.try_lock().is_ok();
+                    eprintln!("[s-lockdog] applier_free={applier_free} tx_free={tx_free}");
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            })
+            .context("spawning the lock watchdog")?;
+    }
 
     // What to look for. Read before the session rather than after it, so a malformed
     // `RAYLAND_C1_PRESENT_SIZE` is a startup refusal naming the setting — not a surprise at the end

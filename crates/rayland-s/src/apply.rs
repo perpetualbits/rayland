@@ -1590,7 +1590,12 @@ fn reply_log_commands(tail: u32, bytes: &[u8]) {
 /// - Prints at most one line per interval; returns nothing. **No-op unless `RAYLAND_S_REPLY_LOG` is
 ///   set.**
 fn reply_log_ring_control_throttled(blob: Option<&HostBlob>, res_id: u32) {
-    if !reply_log_enabled() {
+    // **Its own switch, deliberately.** This is the one diagnostic that runs with the applier lock
+    // held, so it is the one that could plausibly perturb a lock-ordering bug it is being used to
+    // study. Gating it separately means a run can have all the other logging with this specific
+    // instrument removed from the picture — which is how its innocence gets established rather than
+    // assumed.
+    if !reply_log_enabled() || std::env::var_os("RAYLAND_S_POLL_SAMPLE").is_none() {
         return;
     }
     // A process-wide clock base, established on the first sample. `Instant` cannot be a `const`, so
