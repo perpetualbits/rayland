@@ -2214,3 +2214,45 @@ to have to do its work.
 The switch stays in the tree, inert by default and documented as *not* a fix: it publishes a region S also
 writes, which is a clobber, and its `nonzero_runs` is not a diff and cannot un-set a byte. It earned its place
 by answering a question, not by being safe to leave on.
+
+### 2026-07-26 — The token-built resources agree too: there is no byte divergence left, so the wall is object state
+
+Fingerprinting the swapchain images S builds from WP0 buffer tokens closes the last open candidate, and the
+answer is negative in the most useful way.
+
+**First, the instrument had to be fixed — again, and this is now a pattern worth naming.** The blob
+fingerprint hashed every byte of every blob (~11 MiB) twice a second, on C inside the blob-table lock and on
+S inside the applier lock. With it on, the application **never reached its swapchain buffers at all**: five
+runs, all stopping at 36 proxy-trace lines with zero `create_immed`. With it off: three runs, **all** reaching
+52 lines and four `create_immed`. Eight runs, a clean split — causation, not variance. Rewritten to skip zero
+regions with chunk compares that lower to `memcmp`, hashing only non-zero content, it reached the buffers on
+the *first* attempt. **Three separate times today an instrument has changed the behaviour it was measuring**,
+and the reason is now itself a finding: the relay path is so latency-sensitive that tens of milliseconds
+periodically stolen from it decide whether a real application gets through its setup. That is worth knowing
+independently of this bug.
+
+**With a cheap instrument, every resource agrees:**
+
+| resource | C | S | |
+|---|---|---|---|
+| `res=8`, `res=9`, `res=10` — the token-built swapchain images | `nonzero=0` | `nonzero=0` | **match, both empty** |
+| `res=7` | 0 | 0 | match |
+| `res=2` reply arena | 20548 | 20548 | match |
+| `res=4`, `res=5`, `res=6` | identical | identical | match |
+| `res=1` ring | 6568 | 6569 | one byte of sampling skew |
+| `res=3` staging pool | 120 | 0 | the known divergence, already shown irrelevant |
+
+The swapchain images being empty on **both** sides is consistent rather than surprising — the submit that
+would render into them is precisely what fails — but the point is that they *agree*. There is no resource
+whose content C has and S lacks, except the staging pool, which was shipped and made no difference.
+
+**So the elimination is complete, and it is worth stating as a positive claim:** the ring is byte-exact
+(253/253 digests), every blob's content agrees, and the one structural gap was closed experimentally without
+effect. **The failing `vkQueueSubmit` is not short of any bytes.** Whatever it needs, S has the memory for;
+what S evidently does not have is the right *object state* behind it — the `VkImage`, its memory binding, its
+layout — built through the WP0 token path rather than through anything the (c)1 blob machinery touches.
+
+That reframes the remaining work from synchronisation to reconciliation, and it is squarely Task 4.3's:
+the swapchain images exist on S as resources, and the application's commands refer to them as images with
+assumptions — bound memory, a layout, a format — that nothing has yet been made responsible for establishing.
+Chasing bytes is finished; the next question is what S's engine believes those three resources *are*.

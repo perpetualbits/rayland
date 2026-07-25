@@ -1565,14 +1565,17 @@ impl Applier {
 
         for (&res_id, blob) in &self.blobs {
             let bytes = blob.bytes();
-            // The digest says "same bytes or not"; the non-zero count separates *diverged* from
-            // *never populated*, and the latter is exactly what a resource S created from a token but
-            // never received contents for would look like.
-            let nonzero = bytes.iter().filter(|&&b| b != 0).count();
+            // **Cheap by construction.** Hashing every byte of every blob here — under the applier
+            // lock — measurably stopped the application from reaching its swapchain buffers at all
+            // (36 proxy-trace lines against 52 with the instrument off, 5 runs to 3). Zero regions
+            // carry no information, since S's copy of a blob starts as a zero-filled memfd, so they
+            // are dismissed with chunk compares that lower to `memcmp` and only non-zero content is
+            // hashed.
+            let (nonzero, digest) = sparse_fingerprint(bytes);
             eprintln!(
                 "[s-blobfp] tail={tail} res={res_id} len={} nonzero={nonzero} fnv={:016x}",
                 bytes.len(),
-                fnv1a(bytes)
+                digest
             );
         }
     }
@@ -1945,4 +1948,37 @@ fn fnv1a(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(PRIME);
     }
     hash
+}
+
+/// A blob fingerprint that skips zero regions: `(non-zero byte count, digest of the non-zero bytes)`.
+///
+/// Must stay byte-for-byte equivalent to `rayland-c`'s `sparse_fingerprint`, since the whole purpose
+/// is comparing the two sides' output. Duplicated rather than shared for the reason the ring
+/// fingerprints are: two independent computations over two independent buffers is the property being
+/// tested. See that function's docs for why the zero-skipping is not merely an optimisation but a
+/// requirement — the full-hash version changed the behaviour of the system it was measuring.
+fn sparse_fingerprint(bytes: &[u8]) -> (usize, u64) {
+    const CHUNK: usize = 64;
+    const ZEROS: [u8; CHUNK] = [0u8; CHUNK];
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut nonzero = 0usize;
+    let mut hash = OFFSET_BASIS;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let end = (i + CHUNK).min(bytes.len());
+        if bytes[i..end] == ZEROS[..end - i] {
+            i = end;
+            continue;
+        }
+        for &b in &bytes[i..end] {
+            if b != 0 {
+                nonzero += 1;
+                hash ^= b as u64;
+                hash = hash.wrapping_mul(PRIME);
+            }
+        }
+        i = end;
+    }
+    (nonzero, hash)
 }

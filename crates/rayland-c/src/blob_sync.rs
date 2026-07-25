@@ -578,14 +578,17 @@ fn blob_fingerprints(table: &std::collections::HashMap<u32, crate::shm::LocalBlo
 
     for (&res_id, blob) in table.iter() {
         let bytes = blob.bytes();
-        // The digest answers "are these the same bytes"; the non-zero count answers "is this blob
-        // populated at all", which distinguishes *diverged* from *never filled in* — and the latter
-        // is what a resource S built from a token but never received contents for would look like.
-        let nonzero = bytes.iter().filter(|&&b| b != 0).count();
+        // **Cheap by construction, and it has to be.** The first version hashed every byte of every
+        // blob (~11 MiB) twice a second while holding this table's lock, and measurably stopped the
+        // application from reaching its swapchain buffers at all — 36 proxy-trace lines against 52
+        // with the instrument off, 5 runs to 3. The relay path is that latency-sensitive. So the
+        // zero regions, which are the overwhelming majority, are skipped with chunk compares that
+        // lower to `memcmp`, and only non-zero content is hashed.
+        let (nonzero, digest) = sparse_fingerprint(bytes);
         eprintln!(
             "[c-blobfp] tail={tail} res={res_id} len={} nonzero={nonzero} fnv={:016x}",
             bytes.len(),
-            fnv1a_blob(bytes)
+            digest
         );
     }
 }
@@ -674,4 +677,45 @@ fn nonzero_runs(bytes: &[u8]) -> Vec<(usize, usize)> {
         runs.push((start, bytes.len()));
     }
     runs
+}
+
+/// A blob fingerprint that skips zero regions: `(non-zero byte count, digest of the non-zero bytes)`.
+///
+/// # Why not simply hash the blob
+/// Because hashing 11 MiB of mostly-zero memory twice a second, under a lock the relay needs, changed
+/// the behaviour of the system being measured — the application stopped reaching its swapchain
+/// buffers entirely. Zero regions carry no information here: S's copy of a blob starts as a
+/// zero-filled memfd, so agreement on the zeros is the default rather than evidence. Comparing a
+/// chunk against zeros with slice equality lowers to `memcmp`, so the common case costs a vectorised
+/// scan and no hashing at all.
+///
+/// # Inputs / outputs
+/// - `bytes`: the blob's live contents.
+/// - Returns the count of non-zero bytes and an FNV-1a digest **of only those bytes, in order**. Two
+///   blobs agreeing on both agree on their content, since the zeros are implied by the length.
+fn sparse_fingerprint(bytes: &[u8]) -> (usize, u64) {
+    const CHUNK: usize = 64;
+    const ZEROS: [u8; CHUNK] = [0u8; CHUNK];
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut nonzero = 0usize;
+    let mut hash = OFFSET_BASIS;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let end = (i + CHUNK).min(bytes.len());
+        // The whole point: an all-zero chunk is dismissed by one vectorised compare.
+        if bytes[i..end] == ZEROS[..end - i] {
+            i = end;
+            continue;
+        }
+        for &b in &bytes[i..end] {
+            if b != 0 {
+                nonzero += 1;
+                hash ^= b as u64;
+                hash = hash.wrapping_mul(PRIME);
+            }
+        }
+        i = end;
+    }
+    (nonzero, hash)
 }
