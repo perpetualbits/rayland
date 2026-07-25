@@ -2175,3 +2175,42 @@ fixtures would not catch. But as a **diagnostic** it is decisive in one run: if 
 pool is exonerated and the token-built swapchain images are next; if it succeeds, the real design question
 opens — how a region both sides write gets synchronised without either clobbering the other, which is the
 same shape as the (c)2 problem and deserves its own spec rather than a patch at the end of a long day.
+
+### 2026-07-26 — The staging-pool experiment: a clean negative, and the instrument distorted the first attempt
+
+The blob fingerprints left the staging pool as the only structural divergence between the two machines, so
+the experiment was to ship it and see whether the application's `vkQueueSubmit` completed. It was run as an
+explicitly named diagnostic — `RAYLAND_C1_SHIP_BLOB=<res_id>`, the operator naming the resource rather than
+the code inferring "the staging pool" from a size or an id, because inference is what has cost this
+investigation most of its time.
+
+**The mechanism works.** With the switch on, C and S report the same digest for `res=3`
+(`nonzero=28 fnv=87d657a315c264f8`). The pool genuinely crosses; the last structural divergence is closed.
+
+**The first run was invalid, and the reason is worth more than the run.** The application got *less* far with
+the experiment on — 91 deltas and 36 proxy-trace lines, against 253 and 52 without it. S was not starved (3
+slow sections, 91 of 91 deltas applied), so the cost was on C: the first `nonzero_runs` walked all 8 MiB a
+byte at a time on **every relay**. That is precisely the per-relay scan cost removed from S this morning,
+reintroduced on C by the instrument built to study its consequences. Rewritten chunked — comparing 64-byte
+chunks against zeros with slice equality, descending per-byte only inside a non-zero chunk — exactly as the
+S-side diff was.
+
+**With the instrument fixed, the answer is negative.** 85 deltas, 36 proxy lines, ending on the same
+`vkGetImageMemoryRequirements2 / vkAllocateMemory / vkGetImageDrmFormatModifierPropertiesEXT` signature. Both
+runs with the pool shipped reached 36 proxy lines; both runs without it reached 52. **Shipping the staging
+pool does not get the application further, and on this evidence makes it worse** — which is what `blob_id`
+routing exists to prevent, and a reminder that "harmless but pure waste" was the optimistic half of that
+design note.
+
+**So the staging pool is exonerated as the missing ingredient.** That is a real result even though it is a
+negative one: the ring is byte-exact, the application blobs are identical, and now the one remaining
+structural difference has been closed and *did not help*. What the failing submit references is therefore
+**not** raw blob content that C holds and S lacks. The remaining candidate is the one thing on this path that
+never came from the blob machinery at all: the swapchain images S builds from **WP0 buffer tokens**
+(`res=8/9/10`), which the (c)1 blob sync and the WP0 buffer path have never been reconciled against each
+other. That is a seam between two subsystems rather than a missing byte, and it is where 4.3 was always going
+to have to do its work.
+
+The switch stays in the tree, inert by default and documented as *not* a fix: it publishes a region S also
+writes, which is a clobber, and its `nonzero_runs` is not a diff and cannot un-set a byte. It earned its place
+by answering a question, not by being safe to leave on.
