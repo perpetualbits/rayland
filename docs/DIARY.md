@@ -1787,3 +1787,49 @@ consumed somewhere earlier. The ring struct's address is now known at runtime (`
 `pending_notify` flag can be read out of the same mapping S already holds, so this is an observation rather
 than another theory. **Six readings of this stall so far; the ones that survived were all measurements, and
 every one that died was an inference.**
+
+### 2026-07-26 — The two-machine demo ran, and presented a black window: the relay was right and S's presentation was wrong
+
+The owner asked the question this project exists to answer — *can I run something on apollo and see it on my
+laptop?* — and the honest answer today is "half". Recording both halves, because the half that failed is a
+real defect and not the caveat that was expected.
+
+**What worked.** `rayland-icosa-cpu` ran on **apollo**, which links no GPU stack of ours. Its Vulkan command
+stream crossed a real network over QUIC. **The laptop's GPU drew it**, and `rayland-s` opened a genuine
+`xdg_toplevel` window on the laptop's compositor:
+
+```
+rayland-s: resource 6 is 262144 bytes = 256x256x4, so it is a candidate for the frame to present
+rayland-s: presenting resource 6 as the frame (256x256)
+presenting via wl_shm (fallback: this frame source cannot export a dmabuf)
+```
+
+The expected caveat was that this is **one still frame, not an animation**: `present_the_frame` is called
+exactly once (`rayland-s/src/main.rs:544`), at session end, and the window then blocks until closed. That
+caveat was stated before running and is not the problem.
+
+**What failed: the window was black.** And the pixels were *fine* — the application on apollo wrote all 120
+PNGs, and pulling `frame_0060.png` back shows **213 distinct byte values spanning 0–255**, an unambiguously
+real image. So the command stream crossed correctly, S's GPU rendered correctly, and the readback returned
+correctly to the application on C. **Everything the relay is responsible for worked. What showed on screen
+did not.** The fault is in S's own capture-and-present path — `FrameCapture` / `into_frame` / `present_frame`
+— which selected `res=6` at the right size and then presented zeros.
+
+That is worth saying plainly rather than filing under "static demo": for the whole session the presentation
+path has been carried as *working* on the strength of (c)1 Task 7 and a two-machine run recorded in
+`CLAUDE.md` as "presents on dop561's screen". It presents *a window*. Whether what is in the window is the
+frame has evidently not been checked by a human recently, and `rayland-present`'s own module docs say exactly
+why that matters: *"verified by building, by `tests/live_window.rs` … and by a human looking at the screen —
+because no automated test can assert what a compositor actually painted."* The automated tests were green.
+The human looked, and it was black.
+
+**Not diagnosed yet, deliberately** — the owner asked to carry on with the ring stall, and this is a separate
+defect on a separate path. The obvious suspects, in the order worth checking: whether `FrameCapture` holds
+bytes captured *before* the first render (it accumulates during the session and presents at the end, and a
+capture taken at the wrong instant would be exactly this symptom); whether the device-destroy at session end
+disturbs the blob it then reads; and whether `into_frame` picks the right blob for an app whose readback is
+not the refapp's. The size heuristic clearly worked — 256×256×4 is right — so this is about *when* the bytes
+were taken, not *which* resource.
+
+**One thing it does settle, though:** commands-not-pixels works over a real network, machine to machine, with
+an unmodified application. The thesis is not in question. The last mile is.
