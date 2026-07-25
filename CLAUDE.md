@@ -39,6 +39,22 @@ fallback exists but is not the goal (in the target setup, C is the wrong place t
   trait boundary must stay clean enough that the engine could later be Rustified or
   swapped without touching the rest.
 
+## How the human works (read this before touching git)
+
+The repository owner develops with **Claude Code in a shell on their Linux laptop — that
+laptop is the primary copy.** GitHub is the **remote/backup/publishing** point, not the
+working copy. Claude.ai is used for **ideation and for crafting the prompts** that laptop
+Claude Code sessions then execute. Any session that is *not* running on the laptop (e.g.
+Claude Code on the web, in a cloud container) is the exception, and must behave as a
+guest:
+
+- **Never commit to or push `main` from a non-laptop session.** Push finished work to a
+  clearly-named side branch and leave merging to the human on the laptop.
+- Treat a cloud clone as disposable: anything worth keeping is pushed to its side branch
+  before the session ends, and nothing assumes it will still exist tomorrow.
+- If work in a non-laptop session could collide with uncommitted work on the laptop, the
+  laptop wins — leave a branch to reconcile rather than racing the primary.
+
 ## Code conventions
 
 Write code as if a human reviewer — possibly one not deeply versed in

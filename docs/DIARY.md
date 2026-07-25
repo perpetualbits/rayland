@@ -434,3 +434,14 @@ narrative intact (the gate paragraph now says where the logic went, rather than 
 there). The mild lesson for future sessions: a cold read by someone without the previous session's
 context is cheap and catches precisely the staleness the previous session cannot see — its author still
 remembers what the words *meant*, so they read as true.
+
+### 2026-07-25 — Writing down where the truth lives
+
+The human spelled out their working setup, and it is now a convention in `CLAUDE.md`: the Linux laptop
+running Claude Code in a shell is the **primary** copy; GitHub is remote, backup, and publishing;
+Claude.ai is where ideas become prompts for the laptop to execute. Sessions like this one — running in a
+cloud container — are guests, and guests push side branches and never touch `main`. Worth a diary line
+because it settles a question every future non-laptop session would otherwise have to guess at: when two
+copies of the repository disagree, the laptop is the one telling the truth. The same reasoning the
+project applies to its own protocol (know which side owns the ring, which side merely mirrors it)
+applies to its git topology.
