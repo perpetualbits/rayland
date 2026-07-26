@@ -3,8 +3,12 @@
 //! # Why the include order matters
 //! The generated headers `#include "vkr_cs.h"`, and this crate supplies its own replacement for that
 //! file (see `csrc/vkr_cs.h` for why). `csrc/` is therefore placed **before** the vendored directory
-//! on the include path, so ours wins. Reversing these two lines would pull in virglrenderer's header
-//! and, through it, Mesa's util library — which is exactly what this crate exists to avoid.
+//! on the include path, so ours wins. Today `vendor/` holds only `venus-protocol/` — virglrenderer's
+//! own `vkr_cs.h` was never vendored, so this crate's copy is the *only* `vkr_cs.h` anywhere on the
+//! include path, and the order is defensive rather than a tiebreak against a real competing header. It
+//! stays load-bearing precedent for the day a virglrenderer header (or anything else declaring its own
+//! `vkr_cs.h`) is added to `vendor/`: `csrc/` must still resolve first, or Mesa's util library (hash
+//! tables, threads, os_file) would be dragged in through it — exactly what this crate exists to avoid.
 fn main() {
     // Rebuild when anything we compile changes; without these, a header edit is silently ignored.
     println!("cargo:rerun-if-changed=csrc");

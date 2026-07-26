@@ -2438,10 +2438,13 @@ they looked: they're called by `vn_decode_Vk*_temp` for *every* handle-typed com
 nearly every command, so a wrong answer there would have been silent and pervasive rather than confined
 to an edge case. Their correct behavior fell out of two call sites already sitting in the vendored tree —
 `vn_decode_VkInstance_temp` allocates a temp cell before storing an id, `vn_decode_VkBuffer` stores
-straight into the handle slot — which is just Vulkan's own dispatchable/non-dispatchable handle split
-(`VK_DEFINE_HANDLE` vs `VK_DEFINE_NON_DISPATCHABLE_HANDLE`), not a guess. Critically, none of that
-machinery touches the byte cursor — it only manages an in-memory scratch cell — so getting it wrong
-could never corrupt the one number this crate exists to report. The blob-storage functions are the
+straight into the handle slot — which distinguishes Vulkan's dispatchable handle types
+(`VK_DEFINE_HANDLE`) from non-dispatchable ones (`VK_DEFINE_NON_DISPATCHABLE_HANDLE`), not a guess. But
+which of those five dispatchable types actually needs the indirect treatment is a **pointer-size
+comparison** (`sizeof(VkInstance) < sizeof(vkr_object_id)`), not a fixed per-type answer — on every
+64-bit build that comparison is false, so dispatchable handles are direct too, same as non-dispatchable
+ones. Critically, none of that machinery touches the byte cursor — it only manages an in-memory scratch
+cell — so getting it wrong could never corrupt the one number this crate exists to report. The blob-storage functions are the
 one piece left genuinely unresolved: the generated caller pattern skips the fatal flag on a NULL return
 (`if (!val->pData) return;`, no `set_fatal`), so a stub returning NULL is safe *only* because Task 1
 never reaches it — Task 2 must give it a real body before decoding any command with a blob array
@@ -2455,3 +2458,35 @@ is small and documented" undersold it slightly — the header's *prose* is small
 discipline this whole decoder exists to bring to Rayland's own command streams. The crate compiles,
 links, and reports `38` (`VK_COMMAND_TYPE_vkGetFenceStatus_EXT`) — Task 1's whole deliverable — with
 that one deferred item carried forward explicitly rather than silently.
+
+### 2026-07-26 — Task 1 review: the "spec-fixed" claim above was itself imprecise, and the code had a real bug behind it
+
+Task 1 came back Approved, with one Important finding: `vkr_cs_handle_indirect_id` hardcoded `return
+true;` for the five dispatchable handle types. Real virglrenderer computes `sizeof(VkInstance) <
+sizeof(vkr_object_id)` instead — on every realistic (64-bit) build that is `8 < 8`, **false**, so
+dispatchable handles get *direct* storage too, same as non-dispatchable ones. The hardcoded `true` was a
+genuine behavioral divergence from the reference, not a stylistic difference: it made every dispatchable
+handle take the temp-pool-allocation branch when the reference never does, on this architecture. The
+reviewer traced every call site and confirmed it could not corrupt `command_len` (the byte cursor is
+never touched by this code — only in-memory scratch bookkeeping), so it was not urgent, but Task 2 builds
+directly on this header, so it is fixed now: `vkr_cs_handle_indirect_id` computes the same
+pointer-size comparison the reference does, written out (not hardcoded to `false`) so it stays correct if
+this crate is ever built for a target where pointers are narrower than the 64-bit wire id.
+
+**The paragraph above describing this as "just Vulkan's own dispatchable/non-dispatchable handle split
+… spec-fixed … should never need revisiting" was overstated, and that overstatement is exactly how the
+bug survived a first read.** The real distinction is two-layered: WHICH handle types are ever candidates
+for indirection is fixed by Vulkan's type taxonomy (only the five dispatchable types), but WHETHER a
+candidate actually needs it is a runtime/build fact — a comparison between the host's pointer width and
+the wire id's width — not a second fixed fact of the same kind as the first. Collapsing both into one
+"spec-fixed" claim is what let a hardcoded `true` look self-evidently correct instead of like an
+unjustified constant. The wording above has been corrected in place, per the reviewer's request, rather
+than left to mislead a future reader; this entry is the record that it changed and why, so the diary
+still shows the wrong turn rather than only the corrected belief.
+
+`build.rs`'s comment was also tightened: it warned that reversing the include order "would pull in
+virglrenderer's header", but virglrenderer's `vkr_cs.h` was never vendored — only `venus-protocol/` was
+copied — so today this crate's copy is the *only* `vkr_cs.h` on the include path, and the order is
+defensive precedent for if a competing header is ever added to `vendor/`, not a tiebreak against one that
+exists now. The include order itself did not change; only the comment's claim about what it currently
+guards against.

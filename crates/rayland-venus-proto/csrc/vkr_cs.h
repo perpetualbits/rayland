@@ -113,9 +113,11 @@ vkr_cs_decoder_reset_temp_pool(struct vkr_cs_decoder *dec)
 }
 
 /*
- * True for VkInstance, VkPhysicalDevice, VkDevice, VkQueue and VkCommandBuffer — the five
- * "dispatchable" Vulkan handle types (`VK_DEFINE_HANDLE` in the Vulkan headers, as opposed to
- * `VK_DEFINE_NON_DISPATCHABLE_HANDLE` for every other handle type).
+ * Candidates for "indirect" storage are VkInstance, VkPhysicalDevice, VkDevice, VkQueue and
+ * VkCommandBuffer — the five "dispatchable" Vulkan handle types (`VK_DEFINE_HANDLE` in the Vulkan
+ * headers, as opposed to `VK_DEFINE_NON_DISPATCHABLE_HANDLE` for every other handle type). Whether one
+ * of them actually NEEDS indirection is a **pointer-size comparison**, not a fixed yes/no per type —
+ * see below.
  *
  * NOT PART OF THE DOCUMENTED CONTRACT (see the note above `vkr_object`, further down) but required to
  * compile: `vn_decode_Vk*_temp` (the handle-typed argument decoder our shim's call graph does reach)
@@ -124,16 +126,27 @@ vkr_cs_decoder_reset_temp_pool(struct vkr_cs_decoder *dec)
  * WHY THE DISTINCTION EXISTS: a real ICD loader dereferences a dispatchable handle as a pointer to a
  * dispatch-table struct — that is the mechanism Vulkan loaders use to find a driver's function
  * pointers. A decoder fabricating an *unresolved* handle for one of these five types therefore cannot
- * use the raw wire id as the handle value directly; it must give the handle somewhere valid to point,
- * hence "indirect": the caller allocates a temp-pool cell and stores the wire id there, and the handle
- * becomes a pointer to that cell. Every other (non-dispatchable) handle type is just an opaque 64-bit
- * value, so the wire id can be used directly as the handle with no extra storage.
+ * use the raw wire id as the handle value directly *if the handle is narrower than the wire id* — it
+ * must give the handle somewhere valid to point, hence "indirect": the caller allocates a temp-pool
+ * cell and stores the wire id there, and the handle becomes a pointer to that cell. Every other
+ * (non-dispatchable) handle type is always exactly as wide as the wire id (Vulkan's own
+ * `VK_DEFINE_NON_DISPATCHABLE_HANDLE` macro widens it to a 64-bit-compatible representation whenever
+ * pointers are narrower), so it is never indirect.
  *
- * This is inferred directly from two call sites in the vendored tree, not a guess:
+ * THE ACTUAL CONDITION, matching virglrenderer's own `vkr_cs.h`, is `sizeof(VkInstance) <
+ * sizeof(vkr_object_id)` — a comparison between the host's pointer width and the 64-bit wire id, not a
+ * hardcoded "dispatchable handles are always indirect". On every 64-bit build (the only realistic
+ * target for this crate: `sizeof(VkInstance) == sizeof(void*) == 8 == sizeof(vkr_object_id)`), that
+ * comparison is **false** — so on this architecture dispatchable handles are direct too, exactly like
+ * non-dispatchable ones. Writing the comparison out (rather than hardcoding `false`) is what keeps this
+ * correct if this crate is ever built for a 32-bit target, where it would evaluate `true`.
+ *
+ * The switch below is still inferred directly from two call sites in the vendored tree, not a guess:
  * `vn_decode_VkInstance_temp` (`vn_protocol_renderer_handles.h`) allocates a temp cell before storing,
- * while `vn_decode_VkBuffer` in the same file stores straight into the handle slot. Getting this wrong
- * cannot corrupt this crate's byte-count answer — no wire bytes are read here, only scratch-pool
- * bookkeeping — but it is spec-fixed by Vulkan's own handle taxonomy and should never need revisiting.
+ * while `vn_decode_VkBuffer` in the same file stores straight into the handle slot — confirming that
+ * only the five dispatchable types are ever candidates for the indirect branch at all. Getting the
+ * candidate set wrong, or the size comparison wrong, cannot corrupt this crate's byte-count answer — no
+ * wire bytes are read here, only scratch-pool bookkeeping.
  */
 static inline bool
 vkr_cs_handle_indirect_id(VkObjectType type)
@@ -144,7 +157,9 @@ vkr_cs_handle_indirect_id(VkObjectType type)
    case VK_OBJECT_TYPE_DEVICE:
    case VK_OBJECT_TYPE_QUEUE:
    case VK_OBJECT_TYPE_COMMAND_BUFFER:
-      return true;
+      /* False on every 64-bit build; written as a comparison, not a hardcoded constant, so it stays
+       * correct if this crate is ever built where pointers are narrower than a `vkr_object_id`. */
+      return sizeof(VkInstance) < sizeof(vkr_object_id);
    default:
       return false;
    }
