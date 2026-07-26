@@ -3952,3 +3952,34 @@ pushing it green-on-nothing is exactly the move this diary has spent the day arg
 plumbing question it raises — `WaylandReplay` needs access to `Applier`'s descriptors, and the two are
 held separately in `serve` — is a design choice better made with a test in front of it than at the end
 of a long session.
+
+### 2026-07-27 — The soak found something incidentally: `rayland-s` aborts on teardown
+
+Started the overnight soak, checked it was really running rather than trusting that it had launched,
+and the check found a defect the measurement was not looking for.
+
+```
+baseline-rate.sh: line 52: 1080297 Aborted (core dumped)  .../rayland-s ...
+```
+
+**`rayland-s` is dying with `SIGABRT`, not exiting.** The runs themselves are fine — every attempt
+reports `rc=0 frames=120 cores=0`, the application completes, the frames are correct — so this happens
+during *teardown*, after the work is done, when the script terminates S at the end of an iteration.
+`SIGTERM` would have bash print "Terminated"; "Aborted" means signal 6, so something inside S is
+panicking (or double-panicking) on the way out rather than shutting down cleanly.
+
+**Why it matters despite harming no run.** An abort on every session teardown is a permanent false
+positive sitting in front of every future investigation: a real crash on shutdown would look exactly
+like this and be dismissed as the usual noise. Today already spent hours on a signature scan that fired
+on payload bytes and on an unattributed `SIGABRT` in the application; this is the same hazard one layer
+down, in S. It also means no session in this project has ever ended cleanly, which nobody had noticed
+because nothing checks S's exit status.
+
+**Not chased tonight**, deliberately: the soak is using the machines, and the likely candidates (a
+thread panicking on a lock or channel that closes first — `progress_thread` and the engine actor both
+hold `expect`s that assume a live link) are cheap to find with a backtrace once they are free.
+Recorded so it is a known defect rather than familiar noise.
+
+**Disk was the one real risk of leaving this running unattended, and it is not one:** the local
+`core_pattern` pipes to apport, which skips unpackaged binaries, so no `rayland-s` core is written and
+nothing accumulates; `/var/crash` is unchanged and root has 334 GB free.
