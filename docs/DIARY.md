@@ -3009,3 +3009,57 @@ arrived. After nine refuted theories on this stall, that measurement gets taken 
 week fell to an instrument, not an argument, and this one fell to an instrument that took five tasks to build
 while the bug sat untouched. The decoder's first real use refuted two hypotheses, corrected a three-day-old
 misreading, and located the fault — in one run, on the first attempt.
+
+### 2026-07-26 — The queue ids match, and the decoder contradicts S's own device-destroy detector
+
+The measurement asked for: dump the queue handle the submit names against what was created. Both are in the
+stream, and the decoder now reaches them.
+
+**The ids match, exactly and throughout:**
+
+```
+[ring-queue] GetDeviceQueue2 @0    creates queue id 0x6
+[ring-queue] submit @6852          names   queue id 0x6
+[ring-queue] submit @688           names   queue id 0x6
+[ring-queue] submit @64            names   queue id 0x6
+[ring-queue] submit @232           names   queue id 0x6
+[ring-queue] submit @748           names   queue id 0x6
+```
+
+So the failing submit is **not** naming a stale, wrong, or never-created queue. It names precisely the one the
+application acquired. That kills the simplest reading of the previous entry.
+
+**And the shape of the failure is narrower than assumed: five submits, one CS error.** The queue resolved
+perfectly well for the earlier submits. Whatever goes wrong, it makes an id that *was* resolvable stop being
+so, partway through the session — which is why it presents intermittently.
+
+**The finding, and it is a contradiction between two of our own components.** In virglrenderer, the thing that
+destroys a queue is its device being destroyed. So the obvious candidate was `vkDestroyDevice` — and S logs
+exactly that:
+
+> `rayland-s: application destroyed its device (vkDestroyDevice for device 5); retiring the readback gate for
+> ring_idx=1 so no fence can race the queue's destruction`
+
+**But the decoder finds zero `vkDestroyDevice` (type 12) in the entire relayed stream** — across 105 deltas,
+every one walked to `ReachedEnd`. Both cannot be true.
+
+The two differ in kind, and that matters for which to believe. S's `find_destroy_device` is a **signature
+scan** — a byte-pattern heuristic, written precisely because the walker could not reach far enough to decode
+its way there, and documented as such. The decoder is a full walk using Mesa's own generated decoders, which
+agrees with virglrenderer's framing to the byte (its `head` landed on our submit boundary exactly). **A
+heuristic scan and a real decode disagree, and the decode is the better witness.**
+
+If the scan is a false positive, S has been **acting on phantom evidence**: retiring the readback gate for a
+device destruction that never happened. That is a live behaviour change driven by a bad signal, and it was
+invisible until something could read the stream properly. It also would not, on its own, explain the queue
+becoming unresolvable inside virglrenderer — S retiring its own gate does not unregister a host object — so
+this is a real defect found *alongside* the one being hunted, not necessarily the cause of it.
+
+**Deliberately not concluded.** Three readings remain and they are distinguishable: the scan is a false
+positive and something else unregisters the queue; the scan is right and a destroy reaches virglrenderer by a
+path the ring decode does not cover; or the fatal flag is set by neither the queue lookup nor a destroy, but
+by the decode of the submit's *arguments* failing inside virglrenderer's context in a way our stub-lookup
+decode does not reproduce (the dispatcher sets fatal on three distinct conditions, and only one of them is the
+queue). After ten refuted theories on this stall, the next step is to check `find_destroy_device` against the
+decoded stream directly — a self-contained test, no live run required, since both the scanner and the decoder
+can be pointed at the same captured bytes.

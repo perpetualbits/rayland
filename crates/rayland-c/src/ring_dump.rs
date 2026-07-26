@@ -24,6 +24,21 @@
 //! truthfully, because the one legitimate call lives here instead.
 
 use rayland_c::ring::RingDelta;
+// The command types this diagnostic reports on, and the prologue width their arguments follow.
+// Imported rather than re-spelled as literals: `venus_ring::decode` is where the evidence for each
+// number lives, and a second copy here could drift from it silently.
+use rayland_vtest::venus_ring::decode::{
+    VK_COMMAND_TYPE_VK_DESTROY_DEVICE, VK_COMMAND_TYPE_VK_GET_DEVICE_QUEUE2,
+    VK_COMMAND_TYPE_VK_QUEUE_SUBMIT,
+};
+
+/// Width of a Venus command's `[type: u32][flags: u32]` prologue, so the first argument begins here.
+///
+/// Defined locally rather than imported: `venus_ring::decode`'s copy is private, and widening that
+/// crate's public API for a diagnostic is the wrong trade. The value is fixed by the protocol — every
+/// command starts with exactly those two `u32`s, which is what `vn_dispatch_command` reads before it
+/// dispatches — so a local copy cannot drift in any way that matters.
+const COMMAND_HEADER_BYTES: usize = 8;
 
 /// Prints one diagnostic line per ring delta if `RAYLAND_RING_DUMP` is set in the environment;
 /// otherwise returns immediately having done nothing — no decode, no allocation, no cost beyond the
@@ -70,6 +85,41 @@ pub fn dump_if_enabled(pending: &RingDelta) {
         stop,
         named.join(" | ")
     );
+    // **The queue-identity question.** S refuses the application's `vkQueueSubmit` with a
+    // "CS error", and the generated dispatcher sets that same fatal flag on
+    // `if (!args.queue)` — a *handle lookup failure*, not a read past the end
+    // (`vn_protocol_renderer_queue.h:1141-1145`). So the question is whether the id the submit
+    // names is the id the application created. Both are in these bytes, and the walk above now
+    // reaches them, so print them side by side and let the ids answer it.
+    for cmd in &commands {
+        // The queue a submit names: `vn_decode_vkQueueSubmit_args_temp` opens with
+        // `vn_decode_VkQueue_lookup`, so the object id is the `u64` immediately after the
+        // `[type][flags]` prologue.
+        if cmd.command_type == VK_COMMAND_TYPE_VK_QUEUE_SUBMIT {
+            if let Some(id) = read_u64_at(&pending.bytes, cmd.offset + COMMAND_HEADER_BYTES) {
+                eprintln!("[ring-queue] submit @{} names queue id {id:#x}", cmd.offset);
+            }
+            continue;
+        }
+        // The queue the application created: `vn_decode_vkGetDeviceQueue2_args_temp` decodes
+        // `device`, then `pQueueInfo`, then `pQueue` via `vn_decode_VkQueue_temp` — the *creation*
+        // form, carrying the client-chosen id, and it is decoded last. So the id is the command's
+        // final eight bytes (`vn_protocol_renderer_device.h:25397-25411`).
+        if cmd.command_type == VK_COMMAND_TYPE_VK_GET_DEVICE_QUEUE2 {
+            let end = cmd.offset + cmd.encoded_size;
+            if let Some(id) = read_u64_at(&pending.bytes, end.wrapping_sub(8)) {
+                eprintln!("[ring-queue] GetDeviceQueue2 @{} creates queue id {id:#x}", cmd.offset);
+            }
+            continue;
+        }
+        // A device destroy takes its queues with it, so it is the other way the submit's id could
+        // become unresolvable. Its handle is the first argument, same position as the submit's.
+        if cmd.command_type == VK_COMMAND_TYPE_VK_DESTROY_DEVICE {
+            if let Some(id) = read_u64_at(&pending.bytes, cmd.offset + COMMAND_HEADER_BYTES) {
+                eprintln!("[ring-queue] DestroyDevice @{} destroys device id {id:#x}", cmd.offset);
+            }
+        }
+    }
     // **The multi-ring question.** Thread sampling on S found three `vkr-ring-1` threads where (c)1
     // spec §6 assumes one, and S never saw a second *inline* `vkCreateRingMESA` — so any extra ring
     // must be created inside the ring stream, which is exactly what this scans for. `decode_commands`
@@ -127,4 +177,20 @@ fn fnv1a(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(PRIME);
     }
     hash
+}
+
+/// Read a little-endian `u64` at `offset`, or `None` if fewer than eight bytes remain.
+///
+/// Little-endian regardless of the host, for the same reason the ring decoder pins it: these bytes
+/// are a memory image of the machine that wrote them, and decoding them natively would make this
+/// diagnostic silently wrong on a big-endian client — which this project explicitly targets.
+///
+/// # Inputs / outputs
+/// - `bytes`: the delta as relayed; `offset`: where the field begins.
+/// - Returns the value, or `None` when the slice is too short. **Never panics** — a truncated read
+///   is a missing log line, not a crash in a diagnostic.
+fn read_u64_at(bytes: &[u8], offset: usize) -> Option<u64> {
+    let field = bytes.get(offset..offset.checked_add(8)?)?;
+    // `try_into` cannot fail: the slice was just bounds-checked to exactly eight bytes.
+    Some(u64::from_le_bytes(field.try_into().ok()?))
 }
