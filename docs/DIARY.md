@@ -3674,3 +3674,48 @@ vkcube. It does not: vkcube's stream contains **zero** type-180 commands, so it 
 refusal. Its blockers remain the NVIDIA `VK_ERROR_DEVICE_LOST` (not ours, and absent on Intel:
 0/10 against 7/14) and setup latency. What this change unblocks is the general case — *any*
 submission over 8 KiB — which vkcube happens to be too small to need.
+
+### 2026-07-26 (very late) — The readback fragmentation was already fixed, and it was never the bottleneck
+
+Asked to fix the readback fragmentation. Measured it first, and the task dissolved twice over.
+
+**It is already coalesced, and CLAUDE.md is stale.** `take_app_blob_writes` has carried a
+`READBACK_COALESCE_GAP` of 256 for some time, with `blob::coalesce_ranges` behind it and six unit
+tests plus an integration test. The "~5000 one-byte `BlobData`/frame" this file still records was
+fixed in an earlier session and the note outlived the defect.
+
+**The measurement, from a 120-frame `icosa-gpu` run over loopback:**
+
+| resource | messages | bytes | one-byte msgs | mean run |
+|---|---|---|---|---|
+| `res=5` — the readback (256×256×4) | 24874 | 9.4 MB | 41 | **377 B** |
+| `res=2` — the reply arena | 4540 | 20 KB | **3247** | 4.4 B |
+
+So the readback's runs are healthy. The one-byte flood is the **arena**, and its grain is
+*deliberate*: `take_venus_blob_writes` passes gap 0 because a gap byte is one S did **not** write, and
+shipping it could clobber what C's Mesa has there. Coalescing it would trade a correctness property
+for bytes that were never the cost.
+
+**So the cost had to be message *count*, not bytes — and that hypothesis was wrong too.** `ship()`
+took the send lock and flushed **once per message**: 29414 locks and 29414 flushes for that run.
+Batching both is obviously right and completely lossless, so it was done. It is worth **1.03×** —
+median `draw_readback` 50.4 ms → 48.7 ms, measured from the fixture's own microsecond CSV rather than
+from PNG mtimes, which at 1 s granularity over a 6 s run could not have told the difference (and,
+tried first, appeared to show the *opposite*). The change is kept because it is simpler and free, not
+because it fixed anything.
+
+**Which leaves the real answer, arrived at by elimination rather than by assertion.** ~50 ms per frame
+at 256×256 on **loopback**, where the network is not a factor and the whole return path is 78 KB, is
+not bandwidth, not message count, and not flush syscalls. It is the synchronous round trip: with
+feedback off, the application implements `vkWaitForFences` by polling `vkGetFenceStatus`, and every
+poll is a full C→S→execute→reply→C cycle. That is the latency wall this diary has named repeatedly as
+*the* remaining architectural limit, and it is now the measured explanation for the frame time of a
+workload that has nothing else left in it.
+
+**A note on method, because this turn is the cleanest example of it all week.** Three plausible
+theories — fragmentation, message count, flush cost — were held in turn, and the first two were
+retired by measurement before any code was written for them. The third produced code worth keeping
+and a number that says plainly it did not matter. The alternative, which this project has done before,
+would have been to "fix the fragmentation", observe a 3% change, and quietly file it as done. What
+made the difference was measuring **before** the fix rather than after: the per-resource breakdown
+took one run and killed the premise in a single table.
