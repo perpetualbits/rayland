@@ -20,7 +20,9 @@
 //!
 //! See `docs/superpowers/specs/2026-07-26-venus-stream-decoder-design.md`.
 
-// The decoding entry point arrives in Task 2; Task 1 proves the vendored protocol compiles.
+// Task 2 added the real decoding entry point (`rayland_venus_command_len`) on the C side, in
+// `csrc/shim.c`, but this Rust wrapper still only declares Task 1's self-test — the safe Rust
+// `command_len()` wrapper around the new C entry point is later work, not yet written.
 unsafe extern "C" {
     /// Links the shim's self-test, proving the vendored headers compiled and linked.
     fn rayland_venus_proto_selftest() -> core::ffi::c_int;
@@ -28,8 +30,13 @@ unsafe extern "C" {
 
 /// The `VkCommandTypeEXT` of `vkGetFenceStatus`, as reported by the compiled shim.
 ///
-/// Exists only so Task 1 has something testable: it proves the vendored protocol headers are on the
-/// include path, compiled, and linked. Removed in Task 2 when the real entry point lands.
+/// Exists so this crate has something testable end to end (Rust calling into the compiled C and
+/// back) before the real `command_len()` wrapper is written: it proves the vendored protocol
+/// headers are on the include path, compiled, and linked. Deliberately kept past Task 1, rather
+/// than removed once the C-side real entry point landed in Task 2, because nothing has replaced
+/// what this test covers yet — removing it now would leave the crate with no passing test at all
+/// until the Rust wrapper lands. Remove this function and its test once `command_len()` exists and
+/// covers the same ground.
 ///
 /// # Failure modes
 /// None; the shim's implementation is a constant.

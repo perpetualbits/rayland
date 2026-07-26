@@ -395,27 +395,43 @@ vkr_cs_decoder_get_blob_storage(struct vkr_cs_decoder *dec, size_t size)
  * decode pass, so decoding these commands genuinely reaches this function. An `abort()` here (the
  * first-drafted version of this function) would crash on any stream containing one of them.
  *
- * WHY A NON-NULL SENTINEL IS SAFE ANYWAY: every one of the six call sites (verified by reading all
- * six, not sampling) has the identical shape:
+ * THIS FUNCTION MUST RETURN NON-NULL, UNCONDITIONALLY. That is not merely a safe choice among
+ * several — it is the one correctness requirement this function has, and it is easy to miss because
+ * the reasoning is the mirror image of the decoder-side function just above. There, returning NULL on
+ * a genuine shortfall was the fix, because the decoder must be able to report truncation. Here, the
+ * exact opposite is true: this function has no failure the caller can safely act on, because two of
+ * the six call sites decode MORE stream fields after this one, and the generated failure path skips
+ * them silently:
  *
  *     args->pData = vn_cs_encoder_get_blob_storage(enc, offset, array_size);
- *     if (!args->pData) return;
+ *     if (!args->pData) return;              // <-- an early return, and NOT every caller stops here
  *
- * The pointer is only ever STORED into `args->pData` here; it is never dereferenced or written
- * through by the decode function itself. It becomes live only inside the matching `vn_encode_
- * <command>_reply` function — generated in the same header, and never called by this crate, which
- * calls `vn_decode_*_args_temp` and nothing else (see the design spec's architecture section). So any
- * non-null address discharges the contract these six call sites actually rely on, with no need to
- * back `size` bytes of real memory: sizing a real allocation would reintroduce exactly the "our own
- * scratch pool happened to be too small" exhaustion hazard `vkr_cs_decoder_get_blob_storage` above
- * had to close for the DECODE side — except here it would be needless, since nothing is ever written.
- * `vkGetPipelineCacheData` alone can carry a pipeline cache "dozens of MBs" large (per virglrenderer's
- * own comment on its temp-pool size limit), so refusing large requests would make this function
- * exactly the silent-under-report hazard it exists to avoid, for a size nothing will ever use.
+ * Specifically: `vn_decode_vkGetQueryPoolResults_args_temp` still has `stride` and `flags` to decode
+ * after this branch (`vn_protocol_renderer_query_pool.h:179-180`), and
+ * `vn_decode_vkWriteAccelerationStructuresPropertiesKHR_args_temp` still has `stride`
+ * (`vn_protocol_renderer_acceleration_structure.h:365`). If this function ever returned NULL for
+ * either of those two commands, the generated early return would skip those trailing decodes —
+ * WITHOUT calling `vkr_cs_decoder_set_fatal` — and `command_len` would silently under-report the
+ * command's length. That is the identical hazard class the decoder-side fix above exists to close,
+ * reintroduced on the encoder side, and it would be exactly as dangerous: a wrong answer with no
+ * error, not a fault.
+ *
+ * DO NOT "HARDEN" THIS BY ADDING A SIZE CHECK OR A FAILURE PATH. It is tempting — `get_blob_storage`
+ * sounds like it should be able to run out of storage, and the decoder-side sibling above does have a
+ * failure path. It must not, here: nothing in this crate's call graph ever writes through the
+ * returned pointer, so there is nothing a size check would actually be protecting, and refusing a
+ * request only reintroduces the two-command silent-under-report hazard described above. Confirmed,
+ * not merely argued: an exhaustive scan of all `vn_decode_*_args_temp`/`_temp` functions across the
+ * full 43-header vendored tree found no caller of `vn_cs_encoder_write`, `vn_cs_encoder_acquire`, or
+ * `vn_cs_encoder_release` — so the sentinel this function hands back is never dereferenced by
+ * anything this crate's decode-only call graph can reach, for any command Mesa currently generates.
+ * `vkGetPipelineCacheData` alone can request dozens of MB (per virglrenderer's own comment on its
+ * temp-pool size limit) precisely because nothing is ever actually written there; sizing a real
+ * allocation to `size` would only manufacture a new, pointless way for this function to run out.
  *
  * `sentinel` is `static` inside this `static inline` function: each translation unit gets its own
- * private copy with a stable address, which is all a never-dereferenced sentinel needs. `offset` and
- * `size` are intentionally unused for the reason above.
+ * private copy with a stable address, which is all a pointer that must be non-null and is never
+ * dereferenced needs. `offset` and `size` are intentionally unused for the reason above.
  */
 static inline void *
 vkr_cs_encoder_get_blob_storage(struct vkr_cs_encoder *enc, size_t offset, size_t size)
