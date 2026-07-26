@@ -13,10 +13,19 @@
 //! decision to reuse the Venus/virglrenderer engine rather than write one.
 //!
 //! # THE BINDING CONSTRAINT
-//! **This crate is diagnostic and structural only.** It may report, log, measure and assert. It may
-//! never decide what to relay, when to relay it, or which blobs a delta reads. (c)1 spec §7 relays
-//! the ring as opaque bytes precisely so that a decoding bug cannot become a corruption bug, and
-//! that reasoning is untouched here.
+//! **This crate may never decide what to relay, when to relay it, or which blobs a delta reads.**
+//! (c)1 spec §7 relays the ring as opaque bytes precisely so that a decoding bug cannot become a
+//! corruption bug, and that reasoning is untouched here. `rayland-c`'s
+//! `tests/decoder_is_not_load_bearing.rs` pins it mechanically for the relay path.
+//!
+//! **The constraint was once broader — "diagnostic and structural only, never a correctness
+//! decision" — and one deliberate exception was taken on 2026-07-26**, off the relay path:
+//! `rayland_vtest::venus_ring::decode::find_destroy_device` now decodes before believing a
+//! signature match, and `rayland-s` uses its answer to decide when to retire the readback gate.
+//! The bare scan it replaced was measured false-positiving on ordinary payload bytes, retiring
+//! that gate on a device destruction that never happened; the rule existed to stop a decode bug
+//! becoming a corruption bug, and there it was protecting a heuristic proven to corrupt. Recorded
+//! as a trade, not a loophole — see `docs/DIARY.md`, 2026-07-26.
 //!
 //! See `docs/superpowers/specs/2026-07-26-venus-stream-decoder-design.md`.
 
@@ -90,9 +99,11 @@ pub enum DecodeFault {
 /// not read anything into the fact that a command decoded successfully: it means the bytes were
 /// well-formed, not that the command would execute.
 ///
-/// # Pitfall: never make a correctness decision from this
+/// # Pitfall: this must never decide what gets relayed
 /// (c)1 spec §7 relays the ring as opaque bytes so that a decoding bug cannot become a corruption
-/// bug. This function is for reporting, measuring and testing. See the crate docs.
+/// bug. This function is for reporting, measuring and testing. The crate docs record the single
+/// deliberate exception taken off the relay path (`find_destroy_device`, 2026-07-26) — read it
+/// before adding a second one, because the argument that justified it was specific.
 pub fn command_len(stream: &[u8]) -> Result<Command, DecodeFault> {
     let mut command_type: u32 = 0;
     let mut len: usize = 0;

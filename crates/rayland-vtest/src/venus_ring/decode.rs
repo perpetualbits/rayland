@@ -302,8 +302,15 @@ fn read_u64_le(bytes: &[u8], offset: usize) -> Option<u64> {
 ///   borrowed decoder's own scratch arena was too small for this command's arguments — the bytes
 ///   were all present and well-formed. Do not treat it as evidence of a corrupt or torn ring; it is
 ///   a fact about this diagnostic tool's arena size, not about the relay.
-/// - **This is still diagnostic only.** Nothing decoded here — by the table or by the borrowed
-///   decoder — may inform a relay decision; see (c)1 spec §7 and `rayland_venus_proto`'s crate docs.
+/// - **No decode here may inform a *relay* decision.** (c)1 spec §7 relays the ring as opaque bytes
+///   precisely so that a decoding bug cannot become a corruption bug, and `rayland-c`'s
+///   `decoder_is_not_load_bearing` test pins that mechanically. **One deliberate exception exists,
+///   and it is not on the relay path:** [`find_destroy_device`] calls this function, and
+///   `rayland-s` uses its answer to decide when to retire the readback gate. That is a correctness
+///   decision made from a decode. It was taken knowingly on 2026-07-26, because the bare signature
+///   scan it replaced was *measured* false-positiving on payload bytes and retiring the gate on a
+///   device destruction that never happened — the rule existed to prevent corruption, and here it
+///   was protecting a heuristic proven to corrupt. See `docs/DIARY.md`, 2026-07-26.
 pub fn decode_commands(stream: &[u8]) -> (Vec<RingCommand>, DecodeStop) {
     let mut commands = Vec::new();
     // Byte offset of the next command to decode; advanced by each command's own encoded size,

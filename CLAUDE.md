@@ -135,10 +135,16 @@ A Cargo workspace of eighteen crates. Each declares its own license per the poli
   at the start of these bytes? It vendors Mesa's *generated* `venus-protocol` headers and compiles
   them against a replacement `vkr_cs.h` this crate writes itself, so the borrowed decoders run with
   no virglrenderer and no Mesa util library behind them. Byte consumption does not depend on object
-  lookups, so stub lookups give framing identical to a live renderer's. **Diagnostic and structural
-  only — it may never make a correctness decision** ((c)1 spec §7: the ring is relayed as opaque
-  bytes precisely so a decoding bug cannot become a corruption bug), enforced by
-  `rayland-c/tests/decoder_is_not_load_bearing.rs`. LGPL, `publish = false`.
+  lookups, so stub lookups give framing identical to a live renderer's. **It may never decide what gets relayed, when, or
+  which blobs a delta reads** ((c)1 spec §7: the ring is relayed as opaque bytes precisely so a
+  decoding bug cannot become a corruption bug), enforced for the relay path by
+  `rayland-c/tests/decoder_is_not_load_bearing.rs`. That constraint was once broader — "never a
+  correctness decision" — and **one deliberate exception was taken on 2026-07-26, off the relay
+  path**: `find_destroy_device` now validates a signature match against a decoded command boundary,
+  and `rayland-s` uses its answer to retire the readback gate. The bare scan was measured
+  false-positiving on payload bytes and retiring that gate on a device destruction that never
+  happened. The `rayland-c` guard is deliberately **not** widened to cover `rayland-s`, so the
+  discrepancy stays visible instead of being papered over; see `docs/DIARY.md`, 2026-07-26. LGPL, `publish = false`.
 - **`crates/rayland-relay`** — the **(c)1 relay wire protocol**: the `C2S`/`S2C` messages that
   cross the network between C and S (ring deltas, blob syncs, replies) and their `postcard`
   framing. Pure data — no GPU, no sockets, no async runtime — because both `rayland-c` and the

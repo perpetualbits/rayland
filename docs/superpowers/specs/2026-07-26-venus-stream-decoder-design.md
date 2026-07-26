@@ -57,6 +57,22 @@ work. Nothing here may be used to decide what to ship, when to ship it, which bl
 a relay is safe. It may report, log, measure, assert in tests, and answer questions. **The invariant is
 binding, not advisory**, and the implementation plan must carry a test that the relay path does not call it.
 
+> **Amendment, 2026-07-26 — one deliberate exception, taken off the relay path.** The paragraph above is
+> left as written because it is what was decided, and the reasoning it gives is still the right default.
+> It has since been narrowed once, knowingly. `rayland_vtest::venus_ring::decode::find_destroy_device`
+> now calls `decode_commands` to check that a signature match lands on a real command boundary, and
+> `rayland-s` uses its answer (`apply.rs:755`) to decide when to retire the readback gate — a
+> correctness decision made from a decode. The reason it was taken: the bare signature scan it replaced
+> was *measured* firing on ordinary payload bytes (offsets 6236 then 6300 in consecutive runs, in a
+> delta the decoder walks to `ReachedEnd` with no `vkDestroyDevice` in it at all), retiring that gate on
+> a device destruction that never happened. The invariant exists so a decode bug cannot become a
+> corruption bug; in this one spot it was protecting a heuristic *proven* to corrupt.
+>
+> What is preserved: nothing decoded may still decide **what gets relayed, when, or which blobs a delta
+> reads** — that is what `rayland-c/tests/decoder_is_not_load_bearing.rs` pins, and it is untouched. That
+> guard is deliberately **not** widened to cover `rayland-s`, so the discrepancy remains visible in the
+> tree rather than being retro-blessed by a green test. Full reasoning in `docs/DIARY.md`, 2026-07-26.
+
 The distinction is not fussiness. A decoder that is merely *observing* can be wrong and produce a wrong
 diagnosis, which a human notices. A decoder that is *deciding* can be wrong and produce a silently corrupted
 frame, which nobody notices until it is a week of someone's life — which is the exact shape of every wall this
