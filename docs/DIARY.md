@@ -3983,3 +3983,11 @@ Recorded so it is a known defect rather than familiar noise.
 **Disk was the one real risk of leaving this running unattended, and it is not one:** the local
 `core_pattern` pipes to apport, which skips unpackaged binaries, so no `rayland-s` core is written and
 nothing accumulates; `/var/crash` is unchanged and root has 334 GB free.
+
+**Narrowing the teardown abort, cheaply.** Two probes that cost seconds rather than a soak slot:
+`rayland-s` started alone and `SIGTERM`'d exits **cleanly (rc=0)**; started and `SIGTERM`'d with C
+*connected* but no application session, also **rc=0**. So the abort is not in signal handling, not in
+the listener, and not in the link — it needs a **full rendering session** to have happened, i.e. the
+engine actor and the progress thread live and having done GPU work. That is consistent with the
+suspicion above (a thread panicking on a lock or channel during shutdown) and rules out the cheaper
+explanations. Reproducing it needs a whole ~45 s run, which is a soak slot, so it waits.
