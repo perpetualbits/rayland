@@ -141,6 +141,14 @@ window.PROJECT_MAP = {
 
     /* ----------------------------------------------------------------- wire layer */
     {
+      id: "venus-proto", label: "rayland-venus-proto", layer: "wire", status: "planned",
+      tags: ["WP0", "decoder", "spec'd"],
+      desc: "SPEC'D, NOT BUILT. Rayland can relay Venus streams byte-exactly and cannot read them: encoded_size can only express FIXED encodings, so the decoder halts at the application's first real command and 'where does this command end' cannot be asked — which is what blocks the open vkQueueSubmit framing question. This crate borrows Mesa's own generated venus-protocol (73k lines, 43 headers) behind a C shim, rather than reimplementing it, for the same reason CLAUDE.md reuses the rendering engine: a second source of truth for a format Rayland does not own will diverge, and the symptom is a decoder confidently reporting the wrong thing. Feasible because byte consumption is independent of handle lookups, so stub lookups give identical framing with no object table, no validation and no GPU. Entire public surface is one question: how long is the command at the start of this slice. BINDING CONSTRAINT: diagnostic and structural only — it may never make a correctness decision, because (c)1 spec §7 relays the ring as opaque bytes precisely so a decode bug cannot become a corruption bug.",
+      specs: [{ label: "Decoder design", href: "docs/superpowers/specs/2026-07-26-venus-stream-decoder-design.md" }],
+      parts: [],
+      deps: ["vtest"]
+    },
+    {
       id: "vtest", label: "rayland-vtest", layer: "wire", status: "done",
       tags: ["C0", "protocol", "LGPL"],
       desc: "The vtest wire protocol Mesa's Venus ICD speaks, the RenderEngine / VtestTransport traits, and the repository's knowledge of Mesa's command ring. Has no GPU dependencies by construction — only libc and thiserror — and a test asserts the engine never leaks into it, because C must never link a GPU stack.",
