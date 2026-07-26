@@ -3244,3 +3244,73 @@ in `32b56dd` and **deleted in `0a21513`** — the G' commit — and the gate now
 `progress_thread` in `main.rs`. Two documents survived the deletion of the file they cite. Both are
 corrected. The pattern worth noticing is that both of today's documentation defects are the same
 defect: a change landed, did its job, and left behind a description of the world as it was before.
+
+### 2026-07-26 — Eight more theories dead, the failing submit fully characterised, and a wall we cannot see past without source
+
+Spent the day pointing the new decoder at the `vkQueueSubmit` CS error. It did not fall. What it did
+do is stop being mysterious: the failing command is now described down to every field and every
+handle, and eight candidate explanations are refuted by measurement rather than argument.
+
+**What the failing submit actually is.** vkcube issues five `vkQueueSubmit`s per run; four are
+accepted and the fifth is refused. Dumping each one's bytes and decoding them field-by-field against
+the vendored generated decoder:
+
+| | fence | wait sem | cmdbuf | signal sem |
+|---|---|---|---|---|
+| #2 accepted | `0x1d` | `0x1e` | `0x18` | `0x2e` |
+| #5 **refused** | `0x1f` | `0x20` | `0x19` | `0x2f` |
+
+The refused submit is the **second swapchain image's** resource set, structurally identical to the
+accepted one — same command sequence in its delta, same 120-byte encoding, every field parsing to
+exactly 120 bytes with nothing left over. This matches an old entry's guess that "two of three
+swapchain images work and the third does not", now with the actual handles attached.
+
+**Refuted this session, each by a measurement:**
+
+1. *Handle lookup failure (`!args.queue`)* — `VIRGL_LOG_LEVEL=debug` emits no `invalid object id`.
+   **But see the caveat below; this one is not safely closed.**
+2. *Queue id wrong* — all five submits name `0x6`, the id `vkGetDeviceQueue2` created.
+3. *Queue id zero* (the silent `lookup_object` early-out that `VK_NULL_HANDLE` fences require) — no,
+   it is `0x6`.
+4. *Ring wrap* — buffer is 128 KiB; the failure is at free-running 27416.
+5. *Frame desync* — virglrenderer's `head` (26748) lands exactly on a boundary our decoder agrees
+   with, and walks cleanly to the submit before failing.
+6. *Truncation / bounds overrun* — virglrenderer's extent `[26748, 27536)` covers the 120-byte submit
+   exactly.
+7. *Bad `sType` or unknown `pNext`* — our decoder runs the **same generated code** on the same bytes
+   and sets no fatal.
+8. *WSI resource import* — the `vkImportSemaphoreResourceMESA` immediately preceding the submit was
+   the best lead of the day, since swapchain resources are exactly what WP0 has not plumbed. Dumped
+   and decoded: it names `resourceId = 0` in **both** the accepted and refused frames, differing only
+   in which semaphore it targets. Not the differentiator.
+9. *The handles were never created on S* — enumerated every `vkCreateFence`, `vkCreateSemaphore` and
+   `vkAllocateCommandBuffers` id that crossed the ring and cross-referenced them against the refused
+   submit. All fourteen objects exist, command buffer `0x19` included.
+
+**A correction, made mid-investigation and worth stating plainly.** Refutation 1 rests on the claim
+that `vkr_cs_decoder_lookup_object` logs `invalid object id` when a lookup fails. That was inferred
+from the *adjacency* of two strings in the render server's string table — `invalid object id %lu`
+sits immediately before `%s resulted in CS error` — and never verified. Disassembling around the
+reference showed it inside a function doing `calloc` under a mutex, which reads more like an object
+table **insert** (duplicate id on create) than a lookup. So a failed lookup may well be silent, and
+hypothesis 1 is *not* closed. It is left standing in the list with this caveat rather than quietly
+promoted to "refuted", because the difference decides whether the next fix is ours or virglrenderer's.
+
+**Where the wall now is, precisely.** The generated dispatcher has exactly one fatal path we cannot
+reproduce (`if (!args.queue)`), and it calls through to virglrenderer's *own*
+`vkr_dispatch_vkQueueSubmit`, which is not in the vendored headers and can set fatal for reasons we
+cannot enumerate. Every condition we *can* enumerate is refuted. Getting past this needs
+virglrenderer 1.2.0's `src/venus/vkr_queue.c`, and this machine cannot fetch it: gitlab.freedesktop.org
+is behind an anti-bot wall, there is no GitHub mirror of the canonical repo, and `apt-get source` fails
+because no `deb-src` line is configured. Enabling one needs root, which is the owner's to give.
+
+**Method notes, both uncomfortable.** First, instruments moved this measurement for the *fifth* time:
+the failure only occurs when the run is fast enough to reach the submit, so every diagnostic added
+pushes runs from "abort at the submit" (exit 134) into "timeout during setup" (exit 124). The two
+"failure modes" this diary has recorded separately for days are one failure at two speeds. Second, and
+worse: two reproduction runs were launched concurrently against **fixed** socket and log paths, so they
+overwrote each other and both had to be discarded. The script now derives per-run paths from a `RUNID`.
+Neither of these cost a wrong conclusion, but only because they were noticed.
+
+**One thing did hold up.** Across every failing run today, `find_destroy_device` never fired — the
+morning's fix is working under the live workload, and the phantom gate retirement is gone.
