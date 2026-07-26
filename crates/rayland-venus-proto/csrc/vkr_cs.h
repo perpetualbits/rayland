@@ -208,6 +208,15 @@ vkr_cs_handle_load_id(const void **handle, VkObjectType type)
  * Returning NULL on exhaustion is safe: the generated decoders check the pointer and set fatal,
  * which the shim reports as a fault rather than a length. Alignment is rounded to 8, which is the
  * strictest the protocol's decoded types need.
+ *
+ * PRECONDITION THIS FUNCTION TRUSTS RATHER THAN ENFORCES: `dec->temp` itself must already be
+ * 8-byte aligned. Rounding `temp_used` up to a multiple of 8 only produces an 8-byte-aligned
+ * *address* if the base pointer it is added to is itself a multiple of 8 — otherwise the rounding
+ * faithfully preserves whatever misalignment the base already had. Nothing in this header can check
+ * that (a `struct vkr_cs_decoder` only ever sees `temp` as an opaque `uint8_t *`, with no way to ask
+ * the compiler for its alignment at this point), so the caller that populates `temp` is the one that
+ * must guarantee it — see the `_Alignas(8)` on the backing buffer in `shim.c`, the first and only
+ * place that allocates one.
  */
 static inline void *
 vkr_cs_decoder_alloc_temp(struct vkr_cs_decoder *dec, size_t size)
@@ -228,6 +237,14 @@ vkr_cs_decoder_alloc_temp(struct vkr_cs_decoder *dec, size_t size)
  * The bounds check is the mechanism that makes a truncated stream visible: overrunning sets fatal
  * and leaves the cursor alone, exactly as virglrenderer's decoder does — which is why a CS error and
  * this crate's fault mean the same thing.
+ *
+ * ALIASING: `val` can legitimately equal `dec->cur`. `vkr_cs_decoder_get_blob_storage`, below, hands
+ * back a pointer straight into the decoder's own buffer (matching virglrenderer's own
+ * implementation) rather than a copy, so the generated blob-array decode ends up calling this with
+ * `val == dec->cur` — a same-address "copy" that is well-defined only because we special-case it.
+ * `memcpy` with overlapping (here: identical) source and destination is undefined behaviour, so the
+ * `dec->cur != val` guard below — copied from virglrenderer's own `vkr_cs_decoder_read`/`_peek` for
+ * exactly this reason — skips the copy entirely when it would alias.
  */
 static inline void
 vkr_cs_decoder_read(struct vkr_cs_decoder *dec, size_t size, void *val, size_t val_size)
@@ -237,11 +254,15 @@ vkr_cs_decoder_read(struct vkr_cs_decoder *dec, size_t size, void *val, size_t v
       memset(val, 0, val_size);
       return;
    }
-   memcpy(val, dec->cur, val_size < size ? val_size : size);
+   /* Skip the copy when source and destination coincide (see the aliasing note above) — copying
+    * would be UB, and it would also be pointless: the bytes are already exactly where they belong. */
+   if (dec->cur != val)
+      memcpy(val, dec->cur, val_size < size ? val_size : size);
    dec->cur += size;
 }
 
-/* As `read`, but without advancing — used where the protocol inspects a value before consuming it. */
+/* As `read`, but without advancing — used where the protocol inspects a value before consuming it.
+ * Same aliasing hazard and same guard as `vkr_cs_decoder_read`, above. */
 static inline void
 vkr_cs_decoder_peek(const struct vkr_cs_decoder *dec, size_t size, void *val, size_t val_size)
 {
@@ -250,7 +271,8 @@ vkr_cs_decoder_peek(const struct vkr_cs_decoder *dec, size_t size, void *val, si
       memset(val, 0, val_size);
       return;
    }
-   memcpy(val, dec->cur, val_size < size ? val_size : size);
+   if (dec->cur != val)
+      memcpy(val, dec->cur, val_size < size ? val_size : size);
 }
 
 /*
@@ -264,7 +286,9 @@ vkr_cs_decoder_peek(const struct vkr_cs_decoder *dec, size_t size, void *val, si
  * `vkr_cs_decoder_get_blob_storage`, and the generated `vn_replace_Vk*_handle` helpers (present in
  * every handle-typed header, even though this crate's decode-only call graph never reaches them)
  * dereference a `struct vkr_object`. Mesa's own comment simply never caught up to its generator. See
- * Task 1's report for the discovery, and Task 2 before relying on the blob-storage stubs below.
+ * Task 1's report for the discovery. Task 1 left the two blob-storage functions as NULL stubs because
+ * nothing in Task 1 called them; Task 2 implements both for real (see their own doc comments, below)
+ * because Task 2 drives real per-command decoders, several of which carry a blob array.
  */
 
 /*
@@ -308,34 +332,90 @@ vkr_cs_decoder_alloc_temp_array(struct vkr_cs_decoder *dec, size_t size, size_t 
  * Blob storage: where a decoded "blob" array (raw bytes with no further structure — shader
  * specialization constants, push-constant values, pipeline-cache data) gets written.
  *
- * STUB — DELIBERATELY NOT IMPLEMENTED. Task 1's only C entry point is a constant self-test; nothing in
- * Task 1 calls any `vn_decode_*_temp` function, so this body is never reached, and it exists purely so
- * the generated headers — which declare it `static inline` and are therefore type-checked
- * unconditionally by the compiler regardless of whether any caller in this crate reaches them — compile.
+ * IMPLEMENTED FOR REAL — Task 2. Task 1 left this a NULL stub because nothing in Task 1 reached it;
+ * Task 2 drives real `vn_decode_<command>_args_temp` functions, several of which (push constants,
+ * pipeline specialization data, `vkGetPipelineCacheData`) carry a blob array, so a stub is no longer
+ * safe. See the review finding this closes, recorded in the design spec and the Task 1 report.
  *
- * Returning NULL here is safe for Task 1 but is NOT a free pass for Task 2: the generated caller
- * pattern is `val->pData = vkr_cs_decoder_get_blob_storage(...); if (!val->pData) return;` — a NULL
- * return skips the blob read *without* calling `vkr_cs_decoder_set_fatal`, unlike this file's other
- * exhaustion paths. Task 2 must give this a real body (most likely returning a bump-temp allocation, or
- * a pointer straight into the decoder's own buffer) before decoding any command whose payload includes
- * a blob array — until then, `command_len` would silently under-consume the stream for such commands
- * rather than reporting a fault, which is exactly the "confidently wrong" failure mode this crate exists
- * to avoid.
+ * THE HAZARD THIS CLOSES: the generated call site (e.g.
+ * `vn_protocol_renderer_pipeline_cache.h:vn_decode_VkPipelineCacheCreateInfo_self_temp`) reads:
+ *
+ *     val->pInitialData = vkr_cs_decoder_get_blob_storage(dec, array_size);
+ *     if (!val->pInitialData) return;
+ *     vn_decode_blob_array(dec, (void *)val->pInitialData, array_size);
+ *
+ * A NULL return takes the early `return` — which skips `vn_decode_blob_array`, the *only* call that
+ * would advance the cursor past the blob and (via `vkr_cs_decoder_read`'s own bounds check) notice a
+ * truncation. Mesa's generated code never calls `vkr_cs_decoder_set_fatal` on this path itself: it
+ * simply trusts that `get_blob_storage` only refuses when there is a genuine reason, and reports
+ * nothing further. In practice this never bites a real virglrenderer, because a well-formed client's
+ * encoder always reserves enough room for what it writes; it can only be reached here by a stream
+ * that is truncated, corrupt, or simply a byte range this crate was asked to look at without proof it
+ * ends on a command boundary — precisely the input this diagnostic-only crate must expect, since
+ * walking untrusted/partial byte ranges is its whole job. So: on the failure branch, we set fatal
+ * OURSELVES, here, before returning NULL — closing the gap Mesa's own generated call site leaves
+ * open, at the one place in the call graph that can still see it. `command_len` then reports
+ * `RAYLAND_VENUS_FAULT_TRUNCATED` instead of silently under-consuming the stream, which is the
+ * difference between an honest fault and the "confidently wrong length" this crate exists to avoid.
+ *
+ * On the success branch we match virglrenderer's own implementation exactly: hand back a pointer
+ * straight into the decoder's own buffer (`dec->cur`) rather than a fresh copy. That is why
+ * `vkr_cs_decoder_read`/`_peek`, above, carry the `dec->cur != val` aliasing guard — the generated
+ * code immediately "decodes" this blob by reading from `dec->cur` into the very pointer we just
+ * returned, i.e. `dst == src`, and that guard is what makes the resulting memcpy well-defined instead
+ * of UB.
  */
 static inline void *
 vkr_cs_decoder_get_blob_storage(struct vkr_cs_decoder *dec, size_t size)
 {
-   (void)dec;
-   (void)size;
-   return NULL;
+   if (size > (size_t)(dec->end - dec->cur)) {
+      /* See the long comment above: this is the one place that can see the coming truncation before
+       * the generated caller's early return would otherwise swallow it silently. */
+      vkr_cs_decoder_set_fatal(dec);
+      return NULL;
+   }
+   /* Enough room for the whole blob: point the caller at the bytes already sitting in our buffer,
+    * exactly as virglrenderer's own `vkr_cs_decoder_get_blob_storage` does. Nothing is copied here;
+    * the generated code's own subsequent read (see above) is what actually walks these bytes and
+    * advances `dec->cur` past them. */
+   return (void *)dec->cur;
 }
 
 /*
  * The encoder's counterpart to `vkr_cs_decoder_get_blob_storage`, above.
  *
- * STUB — DELIBERATELY NOT IMPLEMENTED, for the same reason `vkr_cs_encoder_write` above is a no-op:
- * this crate never encodes. It exists only so the generated `vn_encode_*` helpers that reference it
- * type-check; Task 1 never calls any of them.
+ * CORRECTION, recorded here rather than silently fixed: the task brief that introduced this function
+ * assumed "the encoder side is never driven by this crate" and allowed a documented no-op. That
+ * assumption is FALSE for six commands at this vendored Mesa version — `vkGetQueryPoolResults`,
+ * `vkGetPipelineCacheData`, `vkCopyImageToMemoryMESA`, `vkWriteAccelerationStructuresPropertiesKHR`,
+ * `vkGetRayTracingShaderGroupHandlesKHR` and `vkGetRayTracingCaptureReplayShaderGroupHandlesKHR`.
+ * Each of these has a `vn_decode_<command>_args_temp` — a *decode* function, in our call graph by
+ * construction — whose generated signature is `(struct vn_cs_decoder *dec, struct vn_cs_encoder *enc,
+ * struct vn_command_<command> *args)`: Mesa pre-allocates the *reply* arena's blob space during the
+ * decode pass, so decoding these commands genuinely reaches this function. An `abort()` here (the
+ * first-drafted version of this function) would crash on any stream containing one of them.
+ *
+ * WHY A NON-NULL SENTINEL IS SAFE ANYWAY: every one of the six call sites (verified by reading all
+ * six, not sampling) has the identical shape:
+ *
+ *     args->pData = vn_cs_encoder_get_blob_storage(enc, offset, array_size);
+ *     if (!args->pData) return;
+ *
+ * The pointer is only ever STORED into `args->pData` here; it is never dereferenced or written
+ * through by the decode function itself. It becomes live only inside the matching `vn_encode_
+ * <command>_reply` function — generated in the same header, and never called by this crate, which
+ * calls `vn_decode_*_args_temp` and nothing else (see the design spec's architecture section). So any
+ * non-null address discharges the contract these six call sites actually rely on, with no need to
+ * back `size` bytes of real memory: sizing a real allocation would reintroduce exactly the "our own
+ * scratch pool happened to be too small" exhaustion hazard `vkr_cs_decoder_get_blob_storage` above
+ * had to close for the DECODE side — except here it would be needless, since nothing is ever written.
+ * `vkGetPipelineCacheData` alone can carry a pipeline cache "dozens of MBs" large (per virglrenderer's
+ * own comment on its temp-pool size limit), so refusing large requests would make this function
+ * exactly the silent-under-report hazard it exists to avoid, for a size nothing will ever use.
+ *
+ * `sentinel` is `static` inside this `static inline` function: each translation unit gets its own
+ * private copy with a stable address, which is all a never-dereferenced sentinel needs. `offset` and
+ * `size` are intentionally unused for the reason above.
  */
 static inline void *
 vkr_cs_encoder_get_blob_storage(struct vkr_cs_encoder *enc, size_t offset, size_t size)
@@ -343,7 +423,8 @@ vkr_cs_encoder_get_blob_storage(struct vkr_cs_encoder *enc, size_t offset, size_
    (void)enc;
    (void)offset;
    (void)size;
-   return NULL;
+   static uint8_t sentinel[1]; /* never read or written; only its non-null address matters */
+   return (void *)sentinel;
 }
 
 #endif /* RAYLAND_VKR_CS_H */
