@@ -2355,3 +2355,56 @@ Distinguishing those needs the stream walked, which is exactly the capability th
 not exist. **The instrument gap and the open question are the same gap.** That is the honest state to leave
 this in: nine theories refuted, the failure narrowed to the framing of a single command, and the next step
 identified as a real piece of engineering rather than another probe.
+
+### 2026-07-26 — Designing the Venus stream decoder: borrow Mesa's, do not rebuild it
+
+The investigation ended at a capability gap rather than a bug: Rayland can relay Venus streams perfectly and
+cannot read them. The design for closing that is written
+(`docs/superpowers/specs/2026-07-26-venus-stream-decoder-design.md`); the reasoning that shaped it is here.
+
+**The first thing settled was what the decoder is *for*, because it changes everything.** A diagnostic-only
+decoder can be narrow and can afford to be wrong. A general capability has to track Mesa exactly. The choice
+was the general capability — and with it, a binding constraint carried over unchanged from (c)1 spec §7:
+**this decoder may never make a correctness decision.** The ring is relayed as opaque bytes precisely so that
+a decoding bug cannot become a corruption bug, and that stays true. A decoder that observes can be wrong and
+produce a wrong diagnosis, which a human notices; a decoder that decides can be wrong and produce a silently
+corrupted frame, which is the exact shape of every wall this week. The plan carries a test that the relay path
+does not depend on it.
+
+**The second was where the knowledge comes from, and the answer is the same one `CLAUDE.md` already made
+about the rendering engine.** Mesa's generated `venus-protocol` is 73,442 lines across 43 headers. Rayland
+reuses Venus/virglrenderer rather than writing its own capture/replay engine because it "already exists and is
+hardened against our exact threat model"; the protocol headers are the same category of artifact. Two
+generator approaches were considered and rejected — parsing the C headers into Rust, or regenerating from
+`vk.xml` — for one shared reason: **both create a second source of truth for a format Rayland does not own.**
+When it diverges from Mesa's, and it will at some release, the symptom is a decoder that confidently reports
+the wrong thing. Borrowing cannot diverge.
+
+**The design turned on a feasibility question that could easily have gone the other way.** The renderer-side
+decoders resolve object handles, which looks like it needs a live virglrenderer context. Reading the generated
+code shows it does not:
+
+```c
+vn_decode_uint64_t(dec, &id);                       /* consumes 8 bytes */
+*val = vn_cs_decoder_lookup_object(dec, id, ...);   /* consumes nothing */
+```
+
+**Byte consumption is independent of the lookup's result**, so a shim with stub lookups produces identical
+framing to a live renderer. Handle validation lives in the *dispatch* functions, after decoding — so calling
+`vn_decode_<cmd>_args_temp` directly gives framing with no object table, no validation, no execution and no
+GPU. Had that check failed, the recommendation would have been wrong, and it was worth making before writing
+a line of design rather than after.
+
+**The shape that fell out is deliberately narrow:** a new crate whose entire public surface is *"how many
+bytes does the command at the start of this slice occupy?"* — total, stateless, side-effect-free. All the
+walking, the error taxonomy and the reporting stay in Rust in `venus_ring::decode`, where they are already
+tested. If the borrowed protocol is ever replaced or the shim rewritten in Rust, one function has to keep its
+meaning.
+
+**Costs are recorded rather than glossed.** `rayland-vtest` advertises "no GPU dependencies, by construction:
+only `libc` and `thiserror`", and that sentence becomes false — it stays GPU-free, but it gains a C
+dependency, and `rayland-c` links it. The headers get vendored with their Mesa version recorded, because a
+build that depends on a scratch directory happening to exist is not a build. And `no_gpu_linkage` gets re-run
+and re-read rather than assumed, since the crate it guards has changed shape.
+
+Not yet built. The spec is the deliverable; the plan comes next.
