@@ -3379,3 +3379,80 @@ hand, adding one `vkr_log` to that `!args.queue` branch (printing `args.queue` a
 turns the last silent branch into a loud one, and virglrenderer builds with meson. That is a far
 better instrument than another round of inference — and this investigation's record is unambiguous
 that instruments settle it and arguments do not. Twelve theories refuted so far.
+
+### 2026-07-26 (evening) — FOUND: the "CS error" is `VK_ERROR_DEVICE_LOST`. It was never a protocol bug.
+
+The wall fell. The failing `vkQueueSubmit` is refused because **S's GPU loses the device executing
+it**, and Venus reports device loss by poisoning the command stream:
+
+```
+RAYLAND: vkQueueSubmit dispatch: fatal_after_decode=0 queue=0x7137c461a770 submitCount=1 fence=...
+RAYLAND: -> FATAL because vkQueueSubmit returned VK_ERROR_DEVICE_LOST (-4)
+RAYLAND: vkQueueSubmit returned VkResult=-4 flags=0x0 fatal_now=1
+virgl_render_server: vkr: vkQueueSubmit resulted in CS error
+```
+
+The four accepted submits in the same run print `VkResult=0`. The fifth prints `-4`.
+
+**The branch nobody had read.** `vn_dispatch_vkQueueSubmit` ends like this:
+
+```c
+    if (flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT) {
+        ... encode reply ...
+    } else if (args.ret == VK_ERROR_DEVICE_LOST) {
+        vn_cs_decoder_set_fatal(ctx->decoder);
+    }
+```
+
+Every submit in this workload has `flags = 0x0` — measured, not assumed — so the `else` is the live
+path on every one of them. A device loss therefore sets the decoder's fatal flag **silently**, with no
+log of its own, and the only thing that ever surfaces is the generic `%s resulted in CS error`. Three
+days of this diary read that message as a *decoding* failure. It is a **GPU** failure wearing a
+decoder's clothes.
+
+**Why every protocol theory died.** Because they were all false, and they were false for the same
+reason: the relay was correct the whole time. The ring was byte-exact, the framing agreed with
+virglrenderer's to the byte, every handle resolved, every object had been created, the extent covered
+the command exactly, and our decoder — running virglrenderer's own generated code, all 42 headers
+byte-identical — accepts the refused bytes with `Ok(len: 120)`. Twelve refutations were twelve correct
+answers to the wrong question. The one measurement that mattered was one nobody could take without
+the renderer's source: *what did `vkQueueSubmit` actually return?*
+
+**How the instrument was built, because the route is reusable.** No root, nothing installed
+system-wide, `/usr/libexec/virgl_render_server` untouched:
+
+1. Source from the Ubuntu **archive pool** over plain HTTP — `apt-get source` failed even after the
+   owner enabled `deb-src`, but
+   `pool/main/v/virglrenderer/virglrenderer_1.2.0.orig.tar.bz2` just works.
+2. `meson`, `ninja`, `pyyaml` into a throwaway venv in the scratchpad (`python3 -m venv`), not apt.
+3. The build hits a genuine glibc-vs-bundled-C11-threads clash on this toolchain; the distro's own
+   `fix-c23.patch` (upstream, landed in virglrenderer 1.3.0) fixes it — the same patch that produced
+   the installed binary, fetched from `virglrenderer_1.2.0-2ubuntu2.debian.tar.xz`.
+4. Two `fprintf`s into the generated `vn_dispatch_vkQueueSubmit`, then
+   `RENDER_SERVER_EXEC_PATH=<build>/server/virgl_render_server` — an env var the *system* library
+   honours (`src/proxy/proxy_server.c:70`), so the patched server is spawned without replacing
+   anything.
+
+**What is now the real question, and it is a different question.** Why does the device die? The
+leading suspect is already on record from the `VKR_DEBUG=validate` run earlier today, and it is not a
+Rayland relay bug either — it is a resource-setup bug:
+
+> `vkBindImageMemory2(): pBindInfos[0].memory has an external handleType of
+> VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT which does not include at least one handle from
+> VkImage handleType VkExternalMemoryHandleTypeFlags(0)` — VUID-VkBindImageMemoryInfo-memory-02728,
+> and the matching `vkBindBufferMemory2` violation twice over.
+
+Binding dma-buf-backed external memory to an image created with `handleTypes = 0` is exactly the kind
+of spec violation that does not fail at bind time and instead faults the GPU when the resource is
+first *rendered into* — which is the second swapchain image, which is the submit that dies. That is a
+hypothesis, clearly labelled: it fits the evidence and has not been tested. It is also consistent with
+the failure being intermittent and with it being the *second* image rather than the first.
+
+**Method note, and it is the whole lesson of the week.** Every wall this week fell to an instrument.
+This one was invisible to every instrument we could build inside Rayland, because the fact it needed
+lived in a process we do not compile — and the fix was to stop reasoning about that process and go
+compile it. Getting the source took three failed routes (Anubis-blocked GitLab, no canonical GitHub
+mirror, `apt-get source` failing even with `deb-src` enabled) and one that worked in a single command.
+The lesson is not "measure more", which this diary already knew. It is that **the boundary of what you
+can measure is a choice, not a fact** — and it was cheaper to move that boundary than to keep
+theorising inside it.
