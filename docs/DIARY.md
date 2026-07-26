@@ -2549,3 +2549,31 @@ deliberately, since deleting it was outside this task's stated file list and wou
 passing test for no requirement). Full detail, including the exact hand-derived byte layouts used to
 verify both blob-storage fixes empirically, is in
 `.superpowers/sdd/2026-07-26-venus-stream-decoder/task-2-report.md`.
+
+### 2026-07-26 — Task 2 review: Approved, with the encoder-sentinel comment fixed for saying "safe" instead of "required"
+
+Task 2 came back Approved. The reviewer verified both discoveries above adversarially rather than on
+trust — re-checked the blob-storage fix against the reference's success path, and re-ran the six-site
+encoder audit as a global scan across all 43 vendored headers, confirming no `vn_decode_*` function
+anywhere calls `vn_cs_encoder_write`/`_acquire`/`_release`. Both held.
+
+One Important finding, and it's a real one about how a true statement can still be the wrong
+justification. The `vkr_cs_encoder_get_blob_storage` comment argued the sentinel is safe because it's
+never dereferenced — accurate, but it answered "could this be NULL without immediate harm" when the
+question that actually matters is "must this always be non-NULL." Two of the six commands
+(`vkGetQueryPoolResults`, `vkWriteAccelerationStructuresPropertiesKHR`) decode more stream fields
+*after* the blob-storage branch, so a NULL return — which nothing currently produces, but which a
+future "let's add a size check to be safe" edit plausibly would — takes the generated early return and
+skips those trailing decodes without setting fatal. Same hazard class as the decoder-side fix, on the
+other side of the same function pair, and the comment that was supposed to prevent exactly this kind of
+regression didn't say so. Rewritten to lead with the requirement, name the two commands and their
+trailing fields, and warn explicitly against "hardening" it later. Also fixed: `src/lib.rs`'s comment
+claiming the self-test would be "removed in Task 2" — stale the moment Task 2 chose to keep it, and
+missed because `src/lib.rs` sat outside Task 2's stated file list, which is not an exemption from
+CLAUDE.md's stale-comment rule.
+
+**What this confirms:** "the code is right, the comment justifying it is wrong" is its own failure mode,
+distinct from a stale comment describing removed code — here the comment was freshly written *for* the
+code it sits above, and still argued the weaker of two true claims. A reviewer checking "is this safe"
+would have agreed with the original wording; only checking "is this comment a load-bearing warning for
+whoever touches this function next" caught that it wasn't.
