@@ -180,6 +180,134 @@ pub enum FrameError {
     },
 }
 
+/// The newest complete frame S has shipped, kept up to date as the session runs.
+///
+/// # Why this exists rather than re-reading the blob when presentation wants it
+/// Two failed approaches sit behind this type, and both are worth knowing before changing it.
+///
+/// **Re-reading at `BlobCreated` alone shows black for any multi-frame application.** Mesa creates
+/// the readback blob lazily at `vkMapMemory`, which for `rayland-refapp` happens *after* the one and
+/// only `vkCmdCopyImageToBuffer` — so the blob is born holding a finished frame. `rayland-icosa-cpu`
+/// renders 120 frames into that same buffer, so its blob is born holding nothing, and the
+/// creation-time snapshot is an empty window.
+///
+/// **Re-reading the blob's live pages on the relay's hot path stalls the ring.** Measured: a 256 KiB
+/// read per apply, with the session lock held, starved the relay into a 30-second stall and killed
+/// the run. The pages are a live GPU-shared mapping, and reading device-visible memory is nothing
+/// like reading RAM. **Re-reading once after the session is over is too late** — by then the
+/// application has freed the buffer and the mapping reads back all zeroes.
+///
+/// So the frame is accumulated *as it is produced*, from bytes S has **already** extracted from its
+/// own mapping in `progress_thread` — the readback runs it ships to C when a fence proves the
+/// application's submit and its copy complete. That costs no additional read of the mapping, and it
+/// happens at exactly the moment the bytes are known to be a whole, untorn frame.
+///
+/// # The one honest caveat about spec §1's "two independent paths"
+/// §1 wants the window and the application's PNG on C to be independent witnesses. These bytes are
+/// still read from **S's own mapping** (`Applier::take_app_blob_writes`), not from C's diff, so the
+/// window still shows what S's GPU wrote. But it is the same read the relay ships from, rather than a
+/// second one — so the two paths now share a step they previously did not. That is a real, if small,
+/// weakening of the independence claim, and it is recorded here rather than left for a reader to
+/// discover.
+pub struct LiveFrame {
+    /// The configured frame width.
+    width: u32,
+    /// The configured frame height.
+    height: u32,
+    /// `width * height * 4`, and the length of `pixels`.
+    expected_len: usize,
+    /// The frame, assembled from shipped runs. All zeroes until the first run lands.
+    pixels: Vec<u8>,
+    /// Whether any run has ever been applied — distinguishes "a genuinely black frame" from "no
+    /// frame yet", which the presentation path must not confuse.
+    written: bool,
+}
+
+impl LiveFrame {
+    /// An empty frame of the configured size.
+    pub fn new(width: u32, height: u32) -> Self {
+        let expected_len = width as usize * height as usize * 4;
+        LiveFrame {
+            width,
+            height,
+            expected_len,
+            pixels: vec![0; expected_len],
+            written: false,
+        }
+    }
+
+    /// Fold the readback runs `progress_thread` is about to ship into the frame.
+    ///
+    /// # Inputs / outputs
+    /// - `messages`: exactly what `Applier::take_app_blob_writes` returned. Anything that is not an
+    ///   [`S2C::BlobData`] is ignored, as is any run whose blob is not the frame's size — size is the
+    ///   only predicate S has for identifying a frame, and this must agree with [`FrameCapture`] or
+    ///   the window would show a different resource than the one that was chosen.
+    /// - A run that would write past the end is **clipped, not dropped**: a partial frame is still a
+    ///   picture, whereas panicking here would take down the daemon over a diagnostic.
+    /// - Returns nothing.
+    pub fn apply_runs(&mut self, messages: &[S2C]) {
+        for message in messages {
+            let S2C::BlobData { offset, bytes, .. } = message else {
+                continue;
+            };
+            let start = *offset as usize;
+            if start >= self.expected_len {
+                continue;
+            }
+            let end = start.saturating_add(bytes.len()).min(self.expected_len);
+            self.pixels[start..end].copy_from_slice(&bytes[..end - start]);
+            self.written = true;
+        }
+    }
+
+    /// Report what the live frame currently holds, for the same reason [`FrameCapture::report`]
+    /// exists: an automated run never opens a window, so without a line in the log a blank frame and
+    /// a correct one are indistinguishable. The distinct-byte-value count is crude on purpose — one
+    /// value means nothing was drawn, many means something was.
+    pub fn report(&self) {
+        if !self.written {
+            eprintln!(
+                "rayland-s: no complete frame was ever shipped; falling back to the capture's \
+                 creation-time snapshot"
+            );
+            return;
+        }
+        let mut seen = [false; 256];
+        for &b in &self.pixels {
+            seen[b as usize] = true;
+        }
+        let distinct = seen.iter().filter(|&&v| v).count();
+        eprintln!(
+            "rayland-s: live frame {}x{} — {} distinct byte values{}",
+            self.width,
+            self.height,
+            distinct,
+            if distinct <= 1 {
+                " (BLANK — this would present as an empty window)"
+            } else {
+                ""
+            }
+        );
+    }
+
+    /// The frame, if anything has ever been written into it.
+    ///
+    /// Returns `None` before the first run lands, so the caller can fall back to
+    /// [`FrameCapture`]'s creation-time snapshot rather than presenting a black rectangle and
+    /// calling it a frame.
+    pub fn frame(&self) -> Option<RenderedFrame> {
+        if !self.written {
+            return None;
+        }
+        Some(RenderedFrame {
+            width: self.width,
+            height: self.height,
+            pixels: self.pixels.clone(),
+        })
+    }
+}
+
 /// A frame-sized blob's pixels, copied out at the moment the blob was created.
 struct CapturedBlob {
     /// The engine's resource id, kept only so a refusal can name it.
@@ -288,6 +416,101 @@ impl FrameCapture {
                 res_id: *res_id,
                 pixels: bytes.to_vec(),
             });
+        }
+    }
+
+    /// Report what S would present, without deciding anything or consuming the capture.
+    ///
+    /// # Why this exists
+    /// [`present_frame`] blocks until a human closes the window, so every automated caller sets
+    /// [`ENV_NO_PRESENT`] and never reaches the point where a frame is identified. That left the one
+    /// question worth asking about presentation — *are the pixels actually a picture?* — answerable
+    /// only by a human looking at a window. A black window and a correct one logged identically,
+    /// which is exactly how a blank presentation went unexplained for a day.
+    ///
+    /// The distinct-byte-value count is a deliberately crude measure and that is its virtue: an
+    /// all-black or uninitialised frame has **one** distinct value, and any real render has many.
+    /// It cannot tell a correct picture from a wrong one — only that something was drawn — which is
+    /// precisely the distinction that was missing.
+    ///
+    /// # Inputs / outputs
+    /// - Borrows `self`; changes nothing and decides nothing. Safe to call when the capture is
+    ///   empty or ambiguous, where [`Self::into_frame`] would refuse.
+    /// - Returns nothing; writes one line per candidate to stderr.
+    pub fn report(&self) {
+        if self.candidates.is_empty() {
+            eprintln!(
+                "rayland-s: no frame candidate ({}x{} = {} bytes); nothing to present",
+                self.width, self.height, self.expected_len
+            );
+            return;
+        }
+        for candidate in &self.candidates {
+            // 256 counters rather than a HashSet: bounded, allocation-free, and this may run on a
+            // multi-megabyte blob.
+            let mut seen = [false; 256];
+            for &b in &candidate.pixels {
+                seen[b as usize] = true;
+            }
+            let distinct = seen.iter().filter(|&&v| v).count();
+            eprintln!(
+                "rayland-s: frame candidate resource {} — {}x{}, {} distinct byte values{}",
+                candidate.res_id,
+                self.width,
+                self.height,
+                distinct,
+                if distinct <= 1 {
+                    " (BLANK — this would present as an empty window)"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
+
+    /// Re-read every candidate's **current** pixels from its live mapping.
+    ///
+    /// # Why this exists, and the bug it fixes
+    /// [`Self::observe_replies`] copies a blob's bytes at `BlobCreated` time, and its doc explains
+    /// why that is the right moment — *for a single-frame application*. `rayland-refapp` renders
+    /// once, and Mesa creates the readback blob lazily at `vkMapMemory`, **after**
+    /// `vkCmdCopyImageToBuffer` has run, so the blob is born with the finished frame already in it.
+    ///
+    /// A **multi-frame** application breaks that assumption completely. `rayland-icosa-cpu` renders
+    /// 120 frames into the *same* readback buffer, so its blob is born long before any of them —
+    /// born, in fact, containing nothing. Presenting the creation-time snapshot therefore showed a
+    /// black window while the relay was working perfectly and the application's own PNGs on C were
+    /// correct. That was observed and misfiled as a presentation-path defect of unknown origin; it
+    /// is this.
+    ///
+    /// # Why re-reading is safe, and why a vanished blob is not an error
+    /// The mapping is live shared memory, and the engine's `unref_resource` may drop it when the
+    /// application frees the buffer on its way out — which is exactly why `observe_replies` copies
+    /// rather than borrows. So a candidate whose blob has gone is simply **left holding its last
+    /// good copy**: that is the newest frame S ever saw, which is precisely what should be
+    /// presented. A blob that changed size is skipped for the same reason, rather than truncating a
+    /// frame to fit.
+    ///
+    /// # Inputs / outputs
+    /// - `applier`: the session state, borrowed to read candidates' live pages. The caller must hold
+    ///   the same lock it holds around `apply`, for the reason [`Self::observe_replies`] gives.
+    /// - Returns nothing; candidates are updated in place. Candidates are never added or removed, so
+    ///   this cannot change what [`Self::into_frame`] decides — only which pixels it presents.
+    pub fn refresh_candidates(&mut self, applier: &Applier) {
+        for candidate in &mut self.candidates {
+            // Gone: the application freed the buffer. Keep the last copy — see the doc above.
+            let Some(blob) = applier.blob(candidate.res_id) else {
+                continue;
+            };
+            let bytes = blob.bytes();
+            // Size is the only predicate S has; a blob that no longer matches it is no longer this
+            // frame, and overwriting with it would present something of the wrong shape.
+            if bytes.len() != self.expected_len {
+                continue;
+            }
+            // `copy_from_slice` rather than reallocating: same length every time, and this runs on
+            // the relay's hot path with the session lock held.
+            candidate.pixels.copy_from_slice(bytes);
         }
     }
 

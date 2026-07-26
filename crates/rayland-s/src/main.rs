@@ -69,7 +69,9 @@ use rayland_s::apply::Applier;
 use rayland_s::wayland_client::{EventSink, WaylandReplay};
 // Presentation: finding the application's readback buffer among S's blobs, and putting it on S's
 // screen. See that module's docs for why finding it is the one guess (c)1 has to make.
-use rayland_s::present::{ENV_NO_PRESENT, FrameCapture, frame_size_from_env, present_frame};
+use rayland_s::present::{
+    ENV_NO_PRESENT, FrameCapture, LiveFrame, frame_size_from_env, present_frame,
+};
 
 // SP2's QUIC transport: the network C's commands cross.
 use rayland_transport::{QuicRecv, QuicSend};
@@ -163,7 +165,27 @@ const ENV_WAYLAND_DISPLAY: &str = "WAYLAND_DISPLAY";
 /// # Errors
 /// Returns an error if the frame could not be identified (no candidate, or an ambiguity S refuses to
 /// guess through), or if presentation itself failed on a machine that does have a compositor.
-fn present_the_frame(capture: FrameCapture) -> Result<()> {
+fn present_the_frame(capture: FrameCapture, live: &Arc<Mutex<LiveFrame>>) -> Result<()> {
+    // Always say what S would show, before any decision to decline. An automated run never reaches
+    // `into_frame`, so without this the only report on presentation is a human looking at a window —
+    // and a blank one looks exactly like a correct one in the log. See `FrameCapture::report`.
+    capture.report();
+    // **Prefer the live frame.** It is the newest frame S proved complete and shipped, whereas the
+    // capture holds each candidate as it looked when its blob was *created* — a finished frame for a
+    // one-frame application, an empty buffer for a multi-frame one. Falling back to the capture when
+    // no run ever landed keeps single-frame applications working exactly as before, including the
+    // ambiguity refusal, which the live frame has no way to express.
+    let live_frame = match live.lock() {
+        Ok(frame) => {
+            frame.report();
+            frame.frame()
+        }
+        Err(poisoned) => {
+            let frame = poisoned.into_inner();
+            frame.report();
+            frame.frame()
+        }
+    };
     if std::env::var_os(ENV_NO_PRESENT).is_some() {
         eprintln!(
             "rayland-s: not presenting ({ENV_NO_PRESENT} is set). The relay itself is unaffected; \
@@ -181,7 +203,16 @@ fn present_the_frame(capture: FrameCapture) -> Result<()> {
     }
     // Refuse loudly here rather than show something wrong. `into_frame`'s two errors both explain
     // themselves at length, so there is nothing to add with a `context`.
-    let frame = capture.into_frame()?;
+    let frame = match live_frame {
+        Some(frame) => {
+            eprintln!(
+                "rayland-s: presenting the newest complete frame S shipped ({}x{})",
+                frame.width, frame.height
+            );
+            frame
+        }
+        None => capture.into_frame()?,
+    };
     present_frame(frame)
 }
 
@@ -401,7 +432,11 @@ impl EventSink for LinkEventSink {
 /// before progress — the same lockstep the working gate used, which initialization depends on (a wholesale
 /// rewrite of this cadence broke device init; see `docs/DIARY.md`, 2026-07-21). Nothing here enters the
 /// engine, so no cycle can form between this thread, the message thread, and the actor.
-fn progress_thread(applier: Arc<Mutex<Applier>>, tx: Arc<Mutex<QuicSend>>) {
+fn progress_thread(
+    applier: Arc<Mutex<Applier>>,
+    tx: Arc<Mutex<QuicSend>>,
+    live: Arc<Mutex<LiveFrame>>,
+) {
     loop {
         // DIAGNOSTIC (`RAYLAND_S_REPLY_LOG`): a heartbeat taken **outside every lock**, unlike the
         // ring sampler inside `take_ring_progress` which necessarily runs with the applier held. If
@@ -451,6 +486,19 @@ fn progress_thread(applier: Arc<Mutex<Applier>>, tx: Arc<Mutex<QuicSend>>) {
                     let mut session = applier.lock().expect("the applier lock is never poisoned");
                     session.take_app_blob_writes()
                 };
+                // Tee the frame before shipping it. These are the only bytes in the whole daemon
+                // that are known to be a *complete* frame — the fence proves the submit and its
+                // readback copy are done — and they have already been read out of S's mapping, so
+                // folding them into the live frame costs no second read of GPU-shared memory. That
+                // matters: doing this read on the relay's path was measured stalling the ring for
+                // 30 s. See `LiveFrame`'s docs for the two approaches that failed before this one.
+                if !app.is_empty() {
+                    match live.lock() {
+                        Ok(mut frame) => frame.apply_runs(&app),
+                        // Presentation is not worth killing a working relay for.
+                        Err(poisoned) => poisoned.into_inner().apply_runs(&app),
+                    }
+                }
                 if !app.is_empty() && ship(&tx, &app).is_err() {
                     return;
                 }
@@ -666,6 +714,15 @@ fn main() -> Result<()> {
     let tx = Arc::new(Mutex::new(tx));
     let applier = Arc::new(Mutex::new(Applier::new()));
 
+    // What to look for. Read *before* the progress thread starts, because that thread accumulates the
+    // frame and so needs the size; and before the session, so a malformed `RAYLAND_C1_PRESENT_SIZE` is
+    // a startup refusal naming the setting rather than a surprise at the end of a run that has
+    // already done all its work and cannot be repeated for free.
+    let (present_width, present_height) = frame_size_from_env()?;
+    // The newest complete frame, assembled by the progress thread from the readback runs it ships.
+    // See `LiveFrame` for why presentation cannot instead just read the blob when it wants it.
+    let live = Arc::new(Mutex::new(LiveFrame::new(present_width, present_height)));
+
     // The poller: the only thing that ever releases the application's synchronous calls. It holds its
     // own `EngineClient` clone so it can drive the readback fence through the actor.
     std::thread::Builder::new()
@@ -673,7 +730,8 @@ fn main() -> Result<()> {
         .spawn({
             let applier = Arc::clone(&applier);
             let tx = Arc::clone(&tx);
-            move || progress_thread(applier, tx)
+            let live = Arc::clone(&live);
+            move || progress_thread(applier, tx, live)
         })
         .context("spawning the progress thread")?;
 
@@ -700,10 +758,6 @@ fn main() -> Result<()> {
             .context("spawning the lock watchdog")?;
     }
 
-    // What to look for. Read before the session rather than after it, so a malformed
-    // `RAYLAND_C1_PRESENT_SIZE` is a startup refusal naming the setting — not a surprise at the end
-    // of a run that has already done all its work and cannot be repeated for free.
-    let (present_width, present_height) = frame_size_from_env()?;
     let mut capture = FrameCapture::new(present_width, present_height);
 
     // `serve` needs `&mut` to call the `RenderEngine` trait methods through the client; the message
@@ -716,12 +770,36 @@ fn main() -> Result<()> {
     let mut wl_replay = WaylandReplay::new(Arc::new(LinkEventSink {
         tx: Arc::clone(&tx),
     }));
+    let applier_for_refresh = Arc::clone(&applier);
     serve(rx, tx, applier, &mut engine, &mut capture, &mut wl_replay)?;
     eprintln!("rayland-s: session ended");
+
+    // **Refresh the frame candidates exactly once, here, and never on the relay's hot path.**
+    //
+    // `observe_replies` captured each candidate at `BlobCreated`, which holds the finished frame for
+    // a one-frame application and an empty buffer for a multi-frame one — so a 120-frame run would
+    // otherwise present black. The fix is to re-read the blob; the trap is *where*.
+    //
+    // Doing it per-apply was measured stalling the ring for 30 s and killing the run outright. The
+    // blob is a live GPU-shared mapping, and reading a quarter of a megabyte from device-visible
+    // memory is nothing like reading it from RAM — while holding the session lock the relay needs.
+    // This repository has now made that same mistake six times with six different instruments (see
+    // `docs/DIARY.md`); the general rule is that anything touching a blob's pages belongs off the
+    // path the application's latency runs through.
+    //
+    // After the session there is no relay left to starve, and one read is all presentation needs. A
+    // candidate whose blob the application already freed keeps its creation-time copy, which
+    // `refresh_candidates` handles by design.
+    match applier_for_refresh.lock() {
+        Ok(session) => capture.refresh_candidates(&session),
+        // A poisoned lock means a thread panicked mid-session. The relay is over and the pixels are
+        // whatever they are; presenting the older copy beats aborting on the way out.
+        Err(poisoned) => capture.refresh_candidates(&poisoned.into_inner()),
+    }
 
     // Now that the session is over, put the frame on screen — and keep it there until a human closes
     // it. Presentation deliberately runs *after* the session rather than alongside it; the reasons
     // (one static frame, and a window that must outlive an application that exits the instant it has
     // its pixels) are on `rayland_s::present::present_frame`.
-    present_the_frame(capture)
+    present_the_frame(capture, &live)
 }
