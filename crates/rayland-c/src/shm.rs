@@ -323,27 +323,64 @@ impl LocalBlob {
         // baseline below does not alias it. The concurrent-writer race is documented above.
         let live: &[u8] = unsafe { std::slice::from_raw_parts(ptr, len) };
         let mut runs = Vec::new();
+        // The start of a changed run still being extended, if any. Carried across chunk boundaries so
+        // a run that straddles one is emitted as a single run, exactly as the byte-at-a-time version
+        // did — the chunking below is an optimisation, and must not change what is produced.
+        let mut open: Option<usize> = None;
         let mut i = 0;
+        // **Compare a chunk at a time, and only descend to bytes inside a chunk that differs.**
+        //
+        // This is not premature optimisation; it is a fix for a measured stall. The byte-at-a-time
+        // version this replaces is fine for a few hundred KiB of application buffers, and ruinous the
+        // moment it is pointed at the 8 MiB command-buffer staging pool — which is exactly what
+        // relaying Venus's out-of-line command streams requires. A slice comparison lowers to
+        // `memcmp`, so an unchanged region costs a wide vectorised scan instead of one branch per
+        // byte, and the overwhelmingly common case here is "almost nothing changed".
+        //
+        // This repository has now stalled the relay three separate times by reading blob pages
+        // byte-at-a-time (see `docs/DIARY.md`); the shape below is the same one that fixed the
+        // 637 ms critical section on S.
+        const CHUNK: usize = 64;
         while i < len {
-            // Skip bytes that already match what S has.
-            if live[i] == self.baseline[i] {
-                i += 1;
+            let chunk_end = (i + CHUNK).min(len);
+            // Whole chunk agrees with what S has: nothing to ship, and any run ends here.
+            if live[i..chunk_end] == self.baseline[i..chunk_end] {
+                if let Some(start) = open.take() {
+                    runs.push(BlobRun {
+                        offset: start as u64,
+                        bytes: self.baseline[start..i].to_vec(),
+                    });
+                }
+                i = chunk_end;
                 continue;
             }
-            // A changed run: extend it while the bytes differ, updating the baseline to the live bytes
-            // as we go so the baseline ends equal to what this run ships.
-            let start = i;
-            while i < len && live[i] != self.baseline[i] {
-                self.baseline[i] = live[i];
-                i += 1;
+            // Something in this chunk differs; find exactly what, byte by byte.
+            for j in i..chunk_end {
+                if live[j] != self.baseline[j] {
+                    // Updating the baseline as we go is what makes the shipped bytes come from
+                    // `self.baseline` rather than a second read of `live` — see below.
+                    self.baseline[j] = live[j];
+                    if open.is_none() {
+                        open = Some(j);
+                    }
+                } else if let Some(start) = open.take() {
+                    runs.push(BlobRun {
+                        offset: start as u64,
+                        bytes: self.baseline[start..j].to_vec(),
+                    });
+                }
             }
+            i = chunk_end;
+        }
+        // A run still open at the end of the mapping.
+        if let Some(start) = open {
             runs.push(BlobRun {
                 offset: start as u64,
-                // From `self.baseline`, not `live`: the loop above just wrote `live[start..i]` into
-                // `self.baseline[start..i]`, so the two agree right now. Reading `live` again here would
-                // be a second, later look at memory Mesa may still be writing — see the doc comment
-                // above for why that reopens the exact gap this method exists to close.
-                bytes: self.baseline[start..i].to_vec(),
+                // From `self.baseline`, not `live`: the loop above just wrote `live[start..len]` into
+                // `self.baseline[start..len]`, so the two agree right now. Reading `live` again here
+                // would be a second, later look at memory Mesa may still be writing — see the doc
+                // comment above for why that reopens the exact gap this method exists to close.
+                bytes: self.baseline[start..len].to_vec(),
             });
         }
         runs
@@ -393,6 +430,87 @@ mod tests {
     const APP_BLOB_ID: u64 = 16;
     /// A Venus-internal shmem id: `blob_id == 0` is the ring/arena/staging pool, never diffed C→S.
     const INTERNAL_BLOB_ID: u64 = 0;
+
+    /// **The chunked diff must produce exactly what a byte-at-a-time diff would.**
+    ///
+    /// `take_changed_runs` compares 64 bytes at a time and only descends into a chunk that differs,
+    /// because pointing a per-byte loop at the 8 MiB staging pool stalls the relay. That optimisation
+    /// is only safe if it is invisible: runs that straddle a chunk boundary must still come out as
+    /// one run, and runs that end exactly on one must not be merged with the next.
+    ///
+    /// So this checks the real implementation against a deliberately naive reference, over patterns
+    /// chosen to sit on and across the 64-byte boundaries — which the pre-existing tests, using small
+    /// buffers, never exercised.
+    #[test]
+    fn the_chunked_diff_agrees_with_a_byte_at_a_time_reference() {
+        /// The obvious implementation, kept dumb on purpose: maximal spans where the bytes differ.
+        fn reference(live: &[u8], baseline: &[u8]) -> Vec<(u64, Vec<u8>)> {
+            let mut out = Vec::new();
+            let mut i = 0;
+            while i < live.len() {
+                if live[i] == baseline[i] {
+                    i += 1;
+                    continue;
+                }
+                let start = i;
+                while i < live.len() && live[i] != baseline[i] {
+                    i += 1;
+                }
+                out.push((start as u64, live[start..i].to_vec()));
+            }
+            out
+        }
+
+        const SIZE: u64 = 512;
+        // Each case is a set of byte indices to change, chosen relative to the 64-byte chunking.
+        let cases: Vec<(&str, Vec<usize>)> = vec![
+            ("nothing changed", vec![]),
+            ("one byte mid-chunk", vec![10]),
+            ("a run straddling the first boundary", (60..70).collect()),
+            ("a run ending exactly on a boundary", (56..64).collect()),
+            ("a run starting exactly on a boundary", (64..72).collect()),
+            ("adjacent chunks, separated by one equal byte", {
+                let mut v: Vec<usize> = (100..128).collect();
+                v.extend(129..160);
+                v
+            }),
+            ("a run spanning several whole chunks", (32..300).collect()),
+            ("the very last byte", vec![SIZE as usize - 1]),
+            ("every byte", (0..SIZE as usize).collect()),
+        ];
+
+        for (name, changed) in cases {
+            let (mut blob, fd) = LocalBlob::create(APP_BLOB_ID, SIZE).expect("a local blob");
+            blob.ensure_baseline();
+            // Drain the initial state so the baseline matches the mapping and the case starts clean.
+            let _ = blob.take_changed_runs();
+
+            // Write through a second mapping of the same memfd, playing the part of Mesa.
+            let mapping = ShmMapping::map(fd.as_fd(), SIZE).expect("second mapping");
+            // SAFETY: `mapping` is a live MAP_SHARED mapping of exactly SIZE bytes that outlives this
+            // borrow, and `u8` has no invalid patterns.
+            let live_writer: &mut [u8] =
+                unsafe { std::slice::from_raw_parts_mut(mapping.as_ptr() as *mut u8, SIZE as usize) };
+            for &i in &changed {
+                live_writer[i] = 0xAB;
+            }
+
+            // What the reference says, from an independent copy of the same before/after state.
+            let mut baseline_copy = vec![0u8; SIZE as usize];
+            let mut live_copy = vec![0u8; SIZE as usize];
+            for &i in &changed {
+                live_copy[i] = 0xAB;
+            }
+            let expected = reference(&live_copy, &mut baseline_copy);
+
+            let got: Vec<(u64, Vec<u8>)> = blob
+                .take_changed_runs()
+                .into_iter()
+                .map(|r| (r.offset, r.bytes))
+                .collect();
+            assert_eq!(got, expected, "case: {name}");
+        }
+    }
 
     /// The blob records the memfd's real inode, and it is the same inode a second `fstat` of the
     /// descriptor reports — the property the buffer-by-token proxy relies on. If the recorded inode
