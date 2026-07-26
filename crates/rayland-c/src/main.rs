@@ -79,7 +79,6 @@ use rayland_relay::{C2S, S2C};
 use rayland_vtest::EngineError;
 // Spec §5.1's guard: notice Venus's out-of-line command path rather than relaying a stream that
 // would misbehave on S's GPU with no trace of the cause.
-use rayland_vtest::venus_ring::scan_for_out_of_line_stream;
 use rayland_vtest::vtest::serve_vtest;
 
 use anyhow::{Context, Result};
@@ -777,24 +776,26 @@ fn ring_watcher_thread(
         // --- 2. Relay, with no lock held. These bytes are the application's Vulkan commands.
         if let Some(delta) = delta {
             let tail = delta.tail;
-            // Before anything crosses: refuse a stream (c)1 v1 cannot faithfully carry. Venus
-            // replaces any submission over `direct_size` (8192 B for the 128 KiB instance ring) with
-            // a `vkExecuteCommandStreamsMESA` pointing at *other* shmems this version never ships —
-            // S would then resolve those ids to blobs it holds and execute their contents, which are
-            // zeros. Spec §5.1 requires that this never be silent, and the scan is deliberately a
-            // sound over-approximation rather than a decode; `scan_for_out_of_line_stream`'s module
-            // docs carry the whole argument and the reason a decode-based check could not work.
+            // **The out-of-line refusal is gone, because the thing it protected against is fixed.**
             //
-            // Exiting rather than continuing, for the same reason the stall below exits: this thread
-            // is detached and the vtest thread is blocked inside `serve_vtest`, so there is nothing
-            // to return an error to — and a relay that carried on would corrupt S's stream, which
-            // surfaces as inexplicable GPU misbehaviour nowhere near the cause.
-            if let Err(found) = scan_for_out_of_line_stream(&delta.bytes) {
-                eprintln!(
-                    "rayland-c: refusing to relay the ring delta ending at tail {tail}: {found}"
-                );
-                std::process::exit(1);
-            }
+            // Venus replaces any submission over `direct_size` (`buffer_size >> 4`, so 8192 B for the
+            // 128 KiB instance ring) with a `vkExecuteCommandStreamsMESA` naming *other* shmems. This
+            // relay used to ship only application memory, so those shmems — the staging pool, which is
+            // `blob_id == 0` — never crossed, and S would have resolved the ids to blobs full of
+            // zeros and executed them. Refusing was right.
+            //
+            // `blob_sync::messages_for_delta` now synchronises **every** blob C holds except the ring
+            // itself, Venus's own shmems included, using the baseline that lets a region both sides
+            // write be published safely. The referenced streams are therefore already on S — shipped
+            // ahead of this delta, since `RingDelta` goes last — and there is nothing left to refuse.
+            //
+            // The scan also had to go on its own merits: it was a byte pattern, not a decode, and it
+            // fired on payload. `rayland-icosa-gpu` was blocked by a dword equal to 180 **inside its
+            // fractal fragment shader's SPIR-V**, in a delta the decoder walks to `ReachedEnd` with no
+            // `vkExecuteCommandStreamsMESA` in it at all (`docs/DIARY.md`, 2026-07-26). Replacing it
+            // with a decode was never an option: this is the relay path, and (c)1 §7 forbids a decode
+            // from deciding what crosses the wire. Making the relay able to carry the stream removes
+            // the question instead of answering it.
             // Record the frontier *before* the send, not after. `Progress::note_consumed` refuses
             // any acknowledgement past `relayed_tail`, and a fast S can answer this delta before
             // this thread would reacquire the progress lock — so noting it afterwards would race,

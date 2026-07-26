@@ -235,43 +235,42 @@ pub fn messages_for_delta(blobs: &BlobTable, ring_res_id: u32, delta: RingDelta)
         blob_fingerprints(&table, delta.tail);
 
         for (&res_id, blob) in table.iter_mut() {
-            // Venus's own shmems — the ring, the reply arena, the staging pool — are not C's to
-            // publish. Ring-findings §6's `blob_id` signal is the line between the application's memory
-            // and the transport's plumbing; `take_changed_runs` also returns empty for them (no
-            // baseline), so this filter is the intent and that is the backstop.
-            if !blob.is_application_memory() {
-                // DIAGNOSTIC (`RAYLAND_C1_SHIP_BLOB=<res_id>`), and **emphatically not a fix.** The
-                // blob fingerprints showed exactly one structural divergence between the two
-                // machines when a submit fails to complete: the staging pool holds content on C and
-                // is all zeros on S, because this filter declines to publish `blob_id == 0` by
-                // design. Naming the resource explicitly — rather than inferring "the staging pool"
-                // from its size or its id — keeps this a stated experiment rather than a guess.
-                //
-                // **Why this must not become the fix:** S writes the reply arena, which is
-                // `blob_id == 0` too, and C's copy of it is stale by construction. Publishing such a
-                // region from C is the clobber `blob_id` routing exists to prevent. If this
-                // experiment shows the submit completing, the answer is a design for synchronising a
-                // region *both* sides write — not this switch left on.
-                if diagnostic_ship_blob() != Some(res_id) {
-                    continue;
-                }
-                // **Incremental, not whole.** The first version of this shipped the blob's non-zero
-                // runs on *every* relay, which tripled C's blob-message count and slowed the relay
-                // enough that the application never reached the submit under test — the experiment
-                // measured nothing and its null result was worthless. Giving the blob a baseline and
-                // shipping only changed runs makes the steady state one chunked compare and no
-                // traffic, so the app runs at the speed it does without the experiment.
-                blob.ensure_baseline();
-                for run in blob.take_changed_runs() {
-                    out.push(C2S::BlobData {
-                        res_id,
-                        offset: run.offset,
-                        bytes: run.bytes,
-                    });
-                }
+            // **The ring is the one blob this loop must never touch.** It has its own message,
+            // `C2S::RingDelta`, which carries the `tail` that makes the bytes meaningful and is
+            // deliberately sent last. Shipping the same pages here as well would publish ring bytes
+            // ahead of the `tail` that validates them, and S's ring thread reads whatever is below
+            // `tail` the instant it lands.
+            if res_id == ring_res_id {
                 continue;
             }
-            // Ship only what changed since C last sent this blob — nothing at all if it is unchanged.
+            // **Everything else C holds is synchronised, including Venus's own shmems.**
+            //
+            // This used to ship only application memory, on ring-findings §6's `blob_id` signal, and
+            // that is why `vkExecuteCommandStreamsMESA` could not be relayed: when a submission
+            // exceeds Mesa's `direct_size` (`buffer_size >> 4`, so 8 KiB for the 128 KiB ring), the
+            // commands do not go in the ring at all — they go into the **staging pool**, which is
+            // `blob_id == 0`, which this loop skipped. S then held a pool of zeros and the referenced
+            // streams were simply absent, so `rayland-c` refused the delta rather than let S execute
+            // whatever its copy happened to contain.
+            //
+            // # Why publishing a region S also writes is safe now, when it was not before
+            // The reply arena is `blob_id == 0` too, and S writes it. The old comment here was right
+            // that publishing C's stale copy of such a region is a clobber — and right that the
+            // answer was "a design for synchronising a region *both* sides write". That design now
+            // exists and is what this rests on: every blob carries a **baseline**, `take_changed_runs`
+            // ships only bytes that differ from it, and `LocalBlob::note_s_wrote` folds each S→C write
+            // into the baseline as it arrives (`main.rs`'s `apply_blob_data` and
+            // `relay_engine.rs`'s `commit_pending_blob`, both teeth-checked). So S's own writes never
+            // look like C-side changes and are never echoed back. What C publishes is exactly what
+            // C's Mesa wrote, which for the arena is nothing.
+            //
+            // # The cost, and why it is affordable
+            // A baseline for the 8 MiB pool, and a chunked compare of it per relay. The compare is
+            // `memcmp`-shaped (see `LocalBlob::take_changed_runs`) and the steady state is "nothing
+            // changed", so it costs a vectorised scan and no traffic. Shipping *whole* blobs here,
+            // which an earlier experiment did, tripled C's message count and slowed the relay enough
+            // that the application never reached the submit under test.
+            blob.ensure_baseline();
             // Each run reuses `BlobData`'s offset field; v1 only ever used offset 0 (the whole blob).
             for run in blob.take_changed_runs() {
                 out.push(C2S::BlobData {
@@ -406,20 +405,21 @@ mod tests {
         );
     }
 
-    /// **Venus's internal shmems must never be shipped C→S**, and this is not tidiness.
+    /// **The ring must never be shipped as `BlobData`**, and this is not tidiness.
     ///
-    /// The reply arena is written by **S** and read by C — it is how every synchronous Vulkan call
-    /// gets its answer (ring-findings §7 measured it at ~12x the command traffic). Shipping C's
-    /// stale copy of it to S would clobber replies S had already written and the application is
-    /// blocked on. The ring likewise: the delta carries it, and a copy of it sent as `BlobData`
-    /// would fight the delta for the same bytes while overwriting the `head` and `status` words
-    /// S's virglrenderer owns.
+    /// The ring has its own message, [`C2S::RingDelta`], which carries the `tail` that makes its
+    /// bytes meaningful and is deliberately sent **last**. A copy sent as `BlobData` would fight the
+    /// delta for the same bytes, publish ring contents ahead of the `tail` that validates them — S's
+    /// ring thread reads whatever is below `tail` the instant it lands — and overwrite the `head` and
+    /// `status` words S's virglrenderer owns.
     ///
-    /// So "sync the application's memory" cannot mean "everything, both ways" — that is not what
-    /// the filter is for, and getting it wrong here is a corruption bug, not merely a wasted byte.
-    /// `blob_id` (ring-findings §6) is the line.
+    /// Everything *else* C holds now crosses, Venus's own shmems included. That is a deliberate
+    /// widening (see this module's docs): the staging pool is `blob_id == 0`, and it is where Mesa
+    /// puts a submission too large to inline, so a relay that skipped it could not carry
+    /// `vkExecuteCommandStreamsMESA` at all. What makes publishing a region **S also writes** safe is
+    /// the baseline, not the `blob_id` — see [`the_reply_arena_is_not_echoed_back_to_s`].
     #[test]
-    fn venus_s_own_shmems_are_never_shipped_c_to_s() {
+    fn the_ring_is_never_shipped_as_blob_data() {
         let blobs = table_of(&[
             (1, RING_BLOB_ID, 131268, 0x11),
             (2, REPLY_ARENA_BLOB_ID, 1048576, 0x22),
@@ -435,12 +435,64 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(
-            shipped,
-            vec![3],
-            "only the application's own memory may cross C->S; shipping C's stale reply arena would \
-             destroy the replies S wrote and the application is blocked on, and shipping the ring \
-             would clobber the head/status words S's virglrenderer owns"
+        assert!(
+            !shipped.contains(&1),
+            "the ring must never cross as BlobData: RingDelta carries it, and a BlobData copy would \
+             publish ring bytes ahead of the tail that validates them and clobber the head/status \
+             words S's virglrenderer owns. shipped: {shipped:?}"
+        );
+        assert!(
+            shipped.contains(&3),
+            "the application's own memory must still cross. shipped: {shipped:?}"
+        );
+        assert!(
+            shipped.contains(&2),
+            "Venus's non-ring shmems must now cross too — the staging pool is blob_id == 0 and is \
+             where an over-sized submission's commands actually live. shipped: {shipped:?}"
+        );
+    }
+
+    /// **The property that makes publishing a region S also writes safe: S's own bytes are never
+    /// echoed back to it.**
+    ///
+    /// This is the guard that replaced `blob_id` routing for C→S, and it is the whole reason the
+    /// reply arena can now be in the sync at all. The arena is written by **S** and read by C — it is
+    /// how every synchronous Vulkan call gets its answer (ring-findings §7 measured it at ~12x the
+    /// command traffic). Shipping C's copy of it back would clobber replies the application is
+    /// blocked on, which is a corruption bug, not a wasted byte.
+    ///
+    /// What prevents that is not the filter but the **baseline**: [`LocalBlob::note_s_wrote`] folds
+    /// each S→C write into it as the write is applied, so those bytes are already "what S has" by the
+    /// time the next diff runs and never appear as a C-side change. This test states that directly —
+    /// write into the mapping exactly as S's reply path does, and require the next relay to carry
+    /// nothing for it.
+    #[test]
+    fn the_reply_arena_is_not_echoed_back_to_s() {
+        const ARENA_RES: u32 = 2;
+        const ARENA_SIZE: u64 = 4096;
+        let blobs = table_of(&[(ARENA_RES, REPLY_ARENA_BLOB_ID, ARENA_SIZE, 0x00)]);
+
+        // First relay establishes the baseline and drains whatever the initial state was.
+        let _ = messages_for_delta(&blobs, 1, a_delta());
+
+        // Now S answers a synchronous call: its reply lands in the arena, through the same path
+        // `apply_blob_data` and `commit_pending_blob` use — write the bytes, then record them.
+        {
+            let mut table = blobs.lock().expect("the blob table lock is never poisoned");
+            let blob = table.get_mut(&ARENA_RES).expect("the arena is in the table");
+            blob.bytes_mut()[64..96].copy_from_slice(&[0xEE; 32]);
+            blob.note_s_wrote(64, &[0xEE; 32]);
+        }
+
+        let msgs = messages_for_delta(&blobs, 1, a_delta());
+        let arena_runs: Vec<&C2S> = msgs
+            .iter()
+            .filter(|m| matches!(m, C2S::BlobData { res_id, .. } if *res_id == ARENA_RES))
+            .collect();
+        assert!(
+            arena_runs.is_empty(),
+            "S's own reply must never be shipped back to S — note_s_wrote folds it into the \
+             baseline so it is not a C-side change. Got: {arena_runs:?}"
         );
     }
 
@@ -598,20 +650,6 @@ fn blob_fingerprints(table: &std::collections::HashMap<u32, crate::shm::LocalBlo
 }
 
 
-/// The resource id the staging-pool experiment names, from `RAYLAND_C1_SHIP_BLOB`.
-///
-/// # Why an explicit id rather than "the staging pool"
-/// C cannot identify the staging pool from anything it knows: `blob_id == 0` covers the ring, the
-/// reply arena **and** the pool alike, and picking it out by size would be exactly the kind of guess
-/// that has cost this investigation days. Making the operator name the resource turns the experiment
-/// into a stated hypothesis with a stated subject.
-///
-/// Returns `None` — the default, and the only safe standing value — unless the variable parses as a
-/// resource id. A malformed value is treated as unset rather than refused: this is a diagnostic, and
-/// failing a render session over a typo in a debug switch would be the wrong trade.
-fn diagnostic_ship_blob() -> Option<u32> {
-    std::env::var("RAYLAND_C1_SHIP_BLOB").ok()?.parse().ok()
-}
 
 
 /// A blob fingerprint that skips zero regions: `(non-zero byte count, digest of the non-zero bytes)`.
