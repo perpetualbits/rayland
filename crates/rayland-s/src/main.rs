@@ -385,6 +385,30 @@ fn s2c_kind(m: &S2C) -> String {
 ///   anything that would release the application to read them.
 /// - Returns `Err(())` if a send failed; the caller ends the session, exactly as the inline sends did.
 fn ship(tx: &Arc<Mutex<QuicSend>>, msgs: &[S2C]) -> Result<(), ()> {
+    if msgs.is_empty() {
+        return Ok(());
+    }
+    // **One lock and one flush for the whole batch, not one per message.**
+    //
+    // This loop used to take the send lock and flush inside it, once per message. That is what made
+    // the return path message-rate bound: a 120-frame `icosa-gpu` run ships **29414** `BlobData`
+    // messages, so it was paying 29414 lock acquisitions and 29414 flushes — and a flush is a
+    // syscall-shaped operation on the QUIC stream, not a memcpy. Measured breakdown of that run:
+    // 24874 messages for the readback (`res=5`, average run 377 bytes — its gap-256 coalescing works)
+    // and 4540 for the reply arena (`res=2`, average 4.4 bytes, 3247 of them a single byte).
+    //
+    // The arena's fine grain is **not** a defect to coalesce away: `take_venus_blob_writes` uses
+    // gap 0 deliberately, because a gap byte is one S did not write, and shipping it could clobber
+    // what C's Mesa has there. So the fix cannot be "send fewer bytes"; it has to be "send the same
+    // bytes in fewer operations", which is exactly what batching the flush does — losslessly, with
+    // no change to the wire format and no byte shipped that was not shipped before.
+    //
+    // Ordering is untouched. Messages are written in the order given, and the *between*-batch
+    // ordering the return path depends on (readback pixels, then reply arena, then the head-advance
+    // that releases the application — see `progress_thread`) is a property of separate `ship` calls,
+    // each of which still flushes before it returns.
+    let mut guard = tx.lock().expect("the link send lock is never poisoned");
+    let stream = &mut *guard;
     for msg in msgs {
         // T6 — transfer packet emitted (design note §7): the point a pixel packet leaves S for C.
         if let S2C::BlobData { res_id, offset, bytes } = msg {
@@ -393,12 +417,20 @@ fn ship(tx: &Arc<Mutex<QuicSend>>, msgs: &[S2C]) -> Result<(), ()> {
                 &format!("side=S res={res_id} off={offset} len={}", bytes.len()),
             );
         }
-        let mut stream = tx.lock().expect("the link send lock is never poisoned");
-        if let Err(e) = send(&mut stream, msg) {
+        link_log("w>", &s2c_kind(msg));
+        if let Err(e) = write_msg(stream, msg).with_context(|| format!("writing {msg:?} to C"))
+        {
             eprintln!("rayland-s: shipping to C failed: {e:#}");
             return Err(());
         }
     }
+    // The flush is what actually delivers: an unflushed message is an answer C never sees, and C may
+    // be blocked in a request/reply waiting for exactly it. Once for the batch, after every write.
+    if let Err(e) = stream.flush().context("flushing the link to C") {
+        eprintln!("rayland-s: shipping to C failed: {e:#}");
+        return Err(());
+    }
+    link_log("w<", &format!("batch of {}", msgs.len()));
     Ok(())
 }
 
