@@ -3314,3 +3314,68 @@ Neither of these cost a wrong conclusion, but only because they were noticed.
 
 **One thing did hold up.** Across every failing run today, `find_destroy_device` never fired — the
 morning's fix is working under the live workload, and the phantom gate retirement is gone.
+
+### 2026-07-26 (later) — The source arrives, four more theories die, and the contradiction sharpens
+
+Got virglrenderer 1.2.0's actual source. The route matters for next time: gitlab.freedesktop.org is
+behind an anti-bot wall and there is no GitHub mirror, but the Ubuntu **archive pool** serves the
+orig tarball over plain HTTP with no `deb-src` line and no root —
+`http://archive.ubuntu.com/ubuntu/pool/main/v/virglrenderer/virglrenderer_1.2.0.orig.tar.bz2`. The
+owner meanwhile enabled `deb-src` and `apt-get source` *still* failed; the tarball had already
+landed. Worth remembering: for an installed package, the pool URL is the reliable path.
+
+**First thing the source did was correct me.** This diary has been reasoning about a log line called
+`invalid object id`, spotted in the render server's string table sitting immediately before
+`%s resulted in CS error`, and treated its absence as proof that every handle lookup succeeded. That
+string is not the lookup's. The real one reads **`failed to look up object %lu of type %d`** (and
+`object %lu has type %d, not %d` for a type mismatch). I had been grepping for the wrong text. The
+conclusion happens to survive — neither real string appears in any failing run, and `vkr_log` emits
+at `VIRGL_LOG_LEVEL_INFO` which our `VIRGL_LOG_LEVEL=debug` runs demonstrably enabled — but it was
+right by luck, not by method, and it was stated to the owner as established. Recorded because the
+whole point of the earlier caveat was that this inference might be wrong; it was, in its reasoning,
+and only accidentally not in its answer.
+
+**The vendored headers are exactly virglrenderer's.** All **42** files byte-identical to
+`src/venus/venus-protocol/`. So our decoder is not an approximation of the renderer's decoder — it is
+the same generated code, and the only thing that can differ is the `vkr_cs.h` primitives underneath,
+which this crate writes itself.
+
+**Refuted against real source this session:**
+
+- *virglrenderer's own handler sets fatal* — it does not. `vkr_dispatch_vkQueueSubmit` is nine lines:
+  look up the queue, `vn_replace_..._handle`, lock, `QueueSubmit`, unlock. No fatal anywhere in it.
+- *The dispatch handler is not installed* — it is, `vkr_queue.c:654`.
+- *Temp-pool exhaustion* — would log `failed to suballocate %zu bytes from the temp pool`. Absent.
+- *The ring frames commands in sized chunks our flat walk cannot see* — it does not.
+  `vkr_ring_thread` computes `cmd_size = tail - cur`, copies that flat range, and
+  `vkr_ring_submit_cmd` sets the decoder over the whole of it. The extent really is `[head, tail)`.
+
+**And the decisive local test.** Fed the captured refused submit's 120 bytes to our `command_len`,
+with the accepted submit from the same run as a control:
+
+```
+refused  -> Ok(Command { command_type: 18, len: 120 })
+accepted -> Ok(Command { command_type: 18, len: 120 })
+```
+
+Identical. The bytes are structurally valid, and this is now a committed test rather than an
+inference from a dump.
+
+**So the contradiction is sharp, and it is worth stating as a contradiction rather than dressing it
+as a lead.** Identical generated code, over identical bytes, with all handle lookups succeeding (both
+failure modes log, and logging was on), no temp-pool failure (logs, absent), a handler that sets no
+fatal, and a decoder extent that covers the command exactly — and yet `vn_dispatch_vkQueueSubmit`
+comes out with the fatal flag set. One of those five statements is false and we cannot yet see which.
+
+The single silent path left in `vkr_cs_decoder_lookup_object` is `if (!id) return NULL;` — no log, no
+fatal — which pairs with the generated `if (!args.queue) { set_fatal; return; }`, also silent. That
+is the *only* silent route to this exact signature. It requires the queue id to decode as **0**, and
+the captured bytes say `0x6` at the offset the decoder reads. Either the id is genuinely 0 at
+dispatch time on S — which would mean the bytes S decoded are not the bytes C relayed — or something
+outside this enumeration is setting the flag.
+
+**The next step is now cheap and was impossible this morning: patch and rebuild.** With the source in
+hand, adding one `vkr_log` to that `!args.queue` branch (printing `args.queue` and the decoded id)
+turns the last silent branch into a loud one, and virglrenderer builds with meson. That is a far
+better instrument than another round of inference — and this investigation's record is unambiguous
+that instruments settle it and arguments do not. Twelve theories refuted so far.
