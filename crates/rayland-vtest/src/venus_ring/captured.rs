@@ -480,8 +480,10 @@ fn get_device_queue2_ring_idx_decodes_from_real_bytes() {
 /// # What this proves
 /// [`VK_COMMAND_TYPE_VK_GET_DEVICE_QUEUE2`] is **deliberately excluded** from [`encoded_size`]'s
 /// table (see that constant's doc comment) even though this particular call shape happens to be a
-/// fixed 80 bytes — the table only ever sizes commands [`decode_commands`]'s linear walk can *reach*,
-/// and `vkGetDeviceQueue2` sits behind variable-length commands the walk cannot get past on its own.
+/// fixed 80 bytes — the table only ever needs to size commands the linear walk can reach using the
+/// table by itself, and in a real session `vkGetDeviceQueue2` sits behind variable-length commands
+/// the *table alone* cannot get past. (The walk as a whole, with its borrowed-decoder fallback, is a
+/// different matter — this very test is the proof that it can size this command once handed to it.)
 /// So when `decode_commands` is handed exactly this command's 80 bytes, `encoded_size` returns
 /// `None` for it and the walk must fall back to `rayland_venus_proto::command_len` — the borrowed
 /// Mesa decoder — to size it at all. That it does, correctly, landing on `stream.len()` with no

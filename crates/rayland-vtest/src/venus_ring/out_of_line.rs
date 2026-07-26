@@ -28,28 +28,44 @@
 //!
 //! # Why this is a dword scan and **not** a decode — the design decision this module encodes
 //! The obvious implementation is to walk the command stream with [`super::decode::decode_commands`]
-//! and look for type 180. **That does not work, and believing it does is worse than having no check
-//! at all.**
+//! and look for type 180. **That does not work as a substitute for this module, and believing it
+//! does is worse than having no check at all.**
 //!
 //! Venus commands are **not self-delimiting**: nothing in a command says how long it is, so finding
 //! command N+1 means already knowing command N's exact encoded size (see [`super::decode`]'s module
-//! docs). [`super::decode::encoded_size`] knows three command types out of Venus's ~1000, and stops
-//! honestly at the first one it cannot size. And Mesa's own source pins where that stop lands: the
-//! first command in the instance ring is `vkEnumerateInstanceVersion`
+//! docs). [`super::decode::encoded_size`]'s own fixed-size table knows three command types out of
+//! Venus's ~1000. At the time this module was written, that table was the *only* thing
+//! `decode_commands` had, and Mesa's own source pinned exactly where that made it stop: the first
+//! command in the instance ring is `vkEnumerateInstanceVersion`
 //! (`vn_instance_init_renderer_versions`, `vn_instance.c:92-93`), and the **second** is
-//! `vkCreateInstance` (`vn_instance.c:362-363`) — which is variable-length and unsizeable. So a
-//! decode-based scan inspects roughly the first two commands a session ever produces and is blind to
-//! every byte after them, including every 180 that could ever appear.
+//! `vkCreateInstance` (`vn_instance.c:362-363`) — unsizeable by the table — so a decode-based scan
+//! back then genuinely could not get past a session's second command, ever, on any workload.
 //!
-//! Such a scan would report "no out-of-line streams" for **every** workload, forever. It would pass
-//! its own tests. It would be silence wearing a check's clothes, which is precisely what §5.1
-//! forbids.
+//! **That specific absolute limit no longer holds.** (c)1's venus-stream-decoder sub-project gave
+//! `decode_commands` a second sizer: where the table cannot answer, it now falls back to
+//! `rayland_venus_proto::command_len`, Mesa's own borrowed decoder, which *can* size a
+//! `vkCreateInstance` — and, given a complete real stream, the walk can continue past it and could in
+//! principle reach a `180` many commands later. So "a decode-based scan can never get past command
+//! two" is no longer a fact about this codebase, and this module's docs must not assert it as one.
+//!
+//! **The conclusion survives anyway, for a sharper reason than "the walk cannot get far enough."**
+//! A decode-based scan for `180` is only as trustworthy as *every single command before it* decoding
+//! without fault. One `DecodeStop::Truncated` or `DecodeStop::UnknownCommandSize` anywhere in that
+//! prefix — and this crate's own fixtures prove both are real, not hypothetical, outcomes on genuine
+//! captured data (see `decode`'s module tests) — silently reintroduces exactly the blind spot
+//! described above: the scan would stop at that fault and never see the `180` beyond it. That is a
+//! *live* risk, not a historical one now closed by a bigger decoder: the more of Venus's ~1000
+//! commands the borrowed decoder can size, the more of the stream a decode-based scan could plausibly
+//! reach, but "plausibly reach most of the time" is not the guarantee §5.1 demands, and no decoder —
+//! borrowed or hand-written — can promise it never faults on some future command shape.
 //!
 //! So this module does something structurally different, and the difference is the whole point:
 //!
 //! - **It has no frame.** It never tracks where a command starts or how long one is, so there is no
-//!   stride to get wrong and nothing to desynchronize. A decoder that loses the frame produces
-//!   confident nonsense forever after; this cannot lose a frame because it never has one.
+//!   stride to get wrong and nothing to desynchronize. A decoder that loses the frame — hits a fault
+//!   partway through, for any reason — produces confident silence for every byte after that point;
+//!   this cannot lose a frame because it never has one, so its correctness never depends on anything
+//!   decoding successfully.
 //! - **It is therefore sound for refusal.** A `vkExecuteCommandStreamsMESA` command's first dword
 //!   *is literally the value 180*, at a 4-byte-aligned offset (see the alignment argument below).
 //!   So "no dword equals 180" is a **trustworthy** answer: this scan cannot miss an out-of-line
@@ -290,25 +306,35 @@ mod tests {
         );
     }
 
-    /// A 180 that appears **after** commands the decoder cannot size must still be found.
+    /// A 180 that appears **after** a command that defeats decoding must still be found.
     ///
     /// **This is the test that pins why this module is not a decoder**, and it is the one that would
     /// have caught the mistake the brief for this task specified. `vkCreateInstance` (type 0) is
-    /// variable-length, so `decode::encoded_size` returns `None` for it and `decode::decode_commands`
-    /// stops there — and Mesa's source puts it at ring command **two** (`vn_instance.c:362-363`). A
-    /// decode-based scan would therefore stop before this 180 and report the stream clean, for every
-    /// workload, forever. The dword scan has no frame to lose and finds it.
+    /// variable-length, so `decode::encoded_size`'s fixed-size table returns `None` for it — and,
+    /// crucially, the two dwords standing in for its payload below are *not* a valid encoding of a
+    /// real `vkCreateInstance` (see the comment on them), so even the borrowed-decoder fallback added
+    /// since this module was written (`decode::decode_commands` now also tries
+    /// `rayland_venus_proto::command_len` where the table cannot answer) faults on this exact stream
+    /// too — `decode_commands` reports `DecodeStop::Truncated { offset: 0 }` on it, confirmed by
+    /// direct experiment. So a decode-based scan would still stop before reaching this `180` *on this
+    /// stream*, for the same reason the module docs give: a decode-based scan's reach is only ever as
+    /// good as its ability to decode everything ahead of it, and one faulty command anywhere in that
+    /// prefix reopens the blind spot regardless of how far the decoder can otherwise get. The dword
+    /// scan below has no frame to lose and finds the `180` regardless.
     #[test]
     fn a_180_after_an_unsizeable_command_is_still_found() {
         let stream = stream_of(&[
-            // The command that stops the decoder dead, at the position Mesa really puts it.
+            // The command that defeats decoding: unsizeable by the fixed-size table, and — because
+            // the two dwords standing in for its payload below are not a real encoding — also faulted
+            // by the borrowed-decoder fallback, so nothing in `decode` can get past it on this stream.
             VK_COMMAND_TYPE_VK_CREATE_INSTANCE,
             0,
             // Stand-in for vkCreateInstance's variable-length payload — application name strings and
-            // an extension list — which is exactly what makes it unsizeable.
+            // an extension list — which is exactly what makes it unsizeable by the table, and, being
+            // fake bytes rather than a real encoding, also unparseable by the borrowed decoder.
             0xdead_beef,
             0xfeed_face,
-            // And the out-of-line wrapper, downstream of the decoder's stop point.
+            // And the out-of-line wrapper, downstream of where any decode-based approach gives up.
             VK_COMMAND_TYPE_VK_EXECUTE_COMMAND_STREAMS_MESA,
             0,
         ]);
@@ -316,8 +342,8 @@ mod tests {
         assert_eq!(
             scan_for_out_of_line_stream(&stream),
             Err(OutOfLineStream { offset: 16 }),
-            "a decoder stops at vkCreateInstance (ring command #2) and would never reach this 180; \
-             the scan must, or the check is silence wearing a check's clothes"
+            "no decode-based approach reaches this 180 on this stream; the frame-free scan must, or \
+             the check is silence wearing a check's clothes"
         );
     }
 

@@ -36,7 +36,13 @@
 //! this decoder now delegates to for how far past those three it can actually reach.
 
 /// `VK_COMMAND_TYPE_vkCreateInstance_EXT`. Variable-size (it carries application name strings and
-/// an extension list), so [`encoded_size`] cannot size it and the decoder stops here.
+/// an extension list), so [`encoded_size`]'s fixed-size table cannot size it by itself. That used to
+/// be the whole story and end the walk here unconditionally; since [`decode_commands`] gained its
+/// borrowed-decoder fallback (`rayland_venus_proto::command_len`), a complete, well-formed
+/// `vkCreateInstance` *can* be sized and the walk can continue past it. On the one captured fixture
+/// this crate has for it, the walk still stops here in practice — but for a different reason
+/// (`DecodeStop::Truncated`, because that particular capture window is too short), not because this
+/// constant's command is unsizeable in general. See [`decode_commands`]'s pitfalls.
 pub const VK_COMMAND_TYPE_VK_CREATE_INSTANCE: u32 = 0;
 
 /// `VK_COMMAND_TYPE_vkEnumerateInstanceVersion_EXT`.
@@ -81,9 +87,16 @@ pub const VK_COMMAND_TYPE_VK_NOTIFY_RING_MESA: u32 = 190;
 ///
 /// Unlike the commands above, this one is **fixed-size** (80 bytes, no strings/arrays/variable pNext
 /// for Mesa's queue-init shape), so it *could* be sized — but it is deliberately kept out of
-/// [`encoded_size`] and the linear walk, because the walk cannot *reach* it: variable-size commands
-/// (`vkCreateInstance`, `vkCreateDevice`, …) precede it and correctly stop the walk long before. It is
-/// instead found by a self-verifying **signature scan** ([`find_get_device_queue2`]).
+/// [`encoded_size`]'s table, because the table only ever needs to size commands [`decode_commands`]'s
+/// linear walk can reach *using the table alone*, and several variable-size commands (`vkCreateInstance`,
+/// `vkCreateDevice`, …) precede it in a real session. Since [`decode_commands`] gained its
+/// borrowed-decoder fallback, "the walk cannot reach it" is no longer an absolute claim — given a
+/// complete real stream where every preceding command decodes successfully, the walk *can* get this
+/// far and would decode it like any other command (a captured, standalone `vkGetDeviceQueue2` proves
+/// exactly that in this crate's tests). What has not changed is that nothing here relies on that: this
+/// command is instead found by a self-verifying **signature scan** ([`find_get_device_queue2`]) that
+/// works whether or not the linear walk could ever get this far, which matters because a decode-based
+/// walk's reach is only ever as good as every command ahead of it decoding without fault.
 pub const VK_COMMAND_TYPE_VK_GET_DEVICE_QUEUE2: u32 = 155;
 
 /// The size in bytes of a command's `[type][flags]` prologue: two little-endian `u32`s.
@@ -137,7 +150,11 @@ pub enum DecodeStop {
     /// begins, is unknowable by any means this crate has. The walk stops rather than guess. This is
     /// now a rare outcome (it means this Mesa build generates no decoder for the command at all),
     /// distinct from [`Truncated`](DecodeStop::Truncated), which means a decoder *could* size the
-    /// command but the slice does not hold all of it.
+    /// command but the slice does not hold all of it. `decode_commands` also folds
+    /// `rayland_venus_proto::DecodeFault::BadArgs` into this variant (its catch-all `Err(_)` arm):
+    /// that fault means the borrowed decoder's C shim rejected its own arguments, a contract
+    /// violation this wrapper should never actually trigger, not "no decoder exists" — but the two
+    /// are indistinguishable to a caller of `decode_commands` today, since both take this arm.
     UnknownCommandSize {
         /// Offset of the command that could not be sized.
         offset: usize,
@@ -460,11 +477,14 @@ pub struct GetDeviceQueue2 {
 /// Find the application's `vkGetDeviceQueue2` in a Venus command stream and read its `ring_idx`.
 ///
 /// # Why this is a signature scan and not part of the linear walk
-/// [`decode_commands`] cannot reach this command: it walks from the stream's start and stops at the
-/// first command it cannot size, and the app's init emits several variable-size commands
-/// (`vkCreateInstance`, `vkCreateDevice`, …) *before* `vkGetDeviceQueue2`. So this instead scans for
-/// the command's fixed 80-byte signature directly. That is not the "guess a size and desynchronize"
-/// failure [`decode_commands`] refuses — it matches on **four independent, self-verifying constants**:
+/// This does not rely on [`decode_commands`] ever reaching `vkGetDeviceQueue2`: the app's init emits
+/// several variable-size commands (`vkCreateInstance`, `vkCreateDevice`, …) *before* it, and a
+/// decode-based walk's reach past them depends on every one of them decoding without fault — real,
+/// not hypothetical, given this crate's own fixtures show both `Truncated` and `UnknownCommandSize`
+/// occurring on genuine captured data (see `decode`'s module tests). So this instead scans for the
+/// command's fixed 80-byte signature directly, independently of whether the linear walk could get
+/// this far on any given stream. That is not the "guess a size and desynchronize" failure
+/// [`decode_commands`] refuses — it matches on **four independent, self-verifying constants**:
 /// the command type (155), the async command flags (0), and two 32-bit `VkStructureType` magic words
 /// ([`STYPE_DEVICE_QUEUE_INFO_2`], [`STYPE_DEVICE_QUEUE_TIMELINE_INFO_MESA`]). A coincidental match of
 /// all four in unrelated argument bytes is astronomically unlikely.
