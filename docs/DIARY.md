@@ -2490,3 +2490,62 @@ copied — so today this crate's copy is the *only* `vkr_cs.h` on the include pa
 defensive precedent for if a competing header is ever added to `vendor/`, not a tiebreak against one that
 exists now. The include order itself did not change; only the comment's claim about what it currently
 guards against.
+
+### 2026-07-26 — Task 2: the deferred blob-storage gap closed, and a second "the brief was wrong" moment
+
+Task 1 left one thing genuinely unresolved and flagged in bold: `vkr_cs_decoder_get_blob_storage`
+returning NULL is safe only because nothing in Task 1 reaches it, and the generated caller's early
+return on NULL (`if (!val->pData) return;`) skips the one call that would notice truncation, without
+setting the fatal flag itself. Task 2's whole first job was closing that before writing the switch that
+would start actually reaching it. The fix ended up being narrow once the hazard was stated precisely:
+match virglrenderer's own success path exactly (return `dec->cur`, no copy), but on the failure path —
+where the reference silently returns NULL and trusts the caller to notice, which it doesn't — set fatal
+ourselves, at the one point in the call graph that can still see the coming truncation before Mesa's own
+generated code would swallow it. Matching the success path exactly meant the generated blob-array decode
+now genuinely aliases (`dst == src`, since it reads from `dec->cur` into the very pointer we just handed
+back pointing at `dec->cur`), which is why the `dec->cur != val` guard carried over from Task 1's review
+(finding #2, previously unreachable) is reachable now — and verified reachable, by a hand-built
+`vkCreatePipelineCache` stream carrying a real 5-byte blob padded to 8, which decodes to the exact
+hand-computed 88 bytes, and reports `FAULT_TRUNCATED` rather than a short length when cut mid-blob.
+Confidence: high — this is no longer "should be safe by inspection," it's measured against a byte layout
+built independently of the code under test.
+
+**The second surprise was not carried forward from Task 1 — it was new, and it echoes Task 1's own
+"stale comment" discovery almost exactly.** The task brief asserted "the encoder side is never driven
+by this crate" and allowed `vkr_cs_encoder_get_blob_storage` to stay a no-op. Building the generated
+switch produced a compile error before a single case ran: six commands —
+`vkGetQueryPoolResults`, `vkGetPipelineCacheData`, `vkCopyImageToMemoryMESA`,
+`vkWriteAccelerationStructuresPropertiesKHR`, `vkGetRayTracingShaderGroupHandlesKHR`,
+`vkGetRayTracingCaptureReplayShaderGroupHandlesKHR` — have generated *decoders* that take a `struct
+vn_cs_encoder *` third argument, because Mesa pre-sizes each command's reply arena during the decode
+pass rather than in a later, separate step. First draft made the encoder stub `abort()`, on the
+(wrong) assumption it was truly unreachable; it would have crashed the moment any of these six commands
+was decoded. Reading all six call sites (not sampling) showed the returned pointer is only ever stored,
+never dereferenced, inside the decode function — it only becomes live inside the matching
+`vn_encode_*_reply` function, which this crate never calls — so a fixed non-null `static` sentinel,
+deliberately not sized to the request, discharges the contract with no exhaustion hazard of its own
+(sizing it would recreate the very "our scratch pool was too small" failure this whole task exists to
+rule out, for a `vkGetPipelineCacheData` reply that can legitimately be dozens of MB).
+
+**What this confirms, restated because Task 1 already said something close and it is worth checking it
+still holds:** a symbol-existence scan ("does `vn_decode_X_args_temp` exist") is not the same question as
+"what does it actually require to call correctly," and only trying to compile against the real signatures
+surfaces the difference. The generator itself had a matching near-miss: an early version of its
+3-argument detection scanned every occurrence of a decoder's name, including the *call site* inside
+`vn_dispatch_*` (whose arguments are variable names like `ctx->encoder`, not the parameter's declared
+type) — and since that call site's match came later in the file than the true declaration, it silently
+overwrote the correct "takes an encoder" answer with a wrong one for every affected command. Caught the
+same way as the signature mismatch: the build failed loudly rather than producing a switch that looked
+right and wasn't. Two independent times this task tried to be clever with a shortcut and got a wrong
+answer, and two independent times the wrongness surfaced as a compile error rather than a silently wrong
+`command_len` — which is the property this whole crate is supposed to have, so it is a reassuring way for
+a mistake to have happened, not just an inconvenient one. Also found, separately: the brief's own Step 1
+Python snippet passes `&dec_public` where `dec_public` is already a pointer — a straightforward typo,
+fixed and documented in the generator rather than silently corrected.
+
+The generated switch has 312 cases (`case 38:` for `vkGetFenceStatus` present, as expected), builds
+clean with no warnings under `-Wall -Wextra`, and Task 1's link-proving self-test still passes (kept
+deliberately, since deleting it was outside this task's stated file list and would have broken a
+passing test for no requirement). Full detail, including the exact hand-derived byte layouts used to
+verify both blob-storage fixes empirically, is in
+`.superpowers/sdd/2026-07-26-venus-stream-decoder/task-2-report.md`.
