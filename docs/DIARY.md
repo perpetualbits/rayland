@@ -3612,3 +3612,65 @@ v2 work); or narrow the scan heuristically (cheap, and still a heuristic that wi
 Recorded rather than chosen. What is *not* in doubt any more is the diagnosis: it is a false positive,
 proved against the bytes, and the workload behind it is the one that makes the whole performance
 argument.
+
+### 2026-07-26 (late night) — The out-of-line path, implemented properly: icosa-gpu runs, and it is 7× faster
+
+The owner chose option 2 over the quick fix, and it was the right call — not because the quick fix
+would have failed, but because the proper one turned out to cost *less* than expected and to
+answer a question the quick fix would have left open.
+
+**The refusal did not need a better check; it needed to stop being necessary.** Venus replaces any
+submission over `direct_size` (`buffer_size >> 4`) with `vkExecuteCommandStreamsMESA` naming other
+shmems. Those live in the staging pool, which is `blob_id == 0`, which C's sync skipped — so S held
+zeros and refusing was correct. The tempting fix was to make the scan precise with the decoder, which
+would have spent (c)1 §7's central guarantee: on the relay path, a decode deciding what crosses the
+wire is exactly the thing the rule forbids. Instead the relay now carries **every blob except the
+ring**, so the referenced streams are simply already on S. The question is removed rather than
+answered, and the decoder stays diagnostic.
+
+**What made publishing a region S also writes safe was already built.** The old comment at that
+filter said, correctly, that C's stale copy of the reply arena would clobber replies the application
+is blocked on, and that the answer would have to be "a design for synchronising a region *both* sides
+write". That design landed earlier the same day, for a different reason: every blob carries a
+baseline, `take_changed_runs` ships only what differs from it, and `note_s_wrote` folds each S→C
+write into the baseline as it arrives. S's own bytes therefore never look like C-side changes. The
+`blob_id` filter was replaced by two tests that state the surviving properties directly — the ring is
+never shipped as `BlobData` (it has `RingDelta`, which carries the `tail` that validates its bytes and
+goes last), and the arena is never echoed back — both teeth-checked.
+
+**One prerequisite, and it was the week's recurring mistake waiting to happen again.**
+`take_changed_runs` compared one byte at a time. Fine for a few hundred KiB of application buffers;
+ruinous pointed at an 8 MiB pool, and this change points it there on every relay. So it was made
+chunked (`memcmp`-shaped, per-byte only inside a chunk that differs) *before* the routing widened —
+proved equivalent to a naive reference across nine patterns sitting on and across the 64-byte
+boundaries, and teeth-checked by closing runs at each boundary, which fails exactly the straddling
+case. That is the fourth time this week a blob-page read has threatened the relay's latency, and the
+first time it was anticipated instead of measured after the fact.
+
+**Results.** `rayland-icosa-gpu` — the fixture that answers "compute the fractal on S from SPIR-V" —
+now runs over the relay, **120/120 frames bit-identical to native on S**. And the number that matters:
+
+| fixture | forward traffic/frame | ms/frame (loopback) | ms/frame (real link) |
+|---|---|---|---|
+| `icosa-cpu` (fractal on C's CPU) | ~1 MiB | 283 | 283 |
+| `icosa-gpu` (fractal in SPIR-V) | ~80 bytes | 50 | ~41 |
+
+**~7× faster over the real network, ~24 fps.** (The real-link figure spans only 5 s against 1 s
+mtime granularity, so read it as 40–50 ms/frame, not as the network beating loopback.)
+
+**A prediction of mine, wrong and usefully so.** Before running it I said the readback path would
+swamp any forward-path gain, since 256 KiB comes back per frame and fragments into ~5000 one-byte
+messages. It did not: the frame time collapsed anyway. So pushing a megabyte per frame through
+uninterceptable mapped memory *was* the dominant cost, and the return path is now the bottleneck —
+which makes that fragmentation the next obvious target, on evidence rather than on the guess I had
+been carrying.
+
+**Regression check, because this touched the path (c)2's correctness rests on.** The two-machine
+sweep on `icosa-cpu` — the fixture whose mapped writes this change most plausibly disturbs — is
+**10/10 runs, 0 stale frames**, unchanged from the pre-change baseline. Full suites green.
+
+**And an expectation corrected before it could disappoint.** The owner hoped this would also unblock
+vkcube. It does not: vkcube's stream contains **zero** type-180 commands, so it never met this
+refusal. Its blockers remain the NVIDIA `VK_ERROR_DEVICE_LOST` (not ours, and absent on Intel:
+0/10 against 7/14) and setup latency. What this change unblocks is the general case — *any*
+submission over 8 KiB — which vkcube happens to be too small to need.

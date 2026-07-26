@@ -5,7 +5,7 @@
 # =====================================================================================
 #
 # This is the thing Rayland exists to do, run end to end for a human to look at:
-#   * `rayland-icosa-cpu` executes on apollo. Apollo does no rendering.
+#   * `$APP` executes on apollo. Apollo does no rendering.
 #   * Its Vulkan commands cross the network as *commands*, not pixels.
 #   * dop561's GPU draws them, and dop561's compositor shows the result live.
 #
@@ -25,6 +25,19 @@
 #   without either problem.
 set -euo pipefail
 
+# Which fixture to run. Both draw the identical picture and differ only in where the fractal is
+# computed, which is the whole point of the pair:
+#   gpu (default) — fractal in a fragment shader, evaluated by S's GPU. ~80 bytes/frame forward.
+#   cpu           — fractal on C's CPU, pushed through mapped memory. ~1 MiB/frame forward, and
+#                   deliberately the worst case for the uninterceptable-mapped-write problem.
+# Measured loopback: ~50 ms/frame for gpu against ~283 ms/frame for cpu.
+FIXTURE="${FIXTURE:-gpu}"
+case "$FIXTURE" in
+  gpu) APP=rayland-icosa-gpu ;;
+  cpu) APP=rayland-icosa-cpu ;;
+  *) echo "FIXTURE must be 'gpu' or 'cpu', got '$FIXTURE'" >&2; exit 2 ;;
+esac
+
 C_HOST="${C_HOST:-apollo}"
 S_IP="${S_IP:-192.168.1.192}"
 PORT="${PORT:-9403}"
@@ -35,11 +48,11 @@ SOCK="/tmp/rl-icosa-demo.sock"
 PRESENT_SIZE="${PRESENT_SIZE:-256x256}"
 
 echo "### building (release: the app must be fast enough to look like motion) ###"
-CARGO_TARGET_DIR="$TARGET_DIR" cargo build --release -p rayland-c -p rayland-s -p rayland-icosa-cpu
+CARGO_TARGET_DIR="$TARGET_DIR" cargo build --release -p rayland-c -p rayland-s -p "$APP"
 
 echo "### deploying C-side binaries to $C_HOST ###"
-scp -q "$BIN/rayland-c" "$BIN/rayland-icosa-cpu" "$C_HOST:/tmp/"
-ssh "$C_HOST" 'chmod +x /tmp/rayland-c /tmp/rayland-icosa-cpu'
+scp -q "$BIN/rayland-c" "$BIN/$APP" "$C_HOST:/tmp/"
+ssh "$C_HOST" 'chmod +x /tmp/rayland-c /tmp/$APP'
 
 S_PID=""
 # Kill only by exact PID — the local rayland-s by the PID captured here, the remote C-side by
@@ -62,14 +75,14 @@ kill -0 "$S_PID" 2>/dev/null || { echo "rayland-s died on startup"; exit 1; }
 echo "### starting C ($C_HOST): the application, which never touches a GPU ###"
 # The fixture writes a PNG per frame and exits non-zero if it cannot; without this it dies on
 # frame 0 having rendered exactly one frame, which looks like "the demo showed a still image".
-ssh "$C_HOST" 'rm -rf /tmp/icosa-demo-out && mkdir -p /tmp/icosa-demo-out'
+ssh "$C_HOST" "rm -rf /tmp/icosa-demo-$FIXTURE && mkdir -p /tmp/icosa-demo-$FIXTURE"
 ssh "$C_HOST" "
   RAYLAND_C1_S_ADDR=$S_IP:$PORT RAYLAND_C1_SOCKET=$SOCK nohup /tmp/rayland-c >/tmp/rayland-c-demo.log 2>&1 &
   echo \$! > /tmp/rayland-c.pid
   sleep 3
   VN_DEBUG=vtest VN_PERF=no_multi_ring,no_fence_feedback,no_semaphore_feedback,no_event_feedback,no_query_feedback \
   VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/virtio_icd.json VTEST_SOCKET_NAME=$SOCK \
-  env -u VK_LOADER_DRIVERS_SELECT /tmp/rayland-icosa-cpu /tmp/icosa-demo-out >/dev/null 2>&1 &
+  env -u VK_LOADER_DRIVERS_SELECT /tmp/$APP /tmp/icosa-demo-$FIXTURE >/dev/null 2>&1 &
   app_pid=\$!; echo \$app_pid > /tmp/rayland-app.pid
   wait \$app_pid || echo APP_EXIT_NONZERO
 "
