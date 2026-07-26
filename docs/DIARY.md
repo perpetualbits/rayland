@@ -3871,3 +3871,45 @@ cause suggested a mechanism; the mechanism was plausible enough to write into tw
 the mechanism killed it. Chasing the failure showed the rate was an order of magnitude off. Neither
 step required cleverness — only declining to treat one observation as a rate, which is the same error
 in a different costume each time it appears.
+
+### 2026-07-27 — The baseline exists now: 0 failures in 80 runs of the shipping config
+
+Measured the number that was missing, and it settles less than hoped — which is itself the finding.
+
+**The measurement.** Sixty real-network runs of `icosa-cpu` in the **shipping** configuration (all
+feedback off), same harness as the feedback hunt, core capture armed on C and restored afterwards,
+deliberately **not** stopping at the first failure because a rate needs its whole denominator.
+**60/60 clean**, verified per-attempt rather than from the summary line. With the two earlier sweeps
+that is **0 failures in 80 runs**.
+
+**The comparison, stated honestly rather than hopefully:**
+
+| configuration | failures / runs | rate |
+|---|---|---|
+| shipping (all feedback off) | **0 / 80** | < 3.7% (rule of three, 95%) |
+| semaphore+event+query feedback on | **1 / 92** | 1.1% |
+
+Fisher's exact on that 2×2 gives **p = 0.53**. There is no significant difference. The intervals
+overlap entirely, and one event across ~90 runs each distinguishes nothing. So after 172 runs the
+position is unchanged from the previous entry: **the sweep failure cannot be attributed to feedback,
+and it also cannot be attributed to anything else.** It remains a single unexplained loss.
+
+**What was actually gained, which is not nothing.** Before today no one knew the shipping
+configuration's failure rate; "10/10 clean" was the strongest statement available, and a single
+failure had nowhere to be read against. Now there is a real bound — **under about 4%, and observed at
+zero across 80 runs** — and the harness to extend it. That is the difference between "it works" and
+"it works at a measured rate", and it is the thing that made the feedback condemnation look decisive
+when it was not.
+
+**Where to stop, and why.** Distinguishing a 1% failure rate from 0% needs several hundred runs of
+each arm — hours of wall-clock for a 1.23× on a path whose bottleneck is elsewhere anyway (the
+synchronous round trip; and the fence feedback that would actually remove those round trips is
+structurally blocked by (c)2's completion barrier). The flags stay off, the reason is now written down
+accurately, and the harness is in the scratchpad for whoever wants to pay for the certainty later.
+
+**The arc of this one question, worth keeping as a cautionary tale.** One failure in ten runs
+suggested feedback was unsafe. A comment in the repository supplied a mechanism. Both went into
+CLAUDE.md and this diary within the hour. The mechanism was refuted by two greps and a run. The rate
+was off by an order of magnitude, shown by 82 runs. And the baseline that would have made the original
+number interpretable did not exist until 60 more. Nothing here required insight — only refusing, four
+times, to let one observation stand as a rate.
