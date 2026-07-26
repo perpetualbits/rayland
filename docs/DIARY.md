@@ -3801,3 +3801,36 @@ it was adopted without a check because it explained the evidence. The check cost
 on each occasion. The rule this diary already knows — a reading that explains the evidence is not
 thereby the cause — apparently needs applying to the repository's own prose, not just to hypotheses
 formed in the moment.
+
+### 2026-07-26 (last) — The feedback abort did not reproduce in 22 tries, which revises the rate, not the verdict
+
+Went to catch the abort with a debugger. Did not catch it, and the failure to catch is the result.
+
+**The hunt.** `icosa-cpu` with semaphore/event/query feedback enabled, the application under
+`gdb --batch -ex run -ex "thread apply all bt 20"` so an abort would yield a full backtrace:
+
+- **loopback: 8/8 clean**, 120 frames each.
+- **real network, apollo → dop561: 14/14 clean**, 120 frames each, backtrace pulled back after every run.
+
+Twenty-two consecutive passes, against the one total-loss run the sweep produced.
+
+**What that does and does not change.** It does *not* exonerate the configuration: the sweep failure
+was real, a whole run lost to a silent `SIGABRT`, and one confirmed failure is not undone by later
+successes. What it changes is the *rate*: "1 in 10" came from a single failure in a single sweep, and
+0-in-22 after it puts the true rate far lower — one loss in 32 runs is ~3%, and plausibly rarer. A 3%
+chance of losing a whole session is still disqualifying, so the verdict stands and the flags stay off.
+
+**A caveat I raised and then had to walk back within the same hunt.** I predicted `gdb` would slow the
+application enough to close the race window, and framed an exhaustion in advance as evidence about the
+instrument rather than the bug. That was overstated: `gdb --batch -ex run` sets no breakpoints, so its
+overhead is ptrace on signals and thread events — light. The honest reading of 22 clean runs is the
+base rate, not masking. Worth recording because pre-committing to an interpretation of a result is
+exactly how a null result gets explained away.
+
+**Where this leaves the feedback question.** Three things are now known and one is not. Known: fence
+feedback is structurally incompatible with (c)2's barrier; the other three are worth 1.23×; and the
+S→C pages are *already relayed*, so the earlier "un-relayed pages" explanation is dead. Not known: why
+the application aborts, rarely. Chasing a ~3% event needs a harness that runs unattended for many more
+iterations than a working session can spare, and — better — one that captures a core rather than
+holding a debugger open, since `ulimit -c` and `core_pattern` on C currently discard the evidence.
+That is the next concrete step, and it is setup work rather than investigation.
