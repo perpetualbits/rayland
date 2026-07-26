@@ -14,7 +14,7 @@ window.PROJECT_MAP = {
     name: "Rayland",
     tagline: "Native remote GPU rendering for Wayland — ship the commands, not the pixels.",
     repo: "rayland",
-    updated: "2026-07-25"
+    updated: "2026-07-26"
   },
 
   // Each status is a colour band the renderer keys on. The hint is the plain-language meaning.
@@ -141,11 +141,16 @@ window.PROJECT_MAP = {
 
     /* ----------------------------------------------------------------- wire layer */
     {
-      id: "venus-proto", label: "rayland-venus-proto", layer: "wire", status: "planned",
-      tags: ["WP0", "decoder", "spec'd"],
-      desc: "SPEC'D, NOT BUILT. Rayland can relay Venus streams byte-exactly and cannot read them: encoded_size can only express FIXED encodings, so the decoder halts at the application's first real command and 'where does this command end' cannot be asked — which is what blocks the open vkQueueSubmit framing question. This crate borrows Mesa's own generated venus-protocol (73k lines, 43 headers) behind a C shim, rather than reimplementing it, for the same reason CLAUDE.md reuses the rendering engine: a second source of truth for a format Rayland does not own will diverge, and the symptom is a decoder confidently reporting the wrong thing. Feasible because byte consumption is independent of handle lookups, so stub lookups give identical framing with no object table, no validation and no GPU. Entire public surface is one question: how long is the command at the start of this slice. BINDING CONSTRAINT: diagnostic and structural only — it may never make a correctness decision, because (c)1 spec §7 relays the ring as opaque bytes precisely so a decode bug cannot become a corruption bug.",
-      specs: [{ label: "Decoder design", href: "docs/superpowers/specs/2026-07-26-venus-stream-decoder-design.md" }],
-      parts: [],
+      id: "venus-proto", label: "rayland-venus-proto", layer: "wire", status: "active",
+      tags: ["WP0", "decoder", "in progress"],
+      desc: "IN PROGRESS (Task 1/N landed). Rayland can relay Venus streams byte-exactly and cannot read them: encoded_size can only express FIXED encodings, so the decoder halts at the application's first real command and 'where does this command end' cannot be asked — which is what blocks the open vkQueueSubmit framing question. This crate borrows Mesa's own generated venus-protocol (73k lines, 43 headers) behind a C shim, rather than reimplementing it, for the same reason CLAUDE.md reuses the rendering engine: a second source of truth for a format Rayland does not own will diverge, and the symptom is a decoder confidently reporting the wrong thing. Feasible because byte consumption is independent of handle lookups, so stub lookups give identical framing with no object table, no validation and no GPU. Entire public surface is one question: how long is the command at the start of this slice. BINDING CONSTRAINT: diagnostic and structural only — it may never make a correctness decision, because (c)1 spec §7 relays the ring as opaque bytes precisely so a decode bug cannot become a corruption bug. Not yet wired into any other crate.",
+      specs: [
+        { label: "Decoder design", href: "docs/superpowers/specs/2026-07-26-venus-stream-decoder-design.md" },
+        { label: "Implementation plan", href: "docs/superpowers/plans/2026-07-26-venus-stream-decoder.md" }
+      ],
+      parts: [
+        { label: "Task 1: crate + vendored headers + compiling shim", status: "done", desc: "52 vendored venus-protocol headers (virglrenderer 1.2.0, 974 KiB) plus a from-scratch csrc/vkr_cs.h satisfying the contract vn_protocol_renderer_cs.h declares. FINDING: that header's own 'these types/functions are expected' comment is stale against its code — six symbols (blob-storage get/put, alloc_temp_array, the three handle-id helpers, and a struct vkr_object) are referenced in the file body but absent from the comment. alloc_temp_array and the handle-id helpers are implemented for real (mechanical extensions of already-blessed primitives, verified against two call sites in the vendored tree); the blob-storage pair is a documented NULL stub — safe because Task 1 calls no decoder at all, but Task 2 must give it a real body before decoding any command with a blob array (vkCmdPushConstants2, pipeline specialization data). Shim compiles, links, and rayland_venus_proto_selftest() reports 38 (VK_COMMAND_TYPE_vkGetFenceStatus_EXT). rayland-c's no_gpu_linkage guard re-run and still green." }
+      ],
       deps: ["vtest"]
     },
     {

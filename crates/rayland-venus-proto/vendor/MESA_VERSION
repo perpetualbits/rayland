@@ -1,0 +1,3 @@
+virglrenderer 1.2.0
+venus-protocol headers as generated in that release.
+Source: src/venus/venus-protocol/

@@ -1,0 +1,19 @@
+# The Venus command-stream decoder: Mesa's own generated protocol, borrowed.
+#
+# This crate exists so Rayland can answer "where does this command end" about a real Venus stream.
+# It is DIAGNOSTIC AND STRUCTURAL ONLY — see the design spec's "What this is not". It links no GPU
+# driver, opens no device, and touches no network: the vendored headers are protocol definitions.
+[package]
+name = "rayland-venus-proto"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+license = "LGPL-3.0-or-later"
+description = "Framing for Venus command streams, using Mesa's own generated protocol decoders"
+repository = "https://github.com/perpetualbits/rayland"
+publish = false
+
+[build-dependencies]
+# Compiles the shim and the vendored headers. A build-host requirement only; nothing links at runtime
+# beyond the shim's own object code.
+cc = "1"

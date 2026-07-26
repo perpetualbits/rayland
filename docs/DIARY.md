@@ -2408,3 +2408,50 @@ build that depends on a scratch directory happening to exist is not a build. And
 and re-read rather than assumed, since the crate it guards has changed shape.
 
 Not yet built. The spec is the deliverable; the plan comes next.
+
+### 2026-07-26 — Task 1 built, and the "documented contract" was thinner than it looked
+
+Task 1's brief was narrow on purpose: vendor Mesa's `venus-protocol` headers, write a replacement
+`vkr_cs.h` satisfying the contract those headers' own comment declares, and prove the whole thing
+compiles and links. The vendoring and the crate skeleton went exactly as planned — 52 files, 974 KiB
+(the source directory's own `du` reports 4.1 MB due to block-size accounting; the file-by-file `diff`
+against the source is empty, so the copy is exact). The surprise was in Step 4.
+
+**The header comment `vn_protocol_renderer_cs.h` carries — the one both the design spec and the brief
+call "the documented contract" — is stale relative to its own file's body.** The comment lists five
+categories (encoder, decoder, object lookup, and four handle-id helpers). The brief's `vkr_cs.h`,
+written from that comment, compiled cleanly against the *comment* and then failed against the *code*:
+GCC reported six missing symbols the moment `shim.c` actually included the vendored tree —
+`vkr_cs_decoder_get_blob_storage`, `vkr_cs_encoder_get_blob_storage`, `vkr_cs_decoder_alloc_temp_array`,
+`vkr_cs_handle_indirect_id`, `vkr_cs_handle_load_id`, `vkr_cs_handle_store_id` — plus a `struct
+vkr_object` the header dereferences directly rather than through a `vkr_cs_*` accessor. None of these
+appear in the file's own "these types/functions are expected" comment. Mesa's generator grew blob-array
+support and moved on; the hand-written comment above it did not follow.
+
+**Whether this mattered for Task 1's narrow deliverable came down to one question: is each of these six
+symbols merely type-checked, or actually exercised, given that Task 1's only C entry point is a constant
+self-test that calls no decoder at all?** Reading the call graph settled it symbol by symbol.
+`alloc_temp_array` is a mechanical composition of primitives the design already blessed (`alloc_temp`
+plus a bounds-checked multiply) — implemented for real, not stubbed, since getting a bump-allocator
+multiply right costs nothing extra. The three `handle_*_id` functions turned out to matter more than
+they looked: they're called by `vn_decode_Vk*_temp` for *every* handle-typed command argument, which is
+nearly every command, so a wrong answer there would have been silent and pervasive rather than confined
+to an edge case. Their correct behavior fell out of two call sites already sitting in the vendored tree —
+`vn_decode_VkInstance_temp` allocates a temp cell before storing an id, `vn_decode_VkBuffer` stores
+straight into the handle slot — which is just Vulkan's own dispatchable/non-dispatchable handle split
+(`VK_DEFINE_HANDLE` vs `VK_DEFINE_NON_DISPATCHABLE_HANDLE`), not a guess. Critically, none of that
+machinery touches the byte cursor — it only manages an in-memory scratch cell — so getting it wrong
+could never corrupt the one number this crate exists to report. The blob-storage functions are the
+one piece left genuinely unresolved: the generated caller pattern skips the fatal flag on a NULL return
+(`if (!val->pData) return;`, no `set_fatal`), so a stub returning NULL is safe *only* because Task 1
+never reaches it — Task 2 must give it a real body before decoding any command with a blob array
+(`vkCmdPushConstants2`, pipeline specialization constants, pipeline-cache data), or `command_len` will
+silently under-report for exactly those commands. That gap is documented at length in `vkr_cs.h` itself,
+flagged in the Task 1 report, and is the first thing Task 2 should read before writing a line of code.
+
+**What this confirms, stated plainly:** "borrow, don't reimplement" was the right call, but "the contract
+is small and documented" undersold it slightly — the header's *prose* is small and documented; its
+*code* is the real contract, and reading code instead of trusting a comment above it is exactly the
+discipline this whole decoder exists to bring to Rayland's own command streams. The crate compiles,
+links, and reports `38` (`VK_COMMAND_TYPE_vkGetFenceStatus_EXT`) — Task 1's whole deliverable — with
+that one deferred item carried forward explicitly rather than silently.

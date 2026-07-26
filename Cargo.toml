@@ -22,6 +22,7 @@ members = [
     "crates/rayland-icosa-cpu",      # fixture A: fractal on the CPU, uploaded per frame (icosa Task 6)
     "crates/rayland-icosa-gpu",      # fixture B: fractal in a fragment shader; the volume control (icosa Task 7)
     "crates/rayland-icosa-window",   # demo (NOT a fixture): the icosa solid live in a Wayland window (icosa window demo)
+    "crates/rayland-venus-proto",    # Venus command-stream framing: Mesa's own generated decoders, borrowed ((c)1 Task 1)
 ]
 
 # Dependency versions shared across member crates, so every crate agrees on one version.
