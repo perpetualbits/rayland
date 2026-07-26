@@ -3913,3 +3913,42 @@ CLAUDE.md and this diary within the hour. The mechanism was refuted by two greps
 was off by an order of magnitude, shown by 82 runs. And the baseline that would have made the original
 number interpretable did not exist until 60 more. Nothing here required insight — only refusing, four
 times, to let one observation stand as a rate.
+
+### 2026-07-27 — WP0 4.3, part 1: the descriptor is kept; and the C half turned out to be already done
+
+Went to build 4.3 (token → `wl_buffer`) and found the work smaller and differently shaped than the
+plan's decomposition implies.
+
+**C's half is complete already.** The plan lists 4.3 as spanning both sides, and `wayland_proxy.rs`'s
+doc comments still describe the fd→token resolution as "the *next* sub-step". They are stale: the
+`params.add` handler resolves the passed memfd's inode to an S-side resource id, `create_immed`
+assembles the full `BufferToken` (resource id, width, height, DRM format, modifier) and forwards it,
+and an unresolved fd is deliberately *not* forwarded rather than guessed at. Nothing is missing there.
+
+**So 4.3 is S-side only, in two pieces.** Piece one is landed: S now **retains** the dma-buf descriptor
+virglrenderer exports for each blob. This is not bookkeeping — virglrenderer's `mem->exported` guard
+permits exactly one export per resource and it already happened at creation, so the descriptor S was
+dropping at the end of the creation scope was the *only* handle to the swapchain image's memory. On a
+normal vtest host it would go to the local client over `SCM_RIGHTS`; S has no local client, so it was
+simply lost. `Applier::exported_fd()` hands back a **borrow**, never ownership, precisely because the
+export cannot be reproduced.
+
+Worth noting what the failure would have looked like without this: not an error, but
+`exported_fd → None` and a frame that silently never appears — the shape of defect this branch keeps
+shipping, which is why it has a test with teeth rather than a comment.
+
+**Piece two, specified rather than attempted.** On a relayed request carrying
+`WaylandArg::Buffer(token)` — currently logged and skipped in `wayland_client.rs` — S must resolve
+`token.resource_id` through `Applier::exported_fd`, build a `wl_buffer` on its own connection via
+`zwp_linux_dmabuf_v1` (`create_params` → `add(fd, 0, offset 0, stride, modifier_hi/lo)` →
+`create_immed` with the token's width/height/format), map the app's buffer id to it in the existing
+`app_id ↔ s_id` table, and let the subsequent `attach`/`commit` replay through the path that already
+works. The commit wants gating on the frame's completion — the (c)2 G' signal that already gates the
+readback.
+
+It is **not** attempted here for a reason worth stating: it cannot be verified tonight. It needs a
+compositor and a GPU, and both are committed to a 400-run soak until morning. Writing it blind and
+pushing it green-on-nothing is exactly the move this diary has spent the day arguing against, and the
+plumbing question it raises — `WaylandReplay` needs access to `Applier`'s descriptors, and the two are
+held separately in `serve` — is a design choice better made with a test in front of it than at the end
+of a long session.
