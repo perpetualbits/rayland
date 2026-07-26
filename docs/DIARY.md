@@ -3456,3 +3456,45 @@ mirror, `apt-get source` failing even with `deb-src` enabled) and one that worke
 The lesson is not "measure more", which this diary already knew. It is that **the boundary of what you
 can measure is a choice, not a fact** — and it was cheaper to move that boundary than to keep
 theorising inside it.
+
+### 2026-07-26 (night) — The device loss is GPU-specific: NVIDIA 7/14, Intel 0/10
+
+Having found that the "CS error" is `VK_ERROR_DEVICE_LOST`, the next question was *why the device
+dies*. Two hypotheses were available. The first was mine and it is now dead; the second holds up.
+
+**Refuted: the `handleType` mismatch.** The entry above nominated the validation errors as the
+leading suspect — dma-buf external memory bound to images and buffers created with `handleTypes = 0`
+(`VUID-VkBindImageMemoryInfo-memory-02728`, and the buffer equivalent twice). It fits so neatly that
+it deserved a test rather than a promotion, and the test killed it: across the three
+`VKR_DEBUG=validate` runs, **all three** carry exactly 3 bind violations and **all three** issue
+exactly 5 submits — but only one of them loses the device. A condition present when the submit
+succeeds cannot be what makes it fail. The violations are real spec breaches worth fixing on their
+own account; they are not this bug.
+
+**Holds up: it is the GPU.** vkcube by default selects **GPU 1 — the discrete NVIDIA RTX A500** — not
+the Intel node `rayland-s` opens (`renderD128`). Forcing `--gpu_number 0` (Intel Iris Xe):
+
+| GPU | runs | device loss | submits dispatched |
+|---|---|---|---|
+| NVIDIA RTX A500 (default) | 14 | **7** (50%) | 5, 6 |
+| Intel Iris Xe (`--gpu_number 0`) | **10** | **0** | 8 every single run |
+
+At NVIDIA's measured 50% rate, ten clean Intel runs by luck is `p ≈ 0.001`. And there is a second,
+independent signal that does not depend on the failure rate at all: Intel dispatches **8** submits on
+every run, where NVIDIA gets 5 or 6 before dying. Intel does not merely fail less; it gets strictly
+further.
+
+**What this does and does not mean, stated carefully.** It does *not* mean vkcube works on Intel —
+both configurations still exit 124, timing out in setup, which is the known (c)1 synchronous-reply
+latency wall and a separate problem. The claim is narrower and it is the one that matters for where
+effort goes next: **the device loss is a property of the NVIDIA driver executing what Venus hands it,
+not of Rayland's relay.** Every relay-side explanation was already refuted byte by byte; this closes
+the loop by showing the same relayed stream is executed without fault by a different driver on the
+same machine, in the same run configuration, through the same code path.
+
+**A note on what nearly went wrong here.** The `handleType` hypothesis was attractive, mechanically
+plausible, and *already written into the diary and the project map as the leading suspect* before it
+was tested. It took one cheap correlation to kill it. That is the same failure mode this diary has
+recorded all week under a different name — a reading that explains the evidence is not thereby the
+cause — and it nearly got recorded as an answer. The rule that keeps working: nominate freely, but
+mark it a hypothesis in writing, and test it before it hardens into a belief.
