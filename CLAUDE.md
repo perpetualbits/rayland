@@ -316,7 +316,9 @@ Venus/virglrenderer capture/replay engine, so *unmodified* applications run.**
   Loopback hides it (0/120). See
   [`docs/design/2026-07-19-c2-true-remote-mapped-sync.md`](docs/design/2026-07-19-c2-true-remote-mapped-sync.md).
   **Landed (2026-07-19), and it sharply reduces but does not eliminate the defect:** the `rayland-s`
-  **readback-completion gate** (`crates/rayland-s/src/delivery.rs`, wired into `progress_thread`)
+  **readback-completion gate** (then `crates/rayland-s/src/delivery.rs`, wired into `progress_thread`; that
+  file was **deleted** by the G' fix below and the gate now lives inside `progress_thread` in
+  `crates/rayland-s/src/main.rs`)
   completes a delivery only once `take_app_blob_writes` shows the readback blob actually advanced past
   the last delivered frame (or a 250 ms identical-frame bound expires), so a two-submits-per-frame app's
   copy submit can no longer ship the previous frame's pixels. Over the real network

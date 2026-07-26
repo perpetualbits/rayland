@@ -3200,3 +3200,47 @@ early is a genuine defect with a genuine consequence, and it is now fixed, but t
 its own cause still unlocated. Two claims this codebase made about itself have now failed a check it
 could not previously perform; the third — that the queue is registered and resolvable at submit time
 — has held up every time it has been tested, which is starting to be informative in its own right.
+
+### 2026-07-26 — Ten clean runs, and the gate that nobody reads
+
+Ran `scripts/c2-icosa-two-machine.sh` over the real link, apollo → dop561: **10/10 runs, 0 stale
+frames**, no wedge, no `SIGABRT`, no `invalid ring_idx`, nothing left running on either machine. That
+is the result the day's change most needed, though not for the reason we set it up.
+
+**What the run actually proves.** It is a *no-regression* result, not a confirmation. The
+false-negative direction was the one worth fearing: if `find_destroy_device` had started missing a
+real `vkDestroyDevice`, S would issue a teardown fence on a freed queue and the render server would
+die. Ten runs across a real network with no wedge is decent evidence the asymmetry (trust the decode
+only where it reached; fall back to the scan over the undecoded tail) does what it was built to do.
+It says nothing about the false positive, because 0/10 is also what the previous commit scored.
+
+**And here is the part that reframes the whole day.** While the sweep ran, we read what the retired
+gate is wired to, and it is wired to nothing. `find_destroy_device`'s one effect is setting
+`self.queue = None`. The queue latch feeds exactly three methods — `retirement_ring_idx`,
+`queue_ring_drained`, `latest_submit_pos` — and **not one of them has a production caller**.
+`main.rs` calls six things on the session: `lock`, `apply`, `reply_arena_fence_signaled`,
+`take_app_blob_writes`, `take_ring_progress`, `take_venus_blob_writes`. The three gate methods appear
+only in `crates/rayland-s/tests/apply.rs`. The G' fix of 2026-07-21 replaced the S-issued fence with
+the reply-arena scan and left this apparatus in place, latching a queue and scanning every relayed
+byte of every delta, feeding a decision nobody makes any more.
+
+So the false positive was **real but inert**. It retired a gate no code reads. It never explained any
+icosa staleness, and this morning's framing — that the sweep might show the fix helping — was wrong
+before the sweep started, not because of anything the sweep found. It is stated here plainly because
+that framing was written down and sent, and the correction belongs next to it.
+
+**The awkward consequence.** The (c)1 spec §7 exception taken earlier today — letting the borrowed
+decoder make a correctness decision in `rayland-s` — is load-bearing on a path that is not itself
+load-bearing. That is a smaller breach than advertised, and it invites the obvious question of
+whether the apparatus should simply be deleted instead of fixed. We are keeping it: it is exactly
+where multi-queue support lands, it is now correct rather than subtly wrong, and deleting it would
+discard the `ring_idx` decoding work that took real effort to get right. Recorded as an open seam on
+the project map rather than quietly removed, so the next person meets it as a known state instead of
+a puzzle.
+
+**A smaller find, same shape.** `CLAUDE.md` and the project map both pointed at
+`crates/rayland-s/src/delivery.rs` as the home of the readback-completion gate. That file was created
+in `32b56dd` and **deleted in `0a21513`** — the G' commit — and the gate now lives inside
+`progress_thread` in `main.rs`. Two documents survived the deletion of the file they cite. Both are
+corrected. The pattern worth noticing is that both of today's documentation defects are the same
+defect: a change landed, did its job, and left behind a description of the world as it was before.

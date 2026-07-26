@@ -228,7 +228,7 @@ window.PROJECT_MAP = {
       id: "s", label: "rayland-s", layer: "sside", status: "done",
       tags: ["(c)1", "daemon", "GPL"],
       desc: "S's daemon: the other end of rayland-c. It does not 'receive commands and execute them' — a relayed ring delta is written into the ring blob's own memory, because that is where virglrenderer's ring thread polls for it. It applies the relay to a real libvirglrenderer and, since (c)2, retires each frame through an engine actor so the readback fence and the ring doorbell cooperate on one thread.",
-      files: ["crates/rayland-s/src/main.rs", "crates/rayland-s/src/apply.rs", "crates/rayland-s/src/delivery.rs"],
+      files: ["crates/rayland-s/src/main.rs", "crates/rayland-s/src/apply.rs"],
       specs: [
         { label: "(c)1 · The network", href: "docs/c1-the-network.md" },
         { label: "Engine actor", href: "docs/design/2026-07-18-c2-engine-actor.md" },
@@ -236,7 +236,8 @@ window.PROJECT_MAP = {
       ],
       parts: [
         { label: "Relay applier", status: "done", desc: "Writes deltas into S's ring mirror and publishes tail; re-wraps the ring." },
-        { label: "Readback completion gate", status: "done", desc: "Ships a frame only once its readback blob has actually advanced." },
+        { label: "Readback completion gate", status: "done", desc: "Ships a frame only once its readback blob has actually advanced. Lives inside progress_thread in main.rs — the src/delivery.rs the earlier design named was DELETED by the 2026-07-21 G' fix (commit 0a21513); docs pointing at that path were corrected 2026-07-26. Re-verified over the real network 2026-07-26: scripts/c2-icosa-two-machine.sh, 10/10 runs, 0 stale frames, no wedge." },
+        { label: "Queue-latch apparatus (DEAD on the shipping path)", status: "seam", desc: "OPEN SEAM found 2026-07-26. apply.rs latches the app's queue from vkGetDeviceQueue2, then scans every delta for find_destroy_device / find_queue_submit to feed three methods: retirement_ring_idx, queue_ring_drained, latest_submit_pos. NONE of the three has a production caller — main.rs calls exactly six session methods (lock, apply, reply_arena_fence_signaled, take_app_blob_writes, take_ring_progress, take_venus_blob_writes) and none of them is these. The 2026-07-21 G' fix replaced the S-issued fence with the reply-arena scan and left this machinery running on every delta, scanning every byte, feeding nothing. Consequence for 2026-07-26's find_destroy_device false-positive fix: that defect was REAL but INERT — it retired a gate nothing reads, so it never explained any icosa staleness, and the (c)1 §7 exception taken for it is load-bearing on a path that is not itself load-bearing. Not deleted, because this is where multi-queue support naturally lands and it now behaves correctly; recorded rather than silently removed. See DIARY.md 2026-07-26." },
         { label: "Wayland replay", status: "active", desc: "Rebuilds the app's object graph on S's real compositor — WP0." },
         { label: "Multi-queue", status: "seam", desc: "ring_idx decode is single-queue today; a second ring stays latent." }
       ],
