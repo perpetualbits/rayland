@@ -2577,3 +2577,53 @@ distinct from a stale comment describing removed code — here the comment was f
 code it sits above, and still argued the weaker of two true claims. A reviewer checking "is this safe"
 would have agreed with the original wording; only checking "is this comment a load-bearing warning for
 whoever touches this function next" caught that it wasn't.
+
+### 2026-07-26 — Task 3: the safe Rust wrapper, and a teeth-check that didn't work as briefed
+
+Wrapped `csrc/shim.c`'s one entry point in `command_len(&[u8]) -> Result<Command, DecodeFault>`,
+`unsafe` confined to the single `extern "C"` call, per the brief's exact code. The brief's four tests
+went red-to-green as expected — the RED was a genuine compile failure (`command_len`, `Command`,
+`DecodeFault` didn't exist), not a runtime assertion, which is as strong a RED as this kind of change
+gets.
+
+Also added the two tests Task 2's review asked to be carried forward, since that review's own
+verification used a throwaway harness that no longer exists and the reviewer wanted the load-bearing
+evidence committed, not re-derived from memory next time someone doubts it. Both expected byte counts —
+88 for a `vkCreatePipelineCache` with a 5-byte (unpadded) `pInitialData` blob, 48 for a
+`vkGetPipelineCacheData` that reaches the 3-argument decoder path and its encoder sentinel — were worked
+out field-by-field from `vn_protocol_renderer_pipeline_cache.h` *before* running anything, the same
+discipline the brief demands for the 24-byte `vkGetFenceStatus` case ("a test whose expectation came
+from the implementation proves only that the code equals itself"). Both passed on the first run, which
+is corroborating, not proof — the derivation is what makes them trustworthy, not the fact that they
+happened to match.
+
+The teeth-check is the thing worth recording carefully, because the brief's literal instruction did not
+survive contact with `size_t` being unsigned. The brief says: flip `vkr_cs_decoder_read`'s bounds check
+from `<` to `>`, rebuild, and the truncation test should fail. Tried exactly that, and it *didn't* fail —
+`a_truncated_command_is_a_fault_not_a_guess` still passed. Not because the check still worked: because
+flipping the operator doesn't disable the check, it inverts *which* case trips it. `remaining > size`
+fires on almost every normal read (there's usually slack left in the buffer), so the very first prologue
+read now sets `fatal` spuriously — and the shim's post-prologue fatal check turns that into
+`DecodeFault::Truncated` before the real truncation site is ever reached. For this test's specific input
+that happens to be the *same* label the test expects, for a completely wrong reason: it's a coincidence,
+not evidence. Running the full suite unmasked it immediately — two *other* tests
+(`a_fixed_size_command_reports_its_real_length`, `an_unknown_command_type_reports_which_one`) failed
+under the exact same mutation, which a filtered `cargo test ... a_truncated` run would never have shown.
+
+That is exactly the "a test that cannot fail is not evidence" trap the task brief itself warned about,
+just arriving from an unexpected direction — not a wrong expected number, but a mutation that doesn't
+falsify the thing it was supposed to falsify. Fixed by using a mutation that actually does what the
+brief's parenthetical said it wanted ("so it never sets fatal"): replaced the check's body with `if (0)`,
+genuinely disabling it. Under *that* mutation, the truncated stream decodes to
+`Ok(Command { command_type: 38, len: 24 })` — a plausible, wrong, unflagged length instead of an error —
+which is the single hazard this entire crate exists to prevent, and is what actually makes
+`a_truncated_command_is_a_fault_not_a_guess` fail. Reverted immediately after; `git diff` on `vkr_cs.h`
+came back empty, confirming a byte-exact restore.
+
+**What this confirms:** an operator flip is a plausible-sounding mutation for a teeth-check but is not
+automatically a *falsifying* one, especially across unsigned arithmetic where "wrong" doesn't mean
+"opposite," it means "wrong in some other shape." The fix wasn't to distrust the brief's intent (a
+genuinely-disabled check is exactly what "so it never sets fatal" describes) — it was to notice that the
+literal edit it named didn't deliver that intent, and to check the *specific test's* pass/fail, not just
+skim a green result, before calling the teeth-check done. Full derivations and both test runs are in
+`.superpowers/sdd/2026-07-26-venus-stream-decoder/task-3-report.md`.
