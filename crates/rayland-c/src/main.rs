@@ -61,6 +61,11 @@
 //!
 //! This file is written to be read, and it says where it is guessing.
 
+// The `RAYLAND_RING_DUMP` diagnostic: the one place in this binary that calls the borrowed Venus
+// decoder. Kept out of this file on purpose — see that module's docs for why the separation is what
+// makes `tests/decoder_is_not_load_bearing.rs` able to assert this file never calls it.
+mod ring_dump;
+
 // The daemon's own pieces.
 use rayland_c::blob_sync::messages_for_delta;
 use rayland_c::link::{QuicRecvLink, QuicSendLink};
@@ -748,62 +753,11 @@ fn ring_watcher_thread(
                 return;
             };
             let delta = watcher.take_delta(blob.bytes());
-            // DIAGNOSTIC (`RAYLAND_RING_DUMP`), throwaway: name the commands in this delta, and in
-            // particular which of them asked for a reply (`command_flags` bit 0). Venus aborts
-            // *silently* when a reply decodes past its end — `vn_cs_decoder_set_fatal` is the only
-            // abort in the ICD that logs nothing, and it reports no opcode, no sizes, nothing — so
-            // the only way to learn which command was in flight is to decode the stream on this
-            // side, where the bytes still are. Inert unless the variable is set.
+            // DIAGNOSTIC (`RAYLAND_RING_DUMP`), throwaway: the decode-and-print lives in
+            // `ring_dump`, not here, so that this function — the one that decides what gets
+            // relayed — never names the borrowed Venus decoder. See that module's docs.
             if let Some(pending) = delta.as_ref() {
-                if std::env::var_os("RAYLAND_RING_DUMP").is_some() {
-                    let (commands, stop) =
-                        rayland_vtest::venus_ring::decode::decode_commands(&pending.bytes);
-                    // One line per delta: the reply-bearing commands are the candidates for the
-                    // abort, so mark them rather than making a reader cross-reference the flags.
-                    let named: Vec<String> = commands
-                        .iter()
-                        .map(|c| {
-                            let reply = if c.command_flags & 1 != 0 { " REPLY" } else { "" };
-                            format!("@{} type={}{}", c.offset, c.command_type, reply)
-                        })
-                        .collect();
-                    eprintln!(
-                        "[ring-cmds] tail={} len={} fnv={:016x} {} cmd(s) stop={:?}: {}",
-                        pending.tail,
-                        pending.bytes.len(),
-                        fnv1a(&pending.bytes),
-                        commands.len(),
-                        stop,
-                        named.join(" | ")
-                    );
-                    // **The multi-ring question.** Thread sampling on S found three `vkr-ring-1`
-                    // threads where (c)1 spec §6 assumes one, and S never saw a second *inline*
-                    // `vkCreateRingMESA` — so any extra ring must be created inside the ring stream,
-                    // which is exactly what this scans for. `decode_commands` cannot walk far enough
-                    // to find them (it halts at the first unknown-size command, which is the
-                    // application's own), so this is a direct scan of the delta's dwords for the
-                    // create/destroy/notify command types. A bare dword match can collide with
-                    // payload data, so the offset is printed and the count is what matters, not any
-                    // single hit: a real ring creation should coincide with a ring thread appearing.
-                    for off in (0..pending.bytes.len().saturating_sub(3)).step_by(4) {
-                        let word = u32::from_le_bytes([
-                            pending.bytes[off],
-                            pending.bytes[off + 1],
-                            pending.bytes[off + 2],
-                            pending.bytes[off + 3],
-                        ]);
-                        let name = match word {
-                            188 => "vkCreateRingMESA",
-                            189 => "vkDestroyRingMESA",
-                            190 => "vkNotifyRingMESA",
-                            _ => continue,
-                        };
-                        eprintln!(
-                            "[ring-life] tail={} off={off} candidate={name} ({word})",
-                            pending.tail
-                        );
-                    }
-                }
+                ring_dump::dump_if_enabled(pending);
             }
             // Draining bytes proves this watcher is awake, so the IDLE claim published before the
             // last park must go — and it must go *here*, before the network send below, not on some
@@ -1420,38 +1374,4 @@ mod tests {
             .checked_sub(ago)
             .expect("the test clock must be able to reach into the past")
     }
-}
-
-/// FNV-1a over a byte slice — a **diagnostic** fingerprint of one ring delta.
-///
-/// # Why this exists
-/// `rayland-s` refuses the application's `vkQueueSubmit` with a virglrenderer "CS error", which is a
-/// *decode* failure: the bytes S parsed were not the bytes it needed. There are two ways that
-/// happens, and they call for completely different fixes — either the ring relay corrupted or
-/// truncated the delta on its way across, or the relay is faithful and the submit refers to bytes
-/// that never travel in the ring at all (Venus's staging pool, which `crate::blob_sync` declines to
-/// publish by design). Hashing the same delta on both sides and comparing per `tail` separates those
-/// two with one run. See `docs/DIARY.md`, 2026-07-26.
-///
-/// # Why FNV-1a rather than anything stronger
-/// This compares two byte strings that are either identical or badly different; it is not defending
-/// against an adversary choosing collisions. FNV-1a is a dozen lines, has no dependency, and runs at
-/// memory speed — which matters because this sits on the relay's hot path, and an instrument that
-/// slows the thing it measures is how the last wall was misread for two days.
-///
-/// # Inputs / outputs
-/// - `bytes`: the delta exactly as relayed.
-/// - Returns the 64-bit hash. Pure; no allocation, no failure mode.
-fn fnv1a(bytes: &[u8]) -> u64 {
-    // The standard 64-bit FNV offset basis and prime.
-    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = OFFSET_BASIS;
-    for &b in bytes {
-        // XOR *then* multiply — that ordering is what makes this FNV-1a rather than FNV-1, and the
-        // two give different digests, so a reader comparing against another implementation needs it.
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(PRIME);
-    }
-    hash
 }

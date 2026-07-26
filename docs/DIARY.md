@@ -2782,3 +2782,69 @@ tasks — 24 bytes for `vkNotifyRingMESA` in Task 4's cross-check, and no disagr
 one deliberately-unresolved gap from Task 4 (no fixture yet proves a multi-command variable-length walk
 reaching `ReachedEnd`) is unchanged by this task and is not this task's to close; it is recorded here
 again so it does not quietly vanish from the record now that the sub-project's last task is done.
+
+### 2026-07-26 — Task 5 review round: the guard we just wrote had a live hole, and where it actually was
+
+Review of Task 5 came back mostly clean — the teeth-check was genuine, the `no_gpu_linkage` re-read was
+correct, the doc corrections held in both directions — but flagged one **Critical** finding against the
+one artifact the whole task existed to build: `decoder_is_not_load_bearing`'s guard would not have
+caught the violation it exists to prevent, and the gap was not in the execution, it was in the plan.
+
+Three facts, composed, made this concrete rather than theoretical. First, `RELAY_PATH` listed
+`blob_sync.rs`, `ring.rs`, `relay_engine.rs`, `link.rs` — and missed `main.rs`, which is where the relay
+decisions actually happen. `ring_watcher_thread` (in `main.rs`) is what calls
+`scan_for_out_of_line_stream`, `messages_for_delta`, and `link.send`; `ring.rs` itself only extracts
+bytes from the ring, it never sends anything anywhere. Second, `main.rs` already held a live, reachable
+call into the borrowed decoder: the `RAYLAND_RING_DUMP` diagnostic (`decode_commands`, gated behind an
+env var, feeding only `eprintln!`) sat inline inside the exact function that also decides what gets
+relayed. Third, even had `main.rs` been in the list, the guard's one needle — the literal string
+`rayland_venus_proto` — would not have matched that call, because it reaches the decoder through
+`rayland-vtest`'s re-export (`rayland_vtest::venus_ring::decode::decode_commands`) and never spells the
+crate's own name. Put together: someone could have made that already-present, already-reachable call
+load-bearing — say, branching on its `stop` result to skip relaying a truncated command — and this
+guard would have stayed green throughout.
+
+**The fix chosen, and why, over the alternative the reviewer offered as a fallback.** The reviewer's own
+proposal — extract the diagnostic into its own module so the relay path contains no decoder call at
+all, then check both needles — is the one implemented, because the alternative (teaching the guard to
+tell "diagnostic" and "load-bearing" call sites apart by inspecting *how* a call's result is used) is not
+a textual check at all; it would need real data-flow analysis, which is a different kind of tool than
+"grep the source for a name." A test that has to reason about intent is a test that can be fooled by
+intent dressed up to look innocent. Moving the call to a place structurally incapable of influencing the
+relay, and then asserting the relay path contains none of it, keeps the guard a mechanical fact rather
+than a judgment call.
+
+The new module is `crates/rayland-c/src/ring_dump.rs`: `dump_if_enabled`, taking a `&RingDelta` and
+doing nothing unless `RAYLAND_RING_DUMP` is set, then printing exactly what the old inline block
+printed (the per-command names/offsets/reply-flags line, the FNV-1a hash, and the raw multi-ring dword
+scan) — moved verbatim, not rewritten, so the diagnostic's actual behavior is unchanged. `fnv1a` moved
+with it, since nothing else in `main.rs` used it. `main.rs` now holds a single call,
+`ring_dump::dump_if_enabled(pending)`, and no longer spells the decoder crate's name, the decoder
+module's path, or `decode_commands` anywhere in its own text.
+
+`RELAY_PATH` gained `main.rs`. The needle became a list, `FORBIDDEN_NEEDLES = ["rayland_venus_proto",
+"decode_commands"]`, checked against every file in `RELAY_PATH` — deliberately **not** including
+`ring_dump.rs` itself, since that file is where the one legitimate call is meant to live. The test's
+honest-limit paragraph was rewritten per the review's Minor finding: it used to say a future author
+"could route a decision through a third module," phrased as a remote hypothetical. It now says what was
+actually true the whole time — the decoder is already reachable from every relay-path file through
+`rayland-vtest`'s public re-export, and today `ring_dump` is the only caller. Stating the real situation
+rather than a generic one is the more honest sentence, not just a more specific one.
+
+**Teeth-checked again, this time for the case the first guard missed.** Restored a real, compiling call
+to `decode_commands` directly inside `ring_watcher_thread` in `main.rs` (`let (_c, _s) =
+rayland_vtest::venus_ring::decode::decode_commands(&pending.bytes);`, right where the diagnostic used to
+live) — confirmed it built clean with `cargo build -p rayland-c`, so this is a real reachable path and
+not a textual trick — then ran the guard: it failed, naming `src/main.rs` and the `"decode_commands"`
+needle, exactly the violation this round exists to catch. Reverted; `git diff` on `main.rs` shows no
+trace of the plant. Re-ran `cargo test -p rayland-c` in full (both `decoder_is_not_load_bearing` and
+`no_gpu_linkage` green, 38+10+13+other suites all passing) and the full workspace suite a second time
+(`cargo test --workspace`, exit 0, 66 `test result: ok` blocks, 0 `FAILED`, including the GPU-backed
+`loopback_e2e` icosa fixtures) to confirm the `main.rs` refactor — not just a doc change this time —
+disturbed nothing on the path this task must never touch.
+
+**What we now believe:** a guard's plan is only as good as the concrete violation it was checked
+against, and this one was checked against an abstraction ("a future author could reach the decoder")
+rather than the actual, already-existing reachable call sitting in the very file the plan forgot to
+list. The corrected guard is checked against that same real call, restored and confirmed to trip it,
+which is a stronger claim than the first round could make.
