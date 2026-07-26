@@ -2717,3 +2717,68 @@ proves the walker can cross *several* variable-length commands in one real strea
 diagnostic used in the 2026-07-15 spike, rerun against a workload and long enough to catch a ring after
 several full application commands, not just an init-only prefix — and is left for whenever that
 stronger proof is actually needed, rather than invented now to make a test title read cleanly.
+
+### 2026-07-26 — Task 5: closing the loop — a test with teeth, a guard re-read rather than assumed, and the docs this work makes false
+
+Task 5 was the last task of this sub-project, and its job was not to add capability but to make the
+rule the previous four tasks all leaned on into something a build can fail on. Across five tasks,
+`rayland-venus-proto` went from "does not exist" to "borrowed Mesa decoder wired in as
+`venus_ring::decode`'s fallback past the fixed-size table" — and every one of those tasks' own docs
+said the same sentence: diagnostic and structural only, never load-bearing for what gets relayed. That
+sentence lived in three places (the design spec, `rayland-venus-proto`'s own crate docs,
+`rayland-vtest`'s crate docs) and none of them fail a build. Today gave it a fourth home that does.
+
+The new test, `rayland-c/tests/decoder_is_not_load_bearing.rs`, is deliberately small: it greps the four
+source files that actually decide what crosses the wire and when — `blob_sync.rs`, `ring.rs`,
+`relay_engine.rs`, `link.rs` — for the literal string `rayland_venus_proto`, and fails loudly, quoting
+(c)1 spec §7, if any of them contains it. The test's own doc comment says plainly what this does *not*
+prove: it catches the direct, accidental case (an author reaching for `rayland_venus_proto::command_len`
+inside the relay path because it happens to be sitting right there), not influence laundered through a
+third module that itself never names the crate. A guard that claimed more than that would be exactly
+the kind of overstatement this sub-project has been trying not to write.
+
+**Teeth-checked for real, following the brief's own warning about Task 3's false-pass trap.** The
+mutation was the literal one specified: add `// rayland_venus_proto` to the end of `blob_sync.rs`,
+re-run, and read the failure — not just its exit code. It failed with exactly the intended message,
+naming `src/blob_sync.rs` and quoting the DIAGNOSTIC ONLY rationale, because the substring check has no
+room to fire for any other reason than the one being tested (unlike Task 3's bounds-check flip, there is
+no unsigned-arithmetic side door here — either the byte string is present in the file or it is not).
+Removed the line, re-ran, green again, and `git diff` on `blob_sync.rs` came back empty, confirming the
+mutation left no trace behind.
+
+**`no_gpu_linkage` was re-run and then actually read, per the brief's instruction not to assume it still
+means what it used to.** It still asserts exactly one thing: `cargo tree -p rayland-c` must not contain
+the string `rayland-engine`. That claim is completely unaffected by today's change — `rayland-venus-proto`
+compiles Mesa's *generated protocol headers* through a `cc` build step, not `libvirglrenderer`, so it
+was never going to trip this guard, and it didn't. The one thing that needed correcting was not this
+test's assertion but its self-description: `rayland-c`'s own `no_gpu_linkage.rs` never actually claimed
+the tree was "only `libc` and `thiserror`" — that phrasing lived in `rayland-vtest`'s crate docs and in
+`CLAUDE.md`, not in the guard itself, so the guard's doc comment needed no correction. What did need
+correcting were the two places that phrase actually lived.
+
+**The documents this closes out.** `rayland-vtest/src/lib.rs`'s "What lives here" section and
+`CLAUDE.md`'s `rayland-vtest` bullet both said "no GPU dependencies, by construction: only `libc` and
+`thiserror`" — true when Task 1 started, false since `rayland-vtest`'s `Cargo.toml` picked up
+`rayland-venus-proto` as a dependency. Both were rewritten to name the real three dependencies and to
+say, precisely, why the crate is still GPU-free despite the new one: the vendored headers are Mesa's
+*generated protocol format* — no driver, no device, no `libvirglrenderer` — and the arrow still points
+`rayland-engine → rayland-vtest`, never the other way. `CLAUDE.md` also gained the `rayland-venus-proto`
+bullet the brief specified, in the same voice as its neighbours.
+
+**Two stale statements found outside this task's declared file list, and fixed rather than excused —**
+the "outside this task's files" excuse has already been rejected twice in this project's own diary, and
+a third instance would have made that rejection meaningless. First, `project-map.js`'s `vtest` node
+still carried the same now-false "only libc and thiserror" sentence in both its `desc` and its
+"no-GPU linkage guard" part — the brief's Step 7 only named the `venus-proto` node, but the `vtest`
+node told the identical lie, so both were corrected. Second, `CLAUDE.md`'s own workspace-size sentence
+— "A Cargo workspace of seventeen crates" — has been wrong since Task 1 landed the eighteenth
+(`rayland-venus-proto`) three tasks ago and nobody updated the count; `ls crates/` says eighteen, and
+the sentence now does too.
+
+**What we now believe, and how confident:** the diagnostic-only invariant is enforced mechanically, not
+just by prose, and the mechanism's own honest limit is written into its doc comment rather than implied.
+The size table and Mesa's borrowed decoder agreed on every command both could size across all five
+tasks — 24 bytes for `vkNotifyRingMESA` in Task 4's cross-check, and no disagreement was ever found. The
+one deliberately-unresolved gap from Task 4 (no fixture yet proves a multi-command variable-length walk
+reaching `ReachedEnd`) is unchanged by this task and is not this task's to close; it is recorded here
+again so it does not quietly vanish from the record now that the sub-project's last task is done.

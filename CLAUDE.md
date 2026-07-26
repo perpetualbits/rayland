@@ -107,7 +107,7 @@ map's existence and this rule by reading this file.
 
 ## Repository status and layout
 
-A Cargo workspace of seventeen crates. Each declares its own license per the policy below
+A Cargo workspace of eighteen crates. Each declares its own license per the policy below
 (library → LGPL, application/binary → GPL); all are `v0.0.x` and pre-stable.
 
 - **`crates/rayland`** — the published placeholder that reserves the crates.io name; the
@@ -123,11 +123,21 @@ A Cargo workspace of seventeen crates. Each declares its own license per the pol
 - **`crates/rayland-vtest`** — the **vtest** wire protocol Mesa's Venus ICD speaks, the
   `RenderEngine` / `VtestTransport` traits, `EngineError`, and `venus_ring/` — the
   repository's knowledge of Mesa's command ring. **Has no GPU dependencies, by
-  construction:** only `libc` and `thiserror`. Rayland's **C** side speaks this protocol
-  but must never link a GPU stack (C is the weak, possibly headless, possibly RISC-V
-  machine), so `tests/no_gpu_linkage.rs` asserts `rayland-engine` is absent from this
-  crate's dependency tree. **The dependency arrow points `rayland-engine` →
+  construction.** It links `libc`, `thiserror`, and `rayland-venus-proto` — the last of
+  which compiles Mesa's *generated protocol headers*, which are format definitions with no
+  driver, no device and no `libvirglrenderer` behind them. Rayland's **C** side speaks this
+  protocol but must never link a GPU stack (C is the weak, possibly headless, possibly
+  RISC-V machine), and `rayland-c`'s `tests/no_gpu_linkage.rs` asserts `rayland-engine` is
+  absent from its dependency tree. **The dependency arrow points `rayland-engine` →
   `rayland-vtest`, and must never be reversed.** LGPL.
+- **`crates/rayland-venus-proto`** — **framing for Venus command streams**: how long is the command
+  at the start of these bytes? It vendors Mesa's *generated* `venus-protocol` headers and compiles
+  them against a replacement `vkr_cs.h` this crate writes itself, so the borrowed decoders run with
+  no virglrenderer and no Mesa util library behind them. Byte consumption does not depend on object
+  lookups, so stub lookups give framing identical to a live renderer's. **Diagnostic and structural
+  only — it may never make a correctness decision** ((c)1 spec §7: the ring is relayed as opaque
+  bytes precisely so a decoding bug cannot become a corruption bug), enforced by
+  `rayland-c/tests/decoder_is_not_load_bearing.rs`. LGPL, `publish = false`.
 - **`crates/rayland-relay`** — the **(c)1 relay wire protocol**: the `C2S`/`S2C` messages that
   cross the network between C and S (ring deltas, blob syncs, replies) and their `postcard`
   framing. Pure data — no GPU, no sockets, no async runtime — because both `rayland-c` and the
