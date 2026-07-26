@@ -156,7 +156,17 @@ A Cargo workspace of eighteen crates. Each declares its own license per the poli
   Mesa Venus ICD connects to: it hands the application plain local memfds for its ring and blobs,
   **watches the ring** (where 100% of the application's Vulkan commands actually live), and relays
   the bytes to S. The insight it rests on is that the vtest protocol's "host" is whoever allocates
-  the ring, and Rayland can be that host — so no Mesa fork and no patch is needed. Its
+  the ring, and Rayland can be that host — so no Mesa fork and no patch is needed.
+  **Since 2026-07-26 it also relays Venus's out-of-line command streams.** Venus replaces any submission
+  over `direct_size` (`buffer_size >> 4`, so 8 KiB for the 128 KiB ring) with `vkExecuteCommandStreamsMESA`
+  naming *other* shmems, which live in the staging pool (`blob_id == 0`). The C→S sync used to skip those,
+  so S held zeros and `rayland-c` refused the delta — correct, but it made every submission over 8 KiB
+  unrelayable, which is most real workloads. It now synchronises **every blob except the ring** (the ring
+  keeps `RingDelta`, which carries the `tail` that validates its bytes and is sent last). Publishing a
+  region S *also* writes is safe because of the **baseline**, not the `blob_id`: `note_s_wrote` folds each
+  S→C write into it, so S's replies are never echoed back. The alternative — making the old refusal precise
+  with the decoder — was rejected because this is the relay path and (c)1 §7 forbids a decode from deciding
+  what crosses the wire; carrying the stream removes the question instead of answering it. Its
   `tests/no_gpu_linkage.rs` guards the **binary**, which covers `rayland-vtest`, `rayland-relay`
   and everything they pull in transitively. GPL, `publish = false`.
 - **`crates/rayland-s`** — **S's daemon ((c)1).** The other end of `rayland-c`: it applies the
@@ -173,7 +183,12 @@ A Cargo workspace of eighteen crates. Each declares its own license per the poli
   `rayland-server` and `rayland-s`, so it lives in its own crate rather than being duplicated.
   **Note (c)1 uses only the `wl_shm` path** and is deliberately *not* zero-copy: S presents the
   application's readback blob, because it cannot see the app's `DEVICE_LOCAL` render target (that
-  produces no blob at all). LGPL.
+  produces no blob at all). **Since 2026-07-26 it can also follow a live render:** `present_live()` takes
+  an optional boxed `'static` closure supplying subsequent frames, and the window re-arms a
+  `wl_surface.frame` callback on every commit. With `None` it is `present()` exactly — no callbacks
+  requested, no behaviour change for `rayland-server`. Pacing is the **compositor's**, not the relay's:
+  the window shows whichever frame S last completed, so a slower remote render repeats frames. That keeps
+  presentation from ever blocking the relay, at the cost of not being frame-accurate. LGPL.
 - **`crates/rayland-engine`** — **the real engine (arc (c)).** FFI-embeds
   `libvirglrenderer` behind `rayland-vtest`'s `RenderEngine` trait, driving a Venus
   context on S's GPU. Since (c)1 Task 1 this crate is *only* the GPU: the `ffi`
@@ -340,11 +355,43 @@ Venus/virglrenderer capture/replay engine, so *unmodified* applications run.**
   polls `VK_NOT_READY` (`[38][1]`) *during* a copy's DMA, so a live `[38][0]` means a fence just signalled.
   `progress_thread` then ships the readback (gated on `take_app_blob_writes` non-empty — a draw's fresh,
   complete `res6`) **before** the reply arena and the head-advance that release the app. No S-issued fence,
-  no timing heuristic; the progress thread no longer touches the engine. **Scope:** feedback-OFF only (the
-  only config that renders over a real network; the feedback-on "buy-back" was loopback-only and is
-  superseded — the loopback icosa e2e now runs feedback-off to guard the shipping path). **Still open:**
-  the readback fragments into ~5000 one-byte `BlobData`/frame (a bandwidth follow-up, not correctness), and
-  multi-queue support.
+  no timing heuristic; the progress thread no longer touches the engine. **Scope:** feedback-OFF only, and
+  2026-07-26 established *why*, per mechanism, by measurement. **`no_fence_feedback` is load-bearing:** the
+  barrier above works by spotting the app's `vkGetFenceStatus` reply reading `VK_SUCCESS`, and fence feedback
+  removes that poll — enabling it gives exit 134 and zero frames, immediately and every time. **Semaphore,
+  event and query feedback look safe and are not:** enabling them measured **1.23×** on `icosa-gpu` over
+  loopback (median `draw_readback` 48.7 ms → 39.5 ms, all 120 frames bit-identical) and then lost a whole run
+  to a silent Venus `SIGABRT` in the two-machine sweep (9/10 clean). They are shared status pages S writes and
+  C's Mesa reads *directly*, and (c)1 does not relay them; Mesa reads a page whose update has not arrived and
+  aborts. **A loopback pass proves nothing about feedback** — adopting any of it needs the pages relayed, not
+  the flag removed. **Still open:** multi-queue support, and the synchronous round trip itself, which is now
+  the *measured* explanation for frame time (see below), not a suspicion.
+**Where (c)1/(c)2 stand after 2026-07-26, measured.** An unmodified application on C, rendered by S's
+GPU and **displayed live on S's screen**, works end to end: `scripts/icosa-remote-demo.sh` runs
+`rayland-icosa-gpu` or `-cpu` on apollo and animates it in a window on dop561. Three findings decide where
+effort goes next:
+
+- **The `vkQueueSubmit` "CS error" was never a Rayland bug.** It is `VK_ERROR_DEVICE_LOST` (`VkResult=-4`)
+  from the real submit on S's GPU; Venus reports device loss by setting the decoder's fatal flag through a
+  branch that runs only when `flags == 0x0`, so it surfaced as the generic `%s resulted in CS error` with no
+  log of its own. Proved by building a patched `virgl_render_server` (source from the Ubuntu archive pool
+  over plain HTTP — no root, no `deb-src`; `meson`/`ninja`/`pyyaml` in a venv; the distro's own
+  `fix-c23.patch`) and spawning it via `RENDER_SERVER_EXEC_PATH`, which the *system* library honours. **It is
+  GPU-specific:** NVIDIA RTX A500 7/14 runs lost, Intel Iris Xe **0/10** and reaching strictly further
+  (8 submits vs 5–6). vkcube defaults to the discrete GPU; `--gpu_number 0` avoids it.
+- **Frame time is the synchronous round trip, and that is now measured rather than suspected.** On loopback,
+  `icosa-gpu` costs ~50 ms/frame with a 78 KB return path — not bandwidth, not message count, not flush
+  syscalls (batching `ship()`'s per-message lock and flush is worth **1.03×**). With feedback off the app
+  implements `vkWaitForFences` by polling `vkGetFenceStatus`, and every poll is a full C→S→execute→reply→C
+  cycle. **The readback is not fragmented** — `res=5` averages 377-byte runs; the one-byte flood is the reply
+  arena, whose gap-0 grain is a deliberate correctness property (a gap byte is one S did not write).
+- **Where the fixtures put the cost.** `icosa-cpu` pushes ~1 MiB/frame of CPU-computed fractal through
+  uninterceptable mapped memory; `icosa-gpu` does the same picture in ~80 bytes by evaluating it in a
+  fragment shader. Measured over the real network: **283 ms/frame against ~41 ms**, i.e. the mapped-write
+  volume *was* the dominant cost. In a command-streaming design resolution is separately cheap — it is the
+  GPU's problem and the GPU is next to the display — but costs bandwidth *today* only because S presents the
+  application's readback buffer, which is what WP0's token → `wl_buffer` path exists to end.
+
 - **(c)3 — content-addressed assets.**
 - **(c)4 — real/complex applications; GL via Zink.**
 

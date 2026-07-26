@@ -33,6 +33,24 @@ C_HOST="${C_HOST:-apollo}"
 S_IP="${S_IP:-192.168.1.192}"
 PORT="${PORT:-9402}"
 RUNS="${1:-10}"
+# Which of Venus's feedback mechanisms Mesa may use. Each one it does NOT have replaces a shared
+# status page with a synchronous round trip, so turning them on is the obvious lever on frame time —
+# and it was tried, on 2026-07-26, and it does not hold. Both halves are worth knowing:
+#
+#   * `no_fence_feedback` is LOAD-BEARING and must stay. (c)2's completion barrier
+#     (`Applier::reply_arena_fence_signaled`) works by spotting the application's `vkGetFenceStatus`
+#     reply reading VK_SUCCESS, and fence feedback removes that poll entirely. Measured: enabling it
+#     gives exit 134 and 0 frames, immediately and every time.
+#
+#   * Semaphore, event and query feedback look safe and ARE NOT. Enabling them measured 1.23x on
+#     icosa-gpu over loopback (median draw_readback 48.7 ms -> 39.5 ms) with all 120 frames still
+#     bit-identical — and then failed this very sweep: 9/10 runs clean, one run lost entirely to a
+#     silent Venus SIGABRT. These mechanisms are shared status pages S writes and C's Mesa reads
+#     directly, and (c)1 does not relay them (see `scripts/c1-two-machine.sh`'s own note). Mesa reads
+#     a page whose update has not arrived and eventually aborts. A loopback pass proves nothing here.
+#
+# Adopting any of these needs the feedback pages relayed, not the flag removed.
+VN_PERF_SETTING="${VN_PERF_SETTING:-no_multi_ring,no_fence_feedback,no_semaphore_feedback,no_event_feedback,no_query_feedback}"
 TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/rayland-c1-target}"
 BIN="$TARGET_DIR/release"
 SOCK="/tmp/rl-c2-icosa.sock"
@@ -68,7 +86,7 @@ for run in $(seq 1 "$RUNS"); do
     RAYLAND_C1_S_ADDR=$S_IP:$PORT RAYLAND_C1_SOCKET=$SOCK nohup /tmp/rayland-c >/tmp/rayland-c-icosa.log 2>&1 &
     echo \$! > /tmp/rayland-c.pid
     sleep 3
-    VN_DEBUG=vtest VN_PERF=no_multi_ring,no_fence_feedback,no_semaphore_feedback,no_event_feedback,no_query_feedback \
+    VN_DEBUG=vtest VN_PERF="$VN_PERF_SETTING" \
     VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/virtio_icd.json VTEST_SOCKET_NAME=$SOCK \
     env -u VK_LOADER_DRIVERS_SELECT /tmp/rayland-icosa-cpu /tmp/icosa-relay >/dev/null 2>&1 &
     app_pid=\$!; echo \$app_pid > /tmp/rayland-app.pid
