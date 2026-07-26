@@ -593,6 +593,55 @@ fn a_ring_delta_larger_than_the_ring_buffer_is_refused() {
 
 /// A delta naming a resource that is not a ring is refused, not panicked on.
 ///
+/// **WP0 4.3 prerequisite: the exported descriptor survives blob creation, and dies with the resource.**
+///
+/// The application's swapchain images are `HOST3D` blobs whose device memory virglrenderer exports as a
+/// dma-buf **once, at creation**. Until 4.3 that descriptor was dropped at the end of the creation scope,
+/// which was harmless while nothing on S needed it — S reaches every blob through its own `mmap`. It is not
+/// harmless now: presentation must hand exactly that descriptor to S's compositor, and virglrenderer's
+/// `mem->exported` guard means it cannot be asked for a second time. A regression here would not fail
+/// loudly; it would make `exported_fd` return `None` and the frame silently never appear.
+///
+/// The release half matters too: a descriptor kept past its resource's `UnrefResource` is a file-table
+/// entry leaked for the rest of the session, and sessions create a swapchain's worth of these.
+#[test]
+fn a_blobs_exported_descriptor_is_retained_and_released_with_the_resource() {
+    let mut engine = RecordingEngine::new();
+    let mut applier = Applier::new();
+    applier.apply(&mut engine, C2S::CreateContext { ctx_id: CTX_ID });
+
+    let out = applier.apply(
+        &mut engine,
+        C2S::CreateBlob {
+            blob_mem: BLOB_MEM_HOST3D,
+            blob_flags: 0,
+            blob_id: 16,
+            size: 64,
+        },
+    );
+    let res_id = match out.as_slice() {
+        [S2C::BlobCreated { res_id, .. }] => *res_id,
+        other => panic!("expected BlobCreated, got {other:?}"),
+    };
+
+    assert!(
+        applier.exported_fd(res_id).is_some(),
+        "the descriptor exported at creation must be retained — 4.3 resolves a BufferToken's \
+         resource id to exactly this, and virglrenderer cannot export it twice"
+    );
+    // A resource that was never created has no descriptor, rather than some other resource's.
+    assert!(
+        applier.exported_fd(res_id + 1000).is_none(),
+        "an unknown resource id must not resolve to a descriptor"
+    );
+
+    applier.apply(&mut engine, C2S::UnrefResource { res_id });
+    assert!(
+        applier.exported_fd(res_id).is_none(),
+        "the descriptor must be released with its resource, or every swapchain image leaks one"
+    );
+}
+
 /// S reads everything off a network. An unknown or non-ring `ring_res_id` must produce a message a
 /// human can act on — indexing a table with it would take the daemon down on a remote peer's say-so.
 #[test]

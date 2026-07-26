@@ -61,7 +61,7 @@ use crate::ring_mirror::{RingDeltaError, RingMirror};
 use std::collections::HashMap;
 // `BlobResource::fd` is an `OwnedFd`; mapping it needs a borrow, and `mmap` keeps its own reference
 // to the underlying object, so the fd may be dropped straight afterwards.
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
 /// The vtest protocol version S implements.
 ///
@@ -231,6 +231,29 @@ pub struct Applier {
     /// Every blob S has created and mapped, keyed by the engine's resource id — the same id every
     /// message on the wire names the resource by, so there is no translation table to drift.
     blobs: HashMap<u32, HostBlob>,
+    /// The descriptor virglrenderer exported for each blob at creation, kept alive and keyed by
+    /// resource id.
+    ///
+    /// # Why S keeps a descriptor it does not read through
+    /// S maps every blob (see [`Self::blobs`]) and reaches its pages that way, so this fd is not how
+    /// S touches the memory — `mmap` holds its own reference and this could be closed with no effect
+    /// on that. It is kept for **presentation** (WP0 4.3): the application's swapchain images are
+    /// `HOST3D` blobs, for which virglrenderer allocated device memory and exported a **dma-buf**,
+    /// and turning one into a `wl_buffer` on S's real compositor needs exactly that descriptor.
+    ///
+    /// # Why it must be retained rather than re-exported on demand
+    /// virglrenderer's `mem->exported` guard permits exactly one export per resource, and that export
+    /// already happened at creation — `create_blob_resource` performs it and hands the descriptor
+    /// back. Asking again later fails. On a normal vtest host the descriptor would be passed to the
+    /// local client over `SCM_RIGHTS` and forgotten; S has no local client, so without this the only
+    /// handle to the swapchain image's memory would be dropped at the end of the creation scope and
+    /// the frame could never be shown.
+    ///
+    /// Every blob's descriptor is kept, not just the `HOST3D` ones: which blobs are swapchain images
+    /// is the *application's* business and nothing S can soundly infer here, the count is small (a
+    /// handful per session), and a descriptor S never uses costs one file-table entry. Entries are
+    /// removed in `UnrefResource` alongside the mapping they accompany.
+    exported_fds: HashMap<u32, OwnedFd>,
     /// A mirror per ring-shaped blob, keyed the same way.
     ///
     /// **A map, not a single latched ring**, deliberately. `rayland-c` latches exactly one because
@@ -542,13 +565,18 @@ impl Applier {
                 // Map before registering anything in `Applier`'s own tables: a mapping failure must
                 // leave no half-built state *there*. It must also not leave the engine holding a
                 // resource nobody can reach any more, which is why the error path unrefs it. The fd
-                // is dropped at the end of this scope either way — `mmap` holds its own reference to
-                // the underlying object, so closing it unmaps nothing.
+                // outlives this scope now (it is retained just below for presentation); `mmap` holds its
+                // own reference regardless, so the mapping does not depend on it either way.
                 let host_blob = HostBlob::map(fd.as_fd(), size).map_err(|source| {
                     engine.unref_resource(res_id);
                     ApplyError::from(source)
                 })?;
                 self.blobs.insert(res_id, host_blob);
+                // **Keep the descriptor.** Until WP0 4.3 it was dropped here, which was correct while
+                // nothing on S needed it; presentation does. See `Applier::exported_fds` for why it
+                // cannot be re-exported later. Stored after the mapping succeeds so a refused blob
+                // leaves no entry behind.
+                self.exported_fds.insert(res_id, fd);
                 // DIAGNOSTIC (`RAYLAND_S_REPLY_LOG`): virglrenderer's Venus implementation makes a
                 // ring-side `vkAllocateMemory` **wait** for the blob resource that backs it, so a
                 // blob C creates but S never does is indistinguishable — from the ring — from a
@@ -867,6 +895,10 @@ impl Applier {
             C2S::UnrefResource { res_id } => {
                 engine.unref_resource(res_id);
                 self.blobs.remove(&res_id);
+                // Released with the mapping it accompanies: the resource is gone from the engine, so
+                // a descriptor naming it is of no further use and holding it would leak a file-table
+                // entry for the rest of the session.
+                self.exported_fds.remove(&res_id);
                 self.rings.remove(&res_id);
                 // Forget the send-order classification too. virglrenderer is free to hand the same
                 // `res_id` to a later blob, and a leftover entry here would silently sort a fresh
@@ -1342,6 +1374,24 @@ impl Applier {
         // late, the ordering is the fault. Inert unless the variable is set.
         reply_log_arena_writes(&out);
         out
+    }
+
+    /// The dma-buf descriptor virglrenderer exported for `res_id`, if S still holds the resource.
+    ///
+    /// This is what WP0 4.3's presentation path resolves a `BufferToken.resource_id` to: the token
+    /// names a swapchain image by the same resource id every other relayed message uses, and the
+    /// descriptor is what S's compositor needs to import it as a `wl_buffer`.
+    ///
+    /// # Inputs / outputs
+    /// - Returns a **borrow**, not the descriptor itself: `Applier` must keep ownership for the life
+    ///   of the resource, because the export cannot be repeated (see [`Self::exported_fds`]). A caller
+    ///   that needs to hand it to a compositor should `try_clone_to_owned` or pass the borrow to a
+    ///   protocol call that dups it.
+    /// - `None` if the resource was never created, or has been unref'd — both of which a correct
+    ///   caller may see, since a token can outlive its resource if the application destroys the
+    ///   swapchain while a frame is in flight.
+    pub fn exported_fd(&self, res_id: u32) -> Option<BorrowedFd<'_>> {
+        self.exported_fds.get(&res_id).map(|fd| fd.as_fd())
     }
 
     /// **(c)2 completion barrier:** does the reply arena currently show a `vkGetFenceStatus` reply reading
