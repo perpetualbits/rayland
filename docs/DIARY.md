@@ -2880,3 +2880,66 @@ against, and this one was checked against an abstraction ("a future author could
 rather than the actual, already-existing reachable call sitting in the very file the plan forgot to
 list. The corrected guard is checked against that same real call, restored and confirmed to trip it,
 which is a stronger claim than the first round could make.
+
+### 2026-07-26 — The Venus stream decoder is built, and the plan that built it was wrong four times
+
+Five tasks, five reviews, five fix rounds, one final whole-change review and one fix wave. `rayland-venus-proto`
+exists: Rayland can now walk a Venus command stream instead of naming its first command. The engineering is
+recorded in the task reports; what belongs here is what the process actually cost and what it caught.
+
+**What was built.** Mesa's generated `venus-protocol` (43 headers, ~97k lines, virglrenderer 1.2.0 — the
+version this machine links) is vendored and compiled against a `vkr_cs.h` this crate writes itself, which is
+what keeps virglrenderer and Mesa's util library out of the build entirely. A ~150-line C shim drives Mesa's
+own per-command decoders over a caller-supplied slice; a generated 312-case switch dispatches to them; and
+Rust exposes exactly one function — *how long is the command at the start of these bytes?* `decode_commands`
+asks its fixed-size table first and falls back to the borrowed decoder, keeping the table as an independent
+cross-check rather than deleting it.
+
+**The plan I wrote was defective four times, and every defect was caught by someone else.** That is worth
+recording plainly, because the plan read as complete when it was written:
+
+1. **A false-pass teeth-check.** Task 3's brief said to invert a bounds check from `<` to `>` and confirm the
+   truncation test fails. It does not fail — the flip fires on the prologue instead, so the test passes for
+   the wrong reason. Caught only because that implementer ran the *whole* suite rather than the named test,
+   noticed two unrelated tests break, and substituted `if (0)` to genuinely disable the guard. A teeth-check
+   that cannot fail is not evidence, and mine could not.
+2. **A fixture that does not exist.** Task 4's anchor test was to walk `CAPTURED_RING_COMMAND_STREAM` to
+   `ReachedEnd`. There is no such fixture; the real capture holds 100 of 216 bytes. The implementer refused to
+   fabricate one — correctly, since the anchor's whole argument is that the byte total comes from a real
+   virglrenderer and not from us — substituted real evidence from another capture, and recorded the residual
+   gap. **That gap is still open: no fixture proves a *multi-command* variable-length walk reaching
+   `ReachedEnd`.** The first real `RAYLAND_RING_DUMP` run of this decoder will settle it.
+3. **A guard with a live hole.** Task 5's invariant test — the mechanical enforcement of "this decoder may
+   never make a correctness decision" — omitted `main.rs`, which is where the relay decisions actually are,
+   and grepped for a needle (`rayland_venus_proto`) that cannot match the reachable path
+   (`rayland_vtest::venus_ring::decode::decode_commands`). `main.rs` *already contained* such a call. The
+   guard would have stayed green through the exact violation it exists to prevent.
+4. **An allowlist that rots.** Even after fixing (3), `RELAY_PATH` named 5 of 10 source files, and its
+   disclosed "residual gap" turned out to be a live path (`main.rs` → `ring_dump::dump_if_enabled`) held open
+   only by prose. It is now inverted — enumerate `src/*.rs`, subtract a justified exclusion set — so a new
+   relay module is covered by default, and `ring_dump`'s returnless signature is pinned by an assertion
+   rather than by a sentence.
+
+**Two things the borrowed protocol taught us that no amount of design could have.** Mesa's generated
+`vn_protocol_renderer_cs.h` **under-documents its own contract**: its "these types/functions are expected"
+comment lists eleven symbols and the body needs six more. And six commands' *decoders* take a
+`struct vn_cs_encoder *`, because Mesa pre-sizes their reply arena during decode — flatly contradicting the
+spec's "this crate never drives the encoder". Both were found by compiling, not by reading.
+
+**The failure mode this crate is built to avoid, and nearly reproduced twice.** A decoder that returns a
+*plausible wrong length* is worse than one that refuses: a walker trusts it, desynchronizes, and reports
+commands that never existed. Two paths could have done exactly that — `vkr_cs_decoder_get_blob_storage`
+returning NULL (which Mesa's own reference does, *without* setting fatal, so the generated caller silently
+skips the cursor-advancing read), and an encoder sentinel that must unconditionally succeed because two
+commands decode trailing fields after that branch. Both are closed, and the second's comment now warns in
+capitals against the "let's harden this with a size check" edit that would silently reopen it.
+
+**A subtler one, caught last.** Temp-pool exhaustion was reported as `Truncated` — which is *literally* the
+CS-error condition the live vkcube investigation is trying to confirm or refute, and our 1 MiB cap is 1000×
+smaller than virglrenderer's 1 GiB. The length would have been safe and the *diagnosis* wrong, which for a
+diagnostic tool is the whole cost of being wrong. It is now a distinct fault end to end.
+
+**What this does not yet do.** It has not been pointed at the failing `vkQueueSubmit`. That is the next
+session's work, and the reason all of this exists: to ask whether a published `tail` can fall mid-command, or
+whether part of that submit lives outside the ring behind a `vkExecuteCommandStreamsMESA`. The instrument is
+built and guarded; the question is still open.
