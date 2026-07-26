@@ -83,17 +83,24 @@ pub fn command_len(stream: &[u8]) -> Result<Command, DecodeFault> {
     let mut command_type: u32 = 0;
     let mut len: usize = 0;
     // SAFETY: `stream` is a valid slice of `stream.len()` readable bytes; the two out-params are
-    // valid, writable locals. The shim reads only within the slice, writes only through the
-    // out-params, allocates nothing that outlives the call, and keeps no state between calls.
+    // valid, writable locals. The shim reads only within the slice and writes only through the
+    // out-params. Nothing it allocates outlives the call, and nothing it returns depends on a
+    // prior call: the per-command scratch pool (`csrc/shim.c`'s `temp`) is `_Thread_local static`
+    // storage whose *bytes* persist between calls, but its `temp_used` bump-allocator cursor is
+    // reset to zero at the top of every call, so no call can ever observe a previous call's
+    // allocations — the persistence is an implementation detail of the arena, not shared state.
     let rc = unsafe {
         rayland_venus_command_len(stream.as_ptr(), stream.len(), &mut command_type, &mut len)
     };
     match rc {
         0 => Ok(Command { command_type, len }),
+        // `RAYLAND_VENUS_FAULT_TRUNCATED` in `csrc/shim.c`: the stream ended inside the command.
         1 => Err(DecodeFault::Truncated),
+        // `RAYLAND_VENUS_FAULT_UNKNOWN_COMMAND` in `csrc/shim.c`: no generated decoder for this type.
         2 => Err(DecodeFault::UnknownCommand { command_type }),
-        // Any other code is a shim contract violation. Reported as `BadArgs` rather than panicking:
-        // a diagnostic that aborts the process is worse than one that says it does not know.
+        // Any other code is a shim contract violation (`RAYLAND_VENUS_FAULT_BAD_ARGS`, or anything
+        // undocumented). Reported as `BadArgs` rather than panicking: a diagnostic that aborts the
+        // process is worse than one that says it does not know.
         _ => Err(DecodeFault::BadArgs),
     }
 }

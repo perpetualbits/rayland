@@ -91,15 +91,3 @@ rayland_venus_command_len(const uint8_t *bytes, size_t len, uint32_t *out_cmd_ty
    *out_len = (size_t)(dec.cur - bytes);
    return 0;
 }
-
-/*
- * Task 1's link-proving self-test. Still linked by `rayland-venus-proto`'s existing Rust wrapper
- * (`src/lib.rs::selftest_command_type` and its test), which Task 2's brief scopes to `csrc/shim.c`
- * only — the Rust side's replacement is later work. Kept, rather than deleted, so this task does not
- * silently break a passing test that is out of its own stated file list.
- */
-int
-rayland_venus_proto_selftest(void)
-{
-   return (int)VK_COMMAND_TYPE_vkGetFenceStatus_EXT;
-}
