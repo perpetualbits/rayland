@@ -157,6 +157,30 @@ pub fn dump_if_enabled(pending: &RingDelta) {
         }
     }
 
+    // **And is `find_get_device_queue2` any better?** It is built the same way as
+    // `find_destroy_device` — a sliding pattern match rather than a decode — and that one was just
+    // proved to fire inside a payload. This crate's decoder can now say, for the same bytes, whether
+    // the scan's hit corresponds to a real `vkGetDeviceQueue2`: the struct reports `end_offset` (the
+    // first byte past the command), so a truthful hit must line up with a decoded type-155 command's
+    // offset plus its size. A hit in a delta containing no type-155 at all is a false positive with
+    // nothing further to argue about.
+    if let Some(found) = rayland_vtest::venus_ring::decode::find_get_device_queue2(&pending.bytes) {
+        let real = commands
+            .iter()
+            .find(|c| c.command_type == VK_COMMAND_TYPE_VK_GET_DEVICE_QUEUE2);
+        let agrees = real.is_some_and(|c| c.offset + c.encoded_size == found.end_offset);
+        eprintln!(
+            "[ring-queuescan] find_get_device_queue2 FIRED: end_offset={} ring_idx={} device={:#x} \
+             — decoder found a real type-155 in this delta: {} (offsets agree: {}); tail={}",
+            found.end_offset,
+            found.ring_idx,
+            found.device_handle,
+            real.is_some(),
+            agrees,
+            pending.tail
+        );
+    }
+
     // **The multi-ring question.** Thread sampling on S found three `vkr-ring-1` threads where (c)1
     // spec §6 assumes one, and S never saw a second *inline* `vkCreateRingMESA` — so any extra ring
     // must be created inside the ring stream, which is exactly what this scans for. `decode_commands`

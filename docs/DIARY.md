@@ -3108,3 +3108,43 @@ long day.
 has now answered two, the second of which nobody had asked. Instruments that report what is actually there
 keep finding defects nobody suspected; arguments about what must be there kept producing theories that
 measurement then killed. Ten refuted so far.
+
+### 2026-07-26 — `find_get_device_queue2` is sound; the two sibling scans differ, and the reason is the command number
+
+Having proved `find_destroy_device` fires inside payloads, the obvious question was whether its sibling — built
+the same way, and trusted for the same kind of decision — is any better. Pointed at the same bytes with the
+decoder beside it:
+
+```
+[ring-queuescan] find_get_device_queue2 FIRED: end_offset=80 ring_idx=1 device=0x5
+                 — decoder found a real type-155 in this delta: true (offsets agree: true); tail=9388
+```
+
+**It is correct.** It fires exactly once in the run; the decoder confirms a real `vkGetDeviceQueue2` in that
+delta; and the offsets agree to the byte — the decoded command's offset plus its encoded size equals the
+scan's reported `end_offset`. There is exactly one type-155 command in the whole stream, and the scan found
+precisely it and nothing else.
+
+So the two are not equally suspect, and it is worth writing down *why*, because "they are built the same way"
+was the reason for suspecting both and it turns out not to be the deciding factor:
+
+- **`vkDestroyDevice` is command type 12.** A `12` is an entirely ordinary value to meet in payload data —
+  counts, enum values, sizes, offsets — and the scan pairs it with a flags word of `0`, which is commoner
+  still. The 64-bit device handle looks like a strong discriminator, but handles appear all over a real stream
+  (most commands take one), so the pattern gets many chances at a coincidence, and it takes them: the false
+  hit landed at **offset 6236** in one run and **6300** in the next, same delta. A match that moves between
+  runs is matching noise, not a command.
+- **`vkGetDeviceQueue2` is command type 155**, a value that rarely occurs as incidental data, and its scan
+  validates more structure around the hit rather than three fields.
+
+The lesson is narrower and more useful than "signature scans are bad": a sliding pattern match's reliability is
+a property of *how distinctive the pattern is in the surrounding data*, not of the technique. Nobody could have
+known which of these two was safe without measuring, and now both are measured — one confirmed, one refuted,
+by the same instrument in the same run.
+
+**Where that leaves the wall.** The confirmed false positive is real and has a real consequence — S retires its
+readback gate on a phantom device destruction — but it still does not explain a `VkQueue` becoming
+unresolvable inside virglrenderer, and the queue ids match throughout. The submit failure remains open, with
+the dispatcher's three distinct fatal conditions still not narrowed to one. What has changed is that this
+codebase can now check a claim about a command stream instead of arguing about it, and two of its own
+long-standing claims have already failed that check.
