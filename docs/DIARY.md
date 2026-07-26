@@ -3762,3 +3762,42 @@ the measurement written beside it.
 and now with both of its obvious escapes closed off: the feedback mechanisms that would remove the
 polls need transport work first, and making each poll cheaper (batching flushes) is worth 1.03×. The
 next real move is relaying the feedback pages — which is a (c)1 transport task, not a tuning knob.
+
+### 2026-07-26 (later still) — "Relay the feedback pages" is not a well-formed task, and the claim was mine
+
+Asked to do the thing the previous entry named as the next move. Checked the premise first, and it
+does not hold — which matters more than the task would have.
+
+**The claim, and where it came from.** `scripts/c1-two-machine.sh` carries a comment saying
+`VN_PERF=no_*_feedback` "disables the S→C shared status pages (c)1 does not yet relay". The previous
+entry repeated it, and so did `CLAUDE.md`, as the explanation for why enabling semaphore/event/query
+feedback lost a run. Both were written **tonight, by me, from that comment**, hours after this same
+diary recorded that inherited claims are exactly what keeps costing this project days.
+
+**It is not supported.** Two readings and one measurement:
+
+- `Applier::emit_blob_writes` excludes **rings only**. Every other blob S holds — application memory
+  and Venus's own shmems alike — goes through it.
+- `HostBlob::take_bytes_s_wrote` does not record `copy_in` calls; it diffs against a **shadow**
+  (`changed_byte_ranges`). So it detects writes virglrenderer's GPU makes *directly into the mapping*,
+  which is precisely how it catches the readback buffer.
+- Measured, `icosa-gpu` over loopback with the three feedbacks enabled: S ships back `res=2` (4542
+  messages, 20058 bytes) and `res=5` (24867 messages, 9386970 bytes) **and nothing else** — against
+  4540/24874 messages with feedback off. Six blobs exist; the other four never change from S's side.
+
+**There is no un-relayed feedback page here.** So the abort has some other mechanism, and the honest
+position is that it is *unknown*, not "known and awaiting transport work". What the feedbacks
+demonstrably do is make the run **faster** (1.23×) while adding no S→C traffic at all — which is
+itself informative: they are removing round trips rather than adding pages, and something about the
+state Mesa then trusts locally is occasionally wrong.
+
+**Not built, deliberately.** Writing a relay for pages that are already relayed would have produced a
+change, a green loopback run, and no effect on the 1-in-10 failure — the precise shape of the "silent
+nothing" this branch keeps shipping. The corrected note is worth more than the code would have been.
+
+**And the pattern is worth naming once more, because it caught me twice in one evening.** Both times
+the false claim arrived as a *comment written by someone who had reason to believe it*, and both times
+it was adopted without a check because it explained the evidence. The check cost one run and two greps
+on each occasion. The rule this diary already knows — a reading that explains the evidence is not
+thereby the cause — apparently needs applying to the repository's own prose, not just to hypotheses
+formed in the moment.

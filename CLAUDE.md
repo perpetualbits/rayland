@@ -361,10 +361,14 @@ Venus/virglrenderer capture/replay engine, so *unmodified* applications run.**
   removes that poll — enabling it gives exit 134 and zero frames, immediately and every time. **Semaphore,
   event and query feedback look safe and are not:** enabling them measured **1.23×** on `icosa-gpu` over
   loopback (median `draw_readback` 48.7 ms → 39.5 ms, all 120 frames bit-identical) and then lost a whole run
-  to a silent Venus `SIGABRT` in the two-machine sweep (9/10 clean). They are shared status pages S writes and
-  C's Mesa reads *directly*, and (c)1 does not relay them; Mesa reads a page whose update has not arrived and
-  aborts. **A loopback pass proves nothing about feedback** — adopting any of it needs the pages relayed, not
-  the flag removed. **Still open:** multi-queue support, and the synchronous round trip itself, which is now
+  to a silent Venus `SIGABRT` in the two-machine sweep (9/10 clean). **The mechanism is NOT known**, and one plausible-sounding
+  explanation was checked and refuted the same evening: "(c)1 does not relay the feedback pages" (a comment in
+  `scripts/c1-two-machine.sh`) is not supported. `emit_blob_writes` excludes only **rings**, and
+  `take_bytes_s_wrote` detects change by diffing a shadow — so it catches writes virglrenderer's GPU makes
+  directly, not just relayed `copy_in`s. Measured with the three feedbacks on: S ships back `res=2` and `res=5`
+  and nothing else, with traffic within 0.1% of the feedback-off run. There is **no un-relayed feedback page**
+  in this workload. Whatever makes the app abort, it is not that. **A loopback pass proves nothing about
+  feedback** — 120/120 bit-identical frames and 1.23× preceded the failure. **Still open:** multi-queue support, and the synchronous round trip itself, which is now
   the *measured* explanation for frame time (see below), not a suspicion.
 **Where (c)1/(c)2 stand after 2026-07-26, measured.** An unmodified application on C, rendered by S's
 GPU and **displayed live on S's screen**, works end to end: `scripts/icosa-remote-demo.sh` runs
