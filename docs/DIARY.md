@@ -3498,3 +3498,62 @@ was tested. It took one cheap correlation to kill it. That is the same failure m
 recorded all week under a different name — a reading that explains the evidence is not thereby the
 cause — and it nearly got recorded as an answer. The rule that keeps working: nominate freely, but
 mark it a hypothesis in writing, and test it before it hardens into a belief.
+
+### 2026-07-26 (late) — The icosahedron is on the screen, and the slowness is fully accounted for
+
+The owner asked, fairly, why after all this time there had been no demo: no spinning solid, no vkcube,
+nothing originating on C and visible on S. The answer turned out to be one bug and one scoping
+decision, and both were ours.
+
+**The black window was never a presentation defect.** `FrameCapture` copies a blob's pixels at
+`BlobCreated`. Its doc explains why that is the right moment, and it is — *for a one-frame
+application*. Mesa creates the readback blob lazily at `vkMapMemory`, which for `rayland-refapp`
+happens **after** its single `vkCmdCopyImageToBuffer`, so the blob is born already holding a finished
+frame. `rayland-icosa-cpu` renders 120 frames into that same buffer, so its blob is born holding
+nothing. We were photographing the buffer before anything had been drawn into it, and the relay was
+correct the entire time — which is exactly what the earlier investigation concluded when it found the
+application's own PNGs on C intact and filed the window as an unexplained defect.
+
+**Two fixes failed before the third worked, and the failures are the useful part.** Re-reading the
+blob's live pages once per apply stalled the ring for 30 s and killed the run: a 256 KiB read of
+GPU-shared memory under the session lock. That is the **sixth** time this week an instrument became a
+participant in the thing it was measuring, and the first time it happened in shipped code rather than
+a diagnostic. Re-reading once *after* the session reads all zeroes, because the application has freed
+the buffer by then. What works is `LiveFrame`: accumulate the frame from the readback runs
+`progress_thread` **already** extracts and ships, gated on the fence that proves the submit and its
+copy complete. No second read of the mapping, and the bytes are known whole by construction.
+
+**The second half was scope, not a bug.** Presentation ran after `serve` returned — correct for one
+still frame, useless for a live one, because by then there is nothing left to follow. It now runs on
+its own thread beside the relay, and `rayland-present` grew `present_live`: an optional closure
+supplying subsequent frames, with the window re-arming a `wl_surface.frame` callback on each commit.
+With `None` it is byte-for-byte the old behaviour, which is what keeps `rayland-server` and the
+single-frame path honest.
+
+**It works.** `scripts/icosa-remote-demo.sh`, apollo → dop561: 120/120 frames, the icosahedron
+turning on the laptop's screen, computed on a machine that never touched a GPU. First attempt showed
+one frame and froze — the script had not created the output directory on C, so the fixture died
+writing `frame_0000.png` having rendered exactly once. A demo failing for a reason that has nothing
+to do with the system being demonstrated is its own small lesson.
+
+**On the honest reading of what was seen.** It ran at roughly 2 fps at 256×256, and it is worth
+writing down *why*, because "slow proof of concept" is the kind of phrase that hides whether anyone
+understands the slowness. Per frame this fixture ships **1 MiB up** (a CPU-computed fractal written
+into mapped memory with no interceptable call — the worst case it was built to be) and **256 KiB
+down**, the latter fragmenting into ~5000 one-byte messages. That is ~2.6 MB/s: nothing on a LAN. So
+it is not bandwidth-bound; it is bound by round trips and message count, both addressable. Its own
+sibling `rayland-icosa-gpu` draws the same picture with **80 bytes per frame**.
+
+And the size question has a pleasing answer: in a command-streaming design resolution is the GPU's
+problem, and the GPU is next to the display. 1920×1080 costs the same on the wire as 256×256 — *once
+pixels stop coming back*, which is precisely what WP0's token → `wl_buffer` path is for. Today S
+presents the application's readback buffer because it cannot see the `DEVICE_LOCAL` render target, so
+resolution costs bandwidth. That is a (c)1 scoping decision with a known exit, not a property of the
+architecture.
+
+The real ceiling is neither pixels nor bytes: it is **how many synchronous round trips the
+application makes**. The icosahedron animates because it runs a fixed schedule and never waits;
+vkcube times out in *setup* because it waits hundreds of times. Every latency mitigation Venus offers
+is currently disabled in every run we do (`VN_PERF=no_fence_feedback,no_semaphore_feedback,...`) —
+not as an oversight, but because feedback-on was loopback-only and was superseded during (c)2. That
+is unclaimed headroom with a known reason for being unclaimed, which is the most honest kind.
