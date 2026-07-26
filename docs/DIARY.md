@@ -2662,3 +2662,58 @@ comment that is actively wrong, and twice it was wrong to try it. The diary reco
 instance did not, by itself, prevent the second — it took a reviewer pointing at the diary's own
 sentence for the rule to actually bind. That is a point in favor of *rereading* the diary before
 declining a fix on scope grounds, not just writing it down and trusting the writing to stick.
+
+### 2026-07-26 — Task 4: the walker reaches past the size table, and a fixture the brief assumed does not exist
+
+Task 4 wired `venus_ring::decode` up to `rayland-venus-proto`: `decode_commands` now tries
+[`encoded_size`]'s fixed table first and, for anything it cannot express, falls back to
+`rayland_venus_proto::command_len` — Mesa's own generated decoder. `Truncated` from the borrowed
+decoder maps to `DecodeStop::Truncated`; anything else maps to the old `DecodeStop::UnknownCommandSize`,
+so the walk still refuses to guess, it just has far more to consult before it has to. The agreement
+test (`the_size_table_and_the_borrowed_decoder_agree`) confirms the table and the borrowed decoder give
+the identical 24-byte answer for `vkNotifyRingMESA`, the one command both can size — the cross-check
+this whole design rests on, and it held with no fuss.
+
+The brief's anchor test (Step 6) assumed a fixture called `CAPTURED_RING_COMMAND_STREAM` that would
+walk a real, multi-command stream all the way to `DecodeStop::ReachedEnd`. That constant does not exist
+anywhere in this repository, and neither does the data it would need: `captured.rs`'s one ring capture
+(2026-07-15) preserves only the first 100 of the 216 bytes the client had actually produced — enough to
+cover the three commands the fixed-size table already knew, plus one byte into `vkCreateInstance`, and
+no further. That is not a gap this task can quietly paper over by writing a bigger fixture from
+scratch: the whole point of a captured fixture, stated in this same file's provenance note, is that the
+bytes are an observation, never synthesized to make an assertion pass. So this task's anchor test could
+not be written as specified, and the honest thing was to say so rather than relax it to match what
+happens to be on hand.
+
+What actually happened when the walker was pointed at the real 100-byte capture (still using its
+existing test, `captured_ring_bytes_decode_as_venus_vulkan_commands`) turned out to be its own small
+finding: the stop at `vkCreateInstance` changed from `DecodeStop::UnknownCommandSize` to
+`DecodeStop::Truncated { offset: 88 }`. Before Task 4, that stop meant "this module does not know how to
+size this command." Now it means something more precise and more true: the borrowed decoder *does* know
+how, in principle — Mesa generates a real decoder for `vkCreateInstance` — it simply was not handed
+enough bytes, because the fixture's capture window ends at 100 while the client's writes did not. The
+walker got strictly more honest about *why* it stopped, even though the offset it stopped at did not
+move. That old assertion was pinning the size table's ceiling, not a requirement, and updating it (rather
+than leaving the walker unable to make this distinction) is exactly what the brief asked for when a
+pre-existing test turns out to have been testing a limitation.
+
+To still get positive evidence that the walker can reach `ReachedEnd` via the borrowed decoder on real
+bytes — the substance Step 6 was reaching for, even though its literal fixture doesn't exist — a
+different real capture already in this file was pressed into service: the 2026-07-19
+`vkGetDeviceQueue2` bytes (`CAPTURED_GET_DEVICE_QUEUE2`), captured whole with nothing before or after
+it. `vkGetDeviceQueue2` is deliberately excluded from `encoded_size`'s table (the walk was never
+expected to *reach* it, since variable-length commands precede it in a real session), so handing its 80
+bytes straight to `decode_commands` genuinely exercises the fallback: the table returns `None`, the
+borrowed decoder sizes it at 80, and the walk lands exactly on `stream.len()` — `ReachedEnd`, produced
+by Mesa's decoder rather than the table, on a real Venus client's bytes. That is the new test
+`the_borrowed_decoder_walks_a_real_variable_format_command_to_its_end`, and it is offered as what this
+task could actually prove with the fixtures on hand, not as a substitute that pretends to be the
+brief's original anchor.
+
+**What is still an open gap, recorded rather than quietly worked around:** nothing in this repository
+proves the walker can cross *several* variable-length commands in one real stream and land on
+`ReachedEnd` — every fixture here is either short (the 100-byte ring prefix) or exactly one command
+(the `vkGetDeviceQueue2` capture). That would need a fresh capture — the same `RAYLAND_RING_DUMP`
+diagnostic used in the 2026-07-15 spike, rerun against a workload and long enough to catch a ring after
+several full application commands, not just an init-only prefix — and is left for whenever that
+stronger proof is actually needed, rather than invented now to make a test title read cleanly.

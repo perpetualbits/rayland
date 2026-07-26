@@ -26,3 +26,6 @@ thiserror = { workspace = true }   # precise, typed error enum (EngineError) map
 # than nix/sendfd. Note this is a *syscall* dependency, not a GPU one: libc is present on every
 # target C could run on, including a headless RISC-V box.
 libc = { workspace = true }
+# Framing for command streams whose encoding is variable-length — everything the fixed-size table
+# below cannot express. DIAGNOSTIC ONLY: see that crate's docs and (c)1 spec §7.
+rayland-venus-proto = { path = "../rayland-venus-proto" }

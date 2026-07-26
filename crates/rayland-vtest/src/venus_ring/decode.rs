@@ -17,16 +17,23 @@
 //!
 //! This has a sharp consequence for any decoder, and it is why [`encoded_size`] returns an
 //! `Option`: a decoder that *guesses* a size does not merely mis-read one command, it loses the
-//! stream frame and every subsequent command is confident nonsense at a wrong offset. So this
-//! decoder knows a handful of sizes exactly, from Mesa's own headers, and **stops** the instant it
-//! meets a command it cannot size. Stopping early is a correct, honest answer. Guessing is not.
+//! stream frame and every subsequent command is confident nonsense at a wrong offset. Guessing is
+//! never acceptable. For a long time this meant [`decode_commands`] could only know a handful of
+//! sizes exactly, from Mesa's own headers, and had to **stop** the instant it met a command outside
+//! that handful — an honest but shallow answer that halted at a real application's very first
+//! command. `rayland-venus-proto` (Task 3 of this crate's own sub-project) lifted that ceiling: it
+//! borrows Mesa's own generated decoder — the same one virglrenderer runs — so [`decode_commands`]
+//! now asks the size table first (pure Rust, no C, and the independent cross-check the fixture
+//! tests rely on) and falls back to that borrowed decoder for anything the table cannot express.
+//! The "stop rather than guess" discipline is unchanged; what changed is how much can be *sized*
+//! before a guess would ever be needed.
 //!
 //! # Scope
 //! See the parent module's scope limits. In short: no ring-wrap handling (the input here is a
-//! **linear** slice, deliberately), no `vkExecuteCommandStreamsMESA` out-of-line streams, and a
-//! size table covering three command types. This decoder exists to prove that the ring's bytes are
-//! the Venus command language — a question it answers conclusively — not to consume a real
-//! workload.
+//! **linear** slice, deliberately), and no `vkExecuteCommandStreamsMESA` out-of-line streams (a
+//! command that points *out* of the ring at other shared memory has no bytes here to size, borrowed
+//! decoder or not). The fixed-size table still covers only three command types — see the module
+//! this decoder now delegates to for how far past those three it can actually reach.
 
 /// `VK_COMMAND_TYPE_vkCreateInstance_EXT`. Variable-size (it carries application name strings and
 /// an extension list), so [`encoded_size`] cannot size it and the decoder stops here.
@@ -117,16 +124,20 @@ pub struct RingCommand {
 ///
 /// Every variant is a normal outcome, not a failure: this decoder's honest answer to most real
 /// streams is "I got this far". Modelling that as an error type would misrepresent it — nothing has
-/// gone *wrong* when a decoder with three known command sizes meets a fourth command.
+/// gone *wrong* when neither the fixed-size table nor the borrowed Mesa decoder can size the next
+/// command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeStop {
     /// The walk consumed the slice exactly, landing on its final byte with no remainder. For a
     /// slice cut at the ring's `tail`, this is the ideal outcome: every produced byte was accounted
     /// for by a whole command, which is strong evidence the frame was never lost.
     ReachedEnd,
-    /// A command's type is not in [`encoded_size`]'s table, so its length — and therefore where the
-    /// next command begins — is unknowable. The walk stops rather than guess. On the captured
-    /// stream this fires at [`VK_COMMAND_TYPE_VK_CREATE_INSTANCE`].
+    /// A command's type is unsizeable by **both** [`encoded_size`]'s table and the borrowed
+    /// `rayland_venus_proto::command_len` — so its length, and therefore where the next command
+    /// begins, is unknowable by any means this crate has. The walk stops rather than guess. This is
+    /// now a rare outcome (it means this Mesa build generates no decoder for the command at all),
+    /// distinct from [`Truncated`](DecodeStop::Truncated), which means a decoder *could* size the
+    /// command but the slice does not hold all of it.
     UnknownCommandSize {
         /// Offset of the command that could not be sized.
         offset: usize,
@@ -166,12 +177,15 @@ pub enum DecodeStop {
 /// - Returns `Some(bytes)` for a command whose encoding is **fixed** and known, else `None`.
 ///
 /// # Failure modes / pitfalls
-/// `None` is not an error; see [`DecodeStop::UnknownCommandSize`]. Critically, `None` is also the
-/// right answer for a command this module *names* but cannot size:
+/// `None` is not an error and, since this crate started borrowing Mesa's own decoder
+/// (`rayland_venus_proto::command_len`), is not even necessarily the end of the walk: see
+/// [`decode_commands`], which tries that decoder before giving up with
+/// [`DecodeStop::UnknownCommandSize`]. Critically, `None` is also the right answer for a command
+/// this module *names* but does not itself size:
 /// [`VK_COMMAND_TYPE_VK_CREATE_INSTANCE`], [`VK_COMMAND_TYPE_VK_CREATE_RING_MESA`] and
 /// [`VK_COMMAND_TYPE_VK_EXECUTE_COMMAND_STREAMS_MESA`] are all variable-length. Recognising a
-/// command is not the same as being able to skip it, and conflating the two is how a decoder
-/// desynchronizes.
+/// command is not the same as being able to size it purely from this table, and conflating the two
+/// — returning a guessed size instead of `None` — is how a decoder desynchronizes.
 pub fn encoded_size(command_type: u32) -> Option<usize> {
     match command_type {
         // A `VkCommandStreamDescriptionMESA` passed by pointer: presence marker, then the struct's
@@ -217,6 +231,12 @@ fn read_u64_le(bytes: &[u8], offset: usize) -> Option<u64> {
 
 /// Walk a Venus command stream, returning every command it could size and why it stopped.
 ///
+/// Sizing tries [`encoded_size`]'s fixed-size table first — pure Rust, and the independent
+/// cross-check the fixture tests rely on — and, for anything the table cannot express, falls back
+/// to the borrowed `rayland_venus_proto::command_len`, which runs Mesa's own generated decoder. That
+/// fallback is what lets this walk continue past the three command types the table knows, which
+/// used to be where every real application's stream stopped (at its very first command).
+///
 /// # Inputs / outputs
 /// - `stream`: the bytes to walk, as a **linear** slice. Callers reading a live ring should pass
 ///   `&blob[RING_BUFFER_OFFSET..][..tail]` — see the pitfalls below before doing so.
@@ -225,9 +245,10 @@ fn read_u64_le(bytes: &[u8], offset: usize) -> Option<u64> {
 ///   may be more after the stop point that this module cannot reach.
 ///
 /// # Failure modes
-/// Cannot fail and cannot panic: every read is bounds-checked, and an unsizeable or incomplete
-/// command ends the walk with the corresponding [`DecodeStop`]. An empty slice yields no commands
-/// and [`DecodeStop::ReachedEnd`].
+/// Cannot fail and cannot panic: every read is bounds-checked (this module's own reads) or
+/// bounds-checked by the borrowed decoder (`rayland_venus_proto::command_len`'s own contract), and
+/// an unsizeable or incomplete command ends the walk with the corresponding [`DecodeStop`]. An empty
+/// slice yields no commands and [`DecodeStop::ReachedEnd`].
 ///
 /// # Pitfalls
 /// - **No wrap handling.** `stream` is linear. A real ring is circular and Mesa indexes it modulo
@@ -237,8 +258,14 @@ fn read_u64_le(bytes: &[u8], offset: usize) -> Option<u64> {
 /// - **Racing the writer.** A ring is being written *by another process* as you read it. Any
 ///   snapshot may be torn. Decoding past a torn `tail` is how you turn a race into a plausible-
 ///   looking command that never existed.
-/// - **The stop point is not the end of the stream.** [`DecodeStop::UnknownCommandSize`] means this
-///   module ran out of knowledge, not that the client ran out of commands.
+/// - **The stop point is not the end of the stream.** [`DecodeStop::UnknownCommandSize`] means
+///   *neither* the table *nor* the borrowed decoder could size the command — a rare event now that
+///   Mesa's own decoder is consulted — not that the client ran out of commands. A far more common
+///   non-`ReachedEnd` stop is now [`DecodeStop::Truncated`]: the borrowed decoder correctly *can*
+///   size the command in principle, but the slice does not hold all of its bytes (e.g. a captured
+///   window narrower than what the client actually produced).
+/// - **This is still diagnostic only.** Nothing decoded here — by the table or by the borrowed
+///   decoder — may inform a relay decision; see (c)1 spec §7 and `rayland_venus_proto`'s crate docs.
 pub fn decode_commands(stream: &[u8]) -> (Vec<RingCommand>, DecodeStop) {
     let mut commands = Vec::new();
     // Byte offset of the next command to decode; advanced by each command's own encoded size,
@@ -257,16 +284,33 @@ pub fn decode_commands(stream: &[u8]) -> (Vec<RingCommand>, DecodeStop) {
         else {
             return (commands, DecodeStop::Truncated { offset });
         };
-        // The whole reason this decoder is conservative: without a known size we cannot find the
-        // next command, and a guess would desynchronize every command after it.
-        let Some(encoded_size) = encoded_size(command_type) else {
-            return (
-                commands,
-                DecodeStop::UnknownCommandSize {
-                    offset,
-                    command_type,
-                },
-            );
+        // The fixed-size table answers first: it is pure Rust, needs no C, and covers the three
+        // commands this crate cares about most — including the doorbell. Where it cannot answer, ask
+        // Mesa's own decoder, which is the only thing that can frame a variable-length command.
+        // **Framing only.** Nothing decoded here may inform a relay decision; see (c)1 spec §7 and
+        // `rayland_venus_proto`'s crate docs.
+        let encoded_size = match encoded_size(command_type) {
+            Some(size) => size,
+            None => match rayland_venus_proto::command_len(&stream[offset..]) {
+                Ok(command) => command.len,
+                // The borrowed decoder ran out of bytes: the slice cuts through this command, which
+                // is the same condition virglrenderer reports as a "CS error".
+                Err(rayland_venus_proto::DecodeFault::Truncated) => {
+                    return (commands, DecodeStop::Truncated { offset });
+                }
+                // Neither the table nor Mesa can size it. Reported exactly as before, so this arm
+                // keeps its old meaning: this module ran out of knowledge, not the client out of
+                // commands.
+                Err(_) => {
+                    return (
+                        commands,
+                        DecodeStop::UnknownCommandSize {
+                            offset,
+                            command_type,
+                        },
+                    );
+                }
+            },
         };
         // The command is sizeable but its bytes are not all here — normal when decoding a captured
         // window, suspicious when decoding up to a live `tail`.
@@ -608,4 +652,34 @@ pub fn find_destroy_device(stream: &[u8], device_handle: u64) -> Option<usize> {
         offset += 4;
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The size table and the borrowed decoder must agree wherever both can answer. They are
+    /// independent — one is hand-derived from Mesa's `vn_sizeof_*`, the other is Mesa's own decoder —
+    /// so agreement is evidence and disagreement means one of them is wrong.
+    #[test]
+    fn the_size_table_and_the_borrowed_decoder_agree() {
+        // `vkNotifyRingMESA`: type, flags, ring handle, seqno, flags — the doorbell, and one of the
+        // three commands the table knows.
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&VK_COMMAND_TYPE_VK_NOTIFY_RING_MESA.to_le_bytes());
+        stream.extend_from_slice(&0u32.to_le_bytes());
+        stream.extend_from_slice(&0xdead_beefu64.to_le_bytes());
+        stream.extend_from_slice(&0u32.to_le_bytes());
+        stream.extend_from_slice(&0u32.to_le_bytes());
+
+        let from_table = encoded_size(VK_COMMAND_TYPE_VK_NOTIFY_RING_MESA)
+            .expect("the table knows the doorbell");
+        let from_decoder = rayland_venus_proto::command_len(&stream)
+            .expect("the borrowed decoder frames the doorbell")
+            .len;
+        assert_eq!(
+            from_table, from_decoder,
+            "the size table and Mesa's own decoder disagree about vkNotifyRingMESA"
+        );
+    }
 }
