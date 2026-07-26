@@ -3063,3 +3063,48 @@ decode does not reproduce (the dispatcher sets fatal on three distinct condition
 queue). After ten refuted theories on this stall, the next step is to check `find_destroy_device` against the
 decoded stream directly — a self-contained test, no live run required, since both the scanner and the decoder
 can be pointed at the same captured bytes.
+
+### 2026-07-26 — `find_destroy_device` is a false positive, proved by running it beside the decoder on identical bytes
+
+The contradiction from the previous entry is settled, and the signature scan is the one that was lying.
+
+Both were pointed at the same delta, in the same run, and the log states the verdict rather than leaving it to
+be cross-referenced by hand:
+
+```
+[ring-destroy] find_destroy_device FIRED at offset 6236 for device 0x5
+               — on a decoded command boundary: false (decoder says type=none); tail=18476
+```
+
+**Offset 6236 is not a command boundary.** The decoder walked that delta to `ReachedEnd` and found no command
+beginning there, so the scan's 16-byte pattern — `[type=12][flags=0][device_handle=0x5]` — matched **inside a
+payload**. S fired on it exactly once this run, which is precisely the one time it logs "application destroyed
+its device (vkDestroyDevice for device 5)".
+
+**The application never destroyed its device. S has been retiring its readback gate on a phantom.**
+
+**Why the scan was structurally vulnerable, and why it looked sound.** Its discriminator is a 64-bit device
+handle, which reads as very specific — a stray `12` alone would not match. But it slides over *arbitrary*
+positions rather than decoded boundaries, so it needs only that the two dwords immediately preceding some
+occurrence of the handle happen to be `12` and `0`. Device handles appear throughout a real stream (most
+commands take one), so the pattern gets many chances. `find_get_device_queue2` is built the same way and is
+under the same suspicion; it has not been checked.
+
+**This is not obviously the cause of the `vkQueueSubmit` failure**, and saying otherwise would be the eleventh
+theory this stall has produced. S retiring its *own* readback gate does not unregister an object inside
+virglrenderer, so the queue's disappearance still wants an explanation. What this is, is a real defect found
+*next to* the one being hunted — and one with its own consequences, since the readback gate is (c)2's
+completion machinery and it has been switching itself off spuriously.
+
+**The fix is now available in a way it was not before.** These scans exist *because* the walker could not
+reach past the first application command — `out_of_line.rs` and `decode.rs` both say so in as many words, and
+one of them argued a decode-based approach could never work "for every workload, forever" (retracted earlier
+today). That constraint is gone. A scan can now confirm its hit is a real decoded command boundary before
+believing it, which converts a heuristic into a check. Whether to fix the scan, replace it with a decode, or
+keep both and cross-check is a design question worth its own scoping rather than a patch at the end of a very
+long day.
+
+**Method note, because it is the fourth time this week.** The decoder was justified on one open question and
+has now answered two, the second of which nobody had asked. Instruments that report what is actually there
+keep finding defects nobody suspected; arguments about what must be there kept producing theories that
+measurement then killed. Ten refuted so far.

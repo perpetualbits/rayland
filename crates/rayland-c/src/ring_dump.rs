@@ -120,6 +120,43 @@ pub fn dump_if_enabled(pending: &RingDelta) {
             }
         }
     }
+    // **Is S's `find_destroy_device` telling the truth?** S logs "application destroyed its device"
+    // and acts on it (retiring the readback gate), but a full decode of this same stream finds no
+    // `vkDestroyDevice` at all. The two disagree, and they differ in kind: `find_destroy_device` is a
+    // sliding 16-byte pattern match (`[type=12][flags=0][device_handle]`) at arbitrary positions,
+    // while the walk above decodes commands at their real boundaries. Running both over the *same*
+    // bytes settles it — if the scan's hit is not one of the decoded offsets above, it matched inside
+    // a payload and S has been acting on a phantom.
+    //
+    // The device handle is remembered from whichever `vkGetDeviceQueue2` crossed earlier, because the
+    // scan needs it as its discriminator and it is the same handle S uses.
+    for cmd in &commands {
+        if cmd.command_type == VK_COMMAND_TYPE_VK_GET_DEVICE_QUEUE2 {
+            if let Some(device) = read_u64_at(&pending.bytes, cmd.offset + COMMAND_HEADER_BYTES) {
+                LAST_DEVICE_HANDLE.store(device, std::sync::atomic::Ordering::Relaxed);
+                eprintln!("[ring-queue] GetDeviceQueue2 @{} device handle {device:#x}", cmd.offset);
+            }
+        }
+    }
+    let device = LAST_DEVICE_HANDLE.load(std::sync::atomic::Ordering::Relaxed);
+    if device != 0 {
+        if let Some(hit) = rayland_vtest::venus_ring::decode::find_destroy_device(&pending.bytes, device) {
+            // The verdict, stated in the log so no one has to cross-reference by hand: a hit that is
+            // not a decoded command offset is a false positive by construction.
+            let on_boundary = commands.iter().any(|c| c.offset == hit);
+            let decoded_type = commands
+                .iter()
+                .find(|c| c.offset == hit)
+                .map_or("none".to_string(), |c| c.command_type.to_string());
+            eprintln!(
+                "[ring-destroy] find_destroy_device FIRED at offset {hit} for device {device:#x} \
+                 — on a decoded command boundary: {on_boundary} (decoder says type={decoded_type}); \
+                 tail={}",
+                pending.tail
+            );
+        }
+    }
+
     // **The multi-ring question.** Thread sampling on S found three `vkr-ring-1` threads where (c)1
     // spec §6 assumes one, and S never saw a second *inline* `vkCreateRingMESA` — so any extra ring
     // must be created inside the ring stream, which is exactly what this scans for. `decode_commands`
@@ -194,3 +231,11 @@ fn read_u64_at(bytes: &[u8], offset: usize) -> Option<u64> {
     // `try_into` cannot fail: the slice was just bounds-checked to exactly eight bytes.
     Some(u64::from_le_bytes(field.try_into().ok()?))
 }
+
+/// The most recent `VkDevice` handle seen crossing in a `vkGetDeviceQueue2`.
+///
+/// Held in a static because `find_destroy_device` needs the handle as its discriminator, and the
+/// destroy may arrive in a *later* delta than the queue acquisition — so the value has to outlive the
+/// call that learned it. Relaxed ordering is right: this is a diagnostic, a stale read costs at worst
+/// one unchecked delta, and the watcher is the only writer.
+static LAST_DEVICE_HANDLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
