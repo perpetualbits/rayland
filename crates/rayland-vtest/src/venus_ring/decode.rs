@@ -581,6 +581,41 @@ pub fn find_get_device_queue2(stream: &[u8]) -> Option<GetDeviceQueue2> {
     None
 }
 
+/// `VK_COMMAND_TYPE_vkImportSemaphoreResourceMESA_EXT` — Venus's WSI synchronisation path: it binds an
+/// existing `VkSemaphore` to a **virgl resource id**, so the compositor and the GPU can synchronise on
+/// a shared buffer rather than on a semaphore that only exists inside one process.
+///
+/// # Why this one is named here
+/// It is the command immediately preceding the `vkQueueSubmit` that vkcube fails on, and it is the only
+/// command in that frame whose argument is a *resource* rather than a Vulkan object — which matters
+/// because a resource is exactly the kind of thing that may exist on C and not on S while WP0's
+/// swapchain plumbing is incomplete. Named for recognition and diagnostics only; `encoded_size`
+/// deliberately does not size it (the borrowed decoder does that).
+pub const VK_COMMAND_TYPE_VK_IMPORT_SEMAPHORE_RESOURCE_MESA: u32 = 246;
+
+/// `VK_COMMAND_TYPE_vkCreateFence_EXT` and `_vkCreateSemaphore_EXT` — the two object *creations* whose
+/// ids the failing `vkQueueSubmit` names.
+///
+/// # Why these two, and why the id is the last eight bytes
+/// Venus object ids are chosen by the **client**, not the renderer: `vn_decode_vkCreateFence_args_temp`
+/// and `..._vkCreateSemaphore_args_temp` both end with `vn_decode_VkFence` / `vn_decode_VkSemaphore` —
+/// the *creation* form (not `_lookup`), carrying the client's chosen id — and it is decoded last. So the
+/// id is the command's final `u64`, exactly as for `vkGetDeviceQueue2`. Naming them here lets a
+/// diagnostic answer "was the handle this submit names ever created at all?" from the ring alone.
+pub const VK_COMMAND_TYPE_VK_CREATE_FENCE: u32 = 35;
+/// See [`VK_COMMAND_TYPE_VK_CREATE_FENCE`] — same shape, same reason.
+pub const VK_COMMAND_TYPE_VK_CREATE_SEMAPHORE: u32 = 40;
+
+/// `VK_COMMAND_TYPE_vkAllocateCommandBuffers_EXT` — the one creation whose ids the failing
+/// `vkQueueSubmit` names and which is **not** a single trailing handle.
+///
+/// # Shape, and why it needs its own treatment
+/// Unlike `vkCreateFence`/`vkCreateSemaphore`, this command creates *several* objects at once: its
+/// arguments end with a counted array, `[u64 count][count x u64 id]`, decoded by
+/// `vn_decode_VkCommandBuffer_temp` (the creation form). So "which command buffers exist" cannot be
+/// read off the last eight bytes — the whole trailing array has to be walked.
+pub const VK_COMMAND_TYPE_VK_ALLOCATE_COMMAND_BUFFERS: u32 = 88;
+
 /// `VK_COMMAND_TYPE_vkQueueSubmit_EXT` and `_vkQueueSubmit2_EXT` — the commands that submit rendering
 /// (and, for a readback frame, the copy-to-buffer) to the application's queue. Both encode an
 /// identical fixed prefix; [`find_queue_submit`] matches either. Source: `vn_protocol_driver_defines.h`.

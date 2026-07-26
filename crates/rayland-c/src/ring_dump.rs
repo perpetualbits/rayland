@@ -29,7 +29,9 @@ use rayland_c::ring::RingDelta;
 // number lives, and a second copy here could drift from it silently.
 use rayland_vtest::venus_ring::decode::{
     VK_COMMAND_TYPE_VK_DESTROY_DEVICE, VK_COMMAND_TYPE_VK_GET_DEVICE_QUEUE2,
-    VK_COMMAND_TYPE_VK_QUEUE_SUBMIT,
+    VK_COMMAND_TYPE_VK_ALLOCATE_COMMAND_BUFFERS, VK_COMMAND_TYPE_VK_CREATE_FENCE,
+    VK_COMMAND_TYPE_VK_CREATE_SEMAPHORE,
+    VK_COMMAND_TYPE_VK_IMPORT_SEMAPHORE_RESOURCE_MESA, VK_COMMAND_TYPE_VK_QUEUE_SUBMIT,
 };
 
 /// Width of a Venus command's `[type: u32][flags: u32]` prologue, so the first argument begins here.
@@ -98,7 +100,79 @@ pub fn dump_if_enabled(pending: &RingDelta) {
         if cmd.command_type == VK_COMMAND_TYPE_VK_QUEUE_SUBMIT {
             if let Some(id) = read_u64_at(&pending.bytes, cmd.offset + COMMAND_HEADER_BYTES) {
                 eprintln!("[ring-queue] submit @{} names queue id {id:#x}", cmd.offset);
+                // **The whole submit, verbatim.** Four of this workload's five submits are accepted
+                // by S and the fifth is refused with a silent CS error, while both decoders agree on
+                // the framing, every handle resolves (virglrenderer logs no `invalid object id`), and
+                // the failing delta's command sequence is structurally identical to the preceding
+                // frame's. What is left is a *field value*, so print the command's bytes and let a
+                // diff of the accepted against the refused one say which field it is. Small by
+                // construction — a `vkQueueSubmit` here is ~120 bytes — and only while dumping.
+                let end = (cmd.offset + cmd.encoded_size).min(pending.bytes.len());
+                let hex: String = pending.bytes[cmd.offset..end]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<Vec<_>>()
+                    .join("");
+                eprintln!("[ring-queue] submit @{} bytes({}) {hex}", cmd.offset, end - cmd.offset);
             }
+            // A submit is not any of the commands checked below, so stop here — as this loop did
+            // before the byte dump was added.
+            continue;
+        }
+        // The remaining creation the refused submit depends on. Its ids are a trailing counted
+        // array rather than one handle (see the constant's docs), so dump the bytes and let the
+        // array be walked offline — the accepted submit uses command buffer 0x18 and the refused one
+        // 0x19, and whether 0x19 was ever allocated is the open question.
+        if cmd.command_type == VK_COMMAND_TYPE_VK_ALLOCATE_COMMAND_BUFFERS {
+            let end = (cmd.offset + cmd.encoded_size).min(pending.bytes.len());
+            let hex: String = pending.bytes[cmd.offset..end]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join("");
+            eprintln!(
+                "[ring-alloccb] AllocateCommandBuffers @{} bytes({}) {hex}",
+                cmd.offset,
+                end - cmd.offset
+            );
+            continue;
+        }
+        // **Was the handle the failing submit names ever created?** Both creations carry the
+        // client-chosen id as their final `u64` (see the constants' docs), so recording them lets the
+        // submit's `wait`/`signal`/`fence` ids be checked against the set that actually crossed the
+        // ring — which distinguishes "S never created this object" from "S created it and rejected
+        // the submit for some other reason". Those need opposite fixes.
+        if cmd.command_type == VK_COMMAND_TYPE_VK_CREATE_SEMAPHORE
+            || cmd.command_type == VK_COMMAND_TYPE_VK_CREATE_FENCE
+        {
+            let kind = if cmd.command_type == VK_COMMAND_TYPE_VK_CREATE_SEMAPHORE {
+                "semaphore"
+            } else {
+                "fence"
+            };
+            let end = cmd.offset + cmd.encoded_size;
+            if let Some(id) = read_u64_at(&pending.bytes, end.wrapping_sub(8)) {
+                eprintln!("[ring-create] {kind} id {id:#x} created @{}", cmd.offset);
+            }
+            continue;
+        }
+        // **The command immediately before the failing submit.** `vkImportSemaphoreResourceMESA`
+        // binds a semaphore to a *virgl resource id* — this is Venus's WSI synchronisation path, and
+        // swapchain resources are precisely what WP0 has not finished plumbing to S. Its arguments
+        // are the semaphore it targets and the resource it names, so dump the bytes and let the
+        // resource id be checked against what S actually holds.
+        if cmd.command_type == VK_COMMAND_TYPE_VK_IMPORT_SEMAPHORE_RESOURCE_MESA {
+            let end = (cmd.offset + cmd.encoded_size).min(pending.bytes.len());
+            let hex: String = pending.bytes[cmd.offset..end]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join("");
+            eprintln!(
+                "[ring-import] ImportSemaphoreResource @{} bytes({}) {hex}",
+                cmd.offset,
+                end - cmd.offset
+            );
             continue;
         }
         // The queue the application created: `vn_decode_vkGetDeviceQueue2_args_temp` decodes
