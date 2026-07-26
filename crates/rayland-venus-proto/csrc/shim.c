@@ -24,6 +24,13 @@
 #define RAYLAND_VENUS_FAULT_TRUNCATED 1        /* the stream ended inside the command */
 #define RAYLAND_VENUS_FAULT_UNKNOWN_COMMAND 2  /* no generated decoder for this command type */
 #define RAYLAND_VENUS_FAULT_BAD_ARGS 3         /* caller passed a null or impossible slice */
+/* The command's bytes were all present; the 1 MiB scratch pool below (`RAYLAND_VENUS_TEMP_BYTES`)
+ * was too small to hold what the generated decoder needed to allocate while decoding it. Distinct
+ * from `_TRUNCATED` on purpose: virglrenderer's own pool cap is 1 GiB
+ * (`VKR_CS_DECODER_TEMP_POOL_MAX_SIZE`), 1000x this one, so a command a real renderer decodes fine
+ * could hit this here — reporting it as a truncated stream would be a wrong diagnosis, not merely an
+ * imprecise one. See `struct vkr_cs_decoder::pool_exhausted` in vkr_cs.h. */
+#define RAYLAND_VENUS_FAULT_TEMP_POOL_EXHAUSTED 4
 
 /* Scratch for decoded arrays. Sized generously against one command, never across commands: the
  * pool is reset per call, so nothing here outlives a single `rayland_venus_command_len`. */
@@ -46,8 +53,17 @@ rayland_venus_command_len(const uint8_t *bytes, size_t len, uint32_t *out_cmd_ty
    if (!bytes || !out_cmd_type || !out_len)
       return RAYLAND_VENUS_FAULT_BAD_ARGS;
 
-   /* The temp pool is a local: one command's arrays cannot outlive this frame, and a static would
-    * make the function non-reentrant for no gain. `_Alignas(8)` makes explicit the precondition
+   /* This IS a `_Thread_local static`: its bytes persist between calls on the same thread, rather
+    * than being freshly stack-allocated each time. That persistence is harmless because `temp_used`
+    * — the bump allocator's cursor, reset to 0 a few lines below, at the top of `dec`'s initializer —
+    * is what actually delimits "this call's" allocations; no call can ever read another call's
+    * leftover bytes, because nothing reads `temp` except through offsets below the current
+    * `temp_used`, and those are always freshly written before they are read. `_Thread_local` (not a
+    * plain `static`) is the part that is load-bearing: two threads may call
+    * `rayland_venus_command_len` concurrently (`rayland-c`'s ring watcher and `rayland_venus_proto`'s
+    * own tests both do), and a plain `static` would let them race over the same bytes and the same
+    * `temp_used` cursor — each thread's `_Thread_local` copy makes that impossible by construction,
+    * at zero cost to reentrancy. `_Alignas(8)` makes explicit the precondition
     * `vkr_cs_decoder_alloc_temp` (csrc/vkr_cs.h) trusts rather than checks: rounding `temp_used` up
     * to a multiple of 8 only yields an 8-byte-aligned *address* if `temp` itself already is one —
     * otherwise the rounding just preserves whatever misalignment the base pointer started with. This
@@ -61,6 +77,7 @@ rayland_venus_command_len(const uint8_t *bytes, size_t len, uint32_t *out_cmd_ty
       .temp = temp,
       .temp_size = sizeof(temp),
       .temp_used = 0,
+      .pool_exhausted = false, /* only an allocator (vkr_cs.h) ever sets this true */
    };
    /* The generated code takes the opaque `struct vn_cs_decoder *`; `vn_protocol_renderer_cs.h`
     * casts it straight back to ours, which is the contract that header documents. */
@@ -79,14 +96,22 @@ rayland_venus_command_len(const uint8_t *bytes, size_t len, uint32_t *out_cmd_ty
    VkCommandFlagsEXT cmd_flags;
    vn_decode_VkCommandTypeEXT(dec_public, &cmd_type);
    vn_decode_VkFlags(dec_public, &cmd_flags);
+   /* Only a short read can fail here: the prologue never allocates from `temp`, so `pool_exhausted`
+    * cannot be set yet — there is nothing for it to distinguish from at this point in the function. */
    if (dec.fatal)
       return RAYLAND_VENUS_FAULT_TRUNCATED;
    *out_cmd_type = (uint32_t)cmd_type;
 
 #include "decode_switch.inc"
 
-   if (dec.fatal)
+   if (dec.fatal) {
+      /* Check pool exhaustion FIRST: it is the more specific fact whenever both are true (which they
+       * always are here, since `vkr_cs_decoder_alloc_temp` sets both together) — see the field's doc
+       * comment on `struct vkr_cs_decoder` in vkr_cs.h for why the two must never be conflated. */
+      if (dec.pool_exhausted)
+         return RAYLAND_VENUS_FAULT_TEMP_POOL_EXHAUSTED;
       return RAYLAND_VENUS_FAULT_TRUNCATED;
+   }
 
    *out_len = (size_t)(dec.cur - bytes);
    return 0;

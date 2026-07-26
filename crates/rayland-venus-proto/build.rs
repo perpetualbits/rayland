@@ -22,6 +22,10 @@ fn main() {
         // drown the shim's own. Rayland's C is only `csrc/`.
         .flag_if_supported("-Wno-unused-parameter")
         .flag_if_supported("-Wno-missing-field-initializers")
-        .std("c99")
+        // `shim.c` uses `_Thread_local` and `_Alignas` (its per-thread scratch pool), both C11
+        // features. GCC accepts them under `-std=c99` as an extension, silently, but `-pedantic`
+        // would not — so `c99` was quietly relying on a compiler-specific leniency rather than the
+        // standard the flag names. `c11` is what the source actually requires.
+        .std("c11")
         .compile("rayland_venus_proto_shim");
 }

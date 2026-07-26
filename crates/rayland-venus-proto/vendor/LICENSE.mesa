@@ -1,0 +1,51 @@
+This directory (`vendor/venus-protocol/`) vendors generated and third-party header files under TWO
+separate, both permissive, licenses. Which license applies to which file is stated in an
+`SPDX-License-Identifier` comment at the top of that file itself — this file exists so the
+attribution is unmistakable at the directory level too, not to override anything any individual
+header says.
+
+# 1. MIT — Mesa's own generated `venus-protocol` headers
+
+Every `vn_protocol_renderer_*.h` file (the generated Venus protocol decoders this crate's `shim.c`
+drives — see `../README`-equivalent docs in `../csrc/shim.c` and the crate's own `src/lib.rs`) is
+MIT-licensed, copyright Google LLC (2020, 2022) and Collabora Ltd. (2022) — see each file's own
+header comment for its specific copyright line.
+
+    MIT License
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy of this software
+    and associated documentation files (the "Software"), to deal in the Software without
+    restriction, including without limitation the rights to use, copy, modify, merge, publish,
+    distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the
+    Software is furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all copies or
+    substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING
+    BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+    NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+    DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+# 2. Apache-2.0 — the Khronos Vulkan headers these decoders build against
+
+`vulkan.h`, `vulkan_core.h`, `vk_platform.h`, and every header under `vk_video/` are Khronos Group's
+own Vulkan headers (pulled in because the generated decoders speak in `Vk*` types), copyright
+2014-2025 / 2015-2025 The Khronos Group Inc., licensed Apache-2.0 — **not** MIT. Do not assume
+everything under `vendor/venus-protocol/` shares one license; these files are the exception, and
+their own `SPDX-License-Identifier: Apache-2.0` header says so.
+
+The full Apache License, Version 2.0 text is available at
+<https://www.apache.org/licenses/LICENSE-2.0> and is not reproduced in full here; per its own terms
+(§4), redistributing these files under Apache-2.0 requires only that recipients be given a copy of
+the License (that URL) and that any changed files be marked as changed — this project has not
+modified any of these headers (see `MESA_VERSION`'s "do not modify" rule).
+
+# Why both matter to this crate
+
+`rayland-venus-proto` is LGPL-3.0-or-later (see its own `Cargo.toml`). Both MIT and Apache-2.0 are
+permissive and compatible with linking into an LGPL crate; nothing here restricts how this crate may
+be built, used or distributed. This file exists purely so a reader — or a future license audit — does
+not have to grep every one of the 52 vendored headers to learn that two different upstream projects,
+under two different licenses, are represented in this one directory.

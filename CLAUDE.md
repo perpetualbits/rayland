@@ -129,7 +129,8 @@ A Cargo workspace of eighteen crates. Each declares its own license per the poli
   protocol but must never link a GPU stack (C is the weak, possibly headless, possibly
   RISC-V machine), and `rayland-c`'s `tests/no_gpu_linkage.rs` asserts `rayland-engine` is
   absent from its dependency tree. **The dependency arrow points `rayland-engine` →
-  `rayland-vtest`, and must never be reversed.** LGPL.
+  `rayland-vtest`, and must never be reversed.** LGPL, `publish = false` (its `rayland-venus-proto`
+  path dependency is itself unpublished; see that crate's `Cargo.toml` for the reasoning).
 - **`crates/rayland-venus-proto`** — **framing for Venus command streams**: how long is the command
   at the start of these bytes? It vendors Mesa's *generated* `venus-protocol` headers and compiles
   them against a replacement `vkr_cs.h` this crate writes itself, so the borrowed decoders run with

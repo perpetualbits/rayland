@@ -2718,6 +2718,38 @@ diagnostic used in the 2026-07-15 spike, rerun against a workload and long enoug
 several full application commands, not just an init-only prefix — and is left for whenever that
 stronger proof is actually needed, rather than invented now to make a test title read cleanly.
 
+### 2026-07-26 — Task 4 review round: retracting absolutist claims that Task 4 itself made false
+
+Task 4's review came back clean on substance but caught something worth recording on its own: several
+comments elsewhere in `venus_ring` were still asserting, in the present tense, that a decode-based walk
+can **never** get past a session's second command — "for every workload, forever", "cannot reach",
+"would never reach". That was true right up until Task 4 landed the borrowed-decoder fallback earlier
+the same day, and false the moment it did, and nobody had gone back to say so. This is exactly the
+"belief later overturned" case CLAUDE.md's diary rule cares most about, and it very nearly went
+unrecorded: the fix (`325e9f0`) touched four files — `out_of_line.rs`'s module docs and the test that
+specifically pinned the absolute claim, `decode.rs`'s docs on `VK_COMMAND_TYPE_VK_CREATE_INSTANCE`,
+`VK_COMMAND_TYPE_VK_GET_DEVICE_QUEUE2` and `find_get_device_queue2`, and `mod.rs`'s scope-limits
+bullet — and changed no code behaviour at all, only what the comments claimed was true.
+
+The correction is precise, not a blanket softening: the walker's blind spot is now **conditional**
+rather than **closed**. A decode-based scan's reach is only ever as good as every command ahead of it
+decoding without fault, and this crate's own fixtures already show both `Truncated` and
+`UnknownCommandSize` occurring on genuine captured data — so "it might still stop early" remains true,
+just not for the reason ("no decoder exists past command two") the stale comments gave. The dword scan
+`out_of_line.rs` actually uses for the multi-ring question is kept for the same reason it always was:
+its correctness does not depend on how far the linear walk can get, which is what makes it sound
+regardless of whether this particular gap is open or closed on any given day.
+
+Two minor corrections rode along: `DecodeStop::UnknownCommandSize`'s doc now notes it also catches
+`DecodeFault::BadArgs` via `decode_commands`'s `Err(_)` catch-all (distinct from "no decoder exists" —
+today unreachable in practice, but the doc should say what the code actually does, not just its common
+case), and `vkGetDeviceQueue2`'s doc got the same present-tense fix as the rest.
+
+**What we now believe:** the sub-project's own docs are not exempt from the staleness this whole
+review pass exists to catch, and "no code behaviour changed" is not a reason to skip writing this
+down — cargo test -p rayland-vtest stayed at 58 passed, 0 failed (plus `no_gpu_linkage`, 1 passed)
+before and after, and the entry that matters here is the retraction, not a diff.
+
 ### 2026-07-26 — Task 5: closing the loop — a test with teeth, a guard re-read rather than assumed, and the docs this work makes false
 
 Task 5 was the last task of this sub-project, and its job was not to add capability but to make the

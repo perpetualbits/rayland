@@ -55,6 +55,20 @@ pub enum DecodeFault {
         /// The type read from the prologue, so a caller can name what stopped it.
         command_type: u32,
     },
+    /// The command's bytes were all present; the shim's 1 MiB scratch pool (`csrc/shim.c`'s `temp`)
+    /// was too small to hold what Mesa's generated decoder needed to allocate while decoding it.
+    ///
+    /// # Do not confuse this with [`Truncated`](DecodeFault::Truncated)
+    /// The two look similar from the caller's side — both stop the walk — but they mean opposite
+    /// things about the *stream*. `Truncated` means the bytes genuinely ran out: the command is
+    /// incomplete, and a caller walking a live ring should treat that as a real red flag (see
+    /// `venus_ring::decode::DecodeStop::Truncated`'s own docs). `TempPoolExhausted` means the bytes
+    /// were fine — the command could have been decoded in full — but this crate's own scratch arena
+    /// was the limiting factor, not the wire. virglrenderer itself caps the equivalent pool at 1 GiB
+    /// (`VKR_CS_DECODER_TEMP_POOL_MAX_SIZE`), a thousand times this shim's 1 MiB, so a command the
+    /// real renderer decodes without complaint could legitimately hit this here. Reporting it as
+    /// `Truncated` would tell a caller "the stream is broken" about a stream that is not.
+    TempPoolExhausted,
     /// The shim rejected its arguments. Unreachable from this wrapper, which always passes a valid
     /// slice and valid out-params; present because the C contract admits it.
     BadArgs,
@@ -89,6 +103,22 @@ pub fn command_len(stream: &[u8]) -> Result<Command, DecodeFault> {
     // storage whose *bytes* persist between calls, but its `temp_used` bump-allocator cursor is
     // reset to zero at the top of every call, so no call can ever observe a previous call's
     // allocations — the persistence is an implementation detail of the arena, not shared state.
+    //
+    // AUDITED, NOT ASSUMED — "writes only through the out-params" rests on one further fact that is
+    // not visible from this file: `vkr_cs_decoder_get_blob_storage` (csrc/vkr_cs.h) casts away
+    // `const` and hands the generated decoder a pointer straight into `stream`'s own bytes — a
+    // *writable* alias into what Rust sees as an immutable `&[u8]`. That is safe only because, as of
+    // virglrenderer 1.2.0, every one of the six generated call sites that receive this pointer
+    // immediately follows the pattern `if (!p) return; vn_decode_blob_array(dec, p, size)`, and
+    // `vn_decode_blob_array` special-cases `dst == src` into a no-op (see `vkr_cs_decoder_read`'s
+    // aliasing guard) — so nothing ever actually writes through it today. This is a property of the
+    // *vendored headers*, not of this crate's own code, and it has no test that would catch a future
+    // Mesa version violating it: **re-audit this on every `vendor/venus-protocol` bump** (see
+    // `vendor/MESA_VERSION`'s update checklist). If a future generated decoder ever writes through
+    // this pointer, this SAFETY comment becomes false and this function silently mutates a Rust
+    // caller's immutable borrow — and on the `RAYLAND_RING_DUMP` path those same bytes are relayed
+    // moments later, which is exactly the diagnostic-becomes-corruption failure this crate exists to
+    // prevent. See the matching note on `vkr_cs_decoder_get_blob_storage` in csrc/vkr_cs.h.
     let rc = unsafe {
         rayland_venus_command_len(stream.as_ptr(), stream.len(), &mut command_type, &mut len)
     };
@@ -98,6 +128,11 @@ pub fn command_len(stream: &[u8]) -> Result<Command, DecodeFault> {
         1 => Err(DecodeFault::Truncated),
         // `RAYLAND_VENUS_FAULT_UNKNOWN_COMMAND` in `csrc/shim.c`: no generated decoder for this type.
         2 => Err(DecodeFault::UnknownCommand { command_type }),
+        // `RAYLAND_VENUS_FAULT_TEMP_POOL_EXHAUSTED` in `csrc/shim.c`: the command's bytes were all
+        // present, but this crate's own 1 MiB scratch pool was too small — a fault about this
+        // crate's arena, not about the stream. See `DecodeFault::TempPoolExhausted`'s doc comment
+        // for why this must never collapse into `Truncated`.
+        4 => Err(DecodeFault::TempPoolExhausted),
         // Any other code is a shim contract violation (`RAYLAND_VENUS_FAULT_BAD_ARGS`, or anything
         // undocumented). Reported as `BadArgs` rather than panicking: a diagnostic that aborts the
         // process is worse than one that says it does not know.
@@ -258,5 +293,33 @@ mod tests {
         let cmd = command_len(&stream).expect("a decodable command");
         assert_eq!(cmd.command_type, 63);
         assert_eq!(cmd.len, 48);
+    }
+
+    /// `vkResetFences` with a `fenceCount` chosen to overrun the shim's 1 MiB temp pool, without
+    /// needing anywhere near 1 MiB of actual stream bytes.
+    ///
+    /// # Why this stream is cheap to construct
+    /// `vn_decode_vkResetFences_args_temp` (`vendor/venus-protocol/vn_protocol_renderer_fence.h`)
+    /// allocates `sizeof(VkFence) * fenceCount` bytes from the temp pool *before* it reads a single
+    /// handle out of the stream — so exhaustion is visible the moment the array-size field is
+    /// decoded, and the function returns immediately on the `if (!args->pFences) return;` guard
+    /// without ever touching `fenceCount * 8` bytes of handle data that this test never provides.
+    /// `sizeof(VkFence)` is 8 on every 64-bit build (`VK_DEFINE_NON_DISPATCHABLE_HANDLE`), so
+    /// `200_000 * 8 = 1_600_000` bytes requested against a `1 << 20 = 1_048_576`-byte pool overruns
+    /// it by a wide, comfortable margin — no edge-case rounding to get right.
+    ///
+    /// Layout: `[type=37][flags]` (prologue, 8) + `[device u64]` (8) + `[fenceCount u32=200_000]` (4)
+    /// + `[array_size u64=200_000]` (8, must equal `fenceCount`) = 28 bytes total. The command type
+    /// 37 is `VK_COMMAND_TYPE_vkResetFences_EXT`
+    /// (`vendor/venus-protocol/vn_protocol_renderer_defines.h`).
+    #[test]
+    fn a_command_whose_array_overruns_the_temp_pool_is_a_distinct_fault() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&37u32.to_le_bytes()); // command type: vkResetFences
+        stream.extend_from_slice(&0u32.to_le_bytes()); // flags
+        stream.extend_from_slice(&0x7777_7777_7777_7777u64.to_le_bytes()); // device handle
+        stream.extend_from_slice(&200_000u32.to_le_bytes()); // fenceCount
+        stream.extend_from_slice(&200_000u64.to_le_bytes()); // array_size, must match fenceCount
+        assert_eq!(command_len(&stream), Err(DecodeFault::TempPoolExhausted));
     }
 }

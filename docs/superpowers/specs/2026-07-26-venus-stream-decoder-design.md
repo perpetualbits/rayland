@@ -88,6 +88,15 @@ The decisive argument against both generators is that they create a **second sou
 Rayland does not own**. When it diverges from Mesa's — and it will, at some Mesa release — the symptom is a
 decoder that confidently reports the wrong thing. Borrowing cannot diverge.
 
+**A qualification on that "none," recorded rather than left as an unconditional claim:** the drift risk is
+none only for as long as the vendored `venus-protocol` tree, the virglrenderer S actually links, and the
+Venus ICD C actually runs are all the same protocol version. That holds today by construction — S and C both
+run against the Mesa this workspace pins — but it is not a law of the approach, only a fact about the current
+deployment. The one way this design *could* still return a plausible wrong length is a newer ICD speaking a
+protocol revision this vendored copy predates (a field added to a command this crate's table or borrowed
+decoder does not yet know to expect); see `vendor/MESA_VERSION`'s update checklist for what re-vendoring must
+re-verify before that risk is closed again.
+
 The cost of borrowing is honest and stated below: a second C dependency, and a crate whose "no dependencies
 but `libc` and `thiserror`" property changes.
 

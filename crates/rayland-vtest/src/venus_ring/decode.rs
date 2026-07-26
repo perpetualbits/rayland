@@ -172,6 +172,23 @@ pub enum DecodeStop {
         /// Offset at which the incomplete command begins.
         offset: usize,
     },
+    /// The command's bytes were all present, but the borrowed decoder's own 1 MiB scratch pool
+    /// (`rayland-venus-proto`'s `csrc/shim.c`) was too small for what it needed to decode this
+    /// command's arguments — [`rayland_venus_proto::DecodeFault::TempPoolExhausted`], passed through
+    /// verbatim rather than folded into [`Truncated`](DecodeStop::Truncated).
+    ///
+    /// # Why this is not `Truncated`
+    /// `Truncated` means the *stream* ran out of bytes — a real red flag when it happens at a ring's
+    /// live `tail`. This means the stream was fine and this crate's own arena was the limit:
+    /// virglrenderer's equivalent pool is 1000x larger, so a command a real renderer decodes without
+    /// complaint could still land here. Collapsing the two would misreport an arena-sizing fact
+    /// about this diagnostic tool as a claim about the relay being broken.
+    TempPoolExhausted {
+        /// Offset of the command whose decode exhausted the pool.
+        offset: usize,
+        /// Its `VkCommandTypeEXT`, so the caller can say which command needed more scratch space.
+        command_type: u32,
+    },
 }
 
 /// The encoded size, in bytes, of a Venus command — or `None` if this module cannot size it.
@@ -281,6 +298,10 @@ fn read_u64_le(bytes: &[u8], offset: usize) -> Option<u64> {
 ///   non-`ReachedEnd` stop is now [`DecodeStop::Truncated`]: the borrowed decoder correctly *can*
 ///   size the command in principle, but the slice does not hold all of its bytes (e.g. a captured
 ///   window narrower than what the client actually produced).
+/// - **A pool-exhaustion stop is not a broken stream.** [`DecodeStop::TempPoolExhausted`] means the
+///   borrowed decoder's own scratch arena was too small for this command's arguments — the bytes
+///   were all present and well-formed. Do not treat it as evidence of a corrupt or torn ring; it is
+///   a fact about this diagnostic tool's arena size, not about the relay.
 /// - **This is still diagnostic only.** Nothing decoded here — by the table or by the borrowed
 ///   decoder — may inform a relay decision; see (c)1 spec §7 and `rayland_venus_proto`'s crate docs.
 pub fn decode_commands(stream: &[u8]) -> (Vec<RingCommand>, DecodeStop) {
@@ -314,6 +335,18 @@ pub fn decode_commands(stream: &[u8]) -> (Vec<RingCommand>, DecodeStop) {
                 // is the same condition virglrenderer reports as a "CS error".
                 Err(rayland_venus_proto::DecodeFault::Truncated) => {
                     return (commands, DecodeStop::Truncated { offset });
+                }
+                // The stream was fine; the borrowed decoder's own scratch pool was not. A distinct
+                // stop so a caller never mistakes an arena-sizing limit for a broken relay — see
+                // `DecodeStop::TempPoolExhausted`'s doc comment.
+                Err(rayland_venus_proto::DecodeFault::TempPoolExhausted) => {
+                    return (
+                        commands,
+                        DecodeStop::TempPoolExhausted {
+                            offset,
+                            command_type,
+                        },
+                    );
                 }
                 // Neither the table nor Mesa can size it. Reported exactly as before, so this arm
                 // keeps its old meaning: this module ran out of knowledge, not the client out of
@@ -700,6 +733,39 @@ mod tests {
         assert_eq!(
             from_table, from_decoder,
             "the size table and Mesa's own decoder disagree about vkNotifyRingMESA"
+        );
+    }
+
+    /// `decode_commands` must pass `rayland_venus_proto::DecodeFault::TempPoolExhausted` through as
+    /// its own [`DecodeStop`] variant, not fold it into [`DecodeStop::UnknownCommandSize`] (which
+    /// would misreport an arena limit as "no decoder exists") or
+    /// [`DecodeStop::Truncated`] (which would misreport it as a broken stream).
+    ///
+    /// Stream: `vkResetFences` (type 37) with a `fenceCount` of 200,000 — `sizeof(VkFence) *
+    /// fenceCount = 1_600_000` bytes requested against the borrowed decoder's `1 << 20 =
+    /// 1_048_576`-byte temp pool. See `rayland-venus-proto`'s own
+    /// `a_command_whose_array_overruns_the_temp_pool_is_a_distinct_fault` test for why this
+    /// particular command and count are cheap to construct: the allocation is requested, and fails,
+    /// before a single fence handle is read, so no stream bytes beyond the array-size field are
+    /// needed.
+    #[test]
+    fn a_pool_exhausting_command_is_reported_distinctly_from_unknown_and_truncated() {
+        const VK_COMMAND_TYPE_VK_RESET_FENCES: u32 = 37;
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&VK_COMMAND_TYPE_VK_RESET_FENCES.to_le_bytes());
+        stream.extend_from_slice(&0u32.to_le_bytes()); // flags
+        stream.extend_from_slice(&0x7777_7777_7777_7777u64.to_le_bytes()); // device handle
+        stream.extend_from_slice(&200_000u32.to_le_bytes()); // fenceCount
+        stream.extend_from_slice(&200_000u64.to_le_bytes()); // array_size, must match fenceCount
+
+        let (commands, stop) = decode_commands(&stream);
+        assert!(commands.is_empty(), "the pool-exhausting command itself is never recorded");
+        assert_eq!(
+            stop,
+            DecodeStop::TempPoolExhausted {
+                offset: 0,
+                command_type: VK_COMMAND_TYPE_VK_RESET_FENCES,
+            }
         );
     }
 }

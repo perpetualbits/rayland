@@ -35,6 +35,14 @@ struct vkr_cs_encoder {
    int unused;
 };
 
+/*
+ * Part of the documented contract: the generated code calls this before writing a reply, the way a
+ * real host would acquire exclusive access to its encoder buffer before touching it.
+ *
+ * Always returns `true` ("go ahead") because this crate has no encoder buffer to contend over — see
+ * `struct vkr_cs_encoder`'s own comment. Returning `false` would tell the generated caller to abandon
+ * the encode, which is not this crate's call to make (never dereferences `enc`, never fails).
+ */
 static inline bool
 vkr_cs_encoder_acquire(struct vkr_cs_encoder *enc)
 {
@@ -42,6 +50,11 @@ vkr_cs_encoder_acquire(struct vkr_cs_encoder *enc)
    return true;
 }
 
+/*
+ * The release half of `vkr_cs_encoder_acquire`'s pair, called once the generated code is done
+ * writing a reply. A no-op for the same reason `acquire` always succeeds: there is no real encoder
+ * buffer here for anything to release.
+ */
 static inline void
 vkr_cs_encoder_release(struct vkr_cs_encoder *enc)
 {
@@ -69,12 +82,32 @@ vkr_cs_encoder_write(struct vkr_cs_encoder *enc, size_t size, const void *val, s
 struct vkr_cs_decoder {
    const uint8_t *cur;   /* next byte to read */
    const uint8_t *end;   /* one past the last readable byte */
-   bool fatal;           /* set when a read would pass `end`; never cleared except by reset */
+   bool fatal;           /* set when a read would pass `end`; nothing in this header ever clears it
+                          * back to false — a persistent virglrenderer decoder would need its own
+                          * reset between commands, but this crate never reuses one: shim.c builds a
+                          * fresh `struct vkr_cs_decoder` (with `fatal = false`) per call instead */
    uint8_t *temp;        /* bump-allocated scratch for decoded arrays */
    size_t temp_size;     /* capacity of `temp` */
    size_t temp_used;     /* bytes handed out so far */
+   /* Set ONLY by `vkr_cs_decoder_alloc_temp`/`_alloc_temp_array` (never by a short-read bounds
+    * check), and ONLY alongside `fatal`. Its whole purpose is to let the shim tell "this command's
+    * *bytes* ran out" (a genuine `Truncated`) apart from "this command's bytes were all present, but
+    * the 1 MiB scratch pool this crate hands the generated decoders was too small to hold what it
+    * needed to decode them" — a fault about THIS crate's arena size, not about the stream. Conflating
+    * the two would misreport a command a real, 1 GiB-pooled virglrenderer decodes without complaint
+    * as a truncated stream, which is the one diagnosis this crate exists to get right. See
+    * `RAYLAND_VENUS_FAULT_TEMP_POOL_EXHAUSTED` in shim.c and `DecodeFault::TempPoolExhausted` in
+    * src/lib.rs. */
+   bool pool_exhausted;
 };
 
+/*
+ * Raise the decoder's sticky fault flag: the one thing every generated decoder does instead of
+ * returning an error when a read would run past `dec->end`, or (via `vkr_cs_decoder_alloc_temp`)
+ * when the temp pool cannot satisfy an allocation. See `struct vkr_cs_decoder::fatal`'s own comment:
+ * nothing in this header ever clears it back to false, including `vkr_cs_decoder_reset_temp_pool`,
+ * which resets only `temp_used` — this crate instead starts every call with a brand-new decoder.
+ */
 static inline void
 vkr_cs_decoder_set_fatal(const struct vkr_cs_decoder *dec)
 {
@@ -83,6 +116,14 @@ vkr_cs_decoder_set_fatal(const struct vkr_cs_decoder *dec)
    ((struct vkr_cs_decoder *)dec)->fatal = true;
 }
 
+/*
+ * Part of the documented contract: the generated `vn_dispatch_vk*` wrappers (in every per-command
+ * header, e.g. `vn_protocol_renderer_host_copy.h`) call this after decoding to decide whether to
+ * generate a reply or log a result. This shim never calls those wrappers — it calls each
+ * `vn_decode_<command>_args_temp` directly and reads `dec->fatal` off the struct itself (see
+ * `shim.c`) — but the generated headers still declare and use this function elsewhere in the same
+ * translation unit, so it must exist and behave correctly for the vendored tree to compile.
+ */
 static inline bool
 vkr_cs_decoder_get_fatal(const struct vkr_cs_decoder *dec)
 {
@@ -106,6 +147,16 @@ vkr_cs_decoder_lookup_object(const struct vkr_cs_decoder *dec, vkr_object_id id,
    return NULL;
 }
 
+/*
+ * Part of the documented contract: the generated `vn_dispatch_vk*` wrappers call this between a
+ * command's decode and its reply, to let a *persistent* decoder's per-command arrays be reused for
+ * the next command. This shim's call graph never reaches those wrappers (see
+ * `vkr_cs_decoder_get_fatal`'s comment, above, for why), so nothing in this crate ever calls this
+ * function: `shim.c` gives every call to `rayland_venus_command_len` a brand-new `struct
+ * vkr_cs_decoder` with `temp_used = 0` already, so there is never a stale pool here to reset. Resets
+ * ONLY `temp_used`, deliberately not `fatal` — see `struct vkr_cs_decoder::fatal`'s own comment for
+ * why conflating the two would be wrong even on a decoder that does reach this function.
+ */
 static inline void
 vkr_cs_decoder_reset_temp_pool(struct vkr_cs_decoder *dec)
 {
@@ -174,6 +225,18 @@ vkr_cs_handle_indirect_id(VkObjectType type)
  * direct types, `*handle` IS the storage: the id is written into the slot itself, reinterpreted as a
  * pointer-sized value. Neither branch touches the byte cursor; this manages only the in-memory shape
  * of a fabricated handle and has no bearing on `command_len`.
+ *
+ * KNOWN DEVIATION FROM UPSTREAM, NOT A PARITY CLAIM: the direct branch below writes `id` through a
+ * `uintptr_t` cast — a **pointer-width** store — whereas virglrenderer's own `vkr_cs.h` writes the
+ * direct case exactly like the indirect one, `*(vkr_object_id *)handle = id`, a full 64-bit store
+ * regardless of pointer width. The two are identical on every 64-bit build (`sizeof(uintptr_t) ==
+ * sizeof(vkr_object_id) == 8`), which is the only target this crate builds for today — but on a
+ * hypothetical 32-bit build, this version would silently truncate a direct handle's id to 32 bits
+ * where upstream (and this file's own `vkr_cs_handle_load_id`, below, and `vkr_cs_handle_indirect_id`
+ * above) stay exactly correct. Since nothing this crate produces is ever dereferenced as a real
+ * pointer (`vkr_cs_decoder_lookup_object` always returns NULL) the truncation cannot corrupt a byte
+ * count either way, but it should be fixed to the full-width store before this crate is ever built
+ * for a 32-bit target.
  */
 static inline void
 vkr_cs_handle_store_id(void **handle, vkr_object_id id, VkObjectType type)
@@ -223,6 +286,10 @@ vkr_cs_decoder_alloc_temp(struct vkr_cs_decoder *dec, size_t size)
 {
    const size_t aligned = (dec->temp_used + 7u) & ~(size_t)7u;
    if (aligned > dec->temp_size || size > dec->temp_size - aligned) {
+      /* The pool itself is too small for this request — not a short stream. `pool_exhausted` records
+       * that distinction for `shim.c` to report as `RAYLAND_VENUS_FAULT_TEMP_POOL_EXHAUSTED` rather
+       * than `_TRUNCATED`; see the field's doc comment on `struct vkr_cs_decoder`, above. */
+      dec->pool_exhausted = true;
       vkr_cs_decoder_set_fatal(dec);
       return NULL;
    }
@@ -245,6 +312,14 @@ vkr_cs_decoder_alloc_temp(struct vkr_cs_decoder *dec, size_t size)
  * `memcpy` with overlapping (here: identical) source and destination is undefined behaviour, so the
  * `dec->cur != val` guard below — copied from virglrenderer's own `vkr_cs_decoder_read`/`_peek` for
  * exactly this reason — skips the copy entirely when it would alias.
+ *
+ * DELIBERATE DEVIATION FROM UPSTREAM: virglrenderer's own `vkr_cs_decoder_read` asserts
+ * `val_size <= size` and then copies `val_size` bytes unconditionally; this version instead clamps
+ * with `val_size < size ? val_size : size` and copies whichever is smaller, silently, with no assert.
+ * That is a strictly safer choice for a decode-only shim with no real caller to catch an assert
+ * (an assert here would turn a hypothetical generated-code/header mismatch into a process abort in a
+ * diagnostic tool), but it is a real behavioural difference from the header this file otherwise
+ * mirrors closely, worth knowing if this function is ever compared line-by-line against upstream.
  */
 static inline void
 vkr_cs_decoder_read(struct vkr_cs_decoder *dec, size_t size, void *val, size_t val_size)
@@ -321,7 +396,11 @@ static inline void *
 vkr_cs_decoder_alloc_temp_array(struct vkr_cs_decoder *dec, size_t size, size_t count)
 {
    if (count != 0 && size > (size_t)-1 / count) {
-      /* size * count would overflow size_t; treat exactly like any other exhausted allocation. */
+      /* size * count would overflow size_t. Reported as pool exhaustion, not truncation: a `count`
+       * this large can only come from a stream that is corrupt or hostile (no real Venus encoder
+       * emits an array this size), and the honest fault here is "this request cannot be satisfied by
+       * any pool", which is exactly what `pool_exhausted` means — not "the stream ran out of bytes". */
+      dec->pool_exhausted = true;
       vkr_cs_decoder_set_fatal(dec);
       return NULL;
    }
@@ -364,6 +443,22 @@ vkr_cs_decoder_alloc_temp_array(struct vkr_cs_decoder *dec, size_t size, size_t 
  * code immediately "decodes" this blob by reading from `dec->cur` into the very pointer we just
  * returned, i.e. `dst == src`, and that guard is what makes the resulting memcpy well-defined instead
  * of UB.
+ *
+ * AUDITED, NOT GUARANTEED BY THE TYPE SYSTEM: this function's caller on the Rust side
+ * (`rayland_venus_proto::command_len`, src/lib.rs) hands `dec->cur` an address that ultimately points
+ * into a Rust `&[u8]` — an IMMUTABLE borrow. Returning `dec->cur` from here as a non-const `void *`
+ * is only sound because nothing downstream ever writes through it: at virglrenderer 1.2.0, every one
+ * of the six generated call sites that call this function immediately does
+ * `if (!p) return; vn_decode_blob_array(dec, p, size)`, and `vn_decode_blob_array` bottoms out in
+ * `vkr_cs_decoder_read`, whose `dec->cur != val` guard turns a same-address call into a no-op rather
+ * than a write. **This is a fact about the vendored headers, true today, not an invariant this file
+ * can enforce** — nothing here stops a future Mesa release from generating a decoder that writes
+ * through a blob-storage pointer for some new command. RE-VERIFY THIS ON EVERY `venus-protocol`
+ * VENDOR BUMP (see `vendor/MESA_VERSION`'s update checklist): a write here would silently mutate the
+ * Rust caller's supposedly-immutable slice, and on the `RAYLAND_RING_DUMP` diagnostic path those same
+ * bytes are relayed to the network moments later — turning a decoding bug into a corruption bug,
+ * which is precisely what this crate's diagnostic-only contract forbids. See the matching note on
+ * the SAFETY comment in src/lib.rs.
  */
 static inline void *
 vkr_cs_decoder_get_blob_storage(struct vkr_cs_decoder *dec, size_t size)
