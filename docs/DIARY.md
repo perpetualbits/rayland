@@ -2943,3 +2943,69 @@ diagnostic tool is the whole cost of being wrong. It is now a distinct fault end
 session's work, and the reason all of this exists: to ask whether a published `tail` can fall mid-command, or
 whether part of that submit lives outside the ring behind a `vkExecuteCommandStreamsMESA`. The instrument is
 built and guarded; the question is still open.
+
+### 2026-07-26 — The decoder pays for itself in one run: "CS error" never meant truncation, and the submit's *queue* is what S cannot find
+
+The stream decoder was built to answer one question. Pointed at the failing submit, it answered it, refuted
+both standing hypotheses, and overturned the premise its own design spec was written on — all from a single
+`RAYLAND_RING_DUMP` run.
+
+**Both hypotheses are dead.**
+
+- *A published `tail` can fall mid-command* — **refuted.** The decoder walks **105 of 105 relayed deltas to
+  `ReachedEnd`**. Every relayed `tail` lands exactly on a command boundary; a mid-command tail would have
+  ended its delta in `Truncated`, and none did. (This was the owner's suggestion, arrived at independently:
+  build the stream up piece by piece and see where it breaks. A walk reaching `ReachedEnd` *is* that check,
+  performed on every boundary at once, and offline — which matters because the live failure is intermittent.)
+- *Part of the submit lives outside the ring* — **refuted.** `vkExecuteCommandStreamsMESA` (type 180) appears
+  **zero** times in the entire stream.
+
+**And virglrenderer agrees with our framing exactly.** In the delta ending at 27536, our decoder puts
+`vkQueueSubmit` (type 18) at offset 748. S's own ring words that run read `s_head = 27416` — which is offset
+**748** in that delta, to the byte. virglrenderer consumed everything before the submit, stopped precisely at
+its first byte, and only then failed. The two independent implementations frame this stream identically.
+
+**So why does it fail? Because "CS error" does not mean what this diary has assumed for three days.** The
+generated dispatcher reports it whenever the decoder's fatal flag is set *after* dispatch — and the fatal flag
+is **overloaded**:
+
+```c
+vn_decode_vkQueueSubmit_args_temp(ctx->decoder, &args);
+if (!args.queue) {
+    vn_cs_decoder_set_fatal(ctx->decoder);   /* handle validation — not truncation */
+    return;
+}
+```
+
+`args.queue` comes from `vkr_cs_decoder_lookup_object(..., VK_OBJECT_TYPE_QUEUE)`, which returns NULL when the
+context holds no object for that id. **A handle that fails lookup produces the identical "resulted in CS
+error" message as a read past the end.**
+
+That is where the earlier inference went wrong. It was derived from `vn_cs_decoder_set_fatal`'s only
+*documented* trigger — the bounds check in `vn_cs_decoder_peek_internal` — and concluded "S's decoder believes
+the submit is truncated". The conclusion was reasonable and false: validation sets the same flag, from a
+different file, with no message distinguishing them. **The design spec for this very decoder opens by asserting
+the truncation reading as fact.** That premise is now retracted; the decoder it justified is what disproved it,
+which is the best outcome an instrument can have.
+
+**What the failure actually is: S cannot resolve the queue the application submits to.** Everything measured
+fits — the bytes are byte-exact, the framing is agreed, our decoder (which stubs lookups and never dispatches)
+succeeds, and virglrenderer's dispatch fails at the first handle it must resolve.
+
+**The queue's lifecycle in that same run, now readable for the first time:** exactly **one**
+`vkGetDeviceQueue2` (type 155) crosses in the whole stream, and between it and the failing submit the
+application issues `vkDestroyDevice` — S logs "application destroyed its device (device 5)". So the queue the
+submit names is plausibly one whose device is gone, or one whose creation S never registered as an object. The
+stream shows no second queue acquisition.
+
+**Deliberately not concluded yet.** Two readings remain and they need opposite fixes: the application really is
+submitting to a queue from a destroyed device (which for vkcube would be surprising and would point at
+something we do to it), or a second device/queue exists whose `vkGetDeviceQueue2` never reached S or was never
+registered there. Distinguishing them is one measurement — dump the queue *handle id* the submit names and the
+handle ids S has registered, and see whether the submit's id was ever created, was destroyed, or never
+arrived. After nine refuted theories on this stall, that measurement gets taken before anything is built.
+
+**Worth recording about method, since it is the third time it has decided an outcome here.** Every wall this
+week fell to an instrument, not an argument, and this one fell to an instrument that took five tasks to build
+while the bug sat untouched. The decoder's first real use refuted two hypotheses, corrected a three-day-old
+misreading, and located the fault — in one run, on the first attempt.
