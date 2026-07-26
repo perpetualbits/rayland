@@ -358,10 +358,16 @@ Venus/virglrenderer capture/replay engine, so *unmodified* applications run.**
   no timing heuristic; the progress thread no longer touches the engine. **Scope:** feedback-OFF only, and
   2026-07-26 established *why*, per mechanism, by measurement. **`no_fence_feedback` is load-bearing:** the
   barrier above works by spotting the app's `vkGetFenceStatus` reply reading `VK_SUCCESS`, and fence feedback
-  removes that poll — enabling it gives exit 134 and zero frames, immediately and every time. **Semaphore,
-  event and query feedback look safe and are not:** enabling them measured **1.23×** on `icosa-gpu` over
-  loopback (median `draw_readback` 48.7 ms → 39.5 ms, all 120 frames bit-identical) and then lost a whole run
-  to a silent Venus `SIGABRT` in the two-machine sweep (9/10 clean). **The mechanism is NOT known**, and one plausible-sounding
+  removes that poll — enabling it gives exit 134 and zero frames, immediately and every time. **Semaphore, event and query
+  feedback are worth 1.23× and their one observed failure is UNATTRIBUTED:** enabling them measured **1.23×**
+  on `icosa-gpu` over loopback (median `draw_readback` 48.7 ms → 39.5 ms, all 120 frames bit-identical), and a
+  two-machine sweep lost one run of ten to a silent Venus `SIGABRT`. That looked decisive and is not. Hunted
+  since: **82 further clean runs with the flags on** — 8 loopback and 14 real-network under `gdb`, then 60
+  real-network unattended with genuine core capture armed on C (`core_pattern` pointed at a file, `ulimit -c
+  unlimited`), all 120 frames, no core produced. So **1 failure in 92 feedback-on runs (~1%) against 0 in 20
+  feedback-off runs** — which is *not* a significant difference, and the failure cannot now be pinned on
+  feedback at all. It may have been unrelated. The flags remain off because an unexplained total-session loss
+  is unexplained either way, but the reason is "we do not know what that was", not "feedback breaks it". **The mechanism is NOT known**, and one plausible-sounding
   explanation was checked and refuted the same evening: "(c)1 does not relay the feedback pages" (a comment in
   `scripts/c1-two-machine.sh`) is not supported. `emit_blob_writes` excludes only **rings**, and
   `take_bytes_s_wrote` detects change by diffing a shadow — so it catches writes virglrenderer's GPU makes

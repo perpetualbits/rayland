@@ -3834,3 +3834,40 @@ the application aborts, rarely. Chasing a ~3% event needs a harness that runs un
 iterations than a working session can spare, and — better — one that captures a core rather than
 holding a debugger open, since `ulimit -c` and `core_pattern` on C currently discard the evidence.
 That is the next concrete step, and it is setup work rather than investigation.
+
+### 2026-07-27 — 82 clean runs later, the feedback failure cannot be blamed on feedback
+
+Set up real core capture on apollo and ran the hunt unattended. The result overturns the conclusion
+two entries above — my own, from a few hours earlier.
+
+**The setup.** `core_pattern` on C pipes to apport, which discards these cores, so it was pointed at
+`/tmp/cores/core.%e.%p` with `ulimit -c unlimited` in the application's own shell, and **restored on
+exit** via a trap (it is a system-wide change on another machine and must not outlive the run — it
+was, and the log says so). No debugger held open this time: lighter, and closer to the conditions
+that produced the original failure.
+
+**60 attempts, all `rc=0 frames=120 cores=0`.** Verified per-attempt rather than trusting the summary
+line — a harness failing fast sixty times would also print EXHAUSTED.
+
+**The tally, and the problem with it.** With the three feedbacks enabled: 8 loopback under `gdb`, 14
+real-network under `gdb`, 60 real-network with core capture — **82 clean runs**. Against them, one
+lost run in the original ten-run sweep. So **1 failure in 92 feedback-on runs, about 1%**, against
+**0 in 20 feedback-off runs**.
+
+That is not a significant difference. Twenty runs cannot distinguish a 1% failure rate from zero.
+**The failure therefore cannot be attributed to feedback**, and this diary said it could — twice, in
+CLAUDE.md and here, with a mechanism ("shared status pages (c)1 does not relay") that was itself
+refuted an hour later. The honest position is that one run of `icosa-cpu` over a real network died of
+something unexplained, and it happened to be a run with feedback on.
+
+**What that changes.** The flags stay off, but for a different and weaker reason: not "feedback breaks
+it" but "an unexplained total-session loss is unexplained either way, and 1.23× does not buy that
+risk". If someone later wants the 1.23×, the work is not "fix feedback" — it is to run the
+feedback-*off* configuration enough times to know its own failure rate, which nobody has done. A
+baseline of 20 is not a baseline.
+
+**The pattern this session kept producing, one last time.** A single failure suggested a cause; the
+cause suggested a mechanism; the mechanism was plausible enough to write into two documents. Checking
+the mechanism killed it. Chasing the failure showed the rate was an order of magnitude off. Neither
+step required cleverness — only declining to treat one observation as a rate, which is the same error
+in a different costume each time it appears.
