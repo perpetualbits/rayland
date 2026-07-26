@@ -3719,3 +3719,46 @@ and a number that says plainly it did not matter. The alternative, which this pr
 would have been to "fix the fragmentation", observe a 3% change, and quietly file it as done. What
 made the difference was measuring **before** the fix rather than after: the per-resource breakdown
 took one run and killed the premise in a single table.
+
+### 2026-07-26 (end of day) — Venus feedback: 1.23× on loopback, one lost run over the wire, not adopted
+
+The last lever named in the previous entry was Venus's feedback mechanisms, disabled wholesale in
+every run this project makes. Tried them. The answer is no, and the shape of the no is worth having.
+
+**Fence feedback cannot be enabled, and the reason is structural rather than incidental.** (c)2's
+completion barrier — `Applier::reply_arena_fence_signaled` — works by spotting the application's
+`vkGetFenceStatus` reply reading `VK_SUCCESS` in the live reply arena. Fence feedback exists precisely
+to stop the application making that call. Enabling it: **exit 134, zero frames, immediately and every
+time.** This is not a bug to fix but a dependency to redesign — the barrier would have to be re-derived
+against the feedback buffer instead of the arena.
+
+**Semaphore, event and query feedback looked like free money, and were not.** They have been off all
+along purely by being in the same `VN_PERF` string as `no_fence_feedback`; nothing had tested them
+separately. Enabled, with fence feedback still off:
+
+- **loopback, `icosa-gpu`: 1.23×** — median `draw_readback` 48.7 ms → 39.5 ms, **all 120 frames
+  bit-identical to native**. Nothing about that run suggested a problem.
+- **two-machine sweep, `icosa-cpu`: FAIL.** Nine runs clean, and one lost *entirely* — the application
+  taking a silent Venus `SIGABRT` (core dumped) partway through, 120/120 frames therefore differing.
+
+The mechanism is not mysterious, and the codebase had already written it down: these are **shared
+status pages S writes and C's Mesa reads directly**, and (c)1 does not relay them —
+`scripts/c1-two-machine.sh` has said so in a comment for weeks. Mesa reads a page whose update has not
+arrived and eventually gives up. Adopting any of this needs the pages relayed, not the flag removed.
+
+**The methodological point, which is the one worth keeping.** A loopback pass proved nothing here, and
+proved it *convincingly*: 120/120 bit-identical frames and a 23% speedup is exactly the evidence one
+would accept if not required to go further. It took a ten-run real-network sweep to find a 1-in-10
+total failure. This file had already recorded, weeks ago, that "the feedback-on buy-back was
+loopback-only and is superseded" — and this session read that as *unexplored* rather than as a finding
+someone had already paid for. It was rediscovered at the cost of a sweep. The note has been rewritten
+to say which mechanism, what it measured, and why, so the next attempt costs a read instead of a run.
+
+**Not adopted.** The sweep script keeps the setting parameterised — making it explicit and testable is
+strictly better than the hardcoded string it replaced — but defaults to the value that passes, with
+the measurement written beside it.
+
+**What that leaves.** The synchronous round trip is confirmed as *the* remaining architectural limit,
+and now with both of its obvious escapes closed off: the feedback mechanisms that would remove the
+polls need transport work first, and making each poll cheaper (batching flushes) is worth 1.03×. The
+next real move is relaying the feedback pages — which is a (c)1 transport task, not a tuning knob.
