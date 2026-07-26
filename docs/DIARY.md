@@ -2627,3 +2627,38 @@ genuinely-disabled check is exactly what "so it never sets fatal" describes) —
 literal edit it named didn't deliver that intent, and to check the *specific test's* pass/fail, not just
 skim a green result, before calling the teeth-check done. Full derivations and both test runs are in
 `.superpowers/sdd/2026-07-26-venus-stream-decoder/task-3-report.md`.
+
+### 2026-07-26 — Task 3 review: Approved, and a stale-comment miss caught by the diary itself
+
+Task 3 came back Approved on substance: the reviewer independently re-derived both carried byte
+counts (88 and 48) from the same generated decoder rather than trusting the report, and independently
+re-traced the teeth-check finding above — confirming the `<`→`>` flip really does fire on the prologue
+read rather than disabling the check, and that `if (0)` really does produce the confidently-wrong
+`Ok(Command{38,24})` this crate exists to prevent. Both held on adversarial re-check, not just on trust.
+
+One finding, and it is the second time this exact crate has produced it. `csrc/shim.c`'s
+`rayland_venus_proto_selftest` (Task 1's link-proving self-test) still carried a comment saying it was
+"still linked by `rayland-venus-proto`'s existing Rust wrapper (`src/lib.rs::selftest_command_type` and
+its test)" — true when Task 2 wrote it, false the moment Task 3 deleted both the function and the test
+it described, since nothing else in the tree calls it. First instinct was to flag it and leave it,
+reasoning that Task 3's stated file list was `src/lib.rs` only and `csrc/shim.c` wasn't otherwise part
+of this task. That reasoning does not survive contact with this diary's own earlier entry, four rounds
+back: "missed because `src/lib.rs` sat outside Task 2's stated file list, which is not an exemption
+from CLAUDE.md's stale-comment rule." Same crate, same shape of excuse, same rule — CLAUDE.md's binding
+text has never been scoped to a task's declared files, and a file list exists to bound what a task
+*builds*, not what it is responsible for leaving accurate. Fixed by deleting the function outright
+(zero callers, and its one job — proving the vendored protocol compiles and links — is now done more
+thoroughly by `command_len`'s six tests, which exercise the real entry point instead of a constant)
+rather than correcting the comment in place, since a function whose only remaining purpose would be
+"exists to be described as unused" is not worth keeping. Also tightened, on the same review pass: the
+two magic fault-code branches in `command_len` now cite their `RAYLAND_VENUS_FAULT_*` names in
+`csrc/shim.c` instead of being bare integers, and the SAFETY comment's "keeps no state between calls"
+claim was corrected — the scratch pool's *bytes* are `_Thread_local static` and do persist, only its
+bump-allocator cursor resets per call, which is what actually makes it safe rather than merely quiet.
+
+**What this confirms, and it is worth saying plainly since it is the second occurrence:** "outside this
+task's file list" is a real fact about scope, but it has been tried twice now as a reason to leave a
+comment that is actively wrong, and twice it was wrong to try it. The diary recording the first
+instance did not, by itself, prevent the second — it took a reviewer pointing at the diary's own
+sentence for the rule to actually bind. That is a point in favor of *rereading* the diary before
+declining a fix on scope grounds, not just writing it down and trusting the writing to stick.
