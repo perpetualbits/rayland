@@ -696,6 +696,22 @@ pub fn frame_size_from_env() -> anyhow::Result<(u32, u32)> {
 /// `main.rs`, which treats a missing compositor as a skip rather than a failure, so that
 /// `rayland-s` on a headless box still relays correctly.
 pub fn present_frame(frame: RenderedFrame) -> anyhow::Result<()> {
+    present_frame_live(frame, None)
+}
+
+/// [`present_frame`], but able to keep following a live render.
+///
+/// # Inputs / outputs
+/// - `frame`: the first frame to show — the window's size comes from it.
+/// - `refresh`: `None` behaves exactly like [`present_frame`] (one still image). `Some(closure)`
+///   makes the window redraw on every compositor frame callback, showing whatever the closure last
+///   returned; returning `None` from it means "nothing new", which leaves the current frame up.
+///   See `rayland_present::present_live` for the pacing this implies.
+/// - Returns when the window is closed, or an error if presentation failed.
+pub fn present_frame_live(
+    frame: RenderedFrame,
+    refresh: Option<Box<dyn FnMut() -> Option<RenderedFrame>>>,
+) -> anyhow::Result<()> {
     let (width, height) = (frame.width, frame.height);
     let mut source = BlobFrameSource {
         frame: Some(frame),
@@ -721,8 +737,12 @@ pub fn present_frame(frame: RenderedFrame) -> anyhow::Result<()> {
         .set_nonblocking(true)
         .map_err(|e| anyhow::anyhow!("making the window's liveness socket non-blocking: {e}"))?;
 
-    println!("presenting the frame in a window; close it to exit");
-    let result = rayland_present::present(&mut source, &config, theirs);
+    if refresh.is_some() {
+        println!("presenting the live remote render in a window; close it to exit");
+    } else {
+        println!("presenting the frame in a window; close it to exit");
+    }
+    let result = rayland_present::present_live(&mut source, &config, theirs, refresh);
     // Explicit rather than implicit: `ours` staying alive across the `present` call above is the
     // entire mechanism keeping the window open, so dropping it is worth a line a reader can see.
     drop(ours);

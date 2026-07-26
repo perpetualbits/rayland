@@ -70,7 +70,7 @@ use rayland_s::wayland_client::{EventSink, WaylandReplay};
 // Presentation: finding the application's readback buffer among S's blobs, and putting it on S's
 // screen. See that module's docs for why finding it is the one guess (c)1 has to make.
 use rayland_s::present::{
-    ENV_NO_PRESENT, FrameCapture, LiveFrame, frame_size_from_env, present_frame,
+    ENV_NO_PRESENT, FrameCapture, LiveFrame, frame_size_from_env, present_frame_live,
 };
 
 // SP2's QUIC transport: the network C's commands cross.
@@ -81,6 +81,7 @@ use anyhow::{Context, Result};
 // reply C never sees.
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -213,7 +214,20 @@ fn present_the_frame(capture: FrameCapture, live: &Arc<Mutex<LiveFrame>>) -> Res
         }
         None => capture.into_frame()?,
     };
-    present_frame(frame)
+    // Keep following the render for as long as the window is open. The closure holds only the shared
+    // frame — the relay may well have ended by now, in which case it simply keeps returning the last
+    // frame and the window behaves like the static one. `try_lock` rather than `lock`: this runs on
+    // the compositor's frame callback, and a presentation path that can block on the progress
+    // thread's lock could stall the relay. A missed frame is not worth that risk; the next callback
+    // is 16 ms away.
+    let live_for_window = Arc::clone(live);
+    present_frame_live(
+        frame,
+        Some(Box::new(move || match live_for_window.try_lock() {
+            Ok(frame) => frame.frame(),
+            Err(_) => None,
+        })),
+    )
 }
 
 /// Frame and write one message to C, flushing it.
@@ -770,6 +784,63 @@ fn main() -> Result<()> {
     let mut wl_replay = WaylandReplay::new(Arc::new(LinkEventSink {
         tx: Arc::clone(&tx),
     }));
+    // **Presentation runs alongside the session, not after it.**
+    //
+    // It used to run only once `serve` returned, which is correct for one still frame and useless
+    // for a live one: by then the render is over and there is nothing left to follow. So the window
+    // gets its own thread, started before the session, which waits for the first complete frame and
+    // then follows the render until a human closes it.
+    //
+    // `presented` records whether that thread ever got a frame. If it did not — a session that
+    // shipped no readback at all — the old post-session path still runs, so single-frame
+    // applications and the ambiguity refusal behave exactly as before.
+    let presented = Arc::new(AtomicBool::new(false));
+    let session_over = Arc::new(AtomicBool::new(false));
+    let window_thread = if std::env::var_os(ENV_NO_PRESENT).is_some()
+        || std::env::var_os(ENV_WAYLAND_DISPLAY).is_none()
+    {
+        // Declined for the same two reasons `present_the_frame` declines, checked here as well so
+        // no thread is spawned at all when presentation is off.
+        None
+    } else {
+        let live = Arc::clone(&live);
+        let presented = Arc::clone(&presented);
+        let session_over = Arc::clone(&session_over);
+        Some(
+            std::thread::Builder::new()
+                .name("rayland-s-present".into())
+                .spawn(move || {
+                    loop {
+                        // `try_lock`: the progress thread owns this lock on the relay's path, and a
+                        // window waiting to open must never be a reason the relay stalls.
+                        let first = live.try_lock().ok().and_then(|frame| frame.frame());
+                        if let Some(first) = first {
+                            presented.store(true, Ordering::SeqCst);
+                            let live_for_window = Arc::clone(&live);
+                            let result = present_frame_live(
+                                first,
+                                Some(Box::new(move || match live_for_window.try_lock() {
+                                    Ok(frame) => frame.frame(),
+                                    Err(_) => None,
+                                })),
+                            );
+                            if let Err(e) = result {
+                                eprintln!("rayland-s: live presentation failed: {e:#}");
+                            }
+                            return;
+                        }
+                        // The session ended without ever shipping a complete frame; leave the
+                        // post-session path to report and decide.
+                        if session_over.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                })
+                .context("spawning the presentation thread")?,
+        )
+    };
+
     let applier_for_refresh = Arc::clone(&applier);
     serve(rx, tx, applier, &mut engine, &mut capture, &mut wl_replay)?;
     eprintln!("rayland-s: session ended");
@@ -795,6 +866,19 @@ fn main() -> Result<()> {
         // A poisoned lock means a thread panicked mid-session. The relay is over and the pixels are
         // whatever they are; presenting the older copy beats aborting on the way out.
         Err(poisoned) => capture.refresh_candidates(&poisoned.into_inner()),
+    }
+
+    // Release the presentation thread if it is still waiting for a frame that will never come.
+    session_over.store(true, Ordering::SeqCst);
+    if let Some(window_thread) = window_thread {
+        // Join rather than detach: the window must outlive the session — an application that exits
+        // the instant it has its pixels would otherwise take the picture off screen with it.
+        let _ = window_thread.join();
+    }
+    // The live window already showed (and followed) the render; there is nothing left to present.
+    if presented.load(Ordering::SeqCst) {
+        capture.report();
+        return Ok(());
     }
 
     // Now that the session is over, put the frame on screen — and keep it there until a human closes
