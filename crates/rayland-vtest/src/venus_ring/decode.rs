@@ -690,9 +690,46 @@ pub fn find_queue_submit(stream: &[u8], queue_handle: u64) -> Option<usize> {
 /// re-admits the fatal teardown fence — so the signature is kept minimal and exact rather than
 /// over-constrained.
 pub fn find_destroy_device(stream: &[u8], device_handle: u64) -> Option<usize> {
+    // **Decode first, and believe the decode wherever it reached.**
+    //
+    // The signature scan below was measured firing on payload bytes — twice, at offsets 6236 and
+    // 6300 in consecutive runs of the same workload, in a delta the decoder walked to `ReachedEnd`
+    // with no `vkDestroyDevice` in it at all. A hit whose offset is not a command boundary is not a
+    // command, and this function's own docs predicted the consequence of believing one: the gate
+    // closes early and the next real readback wedges. See `docs/DIARY.md`, 2026-07-26.
+    //
+    // Why the pattern is weak here and sound in `find_get_device_queue2`: `vkDestroyDevice` is type
+    // **12**, an ordinary value to meet in payload data, paired with a flags word of `0`, which is
+    // commoner still. Type **155** is not. The discriminating power of a sliding match is a property
+    // of the data it slides through, not of the technique.
+    let (commands, stop) = decode_commands(stream);
+    if let Some(found) = commands.iter().find(|c| {
+        c.command_type == VK_COMMAND_TYPE_VK_DESTROY_DEVICE
+            // Still this device's destroy, not any device's: the caller latched one queue's device
+            // and must close that gate, not another's.
+            && read_u64_le(stream, c.offset + DEVICE_HANDLE_OFFSET) == Some(device_handle)
+    }) {
+        return Some(found.offset);
+    }
+    // The walk saw the whole stream and there was no such command. That is a *confident* negative,
+    // which the scan could never give — and a negative is the answer that matters most to get right
+    // in the safe direction here.
+    if stop == DecodeStop::ReachedEnd {
+        return None;
+    }
+    // The walk stopped early, so the decoder has no opinion about the bytes past that point. Fall
+    // back to the scan **only there**. This preserves the old conservative behaviour exactly where
+    // the decoder cannot see, which matters because a false negative is the dangerous direction: it
+    // re-admits a teardown fence that is render-server-fatal, where a false positive merely closes
+    // the gate early. Scanning only the undecoded tail removes every false positive the decoder
+    // could have ruled out, without ever trading one for a missed real destroy.
+    let undecoded_from = commands
+        .last()
+        .map_or(0, |c| c.offset + c.encoded_size);
+
     // The bytes this reads span `[offset, offset + 16)` — type (4) + flags (4) + device (8).
     const READ_SPAN: usize = DEVICE_HANDLE_OFFSET + 8;
-    let mut offset = 0usize;
+    let mut offset = undecoded_from;
     while offset + READ_SPAN <= stream.len() {
         let is_match = read_u32_le(stream, offset) == Some(VK_COMMAND_TYPE_VK_DESTROY_DEVICE)
             // Async command flags: `vkDestroyDevice` is void, emitted `vn_async_*`, so flags == 0.
@@ -710,6 +747,72 @@ pub fn find_destroy_device(stream: &[u8], device_handle: u64) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The regression this fix exists for.** The signature scan matched `[12][0][device]` inside a
+    /// command's *payload* — measured live at offsets 6236 and 6300 in consecutive runs — and S
+    /// believed it, retiring its readback gate for a device destruction that never happened.
+    ///
+    /// Here that pattern is planted deliberately inside a decodable command's arguments. A scan alone
+    /// fires on it; a decode does not, because the offset is not where any command begins.
+    #[test]
+    fn a_destroy_pattern_buried_in_a_payload_is_not_a_destroy() {
+        const DEVICE: u64 = 0x5;
+        // The carrier is a real `vkNotifyRingMESA` — the ring doorbell, a command that genuinely
+        // occurs in every captured stream, and one `encoded_size`'s own table can size (24 bytes:
+        // header, `ring` u64, `seqno` u32, `flags` u32). So the walk gets cleanly past it without
+        // depending on the borrowed decoder being linked.
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&VK_COMMAND_TYPE_VK_NOTIFY_RING_MESA.to_le_bytes());
+        stream.extend_from_slice(&0u32.to_le_bytes());
+        // The trap is laid entirely in this command's *arguments*, at stream offset 8. A `ring` id
+        // of 12 puts `[12][0]` there — reading, to a sliding scan, exactly like a `vkDestroyDevice`
+        // type word followed by an all-clear flags word...
+        stream.extend_from_slice(&12u64.to_le_bytes());
+        // ...and `seqno`/`flags` together occupy the next eight bytes, where the scan expects the
+        // device handle. A doorbell for ring 12 with seqno 5 therefore *is* the 16-byte signature
+        // for "destroy device 5" — with none of it being a command, and nothing contrived about it.
+        stream.extend_from_slice(&(DEVICE as u32).to_le_bytes());
+        stream.extend_from_slice(&0u32.to_le_bytes());
+
+        assert_eq!(
+            find_destroy_device(&stream, DEVICE),
+            None,
+            "a [12][0][device] pattern inside a payload is not a vkDestroyDevice; believing it \
+             closes S's readback gate on a device destruction that never happened"
+        );
+    }
+
+    /// The other direction, which matters more: a **real** destroy must still be found. A false
+    /// negative re-admits a teardown fence on a destroyed queue, which is render-server-fatal — so
+    /// this fix must not have bought its precision with a missed detection.
+    #[test]
+    fn a_real_destroy_command_is_still_found() {
+        const DEVICE: u64 = 0x5;
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&VK_COMMAND_TYPE_VK_DESTROY_DEVICE.to_le_bytes());
+        stream.extend_from_slice(&0u32.to_le_bytes()); // async: void command, no reply
+        stream.extend_from_slice(&DEVICE.to_le_bytes());
+        stream.extend_from_slice(&0u64.to_le_bytes()); // pAllocator: not present
+
+        assert_eq!(
+            find_destroy_device(&stream, DEVICE),
+            Some(0),
+            "a real vkDestroyDevice at offset 0 must still be detected"
+        );
+    }
+
+    /// A destroy of a *different* device must not close this device's gate — the discriminator the
+    /// original scan already had, preserved here so the decode-first path cannot quietly lose it.
+    #[test]
+    fn another_devices_destroy_is_not_this_devices() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&VK_COMMAND_TYPE_VK_DESTROY_DEVICE.to_le_bytes());
+        stream.extend_from_slice(&0u32.to_le_bytes());
+        stream.extend_from_slice(&0x9u64.to_le_bytes()); // some other device
+        stream.extend_from_slice(&0u64.to_le_bytes());
+
+        assert_eq!(find_destroy_device(&stream, 0x5), None);
+    }
 
     /// The size table and the borrowed decoder must agree wherever both can answer. They are
     /// independent — one is hand-derived from Mesa's `vn_sizeof_*`, the other is Mesa's own decoder —

@@ -3148,3 +3148,55 @@ unresolvable inside virglrenderer, and the queue ids match throughout. The submi
 the dispatcher's three distinct fatal conditions still not narrowed to one. What has changed is that this
 codebase can now check a claim about a command stream instead of arguing about it, and two of its own
 long-standing claims have already failed that check.
+
+### 2026-07-26 — The scan that lied, and the invariant it broke on the way out
+
+`find_destroy_device` now decodes before it believes. That is the whole change, and it is small; what
+is worth writing down is what it cost and what it revealed.
+
+**The bug was documented before it was found.** The function's own doc comment said a false positive
+"would close the gate early and, on the next real readback, wedge — but the type + async-flags +
+exact-device-handle triple makes that vanishingly unlikely." Both halves turned out to matter. The
+consequence was stated correctly. The probability estimate was simply wrong, and it was wrong in the
+way estimates written without data usually are: it reasoned about the *pattern* rather than about the
+*data the pattern slides through*. `vkDestroyDevice` is type **12** paired with a flags word of **0**.
+Twelve is an ordinary number to meet in a Vulkan command stream's arguments — a count, an index, a
+small handle, a ring id — and zero is commoner still. Type **155**, which `find_get_device_queue2`
+scans for and which held up under the same test, is not an ordinary number. The discriminating power
+of a sliding match is a property of its haystack, not of the technique. We had no way to check that
+before, and so we asserted it instead.
+
+**The test we wrote for it is the honest version of the bug.** The trap in
+`a_destroy_pattern_buried_in_a_payload_is_not_a_destroy` is not a contrived byte blob: it is a real
+`vkNotifyRingMESA` — the ring doorbell, present in every captured stream — for ring 12 with seqno 5.
+Its arguments spell `[12][0][5]` at offset 8, which *is* the sixteen-byte signature for "destroy
+device 5", with none of it being a command. Writing the test that way took a couple of extra minutes
+and changed what it proves: not "a scan can be fooled by adversarial input" but "a scan is fooled by
+the traffic this system actually carries."
+
+**One asymmetry had to survive the fix.** A false negative here is worse than a false positive: it
+re-admits a teardown fence on a destroyed queue, which is render-server-fatal, where a false positive
+merely closes the gate early. So the decode is trusted only where it actually reached. Walk the
+stream; if a decoded command is the destroy, return it; if the walk consumed the whole stream and
+found none, that is a *confident* negative the scan could never give. Only when the walk stops early
+does the old scan run — and then only over the bytes past where the decoder stopped. Every false
+positive the decoder could have ruled out is gone; no real destroy the scan would have found is lost.
+
+**And it broke a rule we wrote ourselves, deliberately.** (c)1 spec §7 says the borrowed decoder is
+diagnostic: nothing may use it to decide what to ship or when. `rayland-s` calls
+`find_destroy_device` at `apply.rs:755` to decide when to retire the readback gate — a correctness
+decision — and that call now runs `decode_commands`, which falls back to the vendored Mesa headers.
+The decoder is load-bearing on S as of this commit. The guard test does not catch it, because it
+enumerates `rayland-c`'s source files and this is `rayland-s`; the guard is not wrong, it is simply
+aimed at the machine that must never link a GPU stack, which was the invariant it was written for.
+The honest framing is that the rule was written to stop a decoding bug from becoming a corruption
+bug, and here it was blocking the replacement of a heuristic *proven* to corrupt. That is a real
+trade, not a loophole, and it is the owner's to make. It is recorded here rather than quietly
+absorbed, and the guard is left un-widened so the discrepancy stays visible instead of being
+papered over by a green test.
+
+**What it does not explain.** Nothing about the `vkQueueSubmit` CS error moved. The gate retiring
+early is a genuine defect with a genuine consequence, and it is now fixed, but the submit failure has
+its own cause still unlocated. Two claims this codebase made about itself have now failed a check it
+could not previously perform; the third — that the queue is registered and resolvable at submit time
+— has held up every time it has been tested, which is starting to be informative in its own right.
