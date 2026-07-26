@@ -3557,3 +3557,58 @@ vkcube times out in *setup* because it waits hundreds of times. Every latency mi
 is currently disabled in every run we do (`VN_PERF=no_fence_feedback,no_semaphore_feedback,...`) —
 not as an oversight, but because feedback-on was loopback-only and was superseded during (c)2. That
 is unclaimed headroom with a known reason for being unclaimed, which is the most honest kind.
+
+### 2026-07-26 (night) — The GPU-fractal fixture is blocked by a false positive, and the culprit is the shader itself
+
+The owner asked the obvious good question after seeing the demo: could the fractal be computed on
+**S**, by shipping the SPIR-V rather than a megabyte of texture per frame? Two things had to be said.
+First, SPIR-V already crosses — `vkCreateShaderModule` is an ordinary Venus command, and
+`icosa-cpu`'s own shaders run on S. What does *not* cross is the fractal, which that fixture computes
+on C's CPU on purpose, because it is the worst case it was built to be. Second, the fixture that does
+what was asked already exists: `rayland-icosa-gpu`, same geometry, same schedule, same bit-exact
+arithmetic, 80 bytes per frame instead of 1 MiB.
+
+**So we ran it, and it does not work over the relay.** Natively on S it is perfect — 120 frames,
+exit 0. Through Rayland it aborts with no frames. That is a real gap, found by asking for the
+demo rather than by any test.
+
+**The cause, and it is this morning's bug wearing a different hat.** `rayland-c` refuses the delta:
+
+> refusing to relay the ring delta ending at tail 18100: the command stream carries a dword equal to
+> 180 at byte offset 4608, which is `vkExecuteCommandStreamsMESA` — Venus's out-of-line command path
+
+Pointing the decoder at the same bytes settles it. The delta walks cleanly to `ReachedEnd` as ten
+commands — `vkCreateRenderPass`, `vkCreateDescriptorSetLayout`, two `vkCreateShaderModule`,
+`vkCreatePipelineLayout`, `vkCreateGraphicsPipelines`, two `vkDestroyShaderModule`,
+`vkSetReplyCommandStreamMESA`, `vkCreateImage` — and **contains no type 180 at all**. Offset 4608
+falls inside the second `vkCreateShaderModule`'s 5860-byte payload. The matching dword is a word of
+**the fractal fragment shader's own SPIR-V**. The shader that would make this fast is precisely what
+trips the guard against shipping it.
+
+That is the third signature scan this week to fire on payload bytes (`find_destroy_device`, then this),
+and the refusal's own comment predicted it in as many words — "this scan over-approximates on
+purpose". It was written honestly and it was right about itself.
+
+**But the fix is *not* the same fix, and that difference matters.** `find_destroy_device` lives in
+`rayland-s` and decides when to retire a readback gate. This one lives in **`rayland-c`, on the relay
+path**, and decides *what gets relayed* — which is exactly what (c)1 §7 forbids a decode from
+deciding, and what `decoder_is_not_load_bearing` mechanically prevents. Narrowing this refusal with
+the decoder would turn some refusals into relays, so a decoding bug could become a corruption bug by
+the most direct route there is. That is the invariant's central case, not a peripheral one, and it is
+not mine to spend.
+
+**One idea considered and retracted in the same breath.** Mesa spills out-of-line when a submission
+exceeds `direct_size = buffer_size >> 4` — 8192 bytes here, against a batch of 8960, so the workload
+sits *just* over the line. The tempting move was to enlarge the ring, since (c)1 rests on Rayland
+being the host that allocates it. But `buffer_size` is **derived from the blob Mesa asked for**
+(`identity.rs:198-207`); C observes that size, it does not choose it. The lever the refusal message
+names — Mesa's `direct_order` — is a client-side constant, and patching Mesa is the one thing this
+project has refused from the start.
+
+**Where that leaves it.** Three routes, and they are genuinely different in kind: make the refusal
+precise with the decoder (fast, and spends the core invariant); implement the out-of-line path
+properly, relaying the shmems `vkExecuteCommandStreamsMESA` names (the correct answer, and real (c)1
+v2 work); or narrow the scan heuristically (cheap, and still a heuristic that will be wrong again).
+Recorded rather than chosen. What is *not* in doubt any more is the diagnosis: it is a false positive,
+proved against the bytes, and the workload behind it is the one that makes the whole performance
+argument.
