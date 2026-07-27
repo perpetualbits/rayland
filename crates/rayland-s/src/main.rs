@@ -910,12 +910,55 @@ fn main() -> Result<()> {
     // The live window already showed (and followed) the render; there is nothing left to present.
     if presented.load(Ordering::SeqCst) {
         capture.report();
-        return Ok(());
+        exit_without_engine_teardown();
     }
 
     // Now that the session is over, put the frame on screen — and keep it there until a human closes
     // it. Presentation deliberately runs *after* the session rather than alongside it; the reasons
     // (one static frame, and a window that must outlive an application that exits the instant it has
     // its pixels) are on `rayland_s::present::present_frame`.
-    present_the_frame(capture, &live)
+    present_the_frame(capture, &live)?;
+    exit_without_engine_teardown();
+}
+
+/// End the process **without** running `VirglEngine`'s `Drop`, and never return.
+///
+/// # The bug this fixes
+/// About **one session teardown in five** ended with `SIGABRT` rather than a clean exit — 83 of 400
+/// runs in the overnight soak, 2 of 10 in a targeted loopback hunt. The message, which only survives
+/// if the log is not overwritten by the next run:
+///
+/// ```text
+/// epoxy_get_proc_address: Assertion `0 && "Couldn't find current GLX or EGL context."' failed.
+/// ```
+///
+/// That is **libepoxy**, reached from `virgl_renderer_cleanup` inside `VirglEngine::drop` as it
+/// releases the EGL winsys. Something in that path asks epoxy to resolve a GL entry point when no
+/// context is current, and epoxy's response is to `abort()`. It is intermittent because it depends on
+/// the order threads and the render-server subprocess wind down in, which is why a single clean run
+/// looks like a refutation and is not.
+///
+/// # Why skipping the teardown is the right fix rather than a dodge
+/// `VirglEngine::drop` exists so that *repeated* new→use→drop cycles are safe — the tests do exactly
+/// that, and its ordering (resources, then contexts, then `virgl_renderer_cleanup`, then the global
+/// lock) is load-bearing there. **None of that applies to a process that is exiting.** The kernel
+/// reclaims the mappings, the descriptors and the address space, and the render-server subprocess
+/// already exits when its socket closes — demonstrably so, since the ~21% of runs that *did* abort
+/// skipped this same cleanup and left no render server behind.
+///
+/// So the `Drop` stays exactly as it is for every embedder and every test; only the daemon's own exit
+/// declines to run it. That keeps the fix to the one place where cleanup buys nothing and costs a
+/// one-in-five crash.
+///
+/// # Inputs / outputs
+/// - Diverges: `std::process::exit` does not return and does not run destructors.
+/// - Exits `0`. A failure before this point returns through `?` and never reaches here.
+fn exit_without_engine_teardown() -> ! {
+    // Flush our own buffered output first: `process::exit` runs no destructors, and Rust's stdout is
+    // line-buffered to a terminal but block-buffered to a pipe — which is exactly how every script in
+    // `scripts/` runs this daemon.
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    std::process::exit(0);
 }

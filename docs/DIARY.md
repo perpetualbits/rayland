@@ -4030,3 +4030,48 @@ correctly throughout. They were attributable with certainty (this session's buil
 probes run minutes before) and were reaped by exact PID. The lesson is small and repeatable: a
 group-kill of a `setsid`'d process group does not always reap children that have themselves detached,
 and the check that catches it is `ps` after the run, not the exit code of the kill.
+
+### 2026-07-27 — The teardown abort: libepoxy, and the fix is to not clean up
+
+Fixed. The cause is third-party and the fix is to do less, which took some arguing with myself.
+
+**Catching it.** The abort leaves a message, but only if the log survives — every previous harness
+overwrote S's log each iteration, which is why days of runs showed "Aborted" with no explanation. A
+loop that kept *every* log caught it twice in ten:
+
+```
+epoxy_get_proc_address: Assertion `0 && "Couldn't find current GLX or EGL context."' failed.
+```
+
+That is **libepoxy**, reached from `virgl_renderer_cleanup` inside `VirglEngine::drop` as it releases
+the EGL winsys: something there asks epoxy to resolve a GL entry point when no context is current, and
+epoxy's answer to that is `abort()`. Intermittent because it depends on the order threads and the
+render-server subprocess wind down in — which is exactly why the single clean run I did first looked
+like a refutation and was not. One run against a 21% event proves nothing, and I nearly filed it as
+"did not reproduce".
+
+**The fix: the daemon exits without running the engine's `Drop`.** This felt like dodging the problem
+until the reasoning held up. `VirglEngine::drop` exists so *repeated* new→use→drop cycles are safe —
+the tests do exactly that, and its ordering (resources, then contexts, then `virgl_renderer_cleanup`,
+then the global lock) is load-bearing there. For a process that is **exiting**, none of it buys
+anything: the kernel reclaims mappings, descriptors and address space. The one thing worth checking was
+the render-server subprocess, and the evidence was already in hand — the ~21% of runs that *aborted*
+skipped this same cleanup and left no render server behind. Confirmed again after the fix: 16 sessions,
+zero `virgl_render_server` processes surviving.
+
+So `Drop` is untouched for every embedder and every test; only `rayland-s`'s own exit declines it.
+
+**Result: 0 aborts in 16 sessions**, against ~3–4 expected at the measured rate — about a 2% outcome
+if nothing had changed, so good evidence rather than proof. Full `rayland-s` suite green, loopback e2e
+included.
+
+**One detail that would have been a silent regression.** `process::exit` runs no destructors, and
+Rust block-buffers stdout when it is a pipe — which is how every script in `scripts/` runs this
+daemon. Without an explicit flush the daemon's final lines would have vanished from exactly the logs
+this investigation has depended on all week. Flushed explicitly, with the reason written next to it.
+
+**And the honest note on frequency.** This entry's predecessor claimed the abort happened on *every*
+teardown. It happens on about one in five (83/400 in the soak, 2/10 and then 0/16 here). That claim was
+generalised from two log lines seen minutes apart — the third time in two days this diary turned a
+couple of observations into a rate, and the reason the correction is recorded above rather than
+silently fixed.
