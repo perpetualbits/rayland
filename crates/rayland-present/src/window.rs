@@ -232,6 +232,19 @@ struct RaylandWindow {
     exit: bool,
     // True until the first configure, so we draw exactly once when the window is ready.
     first_configure: bool,
+    // How to obtain the *next* frame, for a live source; `None` for a still image.
+    //
+    // Its presence is what makes the window animated: `draw` requests a compositor frame callback
+    // only when this is `Some`, and the callback calls it for fresh pixels. A boxed `'static`
+    // closure rather than a borrow of the `FrameSource`, deliberately — holding the source here
+    // would put a lifetime parameter on this struct and therefore on all six `delegate_*` macros
+    // and nine impls below, for no gain: a live caller already has its frame behind shared state
+    // (`rayland-s` accumulates one in an `Arc<Mutex<LiveFrame>>`) and can hand over a closure that
+    // reads it.
+    //
+    // Returning `None` from the closure means "nothing new yet" and leaves the current frame on
+    // screen; the callback is still re-armed, so the loop keeps running.
+    refresh: Option<Box<dyn FnMut() -> Option<RenderedFrame>>>,
     // Why `draw` failed, if it did — carried out of the event loop so `present` can return it.
     //
     // SCTK's `configure` callback cannot return a `Result` (its signature is the trait's), so a
@@ -251,6 +264,33 @@ impl RaylandWindow {
     /// stays on screen with no further redraws. `qh` is needed only by the dmabuf branch
     /// (`create_params`/`create_immed` are proxy-constructing requests that must know which
     /// queue/state their new objects' events dispatch through).
+    /// Pull the next frame from [`Self::refresh`] and draw it.
+    ///
+    /// # Why only the `wl_shm` path
+    /// A live frame arrives as CPU pixels — `rayland-s` assembles it from the readback bytes it
+    /// ships — so there is nothing to export as a dmabuf. (c)1 presents through `wl_shm` for the
+    /// same reason (see this crate's docs), and a live source is if anything more firmly on that
+    /// path. On the dmabuf path this leaves the existing frame alone rather than guessing.
+    ///
+    /// # Inputs / outputs
+    /// - Returns whatever [`Self::draw`] returns. A refresh that yields `None` is not an error: it
+    ///   means no new frame has arrived, and the current one simply stays up.
+    fn redraw(&mut self, qh: &QueueHandle<Self>) -> anyhow::Result<()> {
+        let next = match self.refresh.as_mut() {
+            Some(refresh) => refresh(),
+            None => None,
+        };
+        if let (Some(next), Presentation::Shm { frame, .. }) = (next, &mut self.presentation) {
+            // Same size every frame — the window is fixed at the source's dimensions — so a
+            // differing length means something is wrong and the old frame is the safer thing to
+            // keep showing.
+            if next.pixels.len() == frame.pixels.len() {
+                frame.pixels = next.pixels;
+            }
+        }
+        self.draw(qh)
+    }
+
     fn draw(&mut self, qh: &QueueHandle<Self>) -> anyhow::Result<()> {
         match &mut self.presentation {
             Presentation::Shm { pool, frame } => {
@@ -271,6 +311,13 @@ impl RaylandWindow {
                     .map_err(|e| anyhow::anyhow!("failed to attach buffer: {e}"))?;
                 // Mark the entire surface as changed so the compositor repaints it.
                 surface.damage_buffer(0, 0, width, height);
+                // Ask for a frame callback *before* committing, so the request rides along with
+                // this commit — a live source is redrawn from that callback. A still image asks for
+                // nothing and the compositor never calls back: exactly the old behaviour.
+                // Re-arm only for a live source; a still image never asks and is never called back.
+                if self.refresh.is_some() {
+                    surface.frame(qh, surface.clone());
+                }
                 // Commit the surface state (buffer + damage) to make it visible.
                 self.window.commit();
             }
@@ -356,14 +403,27 @@ impl CompositorHandler for RaylandWindow {
         _new_transform: wl_output::Transform,
     ) {
     }
-    // We never request frame callbacks (the image is static), so this is a no-op.
+    /// A frame callback fired: the compositor is ready for the next frame.
+    ///
+    /// Only ever called for an animated source, because only `draw` on that path requests the
+    /// callback. Each redraw pulls fresh pixels from the source and asks for the following callback,
+    /// which is what keeps the loop running.
     fn frame(
         &mut self,
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         _surface: &WlSurface,
         _time: u32,
     ) {
+        if self.refresh.is_none() {
+            return;
+        }
+        // Same failure policy as the first configure: keep the error and end the loop rather than
+        // spin forever on a window that cannot be drawn.
+        if let Err(e) = self.redraw(qh) {
+            self.draw_error = Some(e);
+            self.exit = true;
+        }
     }
     // Which output the surface entered is irrelevant to a fixed-size static window.
     fn surface_enter(
@@ -688,6 +748,45 @@ fn compositor_supports_dmabuf_xrgb8888_linear(
 /// fails, buffer allocation/creation fails, or the event loop errors.
 pub fn present<F, S>(source: &mut F, config: &WindowConfig<'_>, disconnect: S) -> anyhow::Result<()>
 where
+    F: FrameSource,
+    S: std::os::fd::AsFd,
+    for<'a> &'a S: std::io::Read,
+{
+    // A still image: no refresh, so no frame callbacks are ever requested and the window behaves
+    // exactly as it did before live presentation existed.
+    present_live(source, config, disconnect, None)
+}
+
+/// [`present`], but with an optional source of *subsequent* frames.
+///
+/// # What `refresh` changes
+/// With `None` this is [`present`] exactly: draw once on the first configure and leave the picture
+/// up until the window is closed. With `Some`, the window additionally requests a `wl_surface.frame`
+/// callback on every commit and calls the closure from it, so the window follows a live render.
+///
+/// The closure returning `None` means "no new frame yet" and is not an error — the current frame
+/// stays on screen and the callback is re-armed.
+///
+/// # Pacing, which is the thing to understand before using this
+/// Redraw is driven by the **compositor's** frame callbacks, not by the arrival of remote frames. The
+/// window shows whatever the closure last had, at the display's refresh rate: a remote render slower
+/// than the display repeats frames, a faster one drops them. That is deliberate — it means
+/// presentation can never block the relay waiting for a screen — but it makes this a viewer for a
+/// live render, not a frame-accurate presentation path.
+///
+/// # Inputs / outputs
+/// - `source`: supplies the window's fixed dimensions and the *first* frame, as for [`present`].
+/// - `refresh`: `None` for a still image; `Some(closure)` for a live one. The closure is `'static`
+///   (rather than borrowing `source`) so that this crate's window state needs no lifetime parameter
+///   — see [`RaylandWindow::refresh`].
+/// - Returns when the window is closed or the peer disconnects, or an error if a draw failed.
+pub fn present_live<F, S>(
+    source: &mut F,
+    config: &WindowConfig<'_>,
+    disconnect: S,
+    refresh: Option<Box<dyn FnMut() -> Option<RenderedFrame>>>,
+) -> anyhow::Result<()>
+where
     // Where the frame comes from, and the only thing that differs between this crate's callers.
     F: FrameSource,
     // `disconnect` must expose a raw fd so calloop's `Generic` source can register it for
@@ -860,6 +959,7 @@ where
         presentation,
         exit: false,
         first_configure: true,
+        refresh,
         draw_error: None,
     };
     // Dispatch events, blocking until one arrives (`None` = no timeout); break out as soon

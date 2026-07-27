@@ -1,0 +1,47 @@
+virglrenderer 1.2.0
+venus-protocol headers as generated in that release.
+Source: src/venus/venus-protocol/
+
+# Updating this vendored tree
+
+Do this whenever `venus-protocol` is re-vendored from a newer Mesa/virglrenderer release. Every step
+matters — skipping one is how this crate would end up compiling against headers whose generated
+switch statement, or whose blob-storage aliasing behaviour, has silently drifted out from under it.
+
+1. **Re-copy the headers.** Replace everything under `vendor/venus-protocol/` with the new release's
+   generated `vn_protocol_renderer_*.h` files (plus whatever Vulkan headers they pull in — currently
+   `vulkan.h`, `vulkan_core.h`, `vk_platform.h`, `vk_video/*.h`). Do **not** hand-edit anything you
+   copy in: this file's own top line records which upstream release the copy came from, and
+   `build.rs`'s comment explains why `csrc/` must still resolve `vkr_cs.h` before this directory does.
+   Update the version line at the top of this file to the new release.
+
+2. **Regenerate the switch.** Run `python3 tools/gen_switch.py > csrc/decode_switch.inc` from the
+   crate root and inspect the diff. A clean re-vendor should mostly add or rename `case` arms for new
+   or renamed command types; a case disappearing entirely is worth understanding before committing,
+   since it means this crate can no longer size a command it previously could.
+
+3. **Re-run the crate's own tests**, `CARGO_TARGET_DIR=/home/roland/.cache/rayland-c1-target cargo
+   test -p rayland-venus-proto` and `cargo test -p rayland-vtest`, and specifically confirm
+   `the_size_table_and_the_borrowed_decoder_agree` (in `rayland-vtest`'s `venus_ring::decode` tests)
+   still passes — it is the cross-check that the hand-derived fixed-size table and Mesa's own
+   generated decoder still agree on the commands both can size. A failure here means either the new
+   Mesa release changed a wire encoding this crate hard-codes in `encoded_size`, or this crate's own
+   understanding of that encoding was wrong all along; either way, do not silence the test to get a
+   green build.
+
+4. **Re-do the write-audit behind the SAFETY comment on `command_len`** (`src/lib.rs`) and the
+   matching comment on `vkr_cs_decoder_get_blob_storage` (`csrc/vkr_cs.h`). Both currently assert that
+   no generated `_temp` decoder at virglrenderer 1.2.0 ever writes through the pointer
+   `vkr_cs_decoder_get_blob_storage` hands back — every call site immediately does
+   `if (!p) return; vn_decode_blob_array(dec, p, size)`, and that function's own same-address
+   special-case turns the "copy" into a no-op. A newer Mesa release could add a command whose
+   generated decoder writes through this pointer for a real reason (not just a same-address copy),
+   which would silently mutate the Rust caller's `&[u8]` — undefined behaviour, and on the
+   `RAYLAND_RING_DUMP` path, a diagnostic-becomes-corruption bug. Re-grep the new tree for every
+   caller of `vkr_cs_decoder_get_blob_storage`/`vkr_cs_encoder_get_blob_storage` and re-confirm the
+   same pattern holds before trusting those two comments again.
+
+5. **Re-check the license split**, `vendor/LICENSE.mesa`: confirm the new release's Mesa-authored
+   `vn_protocol_renderer_*.h` files are still MIT and the Khronos Vulkan headers are still
+   Apache-2.0 (each file's own `SPDX-License-Identifier` line is the source of truth; `LICENSE.mesa`
+   is a convenience summary, not a substitute for checking it).

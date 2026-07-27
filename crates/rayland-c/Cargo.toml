@@ -30,3 +30,16 @@ rayland-relay = { path = "../rayland-relay" }   # the (c)1 C<->S message set and
 rayland-transport = { path = "../rayland-transport" } # SP2's QUIC: the network C's commands cross
 anyhow = { workspace = true }                   # ergonomic top-level errors for the daemon binary
 libc = { workspace = true }                     # mmap-adjacent POSIX bits the daemon needs directly
+# WP0 Wayland proxy: `rayland-c` is a Wayland *server* to the app, forwarding its protocol to S. We use
+# the low-level `wayland_server::backend` (structured `Message`s, not the typed high-level `Dispatch`)
+# so the proxy is transparent, and the generated interface descriptors to advertise the app's globals.
+wayland-server = { workspace = true }           # the server backend + core interface descriptors
+wayland-protocols = { workspace = true }         # xdg-shell + linux-dmabuf server-side descriptors
+
+[dev-dependencies]
+# A real Wayland *client*, used only by the proxy's integration test to connect to the proxy and confirm
+# the WP0 globals are advertised (the app's role, in miniature). `dlopen` loads libwayland at runtime so
+# the dependency adds no build-time system requirement; the test is skipped where libwayland is absent.
+# This is a dev-dependency, so it never enters the shipped C-side binary that must stay GPU-free — and it
+# pulls no GPU stack regardless (`tests/no_gpu_linkage.rs` still passes).
+wayland-client = { workspace = true }

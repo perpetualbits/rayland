@@ -82,12 +82,19 @@
 //!   payloads (commands above roughly 8 KiB). Any real rendering workload is expected to use this
 //!   path, and this module cannot follow it. Note also that only a window of the ring was
 //!   inspected, so "180 was never seen" means "not in the window", not "not in the ring".
-//! - **Anything past `vkCreateInstance`.** [`decode::encoded_size`] knows the size of exactly three
-//!   command types, one of which is the doorbell that never even appears in a ring. It stops cleanly
-//!   at the first command it cannot size rather than guessing — which, on the captured stream,
-//!   happens at command four. That is a feature (a wrong size would desynchronize the walk and
-//!   produce confident nonsense forever after), but it means the decoder covers a rounding error of
-//!   Venus's ~1000-command surface.
+//! - **Anything the borrowed decoder cannot also be handed, or that this crate has not captured
+//!   whole.** [`decode::encoded_size`]'s own fixed-size table still knows the size of exactly three
+//!   command types, one of which is the doorbell that never even appears in a ring — that table's
+//!   scope is fixed and small by design (see its own doc comment). [`decode::decode_commands`] is
+//!   wider than the table alone, though: since (c)1's venus-stream-decoder sub-project it falls back
+//!   to Mesa's own borrowed decoder (`rayland-venus-proto`) for anything the table cannot express,
+//!   which is what lets it size a real `vkCreateInstance` given a complete one. On *this* captured
+//!   stream the walk still stops at command four (`vkCreateInstance`) — but now because the capture
+//!   preserved only 100 of the client's 216 produced bytes (`DecodeStop::Truncated`), not because the
+//!   decoder has no idea what the command is (`DecodeStop::UnknownCommandSize`, the old and only
+//!   reason). Stopping rather than guessing is still the rule (a wrong size would desynchronize the
+//!   walk and produce confident nonsense forever after); what changed is how much can be sized before
+//!   a guess would ever be needed. See `decode`'s own module docs and tests for the current reach.
 //! - **Real GPU work.** No fences, no timelines, no draws.
 //!
 //! In short: this module proves a mechanism. It does not implement a client.

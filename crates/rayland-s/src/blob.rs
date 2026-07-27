@@ -358,16 +358,45 @@ impl HostBlob {
         // Zipped rather than indexed: the pairing of each live byte with *its own* baseline byte is
         // the entire predicate, and `zip` states it in the types instead of leaving it to two index
         // expressions that must be kept identical by hand.
-        for (i, (&now, &then)) in live.iter().zip(self.shadow.iter()).enumerate() {
-            if now != then {
-                // A byte S wrote. Extend the open run, or start one here — `get_or_insert` keeps an
-                // already-open run's start rather than resetting it to `i`.
-                open.get_or_insert(i);
-            } else if let Some(start) = open.take() {
-                // A byte S did not write, so the run stops *before* it. Shipping it would be
-                // shipping a byte S has no claim to — precisely the clobber this grain avoids.
-                ranges.push((start, i));
+        // **Chunked comparison, byte-identical result.** The grain of *detection* is still the byte;
+        // this only changes how the unchanged majority is skipped. Comparing whole chunks with slice
+        // equality lowers to `memcmp` (word-at-a-time, vectorised) instead of a per-byte branch, and
+        // the per-byte loop runs only inside a chunk that already differs. Measured need: this scan
+        // walks every Venus-internal blob — the 8 MiB staging pool included — while holding the
+        // applier lock, on a 200 µs poll loop. Byte-at-a-time it took up to **637 ms per call**, so it
+        // ran essentially back-to-back and starved the message thread out of the lock; the delta that
+        // would have released the application was never applied, and Mesa's ~3.5 s stall abort fired.
+        // That is the vkcube "hang". See `docs/DIARY.md`, 2026-07-26.
+        const CHUNK: usize = 64;
+        let mut i = 0usize;
+        while i < live.len() {
+            // The tail chunk is short; `min` keeps both slices the same length, which slice equality
+            // requires and which also keeps the byte loop below in range.
+            let chunk_end = (i + CHUNK).min(live.len());
+            if live[i..chunk_end] == self.shadow[i..chunk_end] {
+                // Nothing S wrote in this whole chunk. Any run still open ended at the chunk's start:
+                // the first unchanged byte closes it, and every byte here is unchanged.
+                if let Some(start) = open.take() {
+                    ranges.push((start, i));
+                }
+                i = chunk_end;
+                continue;
             }
+            // This chunk differs somewhere, so it — and only it — is examined byte by byte. A run
+            // open from the previous chunk stays open, so runs still merge across chunk boundaries
+            // exactly as the byte-at-a-time version merged them.
+            for j in i..chunk_end {
+                if live[j] != self.shadow[j] {
+                    // A byte S wrote. Extend the open run, or start one here — `get_or_insert` keeps
+                    // an already-open run's start rather than resetting it to `j`.
+                    open.get_or_insert(j);
+                } else if let Some(start) = open.take() {
+                    // A byte S did not write, so the run stops *before* it. Shipping it would be
+                    // shipping a byte S has no claim to — precisely the clobber this grain avoids.
+                    ranges.push((start, j));
+                }
+            }
+            i = chunk_end;
         }
         // A run still open at the end of the blob is closed by the blob's end rather than by an
         // unchanged byte. Without this, a write reaching the final byte would be silently dropped.

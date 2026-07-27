@@ -40,8 +40,34 @@ Two new roles on the two existing processes, plus a new message channel on the e
   Wayland **client** and replays the forwarded session: binds the same globals, creates the surface and
   `xdg_toplevel`, resolves each buffer token to an S-side `wl_buffer`, attaches, and commits.
 - **Transport.** Wayland requests/events cross the **existing QUIC link** as new `rayland-relay` message
-  types (opaque Wayland wire bytes plus the small typed side-band the proxy adds for tokens). No second
-  connection in WP0. The vtest/ring relay is unchanged and runs alongside it.
+  types. No second connection in WP0. The vtest/ring relay is unchanged and runs alongside it.
+
+### Forwarding model (resolved 2026-07-22): a structured message tunnel via `wayland-backend`
+
+The proxy forwards Wayland **at the structured-message layer**, using `wayland-rs`'s low-level
+`wayland-backend` (not the high-level typed `Dispatch`, which is for building a compositor/client with app
+logic, nor raw byte-tunnelling, which would hand-parse the wire). `wayland-backend` delivers each Wayland
+request/event as a `Message { sender_id, opcode, args: [Argument] }`, where `Argument` is a typed enum
+(`Int`, `Uint`, `Fixed`, `Str`, `Object`, `NewId`, `Array`, **`Fd`**) and the library owns all wire
+serialization and fd plumbing. So:
+
+- **C side** runs a `wayland-backend` *server*; the app's every request arrives as a structured `Message`.
+  C forwards it to S. The one special case is the `Argument::Fd` on `zwp_linux_buffer_params_v1.add` (the
+  swapchain memfd): C does not send the fd — it correlates the memfd to a resource id (Spike outcome
+  §4.5) and forwards a **`BufferToken`** in its place.
+- **S side** runs a `wayland-backend` *client* on S's real compositor; it reconstructs each `Message` and
+  submits it, substituting S's own re-exported dma-buf fd for the `BufferToken` at `params.add`. Compositor
+  events reverse the path.
+- **Object-id mapping.** The two connections have independent id spaces (the app's, and S's client's), so
+  the proxy keeps a bidirectional `app_id ↔ s_id` map, translating each `Message`'s `sender_id`/`Object`/
+  `NewId` arguments as it crosses. This is the one piece of state the structured tunnel needs that a
+  raw byte-tunnel would not; it is a `HashMap`, created and torn down with the objects.
+
+This eliminates the whole class of wire-format bugs (the library is the wire authority) while keeping the
+fd interception a single, typed, well-located concern. The `rayland-relay` Wayland messages therefore carry
+a **structured `WaylandMessage`** (`{ object_id, opcode, args: Vec<WaylandArg> }`, `WaylandArg` mirroring
+`wayland-backend`'s `Argument` with the `Fd` case replaced by `BufferToken`), which supersedes Task 2's
+initial opaque-bytes shape — revised as the first step of Task 3.
 
 ## 4. Buffer-by-token — the crux, mechanism-grounded
 
@@ -69,6 +95,21 @@ The flow WP0 builds:
    Mesa's WSI) forward to S, which attaches the resolved `wl_buffer` and commits to S's compositor —
    gated on the frame's completion so the compositor never composites a half-rendered image (WP0 reuses
    the existing return-path completion signal; precise fence/`drm-syncobj` integration is WP3).
+
+### Spike outcome (2026-07-22) — the correlation key is a memfd inode `rayland-c` already owns
+
+The Task-1 spike confirmed the mechanism and sharpened one detail. The swapchain image's `VkDeviceMemory`
+is not a real dma-buf — it is a **`memfd:rayland-blob`**, the exact memfd `rayland-c` allocates
+(`crates/rayland-c/src/shm.rs`) for that resource id and hands the app over vtest. Mesa's WSI reuses that
+same fd at `zwp_linux_buffer_params.add`. So the correlation key is the resource **memfd's identity**
+(`st_dev` + `st_ino`), which `rayland-c` already holds — no fstat guessing against unknown fds, and no need
+to decode `vkSetReplyCommandStreamMESA`-style host state. This also explains why a plain vkcube run aborts
+(`create_immed failed / invalid wl_buffer`): a *real* compositor rejects a memfd presented as a dma-buf.
+The proxy dissolves that: the app connects to the *proxy*, which intercepts `create_params`/`create_immed`,
+correlates the memfd to a resource id → token, and **never forwards the memfd to a real compositor** — S
+supplies the real dma-buf. Legs (a) correlation and (c) render-on-S are confirmed; leg (b) — S re-exporting
+the resource as a dma-buf S's compositor accepts, including format/modifier — is confirmed concretely in
+Task 4.
 
 ## 5. Why this is the right shape
 

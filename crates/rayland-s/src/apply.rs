@@ -49,7 +49,8 @@ use rayland_vtest::venus_ring::decode::{
     find_destroy_device, find_get_device_queue2, find_queue_submit,
 };
 use rayland_vtest::venus_ring::{
-    RING_BUFFER_OFFSET, RingIdentity, notify_ring_command, ring_handle_from_create,
+    RING_BUFFER_OFFSET, RING_HEAD_OFFSET, RING_STATUS_OFFSET, RING_TAIL_OFFSET, RingIdentity,
+    notify_ring_command, ring_handle_from_create,
 };
 use rayland_vtest::{EngineError, RenderEngine};
 // The relay protocol.
@@ -60,7 +61,7 @@ use crate::ring_mirror::{RingDeltaError, RingMirror};
 use std::collections::HashMap;
 // `BlobResource::fd` is an `OwnedFd`; mapping it needs a borrow, and `mmap` keeps its own reference
 // to the underlying object, so the fd may be dropped straight afterwards.
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
 /// The vtest protocol version S implements.
 ///
@@ -80,6 +81,12 @@ pub const SUPPORTED_VTEST_PROTOCOL_VERSION: u32 = 4;
 /// use it.
 #[derive(Debug, thiserror::Error)]
 pub enum ApplyError {
+    /// A WP0 Wayland-proxy message reached the vtest `apply` path. The session router must split the
+    /// Wayland channel off to the S-side Wayland client *before* `apply`; one arriving here is an
+    /// internal routing bug, surfaced loudly rather than silently mis-decoded as a vtest message.
+    #[error("a Wayland-proxy message reached the vtest apply path; the session router failed to split it")]
+    WaylandMessageOnVtestPath,
+
     /// C negotiated a vtest protocol version S does not implement.
     #[error(
         "C negotiated vtest protocol version {got} with Mesa, but S implements \
@@ -206,6 +213,9 @@ fn message_is_solicited(msg: &C2S) -> bool {
         | C2S::SubmitCmd { .. }
         | C2S::NotifyRing { .. }
         | C2S::UnrefResource { .. } => false,
+        // WP0 Wayland-proxy messages never travel this vtest reply path — the session router splits
+        // them off to the S-side Wayland client before `apply` — so they are not solicited replies.
+        C2S::WaylandRequest { .. } | C2S::WaylandBind { .. } => false,
     }
 }
 
@@ -221,6 +231,29 @@ pub struct Applier {
     /// Every blob S has created and mapped, keyed by the engine's resource id — the same id every
     /// message on the wire names the resource by, so there is no translation table to drift.
     blobs: HashMap<u32, HostBlob>,
+    /// The descriptor virglrenderer exported for each blob at creation, kept alive and keyed by
+    /// resource id.
+    ///
+    /// # Why S keeps a descriptor it does not read through
+    /// S maps every blob (see [`Self::blobs`]) and reaches its pages that way, so this fd is not how
+    /// S touches the memory — `mmap` holds its own reference and this could be closed with no effect
+    /// on that. It is kept for **presentation** (WP0 4.3): the application's swapchain images are
+    /// `HOST3D` blobs, for which virglrenderer allocated device memory and exported a **dma-buf**,
+    /// and turning one into a `wl_buffer` on S's real compositor needs exactly that descriptor.
+    ///
+    /// # Why it must be retained rather than re-exported on demand
+    /// virglrenderer's `mem->exported` guard permits exactly one export per resource, and that export
+    /// already happened at creation — `create_blob_resource` performs it and hands the descriptor
+    /// back. Asking again later fails. On a normal vtest host the descriptor would be passed to the
+    /// local client over `SCM_RIGHTS` and forgotten; S has no local client, so without this the only
+    /// handle to the swapchain image's memory would be dropped at the end of the creation scope and
+    /// the frame could never be shown.
+    ///
+    /// Every blob's descriptor is kept, not just the `HOST3D` ones: which blobs are swapchain images
+    /// is the *application's* business and nothing S can soundly infer here, the count is small (a
+    /// handful per session), and a descriptor S never uses costs one file-table entry. Entries are
+    /// removed in `UnrefResource` alongside the mapping they accompany.
+    exported_fds: HashMap<u32, OwnedFd>,
     /// A mirror per ring-shaped blob, keyed the same way.
     ///
     /// **A map, not a single latched ring**, deliberately. `rayland-c` latches exactly one because
@@ -532,13 +565,24 @@ impl Applier {
                 // Map before registering anything in `Applier`'s own tables: a mapping failure must
                 // leave no half-built state *there*. It must also not leave the engine holding a
                 // resource nobody can reach any more, which is why the error path unrefs it. The fd
-                // is dropped at the end of this scope either way — `mmap` holds its own reference to
-                // the underlying object, so closing it unmaps nothing.
+                // outlives this scope now (it is retained just below for presentation); `mmap` holds its
+                // own reference regardless, so the mapping does not depend on it either way.
                 let host_blob = HostBlob::map(fd.as_fd(), size).map_err(|source| {
                     engine.unref_resource(res_id);
                     ApplyError::from(source)
                 })?;
                 self.blobs.insert(res_id, host_blob);
+                // **Keep the descriptor.** Until WP0 4.3 it was dropped here, which was correct while
+                // nothing on S needed it; presentation does. See `Applier::exported_fds` for why it
+                // cannot be re-exported later. Stored after the mapping succeeds so a refused blob
+                // leaves no entry behind.
+                self.exported_fds.insert(res_id, fd);
+                // DIAGNOSTIC (`RAYLAND_S_REPLY_LOG`): virglrenderer's Venus implementation makes a
+                // ring-side `vkAllocateMemory` **wait** for the blob resource that backs it, so a
+                // blob C creates but S never does is indistinguishable — from the ring — from a
+                // consumer that has stopped. `head` freezing exactly at a `vkAllocateMemory` boundary
+                // is precisely that ambiguity, and this line resolves it.
+                reply_log_blob_created(res_id, blob_id, size);
                 // Remember which side of the ordering split this blob falls on. `blob_id == 0` is
                 // ring-findings §6's marker for Venus's own shmems — the ring, the reply arena, the
                 // staging pool — and the reply arena is the one whose bytes release the
@@ -667,6 +711,16 @@ impl Applier {
                         source,
                     })?;
 
+                // DIAGNOSTIC (`RAYLAND_S_REPLY_LOG`): name the commands S has just accepted, so this
+                // side's view can be joined against C's `[ring-cmds]` line for the same `tail`.
+                // vkcube stalls on `vkGetImageDrmFormatModifierPropertiesEXT` (type 187): S applies
+                // the delta — this line is the proof it does — but virglrenderer's ring thread stops
+                // consuming, so `head` freezes, Mesa spins on it, and Venus aborts the application
+                // without logging (every Venus abort logs at `MESA_LOG_DEBUG`, which release Mesa
+                // suppresses). `tail` is the only key both sides share, hence logging against it.
+                // Inert unless the variable is set.
+                reply_log_commands(tail, &bytes);
+
                 // **T0 — guest/API submission accepted** (design note §7). The application's Vulkan
                 // commands for this delta are now in the ring's memory where S's engine will find
                 // them; `tail` names the frontier. Stamped here so the offline join can measure
@@ -765,8 +819,32 @@ impl Applier {
                 // will ever make these bytes execute, so an error here is the session ending, not a
                 // missed optimization.
                 if let (Some(handle), Some(ctx_id)) = (self.venus_ring_handle, self.ctx_id) {
-                    engine.submit(ctx_id, &notify_ring_command(handle))?;
+                    let rung = engine.submit(ctx_id, &notify_ring_command(handle));
+                    // DIAGNOSTIC (`RAYLAND_S_REPLY_LOG`): the doorbell is the *only* thing that makes
+                    // these bytes execute, so "was it rung, for which ring, and did the engine accept
+                    // it" is the question a stalled `head` actually poses. Logged before the `?` so a
+                    // refusal is visible even though it also ends the session.
+                    reply_log_doorbell(tail, Some(handle), Some(ctx_id), rung.is_ok());
+                    rung?;
+                } else {
+                    // No handle or no context means **no doorbell at all** — the bytes are in the
+                    // ring's memory on S and nothing will ever wake the consumer to run them. That is
+                    // indistinguishable, from C, from a slow S; it must not be silent here.
+                    reply_log_doorbell(tail, self.venus_ring_handle, self.ctx_id, false);
                 }
+                // DIAGNOSTIC (`RAYLAND_S_REPLY_LOG`): read **S's own** ring control words, which no
+                // measurement so far has looked at — every `head`/`status` reading to date came from
+                // C's copy, and the two are different memory in different machines. This is the one
+                // place the silent failure would show: `vkr_dispatch_vkNotifyRingMESA` calls
+                // `vkr_context_set_fatal` and returns **with no log at all** when its `lookup_ring`
+                // misses, and a fatal context sets `VK_RING_STATUS_FATAL_BIT_MESA` (0x2) here.
+                reply_log_ring_control(self.blobs.get(&ring_res_id), ring_res_id, tail);
+                // DIAGNOSTIC (`RAYLAND_S_BLOB_FP`), throttled: S's half of the blob comparison,
+                // placed here rather than beside the delta log because the ring mirror's mutable
+                // borrow is still live there. The ring is proven byte-exact, so if S cannot complete
+                // the application's submit, the disagreement must be in the state that submit
+                // references. Joined against C's `[c-blobfp]` on `tail`.
+                self.reply_log_blob_fingerprints(tail);
 
                 // **No `RingProgress` here, and that is the point.** The ring thread runs
                 // asynchronously; at this instant it has almost certainly consumed nothing. Reporting
@@ -785,6 +863,14 @@ impl Applier {
                 // ring its own doorbell — see `venus_ring::doorbell` for why a host on the far side
                 // of a network has to do that at all.
                 self.latch_ring_handle(&cmd);
+                // DIAGNOSTIC (`RAYLAND_S_REPLY_LOG`): `ring_handle_from_create` inspects **offset 0
+                // only**, and its own docs name the hazard — "a batch that buried a ring creation
+                // behind another command would be missed here … the ring would visibly stall". S's
+                // thread sampling found three `vkr-ring-1` threads where spec §6 assumes one, and no
+                // ring creation appears in the ring stream, so the inline batch is the remaining
+                // place they can come from. This scans the whole batch rather than its head, so a
+                // create at a non-zero offset — which the latch silently drops — becomes visible.
+                reply_log_scan_ring_creates(&cmd);
                 engine.submit(ctx_id, &cmd)?;
                 Ok(Vec::new())
             }
@@ -809,6 +895,10 @@ impl Applier {
             C2S::UnrefResource { res_id } => {
                 engine.unref_resource(res_id);
                 self.blobs.remove(&res_id);
+                // Released with the mapping it accompanies: the resource is gone from the engine, so
+                // a descriptor naming it is of no further use and holding it would leak a file-table
+                // entry for the rest of the session.
+                self.exported_fds.remove(&res_id);
                 self.rings.remove(&res_id);
                 // Forget the send-order classification too. virglrenderer is free to hand the same
                 // `res_id` to a later blob, and a leftover entry here would silently sort a fresh
@@ -817,6 +907,11 @@ impl Applier {
                 // exists to prevent. Cheap to drop; invisible and sporadic if not.
                 self.venus_internal.remove(&res_id);
                 Ok(Vec::new())
+            }
+            // WP0 Wayland-proxy messages must never reach the vtest apply path — the session router
+            // splits them off to the S-side Wayland client. One here is an internal routing bug.
+            C2S::WaylandRequest { .. } | C2S::WaylandBind { .. } => {
+                Err(ApplyError::WaylandMessageOnVtestPath)
             }
         }
     }
@@ -1063,6 +1158,16 @@ impl Applier {
     ///   **Empty means the caller must do nothing else**: no retirement, so no wait to release and
     ///   nothing S can honestly claim its GPU wrote.
     pub fn take_ring_progress(&mut self) -> Vec<S2C> {
+        // DIAGNOSTIC (`RAYLAND_S_REPLY_LOG`), throttled: sample every ring's control words on the
+        // *poll* rather than only when a delta is applied. During the vkcube stall C stops relaying
+        // entirely, so delta-driven logging goes silent exactly when the interesting thing happens;
+        // this loop keeps running. `vkr_ring_thread` clears IDLE the instant it wakes from its
+        // `cnd_wait`, so IDLE's behaviour after the stall begins is the discriminator: still set
+        // means the thread never woke (the notify never reached it), cleared with `head` still
+        // frozen means it woke and declined to consume. Those need opposite fixes.
+        for &ring_res_id in self.rings.keys() {
+            reply_log_ring_control_throttled(self.blobs.get(&ring_res_id), ring_res_id);
+        }
         // Ask the rings first, before copying anything: on the overwhelming majority of polls
         // nothing moved, and shipping a blob per poll regardless would make this loop a bandwidth
         // source rather than the latency mechanism it is meant to be.
@@ -1262,7 +1367,31 @@ impl Applier {
             .collect();
         // The reply arena keeps the fine byte grain (gap 0): it is small, and shipping a byte
         // S did not write there could clobber the application's — the grain's whole reason to exist.
-        self.emit_blob_writes(&ids, 0)
+        let out = self.emit_blob_writes(&ids, 0);
+        // DIAGNOSTIC (`RAYLAND_S_REPLY_LOG`): these are the reply-arena bytes S is about to ship —
+        // the other half of the join described at the `RingDelta` call site. If a reply Venus later
+        // overruns never appears here, S never observed it being written; if it appears here but
+        // late, the ordering is the fault. Inert unless the variable is set.
+        reply_log_arena_writes(&out);
+        out
+    }
+
+    /// The dma-buf descriptor virglrenderer exported for `res_id`, if S still holds the resource.
+    ///
+    /// This is what WP0 4.3's presentation path resolves a `BufferToken.resource_id` to: the token
+    /// names a swapchain image by the same resource id every other relayed message uses, and the
+    /// descriptor is what S's compositor needs to import it as a `wl_buffer`.
+    ///
+    /// # Inputs / outputs
+    /// - Returns a **borrow**, not the descriptor itself: `Applier` must keep ownership for the life
+    ///   of the resource, because the export cannot be repeated (see [`Self::exported_fds`]). A caller
+    ///   that needs to hand it to a compositor should `try_clone_to_owned` or pass the borrow to a
+    ///   protocol call that dups it.
+    /// - `None` if the resource was never created, or has been unref'd — both of which a correct
+    ///   caller may see, since a token can outlive its resource if the application destroys the
+    ///   swapchain while a frame is in flight.
+    pub fn exported_fd(&self, res_id: u32) -> Option<BorrowedFd<'_>> {
+        self.exported_fds.get(&res_id).map(|fd| fd.as_fd())
     }
 
     /// **(c)2 completion barrier:** does the reply arena currently show a `vkGetFenceStatus` reply reading
@@ -1442,4 +1571,464 @@ impl Applier {
     pub fn applied_ring_deltas(&self) -> u64 {
         self.applied_ring_deltas
     }
+
+    /// Fingerprint every blob S holds, for comparison against C's copy of the same resources.
+    ///
+    /// # Why this exists
+    /// The ring relay is measured byte-exact — 253 deltas, 253 matching digests — and yet S either
+    /// refuses the application's `vkQueueSubmit` with a decoder error or executes it into a fence
+    /// that never signals, intermittently. Since the command bytes provably arrive intact, what the
+    /// submit *references* is what remains: the swapchain images S builds from WP0 buffer tokens, and
+    /// the staging pool `rayland-c`'s `blob_sync` declines to publish. This is the instrument that
+    /// cleared the ring, applied one level down.
+    ///
+    /// # Inputs / outputs
+    /// - `tail`: the frontier of the delta just applied — the join key against C's `[c-blobfp]`.
+    /// - Prints one line per blob per interval. **No-op unless `RAYLAND_S_BLOB_FP` is set.**
+    ///
+    /// # Pitfall: a transient disagreement is expected; a persistent one is the finding
+    /// The two sides cannot sample at the same instant, and the application writes its mapped memory
+    /// with no interceptable call, so an application blob may legitimately differ between samples. A
+    /// blob that stays different — or one the application never writes and that differs at all — is
+    /// the signal.
+    ///
+    /// # Pitfall: this runs with the applier lock held
+    /// Hence its own switch and the throttle. The previous wall on this path was a lock-held scan
+    /// that grew to 637 ms and starved the message thread; an instrument that reintroduces that would
+    /// manufacture the very symptom it is here to explain.
+    fn reply_log_blob_fingerprints(&self, tail: u32) {
+        if std::env::var_os("RAYLAND_S_BLOB_FP").is_none() {
+            return;
+        }
+        static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        static LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        /// Twice a second, matching C's cadence so the two logs interleave at comparable points.
+        const INTERVAL_MS: u64 = 500;
+        let now_ms = BASE
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis() as u64;
+        if now_ms < LAST_MS.load(std::sync::atomic::Ordering::Relaxed) + INTERVAL_MS {
+            return;
+        }
+        LAST_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+
+        for (&res_id, blob) in &self.blobs {
+            let bytes = blob.bytes();
+            // **Cheap by construction.** Hashing every byte of every blob here — under the applier
+            // lock — measurably stopped the application from reaching its swapchain buffers at all
+            // (36 proxy-trace lines against 52 with the instrument off, 5 runs to 3). Zero regions
+            // carry no information, since S's copy of a blob starts as a zero-filled memfd, so they
+            // are dismissed with chunk compares that lower to `memcmp` and only non-zero content is
+            // hashed.
+            let (nonzero, digest) = sparse_fingerprint(bytes);
+            eprintln!(
+                "[s-blobfp] tail={tail} res={res_id} len={} nonzero={nonzero} fnv={:016x}",
+                bytes.len(),
+                digest
+            );
+        }
+    }
+}
+
+/// Whether the reply diagnostic is switched on, read fresh from `RAYLAND_S_REPLY_LOG`.
+///
+/// The variable's *presence* is the signal, matching `RAYLAND_C1_METRICS` and `RAYLAND_RING_DUMP`:
+/// `RAYLAND_S_REPLY_LOG=0` enabling logging would be a trap, but so would inventing a parsing rule
+/// nobody remembers. Read per call rather than cached in a `OnceLock` because this is throwaway
+/// instrumentation whose cost is irrelevant beside the network and the GPU on the same path.
+fn reply_log_enabled() -> bool {
+    std::env::var_os("RAYLAND_S_REPLY_LOG").is_some()
+}
+
+/// Name the Venus commands S has just written into the ring, for the `tail` that carries them.
+///
+/// # Why this exists
+/// vkcube stalls at `vkGetImageDrmFormatModifierPropertiesEXT` (`VkCommandTypeEXT` 187): S applies
+/// the delta carrying it, but virglrenderer's ring thread stops consuming, so the ring's `head`
+/// freezes, Mesa — which polls `head` as its reply-ready signal — spins, and Venus aborts the
+/// application. **The abort names nothing**, because `vn_log` logs at `MESA_LOG_DEBUG` and a release
+/// Mesa suppresses that, so *every* Venus abort is silent and its silence carries no information.
+/// Neither process therefore names the failure, which is why this logs S's view against `tail` — the
+/// one key both sides share — to be joined against `rayland-c`'s `[ring-cmds]` line for the delta.
+///
+/// # Inputs / outputs
+/// - `tail`: the ring frontier after this delta — the join key, and the only one, because a command's
+///   position in the stream is not otherwise recoverable from either log.
+/// - `bytes`: the delta's command stream, exactly as C relayed it.
+/// - Prints one line to stderr; returns nothing. **No-op unless `RAYLAND_S_REPLY_LOG` is set.**
+///
+/// # Pitfall: the decoder stops early, and that is the useful part
+/// [`decode_commands`](rayland_vtest::venus_ring::decode::decode_commands) is deliberately
+/// conservative — it halts at the first command whose encoded size it does not know rather than
+/// guessing a stride and desynchronising everything after it. In this stream that stop is
+/// *the application's own command*, every time, because the sizes the decoder knows are Venus's
+/// framing commands. So `stop` is the interesting field, not a failure.
+fn reply_log_commands(tail: u32, bytes: &[u8]) {
+    if !reply_log_enabled() {
+        return;
+    }
+    let (commands, stop) = rayland_vtest::venus_ring::decode::decode_commands(bytes);
+    // The decoded framing commands, plus the stop — which names the application command itself.
+    let named: Vec<String> = commands
+        .iter()
+        .map(|c| format!("type={}", c.command_type))
+        .collect();
+    eprintln!(
+        "[s-reply] delta tail={} len={} fnv={:016x} decoded=[{}] stop={:?}",
+        tail,
+        bytes.len(),
+        fnv1a(bytes),
+        named.join(","),
+        stop
+    );
+}
+
+/// Sample a ring's control words on the progress poll, at most a few times a second.
+///
+/// # Why a throttle, and why on the poll at all
+/// [`reply_log_ring_control`] fires when a delta is applied, which is precisely the wrong cadence
+/// for the vkcube stall: once the application blocks, C relays nothing, and the delta-driven log
+/// falls silent at the exact moment the interesting thing happens. The progress poll keeps running
+/// regardless (every 200 µs), so it can watch the stall — but at that rate it would emit thousands
+/// of lines a second and bury the signal, hence the throttle.
+///
+/// # What the sample is for
+/// `vkr_ring_thread` clears `VK_RING_STATUS_IDLE_BIT_MESA` immediately on waking from its
+/// `cnd_wait`. So after the stall begins: **IDLE still set** means the thread never woke, and the
+/// doorbell never reached `vkr_ring_notify`; **IDLE cleared while `head` stays frozen** means it woke
+/// and declined to consume. Those two call for opposite fixes, which is the whole reason to look.
+///
+/// # Inputs / outputs
+/// - `blob`: S's mapping of the ring resource, or `None`.
+/// - `res_id`: the ring's resource id.
+/// - Prints at most one line per interval; returns nothing. **No-op unless `RAYLAND_S_REPLY_LOG` is
+///   set.**
+fn reply_log_ring_control_throttled(blob: Option<&HostBlob>, res_id: u32) {
+    // **Its own switch, deliberately.** This is the one diagnostic that runs with the applier lock
+    // held, so it is the one that could plausibly perturb a lock-ordering bug it is being used to
+    // study. Gating it separately means a run can have all the other logging with this specific
+    // instrument removed from the picture — which is how its innocence gets established rather than
+    // assumed.
+    if !reply_log_enabled() || std::env::var_os("RAYLAND_S_POLL_SAMPLE").is_none() {
+        return;
+    }
+    // A process-wide clock base, established on the first sample. `Instant` cannot be a `const`, so
+    // it is stored once and read thereafter.
+    static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    static LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    /// Roughly four samples a second: dense enough to catch a status bit flipping during the stall,
+    /// sparse enough that the log stays readable next to the doorbell lines.
+    const INTERVAL_MS: u64 = 250;
+
+    let now_ms = BASE
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64;
+    let last = LAST_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if now_ms < last + INTERVAL_MS {
+        return;
+    }
+    // A plain store, not compare-exchange: two threads racing here would at worst emit two samples
+    // in one interval, which is harmless for a diagnostic and not worth the ceremony of a CAS loop.
+    LAST_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+    // Reuse the delta-driven formatter so both cadences print the same shape and can be read
+    // together; `relayed_tail` is 0 here because no delta prompted this sample.
+    reply_log_ring_control(blob, res_id, 0);
+}
+
+/// Report **S's own** copy of a ring's control words: `head`, `tail`, and `status`.
+///
+/// # Why this exists, and why it is not a duplicate of anything C logs
+/// C and S each hold their *own* memory for the ring — C's memfd that Mesa maps, and S's blob that
+/// virglrenderer's ring thread consumes. Every `head`/`tail`/`status` reading taken during this
+/// investigation came from C's copy, and **C's copy cannot show a failure that happens on S**. In
+/// particular `vkr_dispatch_vkNotifyRingMESA` (`vkr_transport.c:301-305`) does this when its ring
+/// lookup misses:
+///
+/// ```c
+/// struct vkr_ring *ring = lookup_ring(ctx, args->ring);
+/// if (!ring) {
+///    vkr_context_set_fatal(ctx);   /* no vkr_log, no message anywhere */
+///    return;
+/// }
+/// ```
+///
+/// A context killed that way announces itself **only** through `VK_RING_STATUS_FATAL_BIT_MESA`
+/// (`0x2`) in S's status word — which nothing in Rayland has ever read. The measured symptom this
+/// exists to explain is a ring thread parked indefinitely on its condition variable
+/// (`cnd_wait`, `abstime=0x0`, captured under gdb) while `head` stays frozen and work sits past it.
+///
+/// # Inputs / outputs
+/// - `blob`: S's mapping of the ring resource, or `None` if it is somehow absent — reported rather
+///   than skipped, because an absent ring blob at this point would itself be the finding.
+/// - `res_id`: the ring's resource id, for the log line.
+/// - `relayed_tail`: the `tail` C just relayed, so S's own words can be compared against what C
+///   believes it sent — a divergence there is a different bug from a fatal context.
+/// - Prints one line to stderr; returns nothing. **No-op unless `RAYLAND_S_REPLY_LOG` is set.**
+///
+/// # Pitfall: these words are written by another process, concurrently
+/// virglrenderer's ring thread stores `head` and `status` from the forked render worker with no
+/// synchronisation with this thread, so a reading is a snapshot that may be stale the instant it is
+/// taken. That is fine for the question being asked — `FATAL` is sticky once set, and a frozen
+/// `head` is frozen for seconds — but it would not be fine for anything load-bearing, and nothing
+/// load-bearing may be built on this.
+fn reply_log_ring_control(blob: Option<&HostBlob>, res_id: u32, relayed_tail: u32) {
+    if !reply_log_enabled() {
+        return;
+    }
+    let Some(blob) = blob else {
+        eprintln!("[s-ringctl] res={res_id} relayed_tail={relayed_tail} blob=ABSENT");
+        return;
+    };
+    let bytes = blob.bytes();
+    // Each control word is a little-endian `u32` at a fixed 64-byte-separated offset; a short read
+    // is reported as `None` rather than assumed, since a ring blob too small for its own control
+    // words would itself be the finding.
+    let word = |offset: usize| -> Option<u32> {
+        bytes
+            .get(offset..offset + 4)
+            .map(|w| u32::from_le_bytes(w.try_into().expect("slice is exactly four bytes")))
+    };
+    let status = word(RING_STATUS_OFFSET);
+    // Spell the bits out: `0x2` is the one that matters and is easy to miss in a raw number.
+    let flags = status.map_or_else(String::new, |s| {
+        let mut set = Vec::new();
+        if s & 0x1 != 0 {
+            set.push("IDLE");
+        }
+        if s & 0x2 != 0 {
+            set.push("FATAL");
+        }
+        if s & 0x4 != 0 {
+            set.push("ALIVE");
+        }
+        format!(" [{}]", set.join("|"))
+    });
+    eprintln!(
+        "[s-ringctl] res={res_id} relayed_tail={relayed_tail} s_head={:?} s_tail={:?} s_status={:?}{}",
+        word(RING_HEAD_OFFSET),
+        word(RING_TAIL_OFFSET),
+        status,
+        flags
+    );
+}
+
+/// Scan a whole inline batch for `vkCreateRingMESA` commands, wherever they sit in it.
+///
+/// # Why this exists
+/// [`ring_handle_from_create`](rayland_vtest::venus_ring::ring_handle_from_create) reads the command
+/// type at **offset 0 only**, and its own documentation names the consequence: *"a batch that buried
+/// a ring creation behind another command would be missed here … S would never learn the handle,
+/// never ring a doorbell, and the ring would visibly stall"*. A visibly stalled ring is exactly
+/// vkcube's symptom, and sampling the render worker's threads found three `vkr-ring-1` threads —
+/// `vkr_ring.c:248` names those by context id, so they are three rings in one context — where (c)1
+/// spec §6 assumes one. No ring creation appears anywhere in the ring stream, so the inline batch is
+/// the only remaining place they can be created. This says whether the latch is missing them.
+///
+/// # Inputs / outputs
+/// - `cmd`: one inline batch, exactly as it arrived from C.
+/// - Prints one line per candidate to stderr; returns nothing. **No-op unless
+///   `RAYLAND_S_REPLY_LOG` is set.**
+///
+/// # Pitfall: a dword match is a candidate, not a proof
+/// This scans for the command-type dword at 4-byte alignment, so a payload word that happens to
+/// equal 188 will show up too. **Offset 0 is the case that matters**: a hit there is what the latch
+/// already handles, and a hit *only* at a non-zero offset is the bug this is looking for. Judge the
+/// pattern across a run, not any single line.
+fn reply_log_scan_ring_creates(cmd: &[u8]) {
+    if !reply_log_enabled() {
+        return;
+    }
+    // The handle sits eight bytes into the command, after `[type][flags]` — the same layout
+    // `ring_handle_from_create` reads, applied at each candidate offset instead of only at zero.
+    const HANDLE_OFFSET: usize = 8;
+    for off in (0..cmd.len().saturating_sub(3)).step_by(4) {
+        let word = u32::from_le_bytes([cmd[off], cmd[off + 1], cmd[off + 2], cmd[off + 3]]);
+        if word != 188 {
+            continue;
+        }
+        // Only report a handle when the batch actually holds eight more bytes for one; a truncated
+        // tail is itself worth seeing rather than silently skipping.
+        let handle = cmd
+            .get(off + HANDLE_OFFSET..off + HANDLE_OFFSET + 8)
+            .map(|h| u64::from_le_bytes(h.try_into().expect("slice is exactly eight bytes")));
+        eprintln!(
+            "[s-ringcreate] batch_len={} off={off} latched_by_offset0={} handle={:?}",
+            cmd.len(),
+            off == 0,
+            handle.map(|h| format!("{h:#x}"))
+        );
+    }
+}
+
+/// Report a blob resource S has created and mapped.
+///
+/// # Why this exists
+/// A ring-side `vkAllocateMemory` that is backed by a blob cannot complete until that blob resource
+/// exists on the host, so if C creates a blob and S does not, virglrenderer's ring thread waits and
+/// `head` stops advancing — which is externally identical to a parked or dead consumer. vkcube
+/// stalls with `head` frozen at exactly a `vkAllocateMemory` boundary while C goes on to create a
+/// 1,008,000-byte blob (its third swapchain image), so whether that blob reached S is the difference
+/// between "the consumer is broken" and "the consumer is correctly waiting for something S never
+/// gave it".
+///
+/// # Inputs / outputs
+/// - `res_id`: the engine-assigned resource id, the same id every wire message names it by.
+/// - `blob_id`: the client-chosen blob id — ring-findings §6's application-versus-Venus signal.
+/// - `size`: the blob's size in bytes, which is what identifies a swapchain image by inspection.
+/// - Prints one line to stderr; returns nothing. **No-op unless `RAYLAND_S_REPLY_LOG` is set.**
+fn reply_log_blob_created(res_id: u32, blob_id: u64, size: u64) {
+    if !reply_log_enabled() {
+        return;
+    }
+    eprintln!("[s-blob] created res={res_id} blob_id={blob_id} size={size}");
+}
+
+/// Report whether the ring's doorbell was rung for a delta, and for which ring.
+///
+/// # Why this exists
+/// virglrenderer's ring thread parks after 1 ms and is woken **only** by `vkNotifyRingMESA`, so this
+/// doorbell is the single thing that makes a relayed delta actually execute. When `head` stops
+/// advancing while `tail` runs on — which is exactly what vkcube's stall looks like — there are only
+/// a few possibilities, and this line separates them: the doorbell was never rung (no ring handle
+/// latched, or no context), it was rung but the engine refused it, or it was rung and accepted and
+/// the consumer still did not advance. The first two are S's bug; the third moves the question into
+/// virglrenderer.
+///
+/// # Inputs / outputs
+/// - `tail`: the delta's frontier — the key that joins this to [`reply_log_commands`] and to
+///   `rayland-c`'s `[ring-cmds]` line.
+/// - `handle`: the latched `vkCreateRingMESA` handle, or `None` if none was ever latched. **`None`
+///   is the loud case**: it means no doorbell was sent at all.
+/// - `ctx_id`: the context the doorbell is submitted on, or `None` for the same reason.
+/// - `accepted`: whether the engine accepted the submission.
+/// - Prints one line to stderr; returns nothing. **No-op unless `RAYLAND_S_REPLY_LOG` is set.**
+///
+/// # Pitfall: "rung and accepted" is not "consumed"
+/// The engine accepting `vkNotifyRingMESA` says the notification reached virglrenderer, not that the
+/// ring thread woke, nor that it consumed anything. Progress is only observable through `head`, which
+/// the consumer writes asynchronously — so a run of accepted doorbells beside a frozen `head` is a
+/// real and meaningful outcome here, not a contradiction.
+fn reply_log_doorbell(tail: u32, handle: Option<u64>, ctx_id: Option<u32>, accepted: bool) {
+    if !reply_log_enabled() {
+        return;
+    }
+    eprintln!(
+        "[s-doorbell] tail={} handle={} ctx={} accepted={}",
+        tail,
+        handle.map_or("NONE".to_string(), |h| format!("{h:#x}")),
+        ctx_id.map_or("NONE".to_string(), |c| c.to_string()),
+        accepted
+    );
+}
+
+/// Report the reply-arena bytes S is about to ship back to C.
+///
+/// # Why this exists
+/// This is the other half of the join described on [`reply_log_commands`], and it is what says
+/// whether the engine produced *anything* for the stalling command. If the arena never receives a
+/// reply for the command `head` is stuck before, the ring thread genuinely never ran it — which is
+/// the parked-consumer failure (c)1's finding #1 named. If a reply does appear here, the engine ran
+/// it and the fault is instead in what releases the application. Printing what is shipped, and when,
+/// is what tells those two apart, and they call for opposite fixes.
+///
+/// # Inputs / outputs
+/// - `messages`: the messages [`Applier::take_venus_blob_writes`] is returning. Only
+///   [`S2C::BlobData`] carries arena bytes; anything else is ignored rather than guessed at.
+/// - Prints one line per `BlobData` to stderr; returns nothing. **No-op unless
+///   `RAYLAND_S_REPLY_LOG` is set.**
+///
+/// # Pitfall: the head of the run is what identifies a reply, so print it
+/// A Venus reply begins with its own `[command_type][flags]` prologue, so the first eight bytes of a
+/// run are what say *which* reply this is. The rest is payload and would only bury the signal, hence
+/// the deliberate truncation.
+fn reply_log_arena_writes(messages: &[S2C]) {
+    if !reply_log_enabled() {
+        return;
+    }
+    for message in messages {
+        let S2C::BlobData {
+            res_id,
+            offset,
+            bytes,
+        } = message
+        else {
+            continue;
+        };
+        // The first eight bytes are the reply's `[command_type][flags]` prologue — the identifying
+        // part. Anything shorter than that is itself worth seeing, so this does not pad or skip.
+        let head: Vec<String> = bytes.iter().take(8).map(|b| format!("{b:02x}")).collect();
+        eprintln!(
+            "[s-reply] arena res={} off={} len={} head={}",
+            res_id,
+            offset,
+            bytes.len(),
+            head.join(" ")
+        );
+    }
+}
+
+/// FNV-1a over a byte slice — the S-side half of the ring-delta fingerprint.
+///
+/// # Why this exists
+/// virglrenderer refuses the application's `vkQueueSubmit` here with a "CS error", which is a
+/// *decode* failure rather than a GPU one. Either the delta arrived corrupted or truncated, or it
+/// arrived perfectly and the submit refers to bytes that never cross in the ring at all — Venus's
+/// staging pool, which `rayland-c`'s `blob_sync` declines to publish by design. Those two have
+/// opposite fixes. Hashing each delta on **both** sides and joining on `tail` decides it in one run,
+/// which is why this deliberately duplicates `rayland-c`'s `fnv1a` rather than sharing it: the whole
+/// point is that the two sides compute the digest independently, from their own copy of the bytes.
+/// A shared helper would still prove they agree, but a reader would have to check that it was fed
+/// the two different buffers — this way the independence is structural. See `docs/DIARY.md`,
+/// 2026-07-26.
+///
+/// # Inputs / outputs
+/// - `bytes`: the delta exactly as S received and applied it.
+/// - Returns the 64-bit hash. Pure; no allocation, no failure mode.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    // The standard 64-bit FNV offset basis and prime; must match `rayland-c`'s constants exactly or
+    // the comparison this exists for is meaningless.
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for &b in bytes {
+        // XOR then multiply: FNV-1a, not FNV-1. The orders give different digests.
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
+/// A blob fingerprint that skips zero regions: `(non-zero byte count, digest of the non-zero bytes)`.
+///
+/// Must stay byte-for-byte equivalent to `rayland-c`'s `sparse_fingerprint`, since the whole purpose
+/// is comparing the two sides' output. Duplicated rather than shared for the reason the ring
+/// fingerprints are: two independent computations over two independent buffers is the property being
+/// tested. See that function's docs for why the zero-skipping is not merely an optimisation but a
+/// requirement — the full-hash version changed the behaviour of the system it was measuring.
+fn sparse_fingerprint(bytes: &[u8]) -> (usize, u64) {
+    const CHUNK: usize = 64;
+    const ZEROS: [u8; CHUNK] = [0u8; CHUNK];
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut nonzero = 0usize;
+    let mut hash = OFFSET_BASIS;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let end = (i + CHUNK).min(bytes.len());
+        if bytes[i..end] == ZEROS[..end - i] {
+            i = end;
+            continue;
+        }
+        for &b in &bytes[i..end] {
+            if b != 0 {
+                nonzero += 1;
+                hash ^= b as u64;
+                hash = hash.wrapping_mul(PRIME);
+            }
+        }
+        i = end;
+    }
+    (nonzero, hash)
 }

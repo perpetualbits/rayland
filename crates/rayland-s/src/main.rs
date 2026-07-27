@@ -63,12 +63,15 @@
 // not an S-issued fence), so only `apply` needs the client, as `&mut dyn RenderEngine`.
 use rayland_engine::{EngineClient, spawn_engine, virgl_available};
 // The relay protocol and its framing.
-use rayland_relay::{C2S, S2C, read_msg, write_msg};
+use rayland_relay::{C2S, S2C, WaylandMessage, read_msg, write_msg};
 // The message applier: everything this daemon actually knows how to do.
 use rayland_s::apply::Applier;
+use rayland_s::wayland_client::{EventSink, WaylandReplay};
 // Presentation: finding the application's readback buffer among S's blobs, and putting it on S's
 // screen. See that module's docs for why finding it is the one guess (c)1 has to make.
-use rayland_s::present::{ENV_NO_PRESENT, FrameCapture, frame_size_from_env, present_frame};
+use rayland_s::present::{
+    ENV_NO_PRESENT, FrameCapture, LiveFrame, frame_size_from_env, present_frame_live,
+};
 
 // SP2's QUIC transport: the network C's commands cross.
 use rayland_transport::{QuicRecv, QuicSend};
@@ -78,6 +81,7 @@ use anyhow::{Context, Result};
 // reply C never sees.
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -162,7 +166,27 @@ const ENV_WAYLAND_DISPLAY: &str = "WAYLAND_DISPLAY";
 /// # Errors
 /// Returns an error if the frame could not be identified (no candidate, or an ambiguity S refuses to
 /// guess through), or if presentation itself failed on a machine that does have a compositor.
-fn present_the_frame(capture: FrameCapture) -> Result<()> {
+fn present_the_frame(capture: FrameCapture, live: &Arc<Mutex<LiveFrame>>) -> Result<()> {
+    // Always say what S would show, before any decision to decline. An automated run never reaches
+    // `into_frame`, so without this the only report on presentation is a human looking at a window —
+    // and a blank one looks exactly like a correct one in the log. See `FrameCapture::report`.
+    capture.report();
+    // **Prefer the live frame.** It is the newest frame S proved complete and shipped, whereas the
+    // capture holds each candidate as it looked when its blob was *created* — a finished frame for a
+    // one-frame application, an empty buffer for a multi-frame one. Falling back to the capture when
+    // no run ever landed keeps single-frame applications working exactly as before, including the
+    // ambiguity refusal, which the live frame has no way to express.
+    let live_frame = match live.lock() {
+        Ok(frame) => {
+            frame.report();
+            frame.frame()
+        }
+        Err(poisoned) => {
+            let frame = poisoned.into_inner();
+            frame.report();
+            frame.frame()
+        }
+    };
     if std::env::var_os(ENV_NO_PRESENT).is_some() {
         eprintln!(
             "rayland-s: not presenting ({ENV_NO_PRESENT} is set). The relay itself is unaffected; \
@@ -180,8 +204,30 @@ fn present_the_frame(capture: FrameCapture) -> Result<()> {
     }
     // Refuse loudly here rather than show something wrong. `into_frame`'s two errors both explain
     // themselves at length, so there is nothing to add with a `context`.
-    let frame = capture.into_frame()?;
-    present_frame(frame)
+    let frame = match live_frame {
+        Some(frame) => {
+            eprintln!(
+                "rayland-s: presenting the newest complete frame S shipped ({}x{})",
+                frame.width, frame.height
+            );
+            frame
+        }
+        None => capture.into_frame()?,
+    };
+    // Keep following the render for as long as the window is open. The closure holds only the shared
+    // frame — the relay may well have ended by now, in which case it simply keeps returning the last
+    // frame and the window behaves like the static one. `try_lock` rather than `lock`: this runs on
+    // the compositor's frame callback, and a presentation path that can block on the progress
+    // thread's lock could stall the relay. A missed frame is not worth that risk; the next callback
+    // is 16 ms away.
+    let live_for_window = Arc::clone(live);
+    present_frame_live(
+        frame,
+        Some(Box::new(move || match live_for_window.try_lock() {
+            Ok(frame) => frame.frame(),
+            Err(_) => None,
+        })),
+    )
 }
 
 /// Frame and write one message to C, flushing it.
@@ -190,8 +236,140 @@ fn present_the_frame(capture: FrameCapture) -> Result<()> {
 /// a request/reply waiting for exactly it — so the application stalls on a reply that was computed
 /// and then sat in a buffer.
 fn send(stream: &mut QuicSend, msg: &S2C) -> Result<()> {
+    // DIAGNOSTIC (`RAYLAND_S_REPLY_LOG`): bracket the write *and the flush* separately. `write_msg`
+    // returning is not delivery — `rayland-c`'s own `record_send` counts after the write and before
+    // its flush, which is why "C sent 91, S applied 90" cannot currently distinguish a message that
+    // was never flushed from one that was never read. A `w>` with no matching `w<` is a send that
+    // did not complete, and that is exactly the shape this is looking for.
+    link_log("w>", &s2c_kind(msg));
     write_msg(stream, msg).with_context(|| format!("writing {msg:?} to C"))?;
-    stream.flush().context("flushing the link to C")
+    let flushed = stream.flush().context("flushing the link to C");
+    link_log("w<", &s2c_kind(msg));
+    flushed
+}
+
+/// Whether the link diagnostic is on, read from `RAYLAND_S_REPLY_LOG` — the same switch as the
+/// applier's instrumentation, so one variable turns the whole investigation's logging on.
+fn link_log_enabled() -> bool {
+    std::env::var_os("RAYLAND_S_REPLY_LOG").is_some()
+}
+
+/// Report how long a lock-held critical section took, when it took long enough to matter.
+///
+/// # Why a threshold rather than every call
+/// This runs on a 200 µs poll loop, so logging unconditionally would emit millions of lines and
+/// change the timing it is measuring. Only sections that are slow enough to starve the message
+/// thread are interesting, and 50 ms is already two orders of magnitude past what a "handful of
+/// loads" (the applier's own description of `take_ring_progress`) should cost.
+///
+/// # Inputs / outputs
+/// - `what`: the call being timed.
+/// - `elapsed`: how long it held the applier lock.
+/// - Prints only above the threshold. **No-op unless `RAYLAND_S_REPLY_LOG` is set.**
+fn section_log(what: &str, elapsed: Duration) {
+    /// Two orders of magnitude above what any of these sections is documented to cost.
+    const REPORT_ABOVE: Duration = Duration::from_millis(50);
+    if !link_log_enabled() || elapsed < REPORT_ABOVE {
+        return;
+    }
+    eprintln!("[s-section] {what} held the applier lock {} ms", elapsed.as_millis());
+}
+
+/// A throttled "the progress thread is still looping" line, emitted while holding **no** lock.
+///
+/// # Why it must be outside the locks
+/// The ring sampler in `Applier::take_ring_progress` runs with the applier lock held — necessarily,
+/// since it reads the applier's blobs — so its silence is ambiguous: it means either "this thread
+/// stopped" or "this thread never got the lock". This heartbeat sits before any acquisition, so it
+/// separates those two, and together with the watchdog it says which thread is blocked on what.
+///
+/// Prints at most once per interval. **No-op unless `RAYLAND_S_REPLY_LOG` is set.**
+fn progress_heartbeat() {
+    if !link_log_enabled() {
+        return;
+    }
+    static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    static LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    /// Twice a second: frequent enough to bracket a ~4 s stall, sparse enough not to flood a log
+    /// that a 200 µs poll loop would otherwise fill with millions of lines.
+    const INTERVAL_MS: u64 = 500;
+
+    let now_ms = BASE
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64;
+    if now_ms < LAST_MS.load(std::sync::atomic::Ordering::Relaxed) + INTERVAL_MS {
+        return;
+    }
+    LAST_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+    eprintln!("[s-heartbeat] progress thread looping at {now_ms}ms");
+}
+
+/// Emit one link-traffic line: a direction marker and a compact message description.
+///
+/// # Inputs / outputs
+/// - `marker`: `r<` for a message read from C, `w>` / `w<` for the start and end of a write to C.
+///   The paired write markers are what make an incomplete send visible.
+/// - `what`: the message description from [`c2s_kind`] or [`s2c_kind`].
+/// - Prints one line to stderr. **No-op unless `RAYLAND_S_REPLY_LOG` is set.**
+fn link_log(marker: &str, what: &str) {
+    if !link_log_enabled() {
+        return;
+    }
+    eprintln!("[s-link] {marker} {what}");
+}
+
+/// Describe a `C2S` in one short line — **never** its payload.
+///
+/// # Why not `{:?}`
+/// A `BlobData` can carry a megabyte, and a `RingDelta` a full ring's worth of commands; debug-
+/// formatting either would produce a log line longer than the rest of the session's output combined
+/// and bury the very sequence this is meant to reveal. Only the identifying fields are printed —
+/// which for the stall means `RingDelta`'s `tail`, the key every other log in this investigation is
+/// already joined on.
+fn c2s_kind(m: &C2S) -> String {
+    match m {
+        C2S::Hello { .. } => "Hello".to_string(),
+        C2S::CreateContext { .. } => "CreateContext".to_string(),
+        C2S::GetCapset { .. } => "GetCapset".to_string(),
+        C2S::CreateBlob { blob_id, size, .. } => format!("CreateBlob blob_id={blob_id} size={size}"),
+        C2S::BlobData {
+            res_id,
+            offset,
+            bytes,
+        } => format!("BlobData res={res_id} off={offset} len={}", bytes.len()),
+        C2S::RingDelta {
+            ring_res_id,
+            tail,
+            bytes,
+        } => format!("RingDelta ring={ring_res_id} tail={tail} len={}", bytes.len()),
+        C2S::SubmitCmd { .. } => "SubmitCmd".to_string(),
+        C2S::NotifyRing { .. } => "NotifyRing".to_string(),
+        C2S::UnrefResource { res_id } => format!("UnrefResource res={res_id}"),
+        C2S::WaylandRequest { .. } => "WaylandRequest".to_string(),
+        C2S::WaylandBind { .. } => "WaylandBind".to_string(),
+    }
+}
+
+/// Describe an `S2C` in one short line — **never** its payload. See [`c2s_kind`] for why.
+fn s2c_kind(m: &S2C) -> String {
+    match m {
+        S2C::Capset { bytes } => format!("Capset len={}", bytes.len()),
+        S2C::BlobCreated { res_id, initial } => {
+            format!("BlobCreated res={res_id} runs={}", initial.len())
+        }
+        S2C::BlobData {
+            res_id,
+            offset,
+            bytes,
+        } => format!("BlobData res={res_id} off={offset} len={}", bytes.len()),
+        S2C::RingProgress {
+            ring_res_id,
+            consumed_tail,
+        } => format!("RingProgress ring={ring_res_id} consumed_tail={consumed_tail}"),
+        S2C::Error { .. } => "Error".to_string(),
+        S2C::WaylandEvent { .. } => "WaylandEvent".to_string(),
+    }
 }
 
 /// Ship a batch of messages to C, stamping the T6 trace point for each `BlobData`.
@@ -207,6 +385,30 @@ fn send(stream: &mut QuicSend, msg: &S2C) -> Result<()> {
 ///   anything that would release the application to read them.
 /// - Returns `Err(())` if a send failed; the caller ends the session, exactly as the inline sends did.
 fn ship(tx: &Arc<Mutex<QuicSend>>, msgs: &[S2C]) -> Result<(), ()> {
+    if msgs.is_empty() {
+        return Ok(());
+    }
+    // **One lock and one flush for the whole batch, not one per message.**
+    //
+    // This loop used to take the send lock and flush inside it, once per message. That is what made
+    // the return path message-rate bound: a 120-frame `icosa-gpu` run ships **29414** `BlobData`
+    // messages, so it was paying 29414 lock acquisitions and 29414 flushes — and a flush is a
+    // syscall-shaped operation on the QUIC stream, not a memcpy. Measured breakdown of that run:
+    // 24874 messages for the readback (`res=5`, average run 377 bytes — its gap-256 coalescing works)
+    // and 4540 for the reply arena (`res=2`, average 4.4 bytes, 3247 of them a single byte).
+    //
+    // The arena's fine grain is **not** a defect to coalesce away: `take_venus_blob_writes` uses
+    // gap 0 deliberately, because a gap byte is one S did not write, and shipping it could clobber
+    // what C's Mesa has there. So the fix cannot be "send fewer bytes"; it has to be "send the same
+    // bytes in fewer operations", which is exactly what batching the flush does — losslessly, with
+    // no change to the wire format and no byte shipped that was not shipped before.
+    //
+    // Ordering is untouched. Messages are written in the order given, and the *between*-batch
+    // ordering the return path depends on (readback pixels, then reply arena, then the head-advance
+    // that releases the application — see `progress_thread`) is a property of separate `ship` calls,
+    // each of which still flushes before it returns.
+    let mut guard = tx.lock().expect("the link send lock is never poisoned");
+    let stream = &mut *guard;
     for msg in msgs {
         // T6 — transfer packet emitted (design note §7): the point a pixel packet leaves S for C.
         if let S2C::BlobData { res_id, offset, bytes } = msg {
@@ -215,13 +417,41 @@ fn ship(tx: &Arc<Mutex<QuicSend>>, msgs: &[S2C]) -> Result<(), ()> {
                 &format!("side=S res={res_id} off={offset} len={}", bytes.len()),
             );
         }
-        let mut stream = tx.lock().expect("the link send lock is never poisoned");
-        if let Err(e) = send(&mut stream, msg) {
+        link_log("w>", &s2c_kind(msg));
+        if let Err(e) = write_msg(stream, msg).with_context(|| format!("writing {msg:?} to C"))
+        {
             eprintln!("rayland-s: shipping to C failed: {e:#}");
             return Err(());
         }
     }
+    // The flush is what actually delivers: an unflushed message is an answer C never sees, and C may
+    // be blocked in a request/reply waiting for exactly it. Once for the batch, after every write.
+    if let Err(e) = stream.flush().context("flushing the link to C") {
+        eprintln!("rayland-s: shipping to C failed: {e:#}");
+        return Err(());
+    }
+    link_log("w<", &format!("batch of {}", msgs.len()));
     Ok(())
+}
+
+/// The WP0 event-return sink: ships each translated compositor event to C as an [`S2C::WaylandEvent`].
+///
+/// The S-side replay ([`WaylandReplay`]) translates a compositor event into the app's id space and hands it
+/// here; this puts it on the same link C's proxy reads, where the reader thread `post`s it to the proxy and
+/// the app receives it. It shares the one send link with the message and progress threads (the mutex inside
+/// [`ship`] serializes the three). Delivery is fire-and-forget: a failed ship is logged by `ship` and
+/// dropped, because an undeliverable event must not stall the compositor-reader thread.
+struct LinkEventSink {
+    /// The shared link to C, locked per message by [`ship`].
+    tx: Arc<Mutex<QuicSend>>,
+}
+
+impl EventSink for LinkEventSink {
+    /// Ship one app-space compositor event to C. Errors are swallowed (logged inside `ship`): the event
+    /// return path is best-effort and independent of the ring/blob path's own error handling.
+    fn emit(&self, event: WaylandMessage) {
+        let _ = ship(&self.tx, &[S2C::WaylandEvent { message: event }]);
+    }
 }
 
 /// The return path: ship each finished readback frame **ahead of** the ring-progress that releases the
@@ -248,14 +478,30 @@ fn ship(tx: &Arc<Mutex<QuicSend>>, msgs: &[S2C]) -> Result<(), ()> {
 /// before progress — the same lockstep the working gate used, which initialization depends on (a wholesale
 /// rewrite of this cadence broke device init; see `docs/DIARY.md`, 2026-07-21). Nothing here enters the
 /// engine, so no cycle can form between this thread, the message thread, and the actor.
-fn progress_thread(applier: Arc<Mutex<Applier>>, tx: Arc<Mutex<QuicSend>>) {
+fn progress_thread(
+    applier: Arc<Mutex<Applier>>,
+    tx: Arc<Mutex<QuicSend>>,
+    live: Arc<Mutex<LiveFrame>>,
+) {
     loop {
+        // DIAGNOSTIC (`RAYLAND_S_REPLY_LOG`): a heartbeat taken **outside every lock**, unlike the
+        // ring sampler inside `take_ring_progress` which necessarily runs with the applier held. If
+        // this line stops while the watchdog still reports, this thread is blocked *acquiring* a
+        // lock; if it keeps going while nothing else moves, it is looping and finding nothing.
+        progress_heartbeat();
         // The head-advance that releases the application's synchronous calls, taken first. Shipped
         // old-style below (only when the ring moved, venus before progress) so init's reply/head lockstep
         // is exactly the working gate's — that lockstep is load-bearing for initialization.
         let progress = {
             let mut session = applier.lock().expect("the applier lock is never poisoned");
-            session.take_ring_progress()
+            let t = std::time::Instant::now();
+            let p = session.take_ring_progress();
+            // DIAGNOSTIC (`RAYLAND_S_REPLY_LOG`): time the critical section. The watchdog showed the
+            // applier lock held essentially continuously while this thread looped only every ~3 s,
+            // which is not a deadlock but a critical section long enough to starve the message
+            // thread past Mesa's ~3.5 s stall abort. This says which call spends it.
+            section_log("take_ring_progress", t.elapsed());
+            p
         };
         if !progress.is_empty() {
             // The reply arena for the commands that just retired, plus a check of whether the arena now
@@ -264,7 +510,15 @@ fn progress_thread(applier: Arc<Mutex<Applier>>, tx: Arc<Mutex<QuicSend>>) {
             // and the contiguous `[38][0]` is not visible in them (see `Applier::reply_arena_fence_signaled`).
             let (venus, signaled) = {
                 let mut session = applier.lock().expect("the applier lock is never poisoned");
-                (session.take_venus_blob_writes(), session.reply_arena_fence_signaled())
+                // Timed separately: these two walk every Venus-internal blob — including the 8 MiB
+                // staging pool — byte-granular at gap 0, and they do it with the lock held.
+                let t = std::time::Instant::now();
+                let v = session.take_venus_blob_writes();
+                section_log("take_venus_blob_writes", t.elapsed());
+                let t = std::time::Instant::now();
+                let s = session.reply_arena_fence_signaled();
+                section_log("reply_arena_fence_signaled", t.elapsed());
+                (v, s)
             };
             if signaled {
                 // A fence just signalled: the application's submit and its readback copy are complete on
@@ -278,6 +532,19 @@ fn progress_thread(applier: Arc<Mutex<Applier>>, tx: Arc<Mutex<QuicSend>>) {
                     let mut session = applier.lock().expect("the applier lock is never poisoned");
                     session.take_app_blob_writes()
                 };
+                // Tee the frame before shipping it. These are the only bytes in the whole daemon
+                // that are known to be a *complete* frame — the fence proves the submit and its
+                // readback copy are done — and they have already been read out of S's mapping, so
+                // folding them into the live frame costs no second read of GPU-shared memory. That
+                // matters: doing this read on the relay's path was measured stalling the ring for
+                // 30 s. See `LiveFrame`'s docs for the two approaches that failed before this one.
+                if !app.is_empty() {
+                    match live.lock() {
+                        Ok(mut frame) => frame.apply_runs(&app),
+                        // Presentation is not worth killing a working relay for.
+                        Err(poisoned) => poisoned.into_inner().apply_runs(&app),
+                    }
+                }
                 if !app.is_empty() && ship(&tx, &app).is_err() {
                     return;
                 }
@@ -317,17 +584,45 @@ fn serve(
     applier: Arc<Mutex<Applier>>,
     engine: &mut EngineClient,
     capture: &mut FrameCapture,
+    wl_replay: &mut WaylandReplay,
 ) -> Result<()> {
     loop {
         // The framed byte count `read_msg` now returns is C's measurement seam (Task 9); S keeps its
         // own accounting out of this path, so it is discarded here rather than plumbed through.
         let msg: C2S = match read_msg(&mut rx) {
-            Ok((m, _framed_bytes)) => m,
+            Ok((m, _framed_bytes)) => {
+                // DIAGNOSTIC (`RAYLAND_S_REPLY_LOG`): the first observable point on S. C reports
+                // sending 91 ring messages while S applies 90, and until now "sent" and "applied"
+                // were the only two points on that path — so a message lost in the link and a message
+                // read but not applied were indistinguishable. This is the read seam.
+                link_log("r<", &c2s_kind(&m));
+                m
+            }
             Err(e) => {
                 // Not necessarily an error: a clean shutdown ends here too.
                 eprintln!("rayland-s: link from C ended: {e}");
                 return Ok(());
             }
+        };
+
+        // **WP0 router.** The Wayland-proxy messages are replayed against S's real compositor by
+        // `wl_replay`, not applied to the vtest engine — `Applier::apply` refuses them by design (they
+        // are not vtest/ring messages). Split them off here, before the apply path; everything else
+        // falls through, rebound to `msg`.
+        let msg = match msg {
+            C2S::WaylandRequest { message } => {
+                wl_replay.handle_request(message);
+                continue;
+            }
+            C2S::WaylandBind {
+                interface,
+                version,
+                app_object_id,
+            } => {
+                wl_replay.handle_bind(interface, version, app_object_id);
+                continue;
+            }
+            other => other,
         };
 
         // **The applier lock is held across `apply` *and* the replies it produced.** Both halves
@@ -465,6 +760,15 @@ fn main() -> Result<()> {
     let tx = Arc::new(Mutex::new(tx));
     let applier = Arc::new(Mutex::new(Applier::new()));
 
+    // What to look for. Read *before* the progress thread starts, because that thread accumulates the
+    // frame and so needs the size; and before the session, so a malformed `RAYLAND_C1_PRESENT_SIZE` is
+    // a startup refusal naming the setting rather than a surprise at the end of a run that has
+    // already done all its work and cannot be repeated for free.
+    let (present_width, present_height) = frame_size_from_env()?;
+    // The newest complete frame, assembled by the progress thread from the readback runs it ships.
+    // See `LiveFrame` for why presentation cannot instead just read the blob when it wants it.
+    let live = Arc::new(Mutex::new(LiveFrame::new(present_width, present_height)));
+
     // The poller: the only thing that ever releases the application's synchronous calls. It holds its
     // own `EngineClient` clone so it can drive the readback fence through the actor.
     std::thread::Builder::new()
@@ -472,25 +776,189 @@ fn main() -> Result<()> {
         .spawn({
             let applier = Arc::clone(&applier);
             let tx = Arc::clone(&tx);
-            move || progress_thread(applier, tx)
+            let live = Arc::clone(&live);
+            move || progress_thread(applier, tx, live)
         })
         .context("spawning the progress thread")?;
 
-    // What to look for. Read before the session rather than after it, so a malformed
-    // `RAYLAND_C1_PRESENT_SIZE` is a startup refusal naming the setting — not a surprise at the end
-    // of a run that has already done all its work and cannot be repeated for free.
-    let (present_width, present_height) = frame_size_from_env()?;
+    // DIAGNOSTIC (`RAYLAND_S_REPLY_LOG`): a lock watchdog. Both of S's threads were measured stopping
+    // at the same instant after S read C's final ring delta, which is the signature of a deadlock —
+    // but "both stopped" does not say *which* lock is held or by whom, and the two threads' own logs
+    // cannot say so because a thread blocked on a lock writes nothing. This one owns no locks and
+    // only ever `try_lock`s, so it keeps reporting while the others are wedged.
+    if link_log_enabled() {
+        let applier_probe = Arc::clone(&applier);
+        let tx_probe = Arc::clone(&tx);
+        std::thread::Builder::new()
+            .name("rayland-s-lockdog".into())
+            .spawn(move || {
+                loop {
+                    // `try_lock` and immediately drop: this must never itself hold either lock, or the
+                    // instrument becomes a participant in the thing it is measuring.
+                    let applier_free = applier_probe.try_lock().is_ok();
+                    let tx_free = tx_probe.try_lock().is_ok();
+                    eprintln!("[s-lockdog] applier_free={applier_free} tx_free={tx_free}");
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            })
+            .context("spawning the lock watchdog")?;
+    }
+
     let mut capture = FrameCapture::new(present_width, present_height);
 
     // `serve` needs `&mut` to call the `RenderEngine` trait methods through the client; the message
     // thread keeps this original `engine`, the progress thread got a clone above.
     let mut engine = engine;
-    serve(rx, tx, applier, &mut engine, &mut capture)?;
+    // WP0: the S-side replay of the app's Wayland session. Unconnected until the first relayed request,
+    // so an offscreen session never touches a compositor. Owned by the message thread, which is the only
+    // thing that dispatches relayed Wayland requests. Its event sink ships compositor events back to C over
+    // the shared link, so the app receives `xdg_surface.configure`, `wl_buffer.release`, and the rest.
+    let mut wl_replay = WaylandReplay::new(Arc::new(LinkEventSink {
+        tx: Arc::clone(&tx),
+    }));
+    // **Presentation runs alongside the session, not after it.**
+    //
+    // It used to run only once `serve` returned, which is correct for one still frame and useless
+    // for a live one: by then the render is over and there is nothing left to follow. So the window
+    // gets its own thread, started before the session, which waits for the first complete frame and
+    // then follows the render until a human closes it.
+    //
+    // `presented` records whether that thread ever got a frame. If it did not — a session that
+    // shipped no readback at all — the old post-session path still runs, so single-frame
+    // applications and the ambiguity refusal behave exactly as before.
+    let presented = Arc::new(AtomicBool::new(false));
+    let session_over = Arc::new(AtomicBool::new(false));
+    let window_thread = if std::env::var_os(ENV_NO_PRESENT).is_some()
+        || std::env::var_os(ENV_WAYLAND_DISPLAY).is_none()
+    {
+        // Declined for the same two reasons `present_the_frame` declines, checked here as well so
+        // no thread is spawned at all when presentation is off.
+        None
+    } else {
+        let live = Arc::clone(&live);
+        let presented = Arc::clone(&presented);
+        let session_over = Arc::clone(&session_over);
+        Some(
+            std::thread::Builder::new()
+                .name("rayland-s-present".into())
+                .spawn(move || {
+                    loop {
+                        // `try_lock`: the progress thread owns this lock on the relay's path, and a
+                        // window waiting to open must never be a reason the relay stalls.
+                        let first = live.try_lock().ok().and_then(|frame| frame.frame());
+                        if let Some(first) = first {
+                            presented.store(true, Ordering::SeqCst);
+                            let live_for_window = Arc::clone(&live);
+                            let result = present_frame_live(
+                                first,
+                                Some(Box::new(move || match live_for_window.try_lock() {
+                                    Ok(frame) => frame.frame(),
+                                    Err(_) => None,
+                                })),
+                            );
+                            if let Err(e) = result {
+                                eprintln!("rayland-s: live presentation failed: {e:#}");
+                            }
+                            return;
+                        }
+                        // The session ended without ever shipping a complete frame; leave the
+                        // post-session path to report and decide.
+                        if session_over.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                })
+                .context("spawning the presentation thread")?,
+        )
+    };
+
+    let applier_for_refresh = Arc::clone(&applier);
+    serve(rx, tx, applier, &mut engine, &mut capture, &mut wl_replay)?;
     eprintln!("rayland-s: session ended");
+
+    // **Refresh the frame candidates exactly once, here, and never on the relay's hot path.**
+    //
+    // `observe_replies` captured each candidate at `BlobCreated`, which holds the finished frame for
+    // a one-frame application and an empty buffer for a multi-frame one — so a 120-frame run would
+    // otherwise present black. The fix is to re-read the blob; the trap is *where*.
+    //
+    // Doing it per-apply was measured stalling the ring for 30 s and killing the run outright. The
+    // blob is a live GPU-shared mapping, and reading a quarter of a megabyte from device-visible
+    // memory is nothing like reading it from RAM — while holding the session lock the relay needs.
+    // This repository has now made that same mistake six times with six different instruments (see
+    // `docs/DIARY.md`); the general rule is that anything touching a blob's pages belongs off the
+    // path the application's latency runs through.
+    //
+    // After the session there is no relay left to starve, and one read is all presentation needs. A
+    // candidate whose blob the application already freed keeps its creation-time copy, which
+    // `refresh_candidates` handles by design.
+    match applier_for_refresh.lock() {
+        Ok(session) => capture.refresh_candidates(&session),
+        // A poisoned lock means a thread panicked mid-session. The relay is over and the pixels are
+        // whatever they are; presenting the older copy beats aborting on the way out.
+        Err(poisoned) => capture.refresh_candidates(&poisoned.into_inner()),
+    }
+
+    // Release the presentation thread if it is still waiting for a frame that will never come.
+    session_over.store(true, Ordering::SeqCst);
+    if let Some(window_thread) = window_thread {
+        // Join rather than detach: the window must outlive the session — an application that exits
+        // the instant it has its pixels would otherwise take the picture off screen with it.
+        let _ = window_thread.join();
+    }
+    // The live window already showed (and followed) the render; there is nothing left to present.
+    if presented.load(Ordering::SeqCst) {
+        capture.report();
+        exit_without_engine_teardown();
+    }
 
     // Now that the session is over, put the frame on screen — and keep it there until a human closes
     // it. Presentation deliberately runs *after* the session rather than alongside it; the reasons
     // (one static frame, and a window that must outlive an application that exits the instant it has
     // its pixels) are on `rayland_s::present::present_frame`.
-    present_the_frame(capture)
+    present_the_frame(capture, &live)?;
+    exit_without_engine_teardown();
+}
+
+/// End the process **without** running `VirglEngine`'s `Drop`, and never return.
+///
+/// # The bug this fixes
+/// About **one session teardown in five** ended with `SIGABRT` rather than a clean exit — 83 of 400
+/// runs in the overnight soak, 2 of 10 in a targeted loopback hunt. The message, which only survives
+/// if the log is not overwritten by the next run:
+///
+/// ```text
+/// epoxy_get_proc_address: Assertion `0 && "Couldn't find current GLX or EGL context."' failed.
+/// ```
+///
+/// That is **libepoxy**, reached from `virgl_renderer_cleanup` inside `VirglEngine::drop` as it
+/// releases the EGL winsys. Something in that path asks epoxy to resolve a GL entry point when no
+/// context is current, and epoxy's response is to `abort()`. It is intermittent because it depends on
+/// the order threads and the render-server subprocess wind down in, which is why a single clean run
+/// looks like a refutation and is not.
+///
+/// # Why skipping the teardown is the right fix rather than a dodge
+/// `VirglEngine::drop` exists so that *repeated* new→use→drop cycles are safe — the tests do exactly
+/// that, and its ordering (resources, then contexts, then `virgl_renderer_cleanup`, then the global
+/// lock) is load-bearing there. **None of that applies to a process that is exiting.** The kernel
+/// reclaims the mappings, the descriptors and the address space, and the render-server subprocess
+/// already exits when its socket closes — demonstrably so, since the ~21% of runs that *did* abort
+/// skipped this same cleanup and left no render server behind.
+///
+/// So the `Drop` stays exactly as it is for every embedder and every test; only the daemon's own exit
+/// declines to run it. That keeps the fix to the one place where cleanup buys nothing and costs a
+/// one-in-five crash.
+///
+/// # Inputs / outputs
+/// - Diverges: `std::process::exit` does not return and does not run destructors.
+/// - Exits `0`. A failure before this point returns through `?` and never reaches here.
+fn exit_without_engine_teardown() -> ! {
+    // Flush our own buffered output first: `process::exit` runs no destructors, and Rust's stdout is
+    // line-buffered to a terminal but block-buffered to a pipe — which is exactly how every script in
+    // `scripts/` runs this daemon.
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    std::process::exit(0);
 }

@@ -10,10 +10,16 @@
 //! driving a real GPU, while (c)1's `RelayEngine` implements it by forwarding to another machine.
 //!
 //! # What lives here, and the one thing that does not
-//! Everything in this crate is pure Rust over `std` plus four POSIX syscalls (`sendmsg`,
-//! `memfd_create`/`mmap`, `eventfd`) — no GPU, no C library, no `build.rs`. What stays behind in
-//! `rayland-engine` is precisely the code that *touches virglrenderer*: the `ffi` declarations and
-//! the `VirglEngine` that drives them.
+//! **Has no GPU dependencies, by construction.** It links `libc`, `thiserror`, and
+//! `rayland-venus-proto` — the last of which compiles Mesa's *generated protocol headers*, which are
+//! format definitions with no driver, no device and no `libvirglrenderer` behind them. Rayland's
+//! **C** side speaks this protocol but must never link a GPU stack (C is the weak, possibly
+//! headless, possibly RISC-V machine), and `rayland-c`'s `tests/no_gpu_linkage.rs` asserts
+//! `rayland-engine` is absent from its dependency tree. **The dependency arrow points
+//! `rayland-engine` → `rayland-vtest`, and must never be reversed.**
+//!
+//! What stays behind in `rayland-engine` is precisely the code that *touches virglrenderer*: the
+//! `ffi` declarations and the `VirglEngine` that drives them.
 //!
 //! # Layout
 //! - [`RenderEngine`] — the trait the rest of Rayland programs against, and the seam a network can

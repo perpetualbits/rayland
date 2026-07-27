@@ -61,6 +61,11 @@
 //!
 //! This file is written to be read, and it says where it is guessing.
 
+// The `RAYLAND_RING_DUMP` diagnostic: the one place in this binary that calls the borrowed Venus
+// decoder. Kept out of this file on purpose — see that module's docs for why the separation is what
+// makes `tests/decoder_is_not_load_bearing.rs` able to assert this file never calls it.
+mod ring_dump;
+
 // The daemon's own pieces.
 use rayland_c::blob_sync::messages_for_delta;
 use rayland_c::link::{QuicRecvLink, QuicSendLink};
@@ -74,7 +79,6 @@ use rayland_relay::{C2S, S2C};
 use rayland_vtest::EngineError;
 // Spec §5.1's guard: notice Venus's out-of-line command path rather than relaying a stream that
 // would misbehave on S's GPU with no trace of the cause.
-use rayland_vtest::venus_ring::scan_for_out_of_line_stream;
 use rayland_vtest::vtest::serve_vtest;
 
 use anyhow::{Context, Result};
@@ -93,6 +97,14 @@ const DEFAULT_VTEST_SOCKET: &str = "/tmp/rl-c1.sock";
 
 /// Environment variable overriding [`DEFAULT_VTEST_SOCKET`].
 const ENV_VTEST_SOCKET: &str = "RAYLAND_C1_SOCKET";
+
+/// Environment variable naming the **Wayland proxy** socket the application connects to (WP0).
+///
+/// When set, the daemon runs a Wayland server at this path (the app's `WAYLAND_DISPLAY` names it) and
+/// forwards the app's Wayland protocol to S, turning each swapchain fd into a buffer token — see
+/// [`rayland_c::wayland_proxy`]. When **unset**, no proxy runs and the daemon behaves exactly as it did
+/// before WP0: the offscreen fixtures and the whole test suite neither set it nor are affected by it.
+const ENV_WAYLAND_DISPLAY: &str = "RAYLAND_C1_WAYLAND_DISPLAY";
 
 /// Environment variable naming S's address, as `host:port`.
 ///
@@ -500,6 +512,7 @@ fn reader_thread(
     blobs: BlobTable,
     progress: Arc<Mutex<Progress>>,
     pending: PendingBlob,
+    wl_events: Option<rayland_c::wayland_proxy::WaylandEventPoster>,
 ) {
     loop {
         let msg = match rx.recv() {
@@ -569,6 +582,21 @@ fn reader_thread(
                      than answered. The session is likely now producing a stream S cannot replay."
                 );
             }
+            // A compositor event from S's Wayland client, bound for the app. **WP0 event return path.**
+            // Hand it to the proxy thread via the poster, which queues it and wakes the proxy's poll loop
+            // so it delivers the event to the app with `send_event`. If no proxy is running (the env var was
+            // unset, so `wl_events` is `None`), there is no app to deliver to — the event is dropped. This
+            // is how `xdg_surface.configure`, `wl_buffer.release`, and the dmabuf/state events reach the app.
+            S2C::WaylandEvent { message } => {
+                if let Some(poster) = &wl_events {
+                    poster.post(message);
+                } else {
+                    eprintln!(
+                        "rayland-c: received a Wayland event for object {} but no proxy is running; dropped",
+                        message.object_id
+                    );
+                }
+            }
             // Solicited (`Capset`, `BlobCreated`, and an `Error` that genuinely answers a request):
             // queue it for whoever asked. The channel is unbounded and its receiver lives inside the
             // engine for the whole session, so a send failure here means only one thing: the engine
@@ -628,6 +656,13 @@ fn apply_blob_data(blobs: &BlobTable, res_id: u32, offset: u64, bytes: &[u8]) ->
 
     let start = offset as usize;
     blob.bytes_mut()[start..end as usize].copy_from_slice(bytes);
+
+    // **Keep C's baseline in step with what S wrote.** S owns the readback buffers and the reply
+    // arena; the bytes it just sent are now what S holds for this blob, so fold them into C's baseline.
+    // Without this, the next C→S diff would see C's mapping (now carrying S's writes) differ from a
+    // stale baseline and ship S's own bytes back to S — the last-writer-wins wobble (c)1 Task 5b fixed
+    // in the S→C direction, here in its C→S twin. See `docs/design/2026-07-25-c1-incremental-blob-sync.md`.
+    blob.note_s_wrote(start, bytes);
 
     // **T7 — packet installed on C** (design note §7): the moment S's bytes are in the pages Mesa
     // mapped. The `res`/`off` match the S-side T6 so the join can pair departure with installation
@@ -717,6 +752,12 @@ fn ring_watcher_thread(
                 return;
             };
             let delta = watcher.take_delta(blob.bytes());
+            // DIAGNOSTIC (`RAYLAND_RING_DUMP`), throwaway: the decode-and-print lives in
+            // `ring_dump`, not here, so that this function — the one that decides what gets
+            // relayed — never names the borrowed Venus decoder. See that module's docs.
+            if let Some(pending) = delta.as_ref() {
+                ring_dump::dump_if_enabled(pending);
+            }
             // Draining bytes proves this watcher is awake, so the IDLE claim published before the
             // last park must go — and it must go *here*, before the network send below, not on some
             // later pass. Mesa tests IDLE on every submit (`vn_ring.c:475-483`) and doorbells if it
@@ -735,24 +776,26 @@ fn ring_watcher_thread(
         // --- 2. Relay, with no lock held. These bytes are the application's Vulkan commands.
         if let Some(delta) = delta {
             let tail = delta.tail;
-            // Before anything crosses: refuse a stream (c)1 v1 cannot faithfully carry. Venus
-            // replaces any submission over `direct_size` (8192 B for the 128 KiB instance ring) with
-            // a `vkExecuteCommandStreamsMESA` pointing at *other* shmems this version never ships —
-            // S would then resolve those ids to blobs it holds and execute their contents, which are
-            // zeros. Spec §5.1 requires that this never be silent, and the scan is deliberately a
-            // sound over-approximation rather than a decode; `scan_for_out_of_line_stream`'s module
-            // docs carry the whole argument and the reason a decode-based check could not work.
+            // **The out-of-line refusal is gone, because the thing it protected against is fixed.**
             //
-            // Exiting rather than continuing, for the same reason the stall below exits: this thread
-            // is detached and the vtest thread is blocked inside `serve_vtest`, so there is nothing
-            // to return an error to — and a relay that carried on would corrupt S's stream, which
-            // surfaces as inexplicable GPU misbehaviour nowhere near the cause.
-            if let Err(found) = scan_for_out_of_line_stream(&delta.bytes) {
-                eprintln!(
-                    "rayland-c: refusing to relay the ring delta ending at tail {tail}: {found}"
-                );
-                std::process::exit(1);
-            }
+            // Venus replaces any submission over `direct_size` (`buffer_size >> 4`, so 8192 B for the
+            // 128 KiB instance ring) with a `vkExecuteCommandStreamsMESA` naming *other* shmems. This
+            // relay used to ship only application memory, so those shmems — the staging pool, which is
+            // `blob_id == 0` — never crossed, and S would have resolved the ids to blobs full of
+            // zeros and executed them. Refusing was right.
+            //
+            // `blob_sync::messages_for_delta` now synchronises **every** blob C holds except the ring
+            // itself, Venus's own shmems included, using the baseline that lets a region both sides
+            // write be published safely. The referenced streams are therefore already on S — shipped
+            // ahead of this delta, since `RingDelta` goes last — and there is nothing left to refuse.
+            //
+            // The scan also had to go on its own merits: it was a byte pattern, not a decode, and it
+            // fired on payload. `rayland-icosa-gpu` was blocked by a dword equal to 180 **inside its
+            // fractal fragment shader's SPIR-V**, in a delta the decoder walks to `ReachedEnd` with no
+            // `vkExecuteCommandStreamsMESA` in it at all (`docs/DIARY.md`, 2026-07-26). Replacing it
+            // with a decode was never an option: this is the relay path, and (c)1 §7 forbids a decode
+            // from deciding what crosses the wire. Making the relay able to carry the stream removes
+            // the question instead of answering it.
             // Record the frontier *before* the send, not after. `Progress::note_consumed` refuses
             // any acknowledgement past `relayed_tail`, and a fast S can answer this delta before
             // this thread would reacquire the progress lock — so noting it afterwards would race,
@@ -982,6 +1025,20 @@ fn main() -> Result<()> {
         progress: Arc::clone(&progress),
     }));
 
+    // --- WP0 event return path. If the Wayland proxy is enabled (its socket env var is set), build the
+    // event channel now, *before* the reader thread that feeds it: the poster goes to the reader (which
+    // `post`s each `S2C::WaylandEvent`), the inbox to the proxy thread (which drains and delivers). When the
+    // proxy is disabled, both are `None` and the reader drops any stray event.
+    let wl_socket = std::env::var_os(ENV_WAYLAND_DISPLAY);
+    let (wl_poster, wl_inbox) = match &wl_socket {
+        Some(_) => {
+            let (poster, inbox) = rayland_c::wayland_proxy::wayland_event_channel()
+                .context("creating the WP0 Wayland event-return channel")?;
+            (Some(poster), Some(inbox))
+        }
+        None => (None, None),
+    };
+
     // --- The reader: the only thing that may `recv`. See the module docs for why a design without
     // it deadlocks.
     std::thread::Builder::new()
@@ -990,7 +1047,7 @@ fn main() -> Result<()> {
             let blobs = Arc::clone(&blobs);
             let progress = Arc::clone(&progress);
             let pending = engine.pending();
-            move || reader_thread(rx, reply_tx, blobs, progress, pending)
+            move || reader_thread(rx, reply_tx, blobs, progress, pending, wl_poster)
         })
         .context("spawning the reader thread")?;
 
@@ -1004,6 +1061,40 @@ fn main() -> Result<()> {
             move || ring_watcher_thread(ring_slot, blobs, tx, progress, stall_timeout)
         })
         .context("spawning the ring watcher thread")?;
+
+    // --- The Wayland proxy (WP0), only when a socket is configured. The application connects here
+    // instead of a real compositor; the proxy forwards its Wayland protocol to S over this same link
+    // and turns each swapchain fd into a buffer token (see `wayland_proxy`/`proxy_link`). Gated on the
+    // env var so offscreen sessions and the whole test suite — which never set it — are untouched. The
+    // proxy's own accept-and-dispatch loop blocks, so it gets its own thread, alongside the app's vtest
+    // session on the main thread.
+    if let Some(wl_socket) = wl_socket {
+        // The sink forwards Wayland requests over the shared send link; the resolver turns a swapchain
+        // fd's inode into the resource id, by scanning the blob table. Both are clones of the same
+        // shared state the reader thread and ring watcher already use.
+        let sink = Arc::new(rayland_c::proxy_link::LinkSink::new(Arc::clone(&tx)));
+        let resolver = Arc::new(rayland_c::proxy_link::BlobInodeResolver::new(Arc::clone(&blobs)));
+        let wl_path = std::path::PathBuf::from(wl_socket);
+        // The inbox was created above alongside the poster the reader holds; both exist iff the socket does.
+        let inbox = wl_inbox.expect("the event inbox is created whenever the proxy socket is set");
+        eprintln!(
+            "rayland-c: Wayland proxy listening at {}; point the app at it with WAYLAND_DISPLAY",
+            wl_path.display()
+        );
+        std::thread::Builder::new()
+            .name("rayland-c-wayland".into())
+            .spawn(move || {
+                // A proxy failure is logged, not fatal to the vtest session: the forward/ring path is
+                // independent, and WP0 keeps the two channels loosely coupled. `run_with_events` wires the
+                // compositor-event return path (the inbox); requests still forward over `sink`.
+                if let Err(e) =
+                    rayland_c::wayland_proxy::run_with_events(wl_path, sink, resolver, inbox)
+                {
+                    eprintln!("rayland-c: the Wayland proxy exited with an error: {e:#}");
+                }
+            })
+            .context("spawning the Wayland proxy thread")?;
+    }
 
     // --- Listen for Mesa. A stale socket from a previous run would make `bind` fail with
     // EADDRINUSE even though nothing is listening, so clear it first. This is safe for the intended
@@ -1066,10 +1157,41 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rayland_c::shm::LocalBlob;
+    use std::collections::HashMap;
 
     /// The frontier from the live capture: 4024 bytes of ring traffic for the reference app's whole
     /// Vulkan initialization (ring-findings §2). Used throughout so the numbers are the real ones.
     const FIRST_FRONTIER: u32 = 4024;
+
+    /// **Wiring test for `apply_blob_data`'s baseline fold (final-review Finding 2's steady-state call
+    /// site).** S's inbound bytes must land in both the mapping *and* the baseline; if only the
+    /// mapping were updated, the very next C→S diff would see the mapping (now carrying S's bytes)
+    /// differ from a stale baseline and read that as an application change, shipping S's own bytes
+    /// straight back to S. `commit_pending_blob` in `rayland_c::relay_engine` has the equivalent test
+    /// for the other call site, the `S2C::BlobCreated::initial` runs a blob may be born with.
+    ///
+    /// Teeth-checked: commenting out the `blob.note_s_wrote(start, bytes)` line in `apply_blob_data`
+    /// makes this test fail (`take_changed_runs` then returns the 64-byte run instead of nothing),
+    /// confirming it actually exercises the fold rather than passing vacuously.
+    #[test]
+    fn apply_blob_data_folds_s_bytes_into_the_baseline_so_they_are_not_reshipped() {
+        // `blob_id = 16`: a real application blob, so it carries a baseline and is diffed.
+        let (blob, _fd) = LocalBlob::create(16, 64).expect("an app blob");
+        let mut table = HashMap::new();
+        table.insert(3u32, blob);
+        let blobs: BlobTable = Arc::new(Mutex::new(table));
+
+        // Stand in for S shipping back bytes it wrote — e.g. a readback buffer's finished frame.
+        apply_blob_data(&blobs, 3, 0, &[0x77; 64]).expect("S's bytes must apply cleanly");
+
+        let mut table = blobs.lock().expect("the blob table lock is never poisoned");
+        let blob = table.get_mut(&3).expect("the blob committed above");
+        assert!(
+            blob.take_changed_runs().is_empty(),
+            "C must not re-ship the bytes S itself just sent back to it"
+        );
+    }
 
     /// Nothing relayed means nothing outstanding: an idle session must never look stalled. Without
     /// this, an application that simply is not drawing would be killed by the stall timeout.

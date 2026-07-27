@@ -51,3 +51,6 @@ pub mod blob;
 pub mod present;
 // S's side of the command ring: where C's relayed bytes are laid down for virglrenderer to find.
 pub mod ring_mirror;
+
+/// WP0 Task 4.2: the S-side replay of the app's Wayland session against S's real compositor.
+pub mod wayland_client;

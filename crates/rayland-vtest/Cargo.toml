@@ -9,6 +9,18 @@
 #
 # This is a LIBRARY crate (no `main`), so per the repository license policy it is
 # LGPL-3.0-or-later (binaries in the workspace are GPL-3.0-or-later).
+#
+# DECISION, recorded rather than left implicit: `publish = false`, below. This crate picked up a
+# versionless `path` dependency on `rayland-venus-proto` (see [dependencies], below), which is itself
+# `publish = false` — its vendored Mesa headers and hand-written `cc` build step have not been
+# reviewed for crates.io distribution (licensing attribution, vendoring policy, build-from-sdist
+# behaviour). A `path`-only dependency on an unpublishable crate would make `cargo publish -p
+# rayland-vtest` fail anyway, but failing loudly *now*, by declaration, is better than failing later
+# at the one moment someone actually tries to publish and has forgotten this crate's dependency
+# graph changed. `rayland` (the workspace's placeholder facade, per CLAUDE.md) is the only crate this
+# repository actually publishes today, so this costs nothing in practice; revisit if `rayland-vtest`
+# is ever meant to be consumed outside this workspace, which would first require making
+# `rayland-venus-proto` itself publishable.
 [package]
 name = "rayland-vtest"                                                         # workspace / crates.io package name
 version = "0.0.1"                                                              # pre-release; arc (c) walking skeleton, not a stable API
@@ -17,6 +29,7 @@ rust-version = "1.85"                                                          #
 description = "Mesa Venus vtest wire protocol and command-ring knowledge. No GPU dependencies."  # one-line purpose
 license = "LGPL-3.0-or-later"                                                  # library crate → LGPL per repo policy
 repository = "https://github.com/perpetualbits/rayland"                        # upstream source location
+publish = false                                                                # depends on rayland-venus-proto, itself publish = false; see note above
 
 [dependencies]
 thiserror = { workspace = true }   # precise, typed error enum (EngineError) mapping every failure
@@ -26,3 +39,6 @@ thiserror = { workspace = true }   # precise, typed error enum (EngineError) map
 # than nix/sendfd. Note this is a *syscall* dependency, not a GPU one: libc is present on every
 # target C could run on, including a headless RISC-V box.
 libc = { workspace = true }
+# Framing for command streams whose encoding is variable-length — everything the fixed-size table
+# below cannot express. DIAGNOSTIC ONLY: see that crate's docs and (c)1 spec §7.
+rayland-venus-proto = { path = "../rayland-venus-proto" }

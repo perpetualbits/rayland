@@ -14,20 +14,47 @@
 //! float-for-float into the triangle's three vertices. Without this module those 64 bytes never
 //! leave C, and the "first light" triangle is drawn from uninitialized memory.
 //!
-//! # The strategy: conservative full sync, and why the trigger is what it is
-//! Spec §7 pins v1's answer: **ship the full contents of every mapped blob, whole, in the direction
-//! it is needed. No dirty tracking, no cleverness.** For a 64-byte vertex buffer and a 16 KiB
-//! readback that is trivially cheap; for a real application it would not be, which is precisely why
-//! the measurement (spec §8) matters. The precision upgrade is deliberately deferred, because
-//! *decoding the ring to make a correctness decision means a decoding bug becomes a corruption bug*,
-//! and v1 would rather pay bytes than debug that.
+//! # The strategy: incremental diff against a per-blob baseline, and why the trigger is what it is
+//! Spec §7 originally pinned v1's answer as **ship the full contents of every mapped blob, whole, in
+//! the direction it is needed — no dirty tracking, no cleverness.** For a 64-byte vertex buffer and a
+//! 16 KiB readback that was trivially cheap. It was not cheap for a real application: measured on
+//! vkcube (spec §8), whole-blob resync cost **16.5 MB** of blob traffic against **23 KB** of actual
+//! ring commands, which buries the link and looks like a hang. That measurement is what retired v1.
+//!
+//! The replacement, described in `docs/design/2026-07-25-c1-incremental-blob-sync.md`,
+//! keeps the same trigger and the same ownership filter, but changes *what* crosses once a blob is
+//! judged eligible: each application blob carries a baseline (its last-agreed state with S, held by
+//! [`crate::shm::LocalBlob`]), and [`LocalBlob::take_changed_runs`](crate::shm::LocalBlob::take_changed_runs)
+//! diffs the live bytes against that baseline in one pass, re-baselining as it goes. An unchanged blob
+//! yields no runs and crosses nothing. A changed blob yields one [`rayland_relay::BlobRun`] per
+//! contiguous run of differing bytes — each reusing `BlobData`'s existing `offset` field, so there is
+//! no wire change — and runs are never coalesced across unchanged bytes in between, because doing so
+//! would re-ship exactly the bytes the diff exists to skip. Byte-granular diffs can therefore
+//! fragment into many small runs; that is why bytes and message count are reported as separate
+//! metrics rather than assumed to move together.
+//!
+//! This does **not** solve remote `vkMapMemory` in general. A blob the application genuinely rewrites
+//! every frame — `rayland-icosa-cpu`'s megabyte of fractal texture is the standing example — still
+//! ships nearly whole, because nearly every byte really did change; making *that* case cheap is
+//! (c)2's problem, not this one's. Deduplicating identical bytes across different blobs, or across
+//! time within one blob's own history, is (c)3's. What this module buys is narrower and still real:
+//! the common case of a blob written once and read many times (the reference app's vertex buffer)
+//! now crosses exactly once, not on every relay.
+//!
+//! The decoding avoidance v1 also cared about still holds: this diff works on raw bytes, never on the
+//! ring's decoded meaning, so *decoding the ring to make a correctness decision means a decoding bug
+//! becomes a corruption bug* remains just as true as it was under v1 — the diff adds no parsing of
+//! Vulkan structures, only a byte comparison against a baseline.
 //!
 //! The trigger deserves its own paragraph, because the phrase that sounds right is wrong. "Sync at
 //! every submission boundary" is not implementable here: **`vkQueueSubmit` is invisible to us.** It
 //! is encoded *inside* the ring, and v1 relays the ring as opaque bytes without parsing them. The
 //! only boundary C can actually observe is **its own relay event** — "we are about to ship ring
-//! bytes to S". So that is the trigger, and it is deliberately over-eager: it syncs blobs that may
-//! not have changed, on relays that may contain no submit at all.
+//! bytes to S". So that is the trigger, and it is deliberately over-eager: it **inspects** every
+//! application blob on every relay, on relays that may contain no submit at all, whether or not that
+//! blob actually changed. Under the diff that over-eagerness is no longer a bandwidth cost — an
+//! unchanged blob costs one comparison pass and ships nothing — it only means the trigger cannot tell
+//! in advance which blobs are worth looking at, so it looks at all of them.
 //!
 //! # Ordering is the correctness property this module exists to guarantee
 //! **Blobs must reach S before the ring delta whose commands may read them.** The ring bytes are
@@ -94,7 +121,8 @@ use rayland_relay::C2S;
 /// - `delta`: the bytes Mesa produced, already un-wrapped by
 ///   [`RingWatcher::take_delta`](crate::ring::RingWatcher::take_delta). Consumed, because its
 ///   `Vec<u8>` is moved onto the wire rather than copied again.
-/// - Returns the messages to send, in order: every application blob's contents, then the ring delta.
+/// - Returns the messages to send, in order: each application blob's *changed* runs (none at all for
+///   an unchanged blob), then the ring delta.
 ///
 /// # Failure modes
 /// Cannot fail. A blob table that does not contain the ring is not this function's problem — the
@@ -103,19 +131,32 @@ use rayland_relay::C2S;
 /// delta may be relayed at all, and the caller runs it.
 ///
 /// # Pitfalls
-/// - **This ships blobs whole, every time, and that is deliberate** (spec §7), and its cost is
-///   *visible* — that part of the trade is real. Do not add dirty tracking here; that is (c)2's
-///   work, and the lever it will use (`/proc/<pid>/pagemap` soft-dirty, or non-coherent memory plus
-///   real flush hooks) is recorded in the spec's §7.
+/// - **This ships only what changed since C's last relay of a given blob, not whole blobs.** An
+///   unchanged blob emits nothing at all; a changed one emits one [`rayland_relay::BlobRun`] per
+///   contiguous run of differing bytes, via
+///   [`LocalBlob::take_changed_runs`](crate::shm::LocalBlob::take_changed_runs). Do **not** read this
+///   as "this module is now cheap in general": a blob the application genuinely rewrites every frame
+///   (`rayland-icosa-cpu`'s fractal texture is the standing example) still ships nearly whole, because
+///   nearly every byte really did change — that is (c)2's problem, not this one's, and this diff must
+///   not be mistaken for having solved it. Cross-blob or cross-time deduplication (the same content
+///   appearing twice) is (c)3's. What this diff buys is narrower and still real: a blob written once
+///   and then only read — the reference app's vertex buffer, and vkcube's setup blobs generally —
+///   crosses exactly once instead of on every relay. Byte-granular diffs can also **fragment**: where
+///   changed bytes are interleaved with unchanged ones, one logical change can surface as many small
+///   runs, so relay bytes and relay *message count* are reported as separate metrics rather than
+///   assumed to move together — a fragmented blob can trade fewer bytes for more messages. See
+///   `docs/design/2026-07-25-c1-incremental-blob-sync.md` for the measurement that retired the old
+///   whole-blob strategy (vkcube: 16.5 MB of blob resends against 23 KB of actual ring commands) and
+///   the fragmentation caveat in full.
 /// - **The lost-write race this used to describe is gone, and it was never fixable here.** Until
 ///   (c)1 Task 5b, S's return path shipped back *every application blob its GPU might have written*,
 ///   which meant S sent C stale copies of blobs S never wrote at all — vertex and uniform buffers,
 ///   the common case — and C's reader laid them over whatever the application had written since.
 ///   This function then faithfully relayed the stale bytes back to S. Spec §7.2 retracted that rule:
 ///   **S now ships back exactly the bytes S is observed to have written**, so nothing arrives here
-///   to overwrite a blob the GPU never touched, and shipping whole blobs C→S is no longer racing
-///   anything on the return leg. The repair had to happen on S because only S can see which bytes S
-///   wrote; there was no version of this function that could have avoided it.
+///   to overwrite a blob the GPU never touched, and shipping a blob's changed runs C→S is no longer
+///   racing anything on the return leg. The repair had to happen on S because only S can see which
+///   bytes S wrote; there was no version of this function that could have avoided it.
 /// - **What remains is narrower than it once was, but it is *two* hazards, not one — an earlier draft
 ///   of this list undercounted them, and this is the correction.**
 ///   - **Tearing.** A blob the application writes *while* this copies it is torn, and nothing here
@@ -124,43 +165,49 @@ use rayland_relay::C2S;
 ///     *correctly synchronized* application it does not fire on memory the GPU actually wrote,
 ///     because S's own ordering guarantees the bytes land before the `head` update that releases the
 ///     app's fence wait.
-///   - **C can relay its own stale copy of a blob that S — not C — currently owns the live contents
-///     of, clobbering S's authoritative copy with old news.** This function ships *every* application
-///     blob whole on *every* relay (spec §7's conservative strategy), and that includes `res=6`, the
-///     readback buffer S's GPU writes and C never touches. Concretely: (1) the app submits a draw; C
-///     relays `[BlobData(res=3), BlobData(res=6 = C's zeros), RingDelta]`; (2) S's GPU writes blue
-///     into `res=6`, and the ring thread stores `head`; (3) the app's *next* ring traffic moves
-///     `tail`, so C's watcher relays again — and, because nothing on C ever refreshes its copy of a
-///     blob it never writes, ships `BlobData(res=6, zeros)` a second time; (4) S's `copy_in`
-///     (`blob.rs:417`) lays those zeros over the real pixels *and* re-snapshots its own shadow to
-///     match, so S now itself believes zeros is the last-agreed state; (5) S polls: `head` moved, but
-///     `take_bytes_s_wrote(res=6)` compares live bytes against that same zeroed shadow and finds no
-///     runs, so no correction is shipped — `RingProgress` goes out anyway, releasing the app onto a
-///     frame that was silently overwritten by C's own relay.
+///   - **C relaying its own stale copy of a blob that S — not C — currently owns the live contents
+///     of, clobbering S's authoritative copy with old news.** Under the old whole-blob strategy this
+///     was a standing hazard on `res=6`, the readback buffer S's GPU writes and C never touches:
+///     C shipped its (stale) copy of `res=6` on *every* relay regardless of whether it had changed,
+///     which could clobber pixels S's GPU had just written with C's zeros.
 ///
-///     **This is not tearing.** C's copy is whole and un-torn; it is simply stale, and this function
-///     ships it with total confidence because ring-findings §6's `blob_id` signal says nothing about
-///     *freshness*, only about *ownership*. The failure is C's conservative sync clobbering the
-///     authoritative copy of a blob that, at this moment, lives on S rather than on C — a silent lost
-///     frame, not a corrupted one.
+///     **This function lands the C-side half of the fix — the symmetric, observed-write rule
+///     `docs/design/2026-07-25-c1-incremental-blob-sync.md` describes — and the fix's other half is
+///     wired in too, at both places S's bytes enter a C mapping.** The diff means C no longer ships
+///     `res=6` on every relay unconditionally; it ships a run only when
+///     [`LocalBlob::take_changed_runs`](crate::shm::LocalBlob::take_changed_runs) sees the live bytes
+///     differ from C's baseline. That baseline is only correct if it is kept in step with S's own
+///     writes as they arrive back over the wire, and [`LocalBlob::note_s_wrote`](crate::shm::LocalBlob::note_s_wrote)
+///     is that fold. It is **not** called from this module — this module only ever ships C→S — so it
+///     must be called everywhere S's bytes are written into a C-side mapping. There are exactly two
+///     such places today, and both call it:
+///     - `apply_blob_data` in `crates/rayland-c/src/main.rs`, on every inbound `S2C::BlobData` — the
+///       steady-state return path (readback buffers, the reply arena) for a blob already registered.
+///     - `commit_pending_blob` in `crates/rayland-c/src/relay_engine.rs`, on the `initial` runs carried
+///       inside `S2C::BlobCreated` — because a readback buffer is routinely born with the finished
+///       frame already in it (Mesa's `vkMapMemory` is lazy, so the blob comes into existence *after*
+///       S's GPU has already rendered into it), which makes creation itself a return-path event, not
+///       merely the steady state.
 ///
-///     **It is not a regression.** Before (c)1 Task 5b, S's own return path shipped this exact stale
-///     blob back and lost the frame the same way; the amendment moved which side owns the mistake,
-///     not whether the mistake happens. It is spec §7's declared v1 strategy — "ship the full
-///     contents of every mapped blob, whole ... no dirty tracking, no cleverness" — paid for exactly
-///     where §7 says it would be paid.
+///     **If a third place is ever added where S's bytes land in a C mapping, it must call
+///     `note_s_wrote` too, or this hazard resurfaces there.** The mechanism of the resurfacing is
+///     mechanical and worth stating once, since it is easy to reintroduce by omission rather than by a
+///     visible bug: C's reader applies S's fresh bytes into the live mapping, the stale baseline does
+///     not reflect them, and the next call to `take_changed_runs` reads the now-fresh bytes as a
+///     *change C made* and ships them straight back to S as `BlobData` — overwriting S's own
+///     authoritative pixels with a copy of what S itself just sent. Byte diffing alone cannot tell
+///     "S just wrote this" apart from "the application just wrote this"; only folding S's writes into
+///     the baseline, at every site they arrive, can.
 ///
-///     **Why the reference app never triggers it:** an application blocked in `vkWaitForFences`
-///     issues no further ring traffic of its own — `vn_ring_wait_seqno` only polls `head` in shared
-///     memory, it writes nothing — so there is no *second* relay event for this function to clobber
-///     the readback with. A real application's frame N+1 command stream is exactly that second
-///     relay, carrying frame N's now-stale readback back over frame N's genuine pixels.
+///     **This is not tearing.** C's copy is whole and un-torn in this scenario; the (now-closed) defect
+///     was that it could be stale-relative-to-freshly-applied in a way plain byte diffing cannot see.
 ///
-///     **The eventual fix is symmetry, not cleverness:** give C the same observed-write rule S now
-///     has for the S→C direction — snapshot a blob's shadow the instant C applies an inbound
-///     `BlobData`, diff live bytes against that shadow before every relay, and ship only the bytes
-///     the *application* actually changed. Until that lands, this function's whole-blob-every-relay
-///     behaviour is deliberate, not merely unaddressed.
+///     **Why the reference app never triggers it, either way.** An application blocked in
+///     `vkWaitForFences` issues no further ring traffic of its own — `vn_ring_wait_seqno` only polls
+///     `head` in shared memory, it writes nothing — so there is no *second* relay event for this
+///     function to clobber the readback with. A real application's frame N+1 command stream is
+///     exactly that second relay, carrying frame N's readback back over frame N's genuine pixels; the
+///     reference app never issues one.
 /// - **A further hazard was recorded here until the §7.2 amendment removed it: false sharing at S's
 ///   page grain.** S's returned run used to be rounded out to a 4096-byte page, so when S's engine
 ///   wrote one region of a page and the application wrote another region of the same page — legal, and
@@ -178,24 +225,60 @@ pub fn messages_for_delta(blobs: &BlobTable, ring_res_id: u32, delta: RingDelta)
     // Scope the lock tightly: it is released before this function returns, so the caller physically
     // cannot hold it across the sends. See the note above on why that matters.
     {
-        let table = blobs.lock().expect("the blob table lock is never poisoned");
-        for (&res_id, blob) in table.iter() {
-            // Venus's own shmems — the ring, the reply arena, the staging pool — are not C's to
-            // publish. Shipping C's stale copy of the reply arena would clobber the replies S wrote
-            // and the application is blocked on; shipping the ring here would fight the RingDelta
-            // below for the same bytes. Ring-findings §6's `blob_id` signal is the line between the
-            // application's memory and the transport's plumbing.
-            if !blob.is_application_memory() {
+        // `iter_mut`, not `iter`: the diff re-baselines each blob it inspects.
+        let mut table = blobs.lock().expect("the blob table lock is never poisoned");
+        // DIAGNOSTIC (`RAYLAND_C1_BLOB_FP`), throttled: fingerprint **every** blob C holds, including
+        // the Venus-internal ones this loop is about to skip. The ring relay is now proven byte-exact
+        // (253/253 matching digests), so S's failure to complete the application's `vkQueueSubmit`
+        // must be about state the submit *references*. This is the same instrument one level down:
+        // if S's copy of some resource disagrees with C's, this and its S-side twin say which.
+        blob_fingerprints(&table, delta.tail);
+
+        for (&res_id, blob) in table.iter_mut() {
+            // **The ring is the one blob this loop must never touch.** It has its own message,
+            // `C2S::RingDelta`, which carries the `tail` that makes the bytes meaningful and is
+            // deliberately sent last. Shipping the same pages here as well would publish ring bytes
+            // ahead of the `tail` that validates them, and S's ring thread reads whatever is below
+            // `tail` the instant it lands.
+            if res_id == ring_res_id {
                 continue;
             }
-            out.push(C2S::BlobData {
-                res_id,
-                // Always 0 in v1: the whole blob is shipped, so it begins at its beginning. The
-                // field exists now so a later dirty-range version can ship partial ranges without
-                // changing the message's shape.
-                offset: 0,
-                bytes: blob.bytes().to_vec(),
-            });
+            // **Everything else C holds is synchronised, including Venus's own shmems.**
+            //
+            // This used to ship only application memory, on ring-findings §6's `blob_id` signal, and
+            // that is why `vkExecuteCommandStreamsMESA` could not be relayed: when a submission
+            // exceeds Mesa's `direct_size` (`buffer_size >> 4`, so 8 KiB for the 128 KiB ring), the
+            // commands do not go in the ring at all — they go into the **staging pool**, which is
+            // `blob_id == 0`, which this loop skipped. S then held a pool of zeros and the referenced
+            // streams were simply absent, so `rayland-c` refused the delta rather than let S execute
+            // whatever its copy happened to contain.
+            //
+            // # Why publishing a region S also writes is safe now, when it was not before
+            // The reply arena is `blob_id == 0` too, and S writes it. The old comment here was right
+            // that publishing C's stale copy of such a region is a clobber — and right that the
+            // answer was "a design for synchronising a region *both* sides write". That design now
+            // exists and is what this rests on: every blob carries a **baseline**, `take_changed_runs`
+            // ships only bytes that differ from it, and `LocalBlob::note_s_wrote` folds each S→C write
+            // into the baseline as it arrives (`main.rs`'s `apply_blob_data` and
+            // `relay_engine.rs`'s `commit_pending_blob`, both teeth-checked). So S's own writes never
+            // look like C-side changes and are never echoed back. What C publishes is exactly what
+            // C's Mesa wrote, which for the arena is nothing.
+            //
+            // # The cost, and why it is affordable
+            // A baseline for the 8 MiB pool, and a chunked compare of it per relay. The compare is
+            // `memcmp`-shaped (see `LocalBlob::take_changed_runs`) and the steady state is "nothing
+            // changed", so it costs a vectorised scan and no traffic. Shipping *whole* blobs here,
+            // which an earlier experiment did, tripled C's message count and slowed the relay enough
+            // that the application never reached the submit under test.
+            blob.ensure_baseline();
+            // Each run reuses `BlobData`'s offset field; v1 only ever used offset 0 (the whole blob).
+            for run in blob.take_changed_runs() {
+                out.push(C2S::BlobData {
+                    res_id,
+                    offset: run.offset,
+                    bytes: run.bytes,
+                });
+            }
         }
     }
 
@@ -309,7 +392,12 @@ mod tests {
                 _ => None,
             })
             .expect("the vertex buffer");
-        assert_eq!(*blob.0, 0, "v1 ships whole blobs, so they start at 0");
+        assert_eq!(
+            *blob.0,
+            0,
+            "a uniformly-filled blob diffed against a zero baseline is exactly one run \
+             covering the whole blob, so it still starts at offset 0"
+        );
         assert_eq!(
             blob.1,
             &vec![0x33u8; 64],
@@ -317,18 +405,21 @@ mod tests {
         );
     }
 
-    /// **Venus's internal shmems must never be shipped C→S**, and this is not tidiness.
+    /// **The ring must never be shipped as `BlobData`**, and this is not tidiness.
     ///
-    /// The reply arena is written by **S** and read by C — it is how every synchronous Vulkan call
-    /// gets its answer (ring-findings §7 measured it at ~12x the command traffic). Shipping C's
-    /// stale copy of it to S would clobber replies S had already written and the application is
-    /// blocked on. The ring likewise: the delta carries it, and a whole-blob copy would fight it for
-    /// the same bytes while overwriting the `head` and `status` words S's virglrenderer owns.
+    /// The ring has its own message, [`C2S::RingDelta`], which carries the `tail` that makes its
+    /// bytes meaningful and is deliberately sent **last**. A copy sent as `BlobData` would fight the
+    /// delta for the same bytes, publish ring contents ahead of the `tail` that validates them — S's
+    /// ring thread reads whatever is below `tail` the instant it lands — and overwrite the `head` and
+    /// `status` words S's virglrenderer owns.
     ///
-    /// So "conservative full sync" cannot mean "everything, both ways" — that is not conservative,
-    /// it is wrong. `blob_id` (ring-findings §6) is the line.
+    /// Everything *else* C holds now crosses, Venus's own shmems included. That is a deliberate
+    /// widening (see this module's docs): the staging pool is `blob_id == 0`, and it is where Mesa
+    /// puts a submission too large to inline, so a relay that skipped it could not carry
+    /// `vkExecuteCommandStreamsMESA` at all. What makes publishing a region **S also writes** safe is
+    /// the baseline, not the `blob_id` — see [`the_reply_arena_is_not_echoed_back_to_s`].
     #[test]
-    fn venus_s_own_shmems_are_never_shipped_c_to_s() {
+    fn the_ring_is_never_shipped_as_blob_data() {
         let blobs = table_of(&[
             (1, RING_BLOB_ID, 131268, 0x11),
             (2, REPLY_ARENA_BLOB_ID, 1048576, 0x22),
@@ -344,18 +435,73 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(
-            shipped,
-            vec![3],
-            "only the application's own memory may cross C->S; shipping C's stale reply arena would \
-             destroy the replies S wrote and the application is blocked on, and shipping the ring \
-             would clobber the head/status words S's virglrenderer owns"
+        assert!(
+            !shipped.contains(&1),
+            "the ring must never cross as BlobData: RingDelta carries it, and a BlobData copy would \
+             publish ring bytes ahead of the tail that validates them and clobber the head/status \
+             words S's virglrenderer owns. shipped: {shipped:?}"
+        );
+        assert!(
+            shipped.contains(&3),
+            "the application's own memory must still cross. shipped: {shipped:?}"
+        );
+        assert!(
+            shipped.contains(&2),
+            "Venus's non-ring shmems must now cross too — the staging pool is blob_id == 0 and is \
+             where an over-sized submission's commands actually live. shipped: {shipped:?}"
+        );
+    }
+
+    /// **The property that makes publishing a region S also writes safe: S's own bytes are never
+    /// echoed back to it.**
+    ///
+    /// This is the guard that replaced `blob_id` routing for C→S, and it is the whole reason the
+    /// reply arena can now be in the sync at all. The arena is written by **S** and read by C — it is
+    /// how every synchronous Vulkan call gets its answer (ring-findings §7 measured it at ~12x the
+    /// command traffic). Shipping C's copy of it back would clobber replies the application is
+    /// blocked on, which is a corruption bug, not a wasted byte.
+    ///
+    /// What prevents that is not the filter but the **baseline**: [`LocalBlob::note_s_wrote`] folds
+    /// each S→C write into it as the write is applied, so those bytes are already "what S has" by the
+    /// time the next diff runs and never appear as a C-side change. This test states that directly —
+    /// write into the mapping exactly as S's reply path does, and require the next relay to carry
+    /// nothing for it.
+    #[test]
+    fn the_reply_arena_is_not_echoed_back_to_s() {
+        const ARENA_RES: u32 = 2;
+        const ARENA_SIZE: u64 = 4096;
+        let blobs = table_of(&[(ARENA_RES, REPLY_ARENA_BLOB_ID, ARENA_SIZE, 0x00)]);
+
+        // First relay establishes the baseline and drains whatever the initial state was.
+        let _ = messages_for_delta(&blobs, 1, a_delta());
+
+        // Now S answers a synchronous call: its reply lands in the arena, through the same path
+        // `apply_blob_data` and `commit_pending_blob` use — write the bytes, then record them.
+        {
+            let mut table = blobs.lock().expect("the blob table lock is never poisoned");
+            let blob = table.get_mut(&ARENA_RES).expect("the arena is in the table");
+            blob.bytes_mut()[64..96].copy_from_slice(&[0xEE; 32]);
+            blob.note_s_wrote(64, &[0xEE; 32]);
+        }
+
+        let msgs = messages_for_delta(&blobs, 1, a_delta());
+        let arena_runs: Vec<&C2S> = msgs
+            .iter()
+            .filter(|m| matches!(m, C2S::BlobData { res_id, .. } if *res_id == ARENA_RES))
+            .collect();
+        assert!(
+            arena_runs.is_empty(),
+            "S's own reply must never be shipped back to S — note_s_wrote folds it into the \
+             baseline so it is not a C-side change. Got: {arena_runs:?}"
         );
     }
 
     /// Every application blob crosses, not just the first one found. The readback buffer matters as
     /// much as the vertex buffer: v1 has no way to know which of the app's blobs a given delta's
-    /// commands touch, which is exactly why the sync is conservative (spec §7).
+    /// commands touch, which is exactly why the sync is conservative (spec §7). This holds here because
+    /// both blobs are freshly filled against a zero baseline, so both are "changed"; under the diff, a
+    /// blob that had not changed since its last relay would rightly be absent, which is a different
+    /// test (`an_unchanged_blob_is_not_reshipped_on_the_next_relay`) below.
     #[test]
     fn every_application_blob_is_shipped_not_merely_one() {
         let blobs = table_of(&[
@@ -415,4 +561,134 @@ mod tests {
         );
         assert!(matches!(msgs[0], C2S::RingDelta { .. }));
     }
+
+    /// The point of the whole change: a blob that has not changed since the last relay must not be
+    /// re-shipped. Relaying twice, the second relay carries only the ring delta.
+    #[test]
+    fn an_unchanged_blob_is_not_reshipped_on_the_next_relay() {
+        let blobs = table_of(&[(3, VERTEX_BUFFER_BLOB_ID, 64, 0x33)]);
+
+        // First relay: the vertex buffer's content crosses (baseline was zeros).
+        let first = messages_for_delta(&blobs, 1, a_delta());
+        assert!(
+            first.iter().any(|m| matches!(m, C2S::BlobData { res_id: 3, .. })),
+            "the first relay must ship the app blob's content"
+        );
+
+        // Second relay, nothing written in between: the blob must not cross again.
+        let second = messages_for_delta(&blobs, 1, a_delta());
+        assert!(
+            !second.iter().any(|m| matches!(m, C2S::BlobData { .. })),
+            "an unchanged blob must not be re-shipped; only the ring delta should cross"
+        );
+        assert!(
+            second.iter().any(|m| matches!(m, C2S::RingDelta { .. })),
+            "the ring delta must still cross on every relay"
+        );
+    }
+}
+
+/// Fingerprint every blob C holds, for comparison against S's copy of the same resources.
+///
+/// # Why this exists
+/// The ring relay is measured byte-exact — 253 deltas, 253 matching digests — yet S either refuses
+/// the application's `vkQueueSubmit` with a decoder error or executes it into a fence that never
+/// signals, and it does so **intermittently**. Since the command bytes provably arrive intact, what
+/// the submit *references* is the remaining suspect: the swapchain images S builds from WP0 buffer
+/// tokens, and the staging pool this very module declines to publish. Fingerprinting both sides'
+/// blobs and joining on `tail` says which resource, if any, they disagree about.
+///
+/// # Inputs / outputs
+/// - `table`: C's blob shadows, already locked by the caller.
+/// - `tail`: the ring frontier of the delta being relayed — the join key against S's log, exactly as
+///   the ring fingerprints used.
+/// - Prints one line per blob per interval. **No-op unless `RAYLAND_C1_BLOB_FP` is set.**
+///
+/// # Pitfall: the two sides sample at different instants, and that is expected
+/// C and S cannot sample simultaneously, and the application writes its mapped memory continuously
+/// with no call to intercept — so a *transient* disagreement on an application blob means only that
+/// a write landed between the samples. **A persistent disagreement is the signal**, and a
+/// disagreement on a blob the application never writes is a stronger one still.
+///
+/// # Pitfall: this is deliberately its own switch
+/// It hashes several megabytes per sample, so it is throttled and gated separately from
+/// `RAYLAND_C1_METRICS` and `RAYLAND_RING_DUMP`. An instrument that changes the timing of the thing
+/// it measures is how the previous wall stayed misread for two days.
+fn blob_fingerprints(table: &std::collections::HashMap<u32, crate::shm::LocalBlob>, tail: u32) {
+    if std::env::var_os("RAYLAND_C1_BLOB_FP").is_none() {
+        return;
+    }
+    // Throttled: hashing megabytes on every relay would dominate the relay itself.
+    static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    static LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    /// Twice a second — dense enough to bracket a submit, sparse enough not to distort the relay.
+    const INTERVAL_MS: u64 = 500;
+    let now_ms = BASE
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64;
+    if now_ms < LAST_MS.load(std::sync::atomic::Ordering::Relaxed) + INTERVAL_MS {
+        return;
+    }
+    LAST_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+
+    for (&res_id, blob) in table.iter() {
+        let bytes = blob.bytes();
+        // **Cheap by construction, and it has to be.** The first version hashed every byte of every
+        // blob (~11 MiB) twice a second while holding this table's lock, and measurably stopped the
+        // application from reaching its swapchain buffers at all — 36 proxy-trace lines against 52
+        // with the instrument off, 5 runs to 3. The relay path is that latency-sensitive. So the
+        // zero regions, which are the overwhelming majority, are skipped with chunk compares that
+        // lower to `memcmp`, and only non-zero content is hashed.
+        let (nonzero, digest) = sparse_fingerprint(bytes);
+        eprintln!(
+            "[c-blobfp] tail={tail} res={res_id} len={} nonzero={nonzero} fnv={:016x}",
+            bytes.len(),
+            digest
+        );
+    }
+}
+
+
+
+
+/// A blob fingerprint that skips zero regions: `(non-zero byte count, digest of the non-zero bytes)`.
+///
+/// # Why not simply hash the blob
+/// Because hashing 11 MiB of mostly-zero memory twice a second, under a lock the relay needs, changed
+/// the behaviour of the system being measured — the application stopped reaching its swapchain
+/// buffers entirely. Zero regions carry no information here: S's copy of a blob starts as a
+/// zero-filled memfd, so agreement on the zeros is the default rather than evidence. Comparing a
+/// chunk against zeros with slice equality lowers to `memcmp`, so the common case costs a vectorised
+/// scan and no hashing at all.
+///
+/// # Inputs / outputs
+/// - `bytes`: the blob's live contents.
+/// - Returns the count of non-zero bytes and an FNV-1a digest **of only those bytes, in order**. Two
+///   blobs agreeing on both agree on their content, since the zeros are implied by the length.
+fn sparse_fingerprint(bytes: &[u8]) -> (usize, u64) {
+    const CHUNK: usize = 64;
+    const ZEROS: [u8; CHUNK] = [0u8; CHUNK];
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut nonzero = 0usize;
+    let mut hash = OFFSET_BASIS;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let end = (i + CHUNK).min(bytes.len());
+        // The whole point: an all-zero chunk is dismissed by one vectorised compare.
+        if bytes[i..end] == ZEROS[..end - i] {
+            i = end;
+            continue;
+        }
+        for &b in &bytes[i..end] {
+            if b != 0 {
+                nonzero += 1;
+                hash ^= b as u64;
+                hash = hash.wrapping_mul(PRIME);
+            }
+        }
+        i = end;
+    }
+    (nonzero, hash)
 }

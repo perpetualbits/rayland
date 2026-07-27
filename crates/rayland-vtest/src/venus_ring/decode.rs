@@ -17,19 +17,32 @@
 //!
 //! This has a sharp consequence for any decoder, and it is why [`encoded_size`] returns an
 //! `Option`: a decoder that *guesses* a size does not merely mis-read one command, it loses the
-//! stream frame and every subsequent command is confident nonsense at a wrong offset. So this
-//! decoder knows a handful of sizes exactly, from Mesa's own headers, and **stops** the instant it
-//! meets a command it cannot size. Stopping early is a correct, honest answer. Guessing is not.
+//! stream frame and every subsequent command is confident nonsense at a wrong offset. Guessing is
+//! never acceptable. For a long time this meant [`decode_commands`] could only know a handful of
+//! sizes exactly, from Mesa's own headers, and had to **stop** the instant it met a command outside
+//! that handful — an honest but shallow answer that halted at a real application's very first
+//! command. `rayland-venus-proto` (Task 3 of this crate's own sub-project) lifted that ceiling: it
+//! borrows Mesa's own generated decoder — the same one virglrenderer runs — so [`decode_commands`]
+//! now asks the size table first (pure Rust, no C, and the independent cross-check the fixture
+//! tests rely on) and falls back to that borrowed decoder for anything the table cannot express.
+//! The "stop rather than guess" discipline is unchanged; what changed is how much can be *sized*
+//! before a guess would ever be needed.
 //!
 //! # Scope
 //! See the parent module's scope limits. In short: no ring-wrap handling (the input here is a
-//! **linear** slice, deliberately), no `vkExecuteCommandStreamsMESA` out-of-line streams, and a
-//! size table covering three command types. This decoder exists to prove that the ring's bytes are
-//! the Venus command language — a question it answers conclusively — not to consume a real
-//! workload.
+//! **linear** slice, deliberately), and no `vkExecuteCommandStreamsMESA` out-of-line streams (a
+//! command that points *out* of the ring at other shared memory has no bytes here to size, borrowed
+//! decoder or not). The fixed-size table still covers only three command types — see the module
+//! this decoder now delegates to for how far past those three it can actually reach.
 
 /// `VK_COMMAND_TYPE_vkCreateInstance_EXT`. Variable-size (it carries application name strings and
-/// an extension list), so [`encoded_size`] cannot size it and the decoder stops here.
+/// an extension list), so [`encoded_size`]'s fixed-size table cannot size it by itself. That used to
+/// be the whole story and end the walk here unconditionally; since [`decode_commands`] gained its
+/// borrowed-decoder fallback (`rayland_venus_proto::command_len`), a complete, well-formed
+/// `vkCreateInstance` *can* be sized and the walk can continue past it. On the one captured fixture
+/// this crate has for it, the walk still stops here in practice — but for a different reason
+/// (`DecodeStop::Truncated`, because that particular capture window is too short), not because this
+/// constant's command is unsizeable in general. See [`decode_commands`]'s pitfalls.
 pub const VK_COMMAND_TYPE_VK_CREATE_INSTANCE: u32 = 0;
 
 /// `VK_COMMAND_TYPE_vkEnumerateInstanceVersion_EXT`.
@@ -74,9 +87,16 @@ pub const VK_COMMAND_TYPE_VK_NOTIFY_RING_MESA: u32 = 190;
 ///
 /// Unlike the commands above, this one is **fixed-size** (80 bytes, no strings/arrays/variable pNext
 /// for Mesa's queue-init shape), so it *could* be sized — but it is deliberately kept out of
-/// [`encoded_size`] and the linear walk, because the walk cannot *reach* it: variable-size commands
-/// (`vkCreateInstance`, `vkCreateDevice`, …) precede it and correctly stop the walk long before. It is
-/// instead found by a self-verifying **signature scan** ([`find_get_device_queue2`]).
+/// [`encoded_size`]'s table, because the table only ever needs to size commands [`decode_commands`]'s
+/// linear walk can reach *using the table alone*, and several variable-size commands (`vkCreateInstance`,
+/// `vkCreateDevice`, …) precede it in a real session. Since [`decode_commands`] gained its
+/// borrowed-decoder fallback, "the walk cannot reach it" is no longer an absolute claim — given a
+/// complete real stream where every preceding command decodes successfully, the walk *can* get this
+/// far and would decode it like any other command (a captured, standalone `vkGetDeviceQueue2` proves
+/// exactly that in this crate's tests). What has not changed is that nothing here relies on that: this
+/// command is instead found by a self-verifying **signature scan** ([`find_get_device_queue2`]) that
+/// works whether or not the linear walk could ever get this far, which matters because a decode-based
+/// walk's reach is only ever as good as every command ahead of it decoding without fault.
 pub const VK_COMMAND_TYPE_VK_GET_DEVICE_QUEUE2: u32 = 155;
 
 /// The size in bytes of a command's `[type][flags]` prologue: two little-endian `u32`s.
@@ -117,16 +137,24 @@ pub struct RingCommand {
 ///
 /// Every variant is a normal outcome, not a failure: this decoder's honest answer to most real
 /// streams is "I got this far". Modelling that as an error type would misrepresent it — nothing has
-/// gone *wrong* when a decoder with three known command sizes meets a fourth command.
+/// gone *wrong* when neither the fixed-size table nor the borrowed Mesa decoder can size the next
+/// command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeStop {
     /// The walk consumed the slice exactly, landing on its final byte with no remainder. For a
     /// slice cut at the ring's `tail`, this is the ideal outcome: every produced byte was accounted
     /// for by a whole command, which is strong evidence the frame was never lost.
     ReachedEnd,
-    /// A command's type is not in [`encoded_size`]'s table, so its length — and therefore where the
-    /// next command begins — is unknowable. The walk stops rather than guess. On the captured
-    /// stream this fires at [`VK_COMMAND_TYPE_VK_CREATE_INSTANCE`].
+    /// A command's type is unsizeable by **both** [`encoded_size`]'s table and the borrowed
+    /// `rayland_venus_proto::command_len` — so its length, and therefore where the next command
+    /// begins, is unknowable by any means this crate has. The walk stops rather than guess. This is
+    /// now a rare outcome (it means this Mesa build generates no decoder for the command at all),
+    /// distinct from [`Truncated`](DecodeStop::Truncated), which means a decoder *could* size the
+    /// command but the slice does not hold all of it. `decode_commands` also folds
+    /// `rayland_venus_proto::DecodeFault::BadArgs` into this variant (its catch-all `Err(_)` arm):
+    /// that fault means the borrowed decoder's C shim rejected its own arguments, a contract
+    /// violation this wrapper should never actually trigger, not "no decoder exists" — but the two
+    /// are indistinguishable to a caller of `decode_commands` today, since both take this arm.
     UnknownCommandSize {
         /// Offset of the command that could not be sized.
         offset: usize,
@@ -143,6 +171,23 @@ pub enum DecodeStop {
     Truncated {
         /// Offset at which the incomplete command begins.
         offset: usize,
+    },
+    /// The command's bytes were all present, but the borrowed decoder's own 1 MiB scratch pool
+    /// (`rayland-venus-proto`'s `csrc/shim.c`) was too small for what it needed to decode this
+    /// command's arguments — [`rayland_venus_proto::DecodeFault::TempPoolExhausted`], passed through
+    /// verbatim rather than folded into [`Truncated`](DecodeStop::Truncated).
+    ///
+    /// # Why this is not `Truncated`
+    /// `Truncated` means the *stream* ran out of bytes — a real red flag when it happens at a ring's
+    /// live `tail`. This means the stream was fine and this crate's own arena was the limit:
+    /// virglrenderer's equivalent pool is 1000x larger, so a command a real renderer decodes without
+    /// complaint could still land here. Collapsing the two would misreport an arena-sizing fact
+    /// about this diagnostic tool as a claim about the relay being broken.
+    TempPoolExhausted {
+        /// Offset of the command whose decode exhausted the pool.
+        offset: usize,
+        /// Its `VkCommandTypeEXT`, so the caller can say which command needed more scratch space.
+        command_type: u32,
     },
 }
 
@@ -166,12 +211,15 @@ pub enum DecodeStop {
 /// - Returns `Some(bytes)` for a command whose encoding is **fixed** and known, else `None`.
 ///
 /// # Failure modes / pitfalls
-/// `None` is not an error; see [`DecodeStop::UnknownCommandSize`]. Critically, `None` is also the
-/// right answer for a command this module *names* but cannot size:
+/// `None` is not an error and, since this crate started borrowing Mesa's own decoder
+/// (`rayland_venus_proto::command_len`), is not even necessarily the end of the walk: see
+/// [`decode_commands`], which tries that decoder before giving up with
+/// [`DecodeStop::UnknownCommandSize`]. Critically, `None` is also the right answer for a command
+/// this module *names* but does not itself size:
 /// [`VK_COMMAND_TYPE_VK_CREATE_INSTANCE`], [`VK_COMMAND_TYPE_VK_CREATE_RING_MESA`] and
 /// [`VK_COMMAND_TYPE_VK_EXECUTE_COMMAND_STREAMS_MESA`] are all variable-length. Recognising a
-/// command is not the same as being able to skip it, and conflating the two is how a decoder
-/// desynchronizes.
+/// command is not the same as being able to size it purely from this table, and conflating the two
+/// — returning a guessed size instead of `None` — is how a decoder desynchronizes.
 pub fn encoded_size(command_type: u32) -> Option<usize> {
     match command_type {
         // A `VkCommandStreamDescriptionMESA` passed by pointer: presence marker, then the struct's
@@ -217,6 +265,12 @@ fn read_u64_le(bytes: &[u8], offset: usize) -> Option<u64> {
 
 /// Walk a Venus command stream, returning every command it could size and why it stopped.
 ///
+/// Sizing tries [`encoded_size`]'s fixed-size table first — pure Rust, and the independent
+/// cross-check the fixture tests rely on — and, for anything the table cannot express, falls back
+/// to the borrowed `rayland_venus_proto::command_len`, which runs Mesa's own generated decoder. That
+/// fallback is what lets this walk continue past the three command types the table knows, which
+/// used to be where every real application's stream stopped (at its very first command).
+///
 /// # Inputs / outputs
 /// - `stream`: the bytes to walk, as a **linear** slice. Callers reading a live ring should pass
 ///   `&blob[RING_BUFFER_OFFSET..][..tail]` — see the pitfalls below before doing so.
@@ -225,9 +279,10 @@ fn read_u64_le(bytes: &[u8], offset: usize) -> Option<u64> {
 ///   may be more after the stop point that this module cannot reach.
 ///
 /// # Failure modes
-/// Cannot fail and cannot panic: every read is bounds-checked, and an unsizeable or incomplete
-/// command ends the walk with the corresponding [`DecodeStop`]. An empty slice yields no commands
-/// and [`DecodeStop::ReachedEnd`].
+/// Cannot fail and cannot panic: every read is bounds-checked (this module's own reads) or
+/// bounds-checked by the borrowed decoder (`rayland_venus_proto::command_len`'s own contract), and
+/// an unsizeable or incomplete command ends the walk with the corresponding [`DecodeStop`]. An empty
+/// slice yields no commands and [`DecodeStop::ReachedEnd`].
 ///
 /// # Pitfalls
 /// - **No wrap handling.** `stream` is linear. A real ring is circular and Mesa indexes it modulo
@@ -237,8 +292,25 @@ fn read_u64_le(bytes: &[u8], offset: usize) -> Option<u64> {
 /// - **Racing the writer.** A ring is being written *by another process* as you read it. Any
 ///   snapshot may be torn. Decoding past a torn `tail` is how you turn a race into a plausible-
 ///   looking command that never existed.
-/// - **The stop point is not the end of the stream.** [`DecodeStop::UnknownCommandSize`] means this
-///   module ran out of knowledge, not that the client ran out of commands.
+/// - **The stop point is not the end of the stream.** [`DecodeStop::UnknownCommandSize`] means
+///   *neither* the table *nor* the borrowed decoder could size the command — a rare event now that
+///   Mesa's own decoder is consulted — not that the client ran out of commands. A far more common
+///   non-`ReachedEnd` stop is now [`DecodeStop::Truncated`]: the borrowed decoder correctly *can*
+///   size the command in principle, but the slice does not hold all of its bytes (e.g. a captured
+///   window narrower than what the client actually produced).
+/// - **A pool-exhaustion stop is not a broken stream.** [`DecodeStop::TempPoolExhausted`] means the
+///   borrowed decoder's own scratch arena was too small for this command's arguments — the bytes
+///   were all present and well-formed. Do not treat it as evidence of a corrupt or torn ring; it is
+///   a fact about this diagnostic tool's arena size, not about the relay.
+/// - **No decode here may inform a *relay* decision.** (c)1 spec §7 relays the ring as opaque bytes
+///   precisely so that a decoding bug cannot become a corruption bug, and `rayland-c`'s
+///   `decoder_is_not_load_bearing` test pins that mechanically. **One deliberate exception exists,
+///   and it is not on the relay path:** [`find_destroy_device`] calls this function, and
+///   `rayland-s` uses its answer to decide when to retire the readback gate. That is a correctness
+///   decision made from a decode. It was taken knowingly on 2026-07-26, because the bare signature
+///   scan it replaced was *measured* false-positiving on payload bytes and retiring the gate on a
+///   device destruction that never happened — the rule existed to prevent corruption, and here it
+///   was protecting a heuristic proven to corrupt. See `docs/DIARY.md`, 2026-07-26.
 pub fn decode_commands(stream: &[u8]) -> (Vec<RingCommand>, DecodeStop) {
     let mut commands = Vec::new();
     // Byte offset of the next command to decode; advanced by each command's own encoded size,
@@ -257,16 +329,45 @@ pub fn decode_commands(stream: &[u8]) -> (Vec<RingCommand>, DecodeStop) {
         else {
             return (commands, DecodeStop::Truncated { offset });
         };
-        // The whole reason this decoder is conservative: without a known size we cannot find the
-        // next command, and a guess would desynchronize every command after it.
-        let Some(encoded_size) = encoded_size(command_type) else {
-            return (
-                commands,
-                DecodeStop::UnknownCommandSize {
-                    offset,
-                    command_type,
-                },
-            );
+        // The fixed-size table answers first: it is pure Rust, needs no C, and covers the three
+        // commands this crate cares about most — including the doorbell. Where it cannot answer, ask
+        // Mesa's own decoder, which is the only thing that can frame a variable-length command.
+        // **Framing only.** Nothing decoded here may inform a relay decision; see (c)1 spec §7 and
+        // `rayland_venus_proto`'s crate docs.
+        let encoded_size = match encoded_size(command_type) {
+            Some(size) => size,
+            None => match rayland_venus_proto::command_len(&stream[offset..]) {
+                Ok(command) => command.len,
+                // The borrowed decoder ran out of bytes: the slice cuts through this command, which
+                // is the same condition virglrenderer reports as a "CS error".
+                Err(rayland_venus_proto::DecodeFault::Truncated) => {
+                    return (commands, DecodeStop::Truncated { offset });
+                }
+                // The stream was fine; the borrowed decoder's own scratch pool was not. A distinct
+                // stop so a caller never mistakes an arena-sizing limit for a broken relay — see
+                // `DecodeStop::TempPoolExhausted`'s doc comment.
+                Err(rayland_venus_proto::DecodeFault::TempPoolExhausted) => {
+                    return (
+                        commands,
+                        DecodeStop::TempPoolExhausted {
+                            offset,
+                            command_type,
+                        },
+                    );
+                }
+                // Neither the table nor Mesa can size it. Reported exactly as before, so this arm
+                // keeps its old meaning: this module ran out of knowledge, not the client out of
+                // commands.
+                Err(_) => {
+                    return (
+                        commands,
+                        DecodeStop::UnknownCommandSize {
+                            offset,
+                            command_type,
+                        },
+                    );
+                }
+            },
         };
         // The command is sizeable but its bytes are not all here — normal when decoding a captured
         // window, suspicious when decoding up to a live `tail`.
@@ -416,11 +517,14 @@ pub struct GetDeviceQueue2 {
 /// Find the application's `vkGetDeviceQueue2` in a Venus command stream and read its `ring_idx`.
 ///
 /// # Why this is a signature scan and not part of the linear walk
-/// [`decode_commands`] cannot reach this command: it walks from the stream's start and stops at the
-/// first command it cannot size, and the app's init emits several variable-size commands
-/// (`vkCreateInstance`, `vkCreateDevice`, …) *before* `vkGetDeviceQueue2`. So this instead scans for
-/// the command's fixed 80-byte signature directly. That is not the "guess a size and desynchronize"
-/// failure [`decode_commands`] refuses — it matches on **four independent, self-verifying constants**:
+/// This does not rely on [`decode_commands`] ever reaching `vkGetDeviceQueue2`: the app's init emits
+/// several variable-size commands (`vkCreateInstance`, `vkCreateDevice`, …) *before* it, and a
+/// decode-based walk's reach past them depends on every one of them decoding without fault — real,
+/// not hypothetical, given this crate's own fixtures show both `Truncated` and `UnknownCommandSize`
+/// occurring on genuine captured data (see `decode`'s module tests). So this instead scans for the
+/// command's fixed 80-byte signature directly, independently of whether the linear walk could get
+/// this far on any given stream. That is not the "guess a size and desynchronize" failure
+/// [`decode_commands`] refuses — it matches on **four independent, self-verifying constants**:
 /// the command type (155), the async command flags (0), and two 32-bit `VkStructureType` magic words
 /// ([`STYPE_DEVICE_QUEUE_INFO_2`], [`STYPE_DEVICE_QUEUE_TIMELINE_INFO_MESA`]). A coincidental match of
 /// all four in unrelated argument bytes is astronomically unlikely.
@@ -476,6 +580,41 @@ pub fn find_get_device_queue2(stream: &[u8]) -> Option<GetDeviceQueue2> {
     }
     None
 }
+
+/// `VK_COMMAND_TYPE_vkImportSemaphoreResourceMESA_EXT` — Venus's WSI synchronisation path: it binds an
+/// existing `VkSemaphore` to a **virgl resource id**, so the compositor and the GPU can synchronise on
+/// a shared buffer rather than on a semaphore that only exists inside one process.
+///
+/// # Why this one is named here
+/// It is the command immediately preceding the `vkQueueSubmit` that vkcube fails on, and it is the only
+/// command in that frame whose argument is a *resource* rather than a Vulkan object — which matters
+/// because a resource is exactly the kind of thing that may exist on C and not on S while WP0's
+/// swapchain plumbing is incomplete. Named for recognition and diagnostics only; `encoded_size`
+/// deliberately does not size it (the borrowed decoder does that).
+pub const VK_COMMAND_TYPE_VK_IMPORT_SEMAPHORE_RESOURCE_MESA: u32 = 246;
+
+/// `VK_COMMAND_TYPE_vkCreateFence_EXT` and `_vkCreateSemaphore_EXT` — the two object *creations* whose
+/// ids the failing `vkQueueSubmit` names.
+///
+/// # Why these two, and why the id is the last eight bytes
+/// Venus object ids are chosen by the **client**, not the renderer: `vn_decode_vkCreateFence_args_temp`
+/// and `..._vkCreateSemaphore_args_temp` both end with `vn_decode_VkFence` / `vn_decode_VkSemaphore` —
+/// the *creation* form (not `_lookup`), carrying the client's chosen id — and it is decoded last. So the
+/// id is the command's final `u64`, exactly as for `vkGetDeviceQueue2`. Naming them here lets a
+/// diagnostic answer "was the handle this submit names ever created at all?" from the ring alone.
+pub const VK_COMMAND_TYPE_VK_CREATE_FENCE: u32 = 35;
+/// See [`VK_COMMAND_TYPE_VK_CREATE_FENCE`] — same shape, same reason.
+pub const VK_COMMAND_TYPE_VK_CREATE_SEMAPHORE: u32 = 40;
+
+/// `VK_COMMAND_TYPE_vkAllocateCommandBuffers_EXT` — the one creation whose ids the failing
+/// `vkQueueSubmit` names and which is **not** a single trailing handle.
+///
+/// # Shape, and why it needs its own treatment
+/// Unlike `vkCreateFence`/`vkCreateSemaphore`, this command creates *several* objects at once: its
+/// arguments end with a counted array, `[u64 count][count x u64 id]`, decoded by
+/// `vn_decode_VkCommandBuffer_temp` (the creation form). So "which command buffers exist" cannot be
+/// read off the last eight bytes — the whole trailing array has to be walked.
+pub const VK_COMMAND_TYPE_VK_ALLOCATE_COMMAND_BUFFERS: u32 = 88;
 
 /// `VK_COMMAND_TYPE_vkQueueSubmit_EXT` and `_vkQueueSubmit2_EXT` — the commands that submit rendering
 /// (and, for a readback frame, the copy-to-buffer) to the application's queue. Both encode an
@@ -593,9 +732,46 @@ pub fn find_queue_submit(stream: &[u8], queue_handle: u64) -> Option<usize> {
 /// re-admits the fatal teardown fence — so the signature is kept minimal and exact rather than
 /// over-constrained.
 pub fn find_destroy_device(stream: &[u8], device_handle: u64) -> Option<usize> {
+    // **Decode first, and believe the decode wherever it reached.**
+    //
+    // The signature scan below was measured firing on payload bytes — twice, at offsets 6236 and
+    // 6300 in consecutive runs of the same workload, in a delta the decoder walked to `ReachedEnd`
+    // with no `vkDestroyDevice` in it at all. A hit whose offset is not a command boundary is not a
+    // command, and this function's own docs predicted the consequence of believing one: the gate
+    // closes early and the next real readback wedges. See `docs/DIARY.md`, 2026-07-26.
+    //
+    // Why the pattern is weak here and sound in `find_get_device_queue2`: `vkDestroyDevice` is type
+    // **12**, an ordinary value to meet in payload data, paired with a flags word of `0`, which is
+    // commoner still. Type **155** is not. The discriminating power of a sliding match is a property
+    // of the data it slides through, not of the technique.
+    let (commands, stop) = decode_commands(stream);
+    if let Some(found) = commands.iter().find(|c| {
+        c.command_type == VK_COMMAND_TYPE_VK_DESTROY_DEVICE
+            // Still this device's destroy, not any device's: the caller latched one queue's device
+            // and must close that gate, not another's.
+            && read_u64_le(stream, c.offset + DEVICE_HANDLE_OFFSET) == Some(device_handle)
+    }) {
+        return Some(found.offset);
+    }
+    // The walk saw the whole stream and there was no such command. That is a *confident* negative,
+    // which the scan could never give — and a negative is the answer that matters most to get right
+    // in the safe direction here.
+    if stop == DecodeStop::ReachedEnd {
+        return None;
+    }
+    // The walk stopped early, so the decoder has no opinion about the bytes past that point. Fall
+    // back to the scan **only there**. This preserves the old conservative behaviour exactly where
+    // the decoder cannot see, which matters because a false negative is the dangerous direction: it
+    // re-admits a teardown fence that is render-server-fatal, where a false positive merely closes
+    // the gate early. Scanning only the undecoded tail removes every false positive the decoder
+    // could have ruled out, without ever trading one for a missed real destroy.
+    let undecoded_from = commands
+        .last()
+        .map_or(0, |c| c.offset + c.encoded_size);
+
     // The bytes this reads span `[offset, offset + 16)` — type (4) + flags (4) + device (8).
     const READ_SPAN: usize = DEVICE_HANDLE_OFFSET + 8;
-    let mut offset = 0usize;
+    let mut offset = undecoded_from;
     while offset + READ_SPAN <= stream.len() {
         let is_match = read_u32_le(stream, offset) == Some(VK_COMMAND_TYPE_VK_DESTROY_DEVICE)
             // Async command flags: `vkDestroyDevice` is void, emitted `vn_async_*`, so flags == 0.
@@ -608,4 +784,133 @@ pub fn find_destroy_device(stream: &[u8], device_handle: u64) -> Option<usize> {
         offset += 4;
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **The regression this fix exists for.** The signature scan matched `[12][0][device]` inside a
+    /// command's *payload* — measured live at offsets 6236 and 6300 in consecutive runs — and S
+    /// believed it, retiring its readback gate for a device destruction that never happened.
+    ///
+    /// Here that pattern is planted deliberately inside a decodable command's arguments. A scan alone
+    /// fires on it; a decode does not, because the offset is not where any command begins.
+    #[test]
+    fn a_destroy_pattern_buried_in_a_payload_is_not_a_destroy() {
+        const DEVICE: u64 = 0x5;
+        // The carrier is a real `vkNotifyRingMESA` — the ring doorbell, a command that genuinely
+        // occurs in every captured stream, and one `encoded_size`'s own table can size (24 bytes:
+        // header, `ring` u64, `seqno` u32, `flags` u32). So the walk gets cleanly past it without
+        // depending on the borrowed decoder being linked.
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&VK_COMMAND_TYPE_VK_NOTIFY_RING_MESA.to_le_bytes());
+        stream.extend_from_slice(&0u32.to_le_bytes());
+        // The trap is laid entirely in this command's *arguments*, at stream offset 8. A `ring` id
+        // of 12 puts `[12][0]` there — reading, to a sliding scan, exactly like a `vkDestroyDevice`
+        // type word followed by an all-clear flags word...
+        stream.extend_from_slice(&12u64.to_le_bytes());
+        // ...and `seqno`/`flags` together occupy the next eight bytes, where the scan expects the
+        // device handle. A doorbell for ring 12 with seqno 5 therefore *is* the 16-byte signature
+        // for "destroy device 5" — with none of it being a command, and nothing contrived about it.
+        stream.extend_from_slice(&(DEVICE as u32).to_le_bytes());
+        stream.extend_from_slice(&0u32.to_le_bytes());
+
+        assert_eq!(
+            find_destroy_device(&stream, DEVICE),
+            None,
+            "a [12][0][device] pattern inside a payload is not a vkDestroyDevice; believing it \
+             closes S's readback gate on a device destruction that never happened"
+        );
+    }
+
+    /// The other direction, which matters more: a **real** destroy must still be found. A false
+    /// negative re-admits a teardown fence on a destroyed queue, which is render-server-fatal — so
+    /// this fix must not have bought its precision with a missed detection.
+    #[test]
+    fn a_real_destroy_command_is_still_found() {
+        const DEVICE: u64 = 0x5;
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&VK_COMMAND_TYPE_VK_DESTROY_DEVICE.to_le_bytes());
+        stream.extend_from_slice(&0u32.to_le_bytes()); // async: void command, no reply
+        stream.extend_from_slice(&DEVICE.to_le_bytes());
+        stream.extend_from_slice(&0u64.to_le_bytes()); // pAllocator: not present
+
+        assert_eq!(
+            find_destroy_device(&stream, DEVICE),
+            Some(0),
+            "a real vkDestroyDevice at offset 0 must still be detected"
+        );
+    }
+
+    /// A destroy of a *different* device must not close this device's gate — the discriminator the
+    /// original scan already had, preserved here so the decode-first path cannot quietly lose it.
+    #[test]
+    fn another_devices_destroy_is_not_this_devices() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&VK_COMMAND_TYPE_VK_DESTROY_DEVICE.to_le_bytes());
+        stream.extend_from_slice(&0u32.to_le_bytes());
+        stream.extend_from_slice(&0x9u64.to_le_bytes()); // some other device
+        stream.extend_from_slice(&0u64.to_le_bytes());
+
+        assert_eq!(find_destroy_device(&stream, 0x5), None);
+    }
+
+    /// The size table and the borrowed decoder must agree wherever both can answer. They are
+    /// independent — one is hand-derived from Mesa's `vn_sizeof_*`, the other is Mesa's own decoder —
+    /// so agreement is evidence and disagreement means one of them is wrong.
+    #[test]
+    fn the_size_table_and_the_borrowed_decoder_agree() {
+        // `vkNotifyRingMESA`: type, flags, ring handle, seqno, flags — the doorbell, and one of the
+        // three commands the table knows.
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&VK_COMMAND_TYPE_VK_NOTIFY_RING_MESA.to_le_bytes());
+        stream.extend_from_slice(&0u32.to_le_bytes());
+        stream.extend_from_slice(&0xdead_beefu64.to_le_bytes());
+        stream.extend_from_slice(&0u32.to_le_bytes());
+        stream.extend_from_slice(&0u32.to_le_bytes());
+
+        let from_table = encoded_size(VK_COMMAND_TYPE_VK_NOTIFY_RING_MESA)
+            .expect("the table knows the doorbell");
+        let from_decoder = rayland_venus_proto::command_len(&stream)
+            .expect("the borrowed decoder frames the doorbell")
+            .len;
+        assert_eq!(
+            from_table, from_decoder,
+            "the size table and Mesa's own decoder disagree about vkNotifyRingMESA"
+        );
+    }
+
+    /// `decode_commands` must pass `rayland_venus_proto::DecodeFault::TempPoolExhausted` through as
+    /// its own [`DecodeStop`] variant, not fold it into [`DecodeStop::UnknownCommandSize`] (which
+    /// would misreport an arena limit as "no decoder exists") or
+    /// [`DecodeStop::Truncated`] (which would misreport it as a broken stream).
+    ///
+    /// Stream: `vkResetFences` (type 37) with a `fenceCount` of 200,000 — `sizeof(VkFence) *
+    /// fenceCount = 1_600_000` bytes requested against the borrowed decoder's `1 << 20 =
+    /// 1_048_576`-byte temp pool. See `rayland-venus-proto`'s own
+    /// `a_command_whose_array_overruns_the_temp_pool_is_a_distinct_fault` test for why this
+    /// particular command and count are cheap to construct: the allocation is requested, and fails,
+    /// before a single fence handle is read, so no stream bytes beyond the array-size field are
+    /// needed.
+    #[test]
+    fn a_pool_exhausting_command_is_reported_distinctly_from_unknown_and_truncated() {
+        const VK_COMMAND_TYPE_VK_RESET_FENCES: u32 = 37;
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&VK_COMMAND_TYPE_VK_RESET_FENCES.to_le_bytes());
+        stream.extend_from_slice(&0u32.to_le_bytes()); // flags
+        stream.extend_from_slice(&0x7777_7777_7777_7777u64.to_le_bytes()); // device handle
+        stream.extend_from_slice(&200_000u32.to_le_bytes()); // fenceCount
+        stream.extend_from_slice(&200_000u64.to_le_bytes()); // array_size, must match fenceCount
+
+        let (commands, stop) = decode_commands(&stream);
+        assert!(commands.is_empty(), "the pool-exhausting command itself is never recorded");
+        assert_eq!(
+            stop,
+            DecodeStop::TempPoolExhausted {
+                offset: 0,
+                command_type: VK_COMMAND_TYPE_VK_RESET_FENCES,
+            }
+        );
+    }
 }

@@ -218,20 +218,32 @@ fn captured_ring_bytes_decode_as_venus_vulkan_commands() {
     assert_eq!(commands[2].command_flags, 0);
     assert_eq!(commands[2].encoded_size, 36);
 
-    // The walk stops at command 4 — `vkCreateInstance`, whose encoding is variable-length because
-    // it carries application strings and an extension list. Stopping is the correct answer: see
-    // `decode_commands`'s pitfalls on why guessing a size would desynchronize everything after it.
+    // The walk reaches command 4 — `vkCreateInstance`, whose encoding is variable-length because it
+    // carries application strings and an extension list. [`encoded_size`]'s fixed-size table still
+    // cannot size it (asserted below), but since (c)1 Task 4 the walker no longer gives up there: it
+    // falls back to the borrowed `rayland_venus_proto::command_len`, which *can* size a
+    // `vkCreateInstance` in principle — Mesa generates a real decoder for it. That decoder asks for
+    // more bytes than this fixture has: the capture preserved only the first 100 of the client's 216
+    // produced buffer bytes (see the module docs), so `vkCreateInstance`'s body runs off the end of
+    // `stream` and the borrowed decoder correctly reports `Truncated`, not a guessed length.
+    //
+    // This assertion used to read `DecodeStop::UnknownCommandSize { offset: 88, command_type:
+    // VK_COMMAND_TYPE_VK_CREATE_INSTANCE }` — that was pinning the *old* ceiling (this module's own
+    // ignorance of `vkCreateInstance`'s size), not a requirement. Task 4 lifted that ceiling, and the
+    // more precise, more honest answer for *this* fixture is `Truncated`: the borrowed decoder knows
+    // how to size the command, it simply does not have all of it. Proving the walker can reach
+    // `DecodeStop::ReachedEnd` on a stream containing a command outside the fixed-size table needs a
+    // *complete* capture of one — see `the_borrowed_decoder_walks_a_real_variable_format_command_to_its_end`
+    // below, which uses the 2026-07-19 `vkGetDeviceQueue2` capture for exactly that, and the diary
+    // entry recording why the 2026-07-15 ring prefix here cannot do the same.
     assert_eq!(
         stop,
-        DecodeStop::UnknownCommandSize {
-            offset: 88,
-            command_type: VK_COMMAND_TYPE_VK_CREATE_INSTANCE,
-        },
-        "the fourth command is vkCreateInstance, which this decoder cannot size"
+        DecodeStop::Truncated { offset: 88 },
+        "the fourth command (vkCreateInstance) is now sizeable in principle by the borrowed \
+         decoder, but this 100-byte capture window does not hold all of it"
     );
-    // And that stop is a real limit of our knowledge, not of the data: the client had produced 216
-    // bytes, so vkCreateInstance's body genuinely exists — beyond both our size table and the
-    // 100 bytes the capture preserved.
+    // The fixed-size table's own limitation is unchanged: it still cannot size vkCreateInstance by
+    // itself. Only the *walker*, via the borrowed decoder, can go further.
     assert_eq!(encoded_size(VK_COMMAND_TYPE_VK_CREATE_INSTANCE), None);
 }
 
@@ -449,6 +461,62 @@ fn get_device_queue2_ring_idx_decodes_from_real_bytes() {
         found,
         GetDeviceQueue2 { ring_idx: 1, end_offset: 80, device_handle: 3, queue_handle: 5 },
         "real Mesa bytes yield ring_idx=1, device handle 3, queue handle 5, command ending at byte 80"
+    );
+}
+
+/// **The anchor: the borrowed decoder walks a real, variable-format command all the way to
+/// `ReachedEnd`, using genuinely captured bytes.**
+///
+/// # Why this is the fixture to anchor on, not the 2026-07-15 ring prefix
+/// [`CAPTURED_RING_PREFIX`] only preserves the first 100 of the client's 216 produced buffer bytes
+/// (see the module's provenance note), so it can never demonstrate `ReachedEnd` past its three
+/// known-table commands — [`captured_ring_bytes_decode_as_venus_vulkan_commands`] shows it instead
+/// correctly reports `Truncated` once the walk reaches `vkCreateInstance`, because the capture window
+/// itself is short, not because the borrowed decoder failed. Proving the walker can *finish* a
+/// variable-format command therefore needs a fixture that captured one **whole**. The 2026-07-19
+/// `vkGetDeviceQueue2` capture ([`CAPTURED_GET_DEVICE_QUEUE2`]) is exactly that: a real command Mesa
+/// wrote, complete, with nothing captured either side of it.
+///
+/// # What this proves
+/// [`VK_COMMAND_TYPE_VK_GET_DEVICE_QUEUE2`] is **deliberately excluded** from [`encoded_size`]'s
+/// table (see that constant's doc comment) even though this particular call shape happens to be a
+/// fixed 80 bytes — the table only ever needs to size commands the linear walk can reach using the
+/// table by itself, and in a real session `vkGetDeviceQueue2` sits behind variable-length commands
+/// the *table alone* cannot get past. (The walk as a whole, with its borrowed-decoder fallback, is a
+/// different matter — this very test is the proof that it can size this command once handed to it.)
+/// So when `decode_commands` is handed exactly this command's 80 bytes, `encoded_size` returns
+/// `None` for it and the walk must fall back to `rayland_venus_proto::command_len` — the borrowed
+/// Mesa decoder — to size it at all. That it does, correctly, landing on `stream.len()` with no
+/// remainder is `DecodeStop::ReachedEnd`: the outcome that says the frame was never lost, produced
+/// here by the borrowed decoder rather than the fixed-size table, on bytes a live Mesa client
+/// actually wrote.
+#[test]
+fn the_borrowed_decoder_walks_a_real_variable_format_command_to_its_end() {
+    let bytes = captured_gdq2_bytes();
+    let (commands, stop) = decode_commands(&bytes);
+
+    // Exactly one command was decoded, and it accounts for every byte.
+    assert_eq!(commands.len(), 1, "the capture holds exactly one whole command");
+    assert_eq!(commands[0].offset, 0);
+    assert_eq!(
+        commands[0].command_type,
+        super::decode::VK_COMMAND_TYPE_VK_GET_DEVICE_QUEUE2
+    );
+    assert_eq!(
+        commands[0].encoded_size, 80,
+        "the borrowed decoder's own answer, not a value copied from GET_DEVICE_QUEUE2_SIZE"
+    );
+    assert_eq!(
+        stop,
+        DecodeStop::ReachedEnd,
+        "the whole 80-byte capture was consumed by one command, with no remainder"
+    );
+    // And the fixed-size table genuinely never sized this: the fallback path was exercised, not
+    // skipped by a table hit that happened to agree.
+    assert_eq!(
+        encoded_size(super::decode::VK_COMMAND_TYPE_VK_GET_DEVICE_QUEUE2),
+        None,
+        "vkGetDeviceQueue2 must not be in the fixed-size table, or this test would not exercise the fallback"
     );
 }
 

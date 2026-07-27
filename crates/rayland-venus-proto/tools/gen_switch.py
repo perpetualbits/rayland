@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""Emit the command-type -> decode-args switch used by the shim.
+
+WHY THIS IS GENERATED
+The switch has one case per Venus command (~331 of them) and must track Mesa exactly. Typing it by
+hand would guarantee drift. This is deliberately a *symbol enumerator*, not a C parser: it only needs
+to find which `vn_decode_<name>_args_temp` functions exist and what command-type enumerator each
+corresponds to. That is why it is robust where parsing C types would not be.
+
+Run from the crate root:  python3 tools/gen_switch.py > csrc/decode_switch.inc
+"""
+import pathlib
+import re
+import sys
+
+VENDOR = pathlib.Path("vendor/venus-protocol")
+
+# Every generated decoder is named `vn_decode_<Command>_args_temp`. Its parameter list is captured
+# too (group 2), not just its name: a handful of commands generate a THREE-argument decoder —
+# `(struct vn_cs_decoder *dec, struct vn_cs_encoder *enc, struct vn_command_<name> *args)` — because
+# Mesa pre-sizes that command's *reply* arena during the decode pass (queries and other "get data
+# back" commands: vkGetQueryPoolResults, vkGetPipelineCacheData, vkCopyImageToMemoryMESA,
+# vkWriteAccelerationStructuresPropertiesKHR, vkGetRayTracingShaderGroupHandlesKHR,
+# vkGetRayTracingCaptureReplayShaderGroupHandlesKHR, at this vendored version). The ordinary shape has
+# only `(dec, args)`. Both must be matched with the right number of arguments, or the call fails to
+# compile (a real per-command discrepancy found the first time this generator was run against the
+# vendored headers — see csrc/vkr_cs.h's comment on `vkr_cs_encoder_get_blob_storage` for what it
+# means for the shim). This is still a symbol/text scan, not a C parser: every one of these
+# declarations lives entirely on one source line in the vendored headers, so a plain regex over the
+# parenthesised parameter list is enough to tell the two shapes apart.
+#
+# The `static inline void` prefix is required, not optional: without it this would also match every
+# CALL site of a decoder (e.g. `vn_dispatch_vkGetQueryPoolResults`'s own
+# `vn_decode_vkGetQueryPoolResults_args_temp(ctx->decoder, ctx->encoder, &args)`), and a call site's
+# argument text is variable names (`ctx->encoder`), not the parameter's declared TYPE
+# (`struct vn_cs_encoder *enc`) — so the same 3-argument decoder would look like it takes only two
+# to the `"vn_cs_encoder" in params` test below, depending on which occurrence in the file was matched
+# last. Anchoring on the declaration keyword is what this generator caught the first time it ran.
+DECODER = re.compile(r"static inline void\s+vn_decode_(vk[A-Za-z0-9_]+)_args_temp\s*\(([^)]*)\)")
+# Every command type is `VK_COMMAND_TYPE_<Command>_EXT = <n>,`.
+CMDTYPE = re.compile(r"\bVK_COMMAND_TYPE_(vk[A-Za-z0-9_]+)_EXT\s*=\s*(\d+)")
+
+def main() -> int:
+    """Scan the vendored venus-protocol headers and print the generated `decode_switch.inc` body.
+
+    Reads `vn_protocol_renderer_defines.h` for the `cmd_type -> name` table and every
+    `vn_protocol_renderer_*.h` for `vn_decode_<name>_args_temp` declarations (see DECODER/CMDTYPE,
+    above, for why this is a text scan rather than a C parser). Emits, to stdout, one `switch` case
+    per command that has both a command-type enumerator and a generated decoder, each calling that
+    decoder with the right number of arguments (see the `decoders[name]` branch below), plus a
+    `default` case that reports any other command type as unknown. Always returns 0: there is no
+    failure mode short of a missing/unreadable vendored header, which raises rather than returning
+    non-zero, so a non-zero exit here always means "something is broken enough to look at directly."
+    """
+    defines = (VENDOR / "vn_protocol_renderer_defines.h").read_text()
+    # command name -> numeric type, from the one header that defines them all.
+    types = {m.group(1): int(m.group(2)) for m in CMDTYPE.finditer(defines)}
+
+    # command name -> True if its generated decoder also takes a `struct vn_cs_encoder *` (see the
+    # comment on DECODER above).
+    decoders = {}
+    for header in sorted(VENDOR.glob("vn_protocol_renderer_*.h")):
+        for m in DECODER.finditer(header.read_text()):
+            decoders[m.group(1)] = "vn_cs_encoder" in m.group(2)
+
+    # Only commands that have BOTH a type and a decoder can be walked. A command with a type but no
+    # decoder is not an error — it is simply one this switch reports as unknown. The symmetric case,
+    # a decoder with no command-type enumerator, is not an error either, and needs no handling here:
+    # such a name is simply absent from `types`, so it is dropped by the set intersection below and
+    # never printed as a case at all — there is no `cmd_type` value that could ever reach it, since
+    # every `cmd_type` this switch is fed comes from decoding the wire's `VkCommandTypeEXT`, which by
+    # construction can only ever be one of the values `types` enumerates.
+    both = sorted(set(types) & set(decoders), key=lambda n: types[n])
+
+    print("/* GENERATED by tools/gen_switch.py — do not edit. */")
+    print("/* Regenerate after updating vendor/venus-protocol; see vendor/MESA_VERSION. */")
+    print(f"/* {len(both)} commands with both a command type and a generated decoder. */")
+    print("switch (cmd_type) {")
+    for name in both:
+        print(f"case {types[name]}: {{")
+        print(f"    struct vn_command_{name} args;")
+        # NOTE: `dec_public`/`enc_public` (shim.c) are already `struct vn_cs_decoder *`/
+        # `struct vn_cs_encoder *`, matching what every generated `_args_temp` function expects — see
+        # shim.c's own `vn_decode_VkCommandTypeEXT(dec_public, ...)` calls just above the `#include`
+        # of this file. Passing `&dec_public` here (as the task brief's literal snippet does) would
+        # hand the decoder a `struct vn_cs_decoder **` instead; that is a typo this generator corrects.
+        if decoders[name]:
+            print(f"    vn_decode_{name}_args_temp(dec_public, enc_public, &args);")
+        else:
+            print(f"    vn_decode_{name}_args_temp(dec_public, &args);")
+        print("    break;")
+        print("}")
+    print("default:")
+    print("    /* A command this Mesa does not generate a decoder for. Not an error: the caller")
+    print("     * reports it as an unknown type and stops, exactly as the old size table did. */")
+    print("    return RAYLAND_VENUS_FAULT_UNKNOWN_COMMAND;")
+    print("}")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

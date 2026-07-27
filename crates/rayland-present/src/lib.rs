@@ -67,4 +67,4 @@ pub mod window;
 pub use frame::{
     DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_XRGB8888, DmabufFrame, RenderedFrame, pack_xrgb8888,
 };
-pub use window::{FrameSource, WindowConfig, present};
+pub use window::{FrameSource, WindowConfig, present, present_live};

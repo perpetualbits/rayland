@@ -1,0 +1,664 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project map</title>
+<style>
+  /* ---------------------------------------------------------------------------
+     Project-agnostic renderer for window.PROJECT_MAP. Instrument-panel styling:
+     a command stream descending from the application machine to the GPU machine.
+     Theme is driven entirely by custom properties. Light is the base; dark is the
+     prefers-color-scheme override; [data-theme] on :root forces either, both ways.
+     --------------------------------------------------------------------------- */
+  :root {
+    color-scheme: light dark;
+
+    --bg:      #e7edf0;
+    --bg-grid: #d5e0e6;
+    --panel:   #ffffff;
+    --raised:  #f3f8fa;
+    --line:    #cfdae1;
+    --line-2:  #b6c7d0;
+    --ink:     #10202a;
+    --ink-dim: #4b626e;
+    --ink-faint:#6f8794;
+    --accent:  #0e9c8e;
+    --accent-ink:#0a6e64;
+
+    --s-done:   #10936f;
+    --s-active: #b0761b;
+    --s-planned:#54697a;
+    --s-seam:   #a636ad;
+
+    --s-done-soft:   rgba(16,147,111,.14);
+    --s-active-soft: rgba(176,118,27,.15);
+    --s-planned-soft:rgba(84,105,122,.13);
+    --s-seam-soft:   rgba(166,54,173,.14);
+
+    --shadow: 0 1px 2px rgba(16,32,42,.08), 0 8px 30px rgba(16,32,42,.06);
+    --radius: 9px;
+
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:      #0c1317;
+      --bg-grid: #131f26;
+      --panel:   #131e25;
+      --raised:  #1a2831;
+      --line:    #24343d;
+      --line-2:  #334954;
+      --ink:     #dbe7ed;
+      --ink-dim: #8ba1ad;
+      --ink-faint:#5f7683;
+      --accent:  #40d2c5;
+      --accent-ink:#8fe8de;
+
+      --s-done:   #33c8a0;
+      --s-active: #f4b545;
+      --s-planned:#7b93a1;
+      --s-seam:   #d774dc;
+
+      --s-done-soft:   rgba(51,200,160,.15);
+      --s-active-soft: rgba(244,181,69,.15);
+      --s-planned-soft:rgba(123,147,161,.16);
+      --s-seam-soft:   rgba(215,116,220,.16);
+
+      --shadow: 0 1px 2px rgba(0,0,0,.4), 0 10px 34px rgba(0,0,0,.35);
+    }
+  }
+  /* Manual toggle wins over the media query in both directions. */
+  :root[data-theme="light"] {
+    --bg:#e7edf0; --bg-grid:#d5e0e6; --panel:#ffffff; --raised:#f3f8fa; --line:#cfdae1; --line-2:#b6c7d0;
+    --ink:#10202a; --ink-dim:#4b626e; --ink-faint:#6f8794; --accent:#0e9c8e; --accent-ink:#0a6e64;
+    --s-done:#10936f; --s-active:#b0761b; --s-planned:#54697a; --s-seam:#a636ad;
+    --s-done-soft:rgba(16,147,111,.14); --s-active-soft:rgba(176,118,27,.15);
+    --s-planned-soft:rgba(84,105,122,.13); --s-seam-soft:rgba(166,54,173,.14);
+    --shadow:0 1px 2px rgba(16,32,42,.08), 0 8px 30px rgba(16,32,42,.06);
+  }
+  :root[data-theme="dark"] {
+    --bg:#0c1317; --bg-grid:#131f26; --panel:#131e25; --raised:#1a2831; --line:#24343d; --line-2:#334954;
+    --ink:#dbe7ed; --ink-dim:#8ba1ad; --ink-faint:#5f7683; --accent:#40d2c5; --accent-ink:#8fe8de;
+    --s-done:#33c8a0; --s-active:#f4b545; --s-planned:#7b93a1; --s-seam:#d774dc;
+    --s-done-soft:rgba(51,200,160,.15); --s-active-soft:rgba(244,181,69,.15);
+    --s-planned-soft:rgba(123,147,161,.16); --s-seam-soft:rgba(215,116,220,.16);
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 10px 34px rgba(0,0,0,.35);
+  }
+
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    font-family: var(--sans);
+    color: var(--ink);
+    background:
+      linear-gradient(var(--bg-grid) 1px, transparent 1px) 0 0 / 100% 34px,
+      linear-gradient(90deg, var(--bg-grid) 1px, transparent 1px) 0 0 / 34px 100%,
+      var(--bg);
+    line-height: 1.5;
+    overflow-x: hidden;
+  }
+  a { color: var(--accent-ink); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  .wrap { max-width: 1360px; margin: 0 auto; padding: clamp(14px, 3vw, 34px); }
+
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: .22em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+  }
+
+  /* ------------------------------------------------------------- masthead */
+  .masthead {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: clamp(18px, 3vw, 30px);
+    position: relative;
+    overflow: hidden;
+  }
+  .mast-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; flex-wrap: wrap; }
+  .mast-id { min-width: 260px; flex: 1 1 340px; }
+  .mast-name {
+    font-family: var(--mono);
+    font-weight: 700;
+    font-size: clamp(30px, 6vw, 52px);
+    letter-spacing: -.02em;
+    margin: 6px 0 8px;
+    line-height: 1;
+  }
+  .mast-name b { color: var(--accent); font-weight: 700; }
+  .mast-tag { color: var(--ink-dim); max-width: 46ch; font-size: 15px; }
+  .mast-meta { font-family: var(--mono); font-size: 11px; color: var(--ink-faint); margin-top: 12px; letter-spacing: .04em; }
+
+  .toolbar { display: flex; gap: 8px; align-items: center; }
+  .btn {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--ink-dim);
+    background: var(--raised);
+    border: 1px solid var(--line);
+    border-radius: 7px;
+    padding: 8px 12px;
+    cursor: pointer;
+  }
+  .btn:hover { border-color: var(--line-2); color: var(--ink); }
+  .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  /* signal bus: the characteristic Rayland motion — commands flow C -> S */
+  .bus { margin-top: 22px; display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 14px; }
+  .bus-end { font-family: var(--mono); text-align: center; }
+  .bus-end .k { font-size: 22px; font-weight: 700; color: var(--ink); line-height: 1; }
+  .bus-end .l { font-size: 10px; letter-spacing: .14em; text-transform: uppercase; color: var(--ink-faint); margin-top: 5px; white-space: nowrap; }
+  .bus-line { position: relative; height: 30px; }
+  .bus-line svg { width: 100%; height: 100%; display: block; overflow: visible; }
+  .bus-flow { stroke: var(--accent); stroke-width: 2; fill: none; stroke-dasharray: 3 9; stroke-linecap: round; opacity: .9; }
+  .bus-rail { stroke: var(--line-2); stroke-width: 1; fill: none; }
+  .bus-tag {
+    position: absolute; top: -9px; left: 50%; transform: translateX(-50%);
+    font-family: var(--mono); font-size: 10px; letter-spacing: .16em; text-transform: uppercase;
+    color: var(--ink-faint); background: var(--panel); padding: 0 8px;
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .bus-flow { animation: flow 1.15s linear infinite; }
+    @keyframes flow { to { stroke-dashoffset: -24; } }
+  }
+
+  /* stat gauges */
+  .stats { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 12px; margin-top: 22px; }
+  .gauge { background: var(--raised); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; }
+  .gauge .g-top { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .gauge .g-num { font-family: var(--mono); font-size: 21px; font-weight: 700; color: var(--ink); }
+  .gauge .g-lab { font-family: var(--mono); font-size: 10px; letter-spacing: .12em; text-transform: uppercase; color: var(--ink-faint); }
+  .g-bar { height: 6px; border-radius: 4px; background: color-mix(in srgb, var(--ink-faint) 24%, transparent); margin-top: 10px; overflow: hidden; }
+  .g-bar > span { display: block; height: 100%; border-radius: 4px; background: var(--s-done); }
+
+  /* --------------------------------------------------------------- legend */
+  .legend { display: flex; flex-wrap: wrap; gap: 8px 16px; margin: 20px 2px 6px; align-items: center; }
+  .legend .eyebrow { margin-right: 4px; }
+  .lg-item { display: inline-flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--ink-dim); }
+  .lg-dot { width: 11px; height: 11px; border-radius: 50%; box-shadow: 0 0 0 3px var(--dot-soft); background: var(--dot); flex: none; }
+  .lg-item b { color: var(--ink); font-weight: 600; }
+  .lg-item .hint { color: var(--ink-faint); }
+
+  /* -------------------------------------------------- graph + details grid */
+  .board { display: grid; grid-template-columns: 1fr; gap: 18px; margin-top: 6px; }
+  @media (min-width: 1000px) { .board { grid-template-columns: minmax(0,1fr) 340px; align-items: start; } }
+
+  .graph {
+    position: relative;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 6px clamp(10px, 2vw, 20px) 16px;
+    overflow: hidden;
+  }
+  .graph-inner { position: relative; z-index: 1; }
+  .edges { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 0; pointer-events: none; overflow: visible; }
+  .edge { fill: none; stroke: var(--line-2); stroke-width: 1.4; opacity: .55; transition: opacity .18s, stroke .18s, stroke-width .18s; }
+  .graph.has-focus .edge { opacity: .1; }
+  .graph.has-focus .edge.hot { opacity: .95; stroke: var(--accent); stroke-width: 2; }
+
+  .band { border-top: 1px dashed var(--line); padding: 15px 0 9px; }
+  .band:first-child { border-top: none; }
+  .band-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
+  .band-label { font-family: var(--mono); font-size: 12px; letter-spacing: .13em; text-transform: uppercase; color: var(--ink); font-weight: 600; }
+  .band-hint { font-size: 12px; color: var(--ink-faint); max-width: 62ch; }
+  .band-nodes { display: flex; flex-wrap: wrap; gap: 10px; }
+
+  .node {
+    --dot: var(--s-planned); --dot-soft: var(--s-planned-soft);
+    position: relative;
+    text-align: left;
+    font-family: inherit;
+    background: var(--raised);
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--dot);
+    border-radius: 8px;
+    padding: 9px 12px 9px 11px;
+    cursor: pointer;
+    min-width: 150px;
+    max-width: 230px;
+    color: var(--ink);
+    transition: transform .16s, border-color .16s, box-shadow .16s, opacity .18s;
+  }
+  .node:hover { transform: translateY(-2px); box-shadow: var(--shadow); border-color: var(--dot); }
+  .node:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .node .n-name { font-family: var(--mono); font-weight: 600; font-size: 13.5px; display: flex; align-items: center; gap: 7px; }
+  .node .n-led { width: 9px; height: 9px; border-radius: 50%; background: var(--dot); box-shadow: 0 0 0 3px var(--dot-soft); flex: none; }
+  .node .n-tags { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 4px; }
+  .n-tag { font-family: var(--mono); font-size: 9.5px; letter-spacing: .04em; color: var(--ink-dim); background: color-mix(in srgb, var(--ink-faint) 15%, transparent); border-radius: 4px; padding: 1px 5px; }
+  .node.is-selected { border-color: var(--dot); box-shadow: 0 0 0 2px var(--dot-soft), var(--shadow); }
+  .graph.has-focus .node { opacity: .32; }
+  .graph.has-focus .node.is-active,
+  .graph.has-focus .node.is-linked { opacity: 1; }
+  .graph.has-focus .node.is-active { border-color: var(--dot); }
+
+  .node.st-done    { --dot: var(--s-done);    --dot-soft: var(--s-done-soft); }
+  .node.st-active  { --dot: var(--s-active);  --dot-soft: var(--s-active-soft); }
+  .node.st-planned { --dot: var(--s-planned); --dot-soft: var(--s-planned-soft); }
+  .node.st-seam    { --dot: var(--s-seam);    --dot-soft: var(--s-seam-soft); }
+
+  /* --------------------------------------------------------------- details */
+  .details {
+    position: sticky; top: 14px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 18px;
+    min-height: 220px;
+  }
+  .d-empty { color: var(--ink-faint); font-size: 13px; }
+  .d-head { display: flex; align-items: flex-start; gap: 10px; justify-content: space-between; }
+  .d-name { font-family: var(--mono); font-weight: 700; font-size: 17px; word-break: break-word; }
+  .pill {
+    font-family: var(--mono); font-size: 10px; letter-spacing: .1em; text-transform: uppercase;
+    padding: 4px 9px; border-radius: 20px; white-space: nowrap; flex: none;
+    color: var(--pill-ink); background: var(--pill-soft); border: 1px solid var(--pill-ink);
+  }
+  .pill.st-done    { --pill-ink: var(--s-done);    --pill-soft: var(--s-done-soft); }
+  .pill.st-active  { --pill-ink: var(--s-active);  --pill-soft: var(--s-active-soft); }
+  .pill.st-planned { --pill-ink: var(--s-planned); --pill-soft: var(--s-planned-soft); }
+  .pill.st-seam    { --pill-ink: var(--s-seam);    --pill-soft: var(--s-seam-soft); }
+  .d-tags { margin: 10px 0 0; display: flex; flex-wrap: wrap; gap: 5px; }
+  .d-desc { margin: 14px 0 0; font-size: 13.5px; color: var(--ink-dim); }
+  .d-sec-label { font-family: var(--mono); font-size: 10px; letter-spacing: .16em; text-transform: uppercase; color: var(--ink-faint); margin: 18px 0 8px; }
+  .d-part { display: flex; gap: 9px; padding: 7px 0; border-top: 1px solid var(--line); }
+  .d-part:first-of-type { border-top: none; }
+  .d-part .p-led { width: 8px; height: 8px; border-radius: 50%; margin-top: 6px; flex: none; background: var(--dot); box-shadow: 0 0 0 3px var(--dot-soft); }
+  .d-part.st-done    { --dot: var(--s-done);    --dot-soft: var(--s-done-soft); }
+  .d-part.st-active  { --dot: var(--s-active);  --dot-soft: var(--s-active-soft); }
+  .d-part.st-planned { --dot: var(--s-planned); --dot-soft: var(--s-planned-soft); }
+  .d-part.st-seam    { --dot: var(--s-seam);    --dot-soft: var(--s-seam-soft); }
+  .d-part .p-name { font-family: var(--mono); font-size: 12.5px; font-weight: 600; color: var(--ink); }
+  .d-part .p-desc { font-size: 12px; color: var(--ink-dim); }
+  .d-links { display: flex; flex-direction: column; gap: 4px; }
+  .d-link { font-family: var(--mono); font-size: 12px; display: flex; gap: 7px; align-items: baseline; }
+  .d-link .arrow { color: var(--ink-faint); }
+
+  /* --------------------------------------------------------------- roadmap */
+  .roadmap { margin-top: 22px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); padding: 16px clamp(12px,2vw,20px) 20px; }
+  .rm-groups { display: grid; gap: 16px; grid-template-columns: 1fr; }
+  @media (min-width: 760px) { .rm-groups { grid-template-columns: 3fr 2fr; } }
+  .rm-track { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  .rm-item {
+    --dot: var(--s-planned); --dot-soft: var(--s-planned-soft);
+    display: flex; align-items: center; gap: 8px;
+    font-family: var(--mono); font-size: 11.5px; color: var(--ink);
+    background: var(--raised); border: 1px solid var(--line);
+    border-bottom: 2px solid var(--dot);
+    border-radius: 6px; padding: 7px 10px;
+  }
+  .rm-item .r-led { width: 8px; height: 8px; border-radius: 50%; background: var(--dot); box-shadow: 0 0 0 3px var(--dot-soft); flex: none; }
+  .rm-item.st-done    { --dot: var(--s-done);    --dot-soft: var(--s-done-soft); }
+  .rm-item.st-active  { --dot: var(--s-active);  --dot-soft: var(--s-active-soft); }
+  .rm-item.st-planned { --dot: var(--s-planned); --dot-soft: var(--s-planned-soft); }
+  .rm-item.st-seam    { --dot: var(--s-seam);    --dot-soft: var(--s-seam-soft); }
+
+  footer { color: var(--ink-faint); font-size: 11.5px; font-family: var(--mono); text-align: center; margin: 26px 0 8px; letter-spacing: .04em; }
+
+  .fail { font-family: var(--mono); color: var(--s-seam); padding: 40px; }
+</style>
+
+<div class="wrap" id="app"></div>
+<script src="project-map.js"></script>
+<script>
+(function () {
+  "use strict";
+  var M = window.PROJECT_MAP;
+  var app = document.getElementById("app");
+  if (!M) { app.innerHTML = '<p class="fail">project-map.js did not load — window.PROJECT_MAP is undefined.</p>'; return; }
+
+  var ORDER = ["done", "active", "planned", "seam"];   // legend / counting order
+  function el(tag, cls, txt) { var e = document.createElement(tag); if (cls) e.className = cls; if (txt != null) e.textContent = txt; return e; }
+  function nodeById(id) { return M.nodes.filter(function (n) { return n.id === id; })[0]; }
+
+  // ---- theme toggle: stamp data-theme, remember it, and reflect the label ----
+  var root = document.documentElement;
+  function currentTheme() {
+    var t = root.getAttribute("data-theme");
+    if (t) return t;
+    return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  }
+  try { var saved = localStorage.getItem("pm-theme"); if (saved) root.setAttribute("data-theme", saved); } catch (e) {}
+
+  // ---- masthead --------------------------------------------------------------
+  var mast = el("section", "masthead");
+  var top = el("div", "mast-top");
+  var idb = el("div", "mast-id");
+  idb.appendChild(el("div", "eyebrow", "Project map"));
+  var name = el("h1", "mast-name");
+  name.innerHTML = "<b>" + esc(M.project.name) + "</b>";
+  idb.appendChild(name);
+  idb.appendChild(el("p", "mast-tag", M.project.tagline));
+  idb.appendChild(el("div", "mast-meta", "repo " + M.project.repo + "  ·  updated " + M.project.updated + "  ·  " + M.nodes.length + " nodes"));
+  top.appendChild(idb);
+
+  var toolbar = el("div", "toolbar");
+  var themeBtn = el("button", "btn"); themeBtn.type = "button";
+  function setThemeLabel() { themeBtn.textContent = currentTheme() === "dark" ? "◑ Light" : "◐ Dark"; }
+  setThemeLabel();
+  themeBtn.addEventListener("click", function () {
+    var next = currentTheme() === "dark" ? "light" : "dark";
+    root.setAttribute("data-theme", next);
+    try { localStorage.setItem("pm-theme", next); } catch (e) {}
+    setThemeLabel();
+    layoutEdges();
+  });
+  toolbar.appendChild(themeBtn);
+  top.appendChild(toolbar);
+  mast.appendChild(top);
+
+  // signal bus: C -> commands -> S
+  var bus = el("div", "bus");
+  bus.appendChild(busEnd("C", "application machine"));
+  var line = el("div", "bus-line");
+  line.innerHTML =
+    '<div class="bus-tag">commands, not pixels</div>' +
+    '<svg viewBox="0 0 100 30" preserveAspectRatio="none" aria-hidden="true">' +
+    '<line class="bus-rail" x1="0" y1="15" x2="100" y2="15"></line>' +
+    '<line class="bus-flow" x1="0" y1="15" x2="100" y2="15"></line></svg>';
+  bus.appendChild(line);
+  bus.appendChild(busEnd("S", "GPU + display"));
+  mast.appendChild(bus);
+
+  // stats
+  var counts = countStatus(M.nodes);
+  var phases = M.roadmap.filter(function (r) { return r.kind === "phase"; });
+  var harden = M.roadmap.filter(function (r) { return r.kind === "harden"; });
+  var stats = el("div", "stats");
+  stats.appendChild(gauge(counts.done, M.nodes.length, "shipped nodes"));
+  stats.appendChild(gauge(doneOf(phases), phases.length, "phases done"));
+  stats.appendChild(gauge(doneOf(harden), harden.length, "hardening done"));
+  mast.appendChild(stats);
+  app.appendChild(mast);
+
+  // ---- legend ---------------------------------------------------------------
+  var legend = el("div", "legend");
+  legend.appendChild(el("span", "eyebrow", "Status"));
+  ORDER.forEach(function (k) {
+    var s = M.statuses[k]; if (!s) return;
+    var item = el("span", "lg-item");
+    var dot = el("span", "lg-dot");
+    dot.style.setProperty("--dot", "var(--s-" + k + ")");
+    dot.style.setProperty("--dot-soft", "var(--s-" + k + "-soft)");
+    item.appendChild(dot);
+    var b = el("b", null, s.label); item.appendChild(b);
+    item.appendChild(el("span", "hint", "· " + s.hint));
+    legend.appendChild(item);
+  });
+  app.appendChild(legend);
+
+  // ---- board: graph + details ------------------------------------------------
+  var board = el("div", "board");
+  var graph = el("div", "graph");
+  var svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("class", "edges"); svg.setAttribute("aria-hidden", "true");
+  graph.appendChild(svg);
+  var inner = el("div", "graph-inner");
+  graph.appendChild(inner);
+
+  var nodeEls = {};        // id -> button element
+  var neighbours = {};     // id -> Set of connected node ids (deps + dependents)
+  M.nodes.forEach(function (n) { neighbours[n.id] = {}; });
+  M.nodes.forEach(function (n) {
+    (n.deps || []).forEach(function (d) {
+      if (!nodeById(d)) return;
+      neighbours[n.id][d] = true;
+      neighbours[d][n.id] = true;
+    });
+  });
+
+  M.layers.forEach(function (layer) {
+    var members = M.nodes.filter(function (n) { return n.layer === layer.id; });
+    if (!members.length) return;
+    var band = el("div", "band");
+    var head = el("div", "band-head");
+    head.appendChild(el("span", "band-label", layer.label));
+    if (layer.hint) head.appendChild(el("span", "band-hint", layer.hint));
+    band.appendChild(head);
+    var row = el("div", "band-nodes");
+    members.forEach(function (n) { row.appendChild(makeNode(n)); });
+    band.appendChild(row);
+    inner.appendChild(band);
+  });
+  board.appendChild(graph);
+
+  var details = el("aside", "details");
+  details.setAttribute("aria-live", "polite");
+  board.appendChild(details);
+  app.appendChild(board);
+
+  // ---- roadmap ---------------------------------------------------------------
+  var roadmap = el("section", "roadmap");
+  roadmap.appendChild(el("div", "eyebrow", "Roadmap"));
+  var groups = el("div", "rm-groups");
+  groups.appendChild(track("Walking-skeleton phases", phases));
+  groups.appendChild(track("Hardening & later tracks", harden));
+  roadmap.appendChild(groups);
+  app.appendChild(roadmap);
+
+  app.appendChild(el("footer", null, "window.PROJECT_MAP · " + M.nodes.length + " nodes · " + M.roadmap.length + " roadmap items · rendered from project-map.js"));
+
+  // default details view
+  showEmpty();
+
+  // ---- edges: build once, position on load / resize / theme change ----------
+  var edgePaths = [];  // { el, from, to }
+  M.nodes.forEach(function (n) {
+    (n.deps || []).forEach(function (d) {
+      if (!nodeEls[d] || !nodeEls[n.id]) return;
+      var p = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      p.setAttribute("class", "edge");
+      svg.appendChild(p);
+      edgePaths.push({ el: p, from: n.id, to: d });
+    });
+  });
+
+  function layoutEdges() {
+    var gb = graph.getBoundingClientRect();
+    svg.setAttribute("viewBox", "0 0 " + gb.width + " " + gb.height);
+    edgePaths.forEach(function (e) {
+      var a = center(nodeEls[e.from], gb), b = center(nodeEls[e.to], gb);
+      var midY = (a.y + b.y) / 2;
+      e.el.setAttribute("d", "M " + a.x + " " + a.y + " C " + a.x + " " + midY + " " + b.x + " " + midY + " " + b.x + " " + b.y);
+    });
+  }
+  function center(node, gb) {
+    var r = node.getBoundingClientRect();
+    return { x: r.left - gb.left + r.width / 2, y: r.top - gb.top + r.height / 2 };
+  }
+
+  layoutEdges();
+  window.addEventListener("load", layoutEdges);
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(layoutEdges);
+  var rt;
+  window.addEventListener("resize", function () { clearTimeout(rt); rt = setTimeout(layoutEdges, 120); });
+
+  // =========================================================================
+  // builders
+  // =========================================================================
+  function busEnd(k, l) {
+    var e = el("div", "bus-end");
+    e.appendChild(el("div", "k", k));
+    e.appendChild(el("div", "l", l));
+    return e;
+  }
+  function gauge(num, total, label) {
+    var g = el("div", "gauge");
+    var t = el("div", "g-top");
+    t.appendChild(el("span", "g-num", num + " / " + total));
+    t.appendChild(el("span", "g-lab", label));
+    g.appendChild(t);
+    var bar = el("div", "g-bar");
+    var fill = el("span");
+    fill.style.width = (total ? Math.round((num / total) * 100) : 0) + "%";
+    bar.appendChild(fill);
+    g.appendChild(bar);
+    return g;
+  }
+  function track(label, items) {
+    var wrap = el("div", "rm-group");
+    wrap.appendChild(el("div", "d-sec-label", label));
+    var t = el("div", "rm-track");
+    items.forEach(function (r) {
+      var it = el("div", "rm-item st-" + r.status);
+      it.appendChild(el("span", "r-led"));
+      it.appendChild(el("span", null, r.label));
+      it.title = (M.statuses[r.status] || {}).label || r.status;
+      t.appendChild(it);
+    });
+    wrap.appendChild(t);
+    return wrap;
+  }
+  function makeNode(n) {
+    var b = el("button", "node st-" + n.status);
+    b.type = "button";
+    b.setAttribute("data-id", n.id);
+    b.setAttribute("aria-label", n.label + " — " + (M.statuses[n.status] || {}).label);
+    var nm = el("div", "n-name");
+    nm.appendChild(el("span", "n-led"));
+    nm.appendChild(el("span", null, n.label));
+    b.appendChild(nm);
+    if (n.tags && n.tags.length) {
+      var tg = el("div", "n-tags");
+      n.tags.forEach(function (t) { tg.appendChild(el("span", "n-tag", t)); });
+      b.appendChild(tg);
+    }
+    b.addEventListener("click", function () { select(n.id); });
+    b.addEventListener("mouseenter", function () { highlight(n.id); });
+    b.addEventListener("mouseleave", clearHighlight);
+    b.addEventListener("focus", function () { highlight(n.id); });
+    b.addEventListener("blur", clearHighlight);
+    nodeEls[n.id] = b;
+    return b;
+  }
+
+  // =========================================================================
+  // interaction
+  // =========================================================================
+  var selectedId = null;
+  function highlight(id) {
+    graph.classList.add("has-focus");
+    Object.keys(nodeEls).forEach(function (nid) {
+      var e = nodeEls[nid];
+      e.classList.toggle("is-active", nid === id);
+      e.classList.toggle("is-linked", !!neighbours[id][nid]);
+    });
+    edgePaths.forEach(function (ep) {
+      ep.el.classList.toggle("hot", ep.from === id || ep.to === id);
+    });
+  }
+  function clearHighlight() {
+    graph.classList.remove("has-focus");
+    Object.keys(nodeEls).forEach(function (nid) {
+      nodeEls[nid].classList.remove("is-active", "is-linked");
+    });
+    edgePaths.forEach(function (ep) { ep.el.classList.remove("hot"); });
+  }
+  function select(id) {
+    selectedId = id;
+    Object.keys(nodeEls).forEach(function (nid) {
+      nodeEls[nid].classList.toggle("is-selected", nid === id);
+    });
+    renderDetails(nodeById(id));
+  }
+
+  function showEmpty() {
+    details.innerHTML = "";
+    details.appendChild(el("div", "eyebrow", "Inspector"));
+    var p = el("p", "d-empty", "Select a node to read its function, sub-parts, and the files and specs behind it. Hover a node to trace its dependency cables.");
+    details.appendChild(p);
+  }
+
+  function renderDetails(n) {
+    details.innerHTML = "";
+    details.appendChild(el("div", "eyebrow", "Inspector"));
+    var head = el("div", "d-head");
+    head.appendChild(el("div", "d-name", n.label));
+    var pill = el("span", "pill st-" + n.status, (M.statuses[n.status] || {}).label || n.status);
+    head.appendChild(pill);
+    details.appendChild(head);
+
+    if (n.tags && n.tags.length) {
+      var tags = el("div", "d-tags");
+      n.tags.forEach(function (t) { tags.appendChild(el("span", "n-tag", t)); });
+      details.appendChild(tags);
+    }
+    details.appendChild(el("p", "d-desc", n.desc || ""));
+
+    if (n.parts && n.parts.length) {
+      details.appendChild(el("div", "d-sec-label", "Sub-parts"));
+      n.parts.forEach(function (pt) {
+        var row = el("div", "d-part st-" + pt.status);
+        row.appendChild(el("span", "p-led"));
+        var body = el("div");
+        var pn = el("div", "p-name");
+        pn.appendChild(document.createTextNode(pt.label + " "));
+        var mini = el("span", "pill st-" + pt.status, (M.statuses[pt.status] || {}).label || pt.status);
+        mini.style.fontSize = "8.5px"; mini.style.padding = "2px 6px";
+        pn.appendChild(mini);
+        body.appendChild(pn);
+        if (pt.desc) body.appendChild(el("div", "p-desc", pt.desc));
+        row.appendChild(body);
+        details.appendChild(row);
+      });
+    }
+
+    if (n.deps && n.deps.length) {
+      details.appendChild(el("div", "d-sec-label", "Depends on"));
+      var dl = el("div", "d-links");
+      n.deps.forEach(function (d) {
+        var dep = nodeById(d); if (!dep) return;
+        var a = el("button", "d-link");
+        a.type = "button";
+        a.style.background = "none"; a.style.border = "none"; a.style.padding = "0"; a.style.cursor = "pointer"; a.style.color = "var(--accent-ink)";
+        a.innerHTML = '<span class="arrow">→</span>' + esc(dep.label);
+        a.addEventListener("click", function () { select(d); });
+        dl.appendChild(a);
+      });
+      details.appendChild(dl);
+    }
+
+    if (n.files && n.files.length) {
+      details.appendChild(el("div", "d-sec-label", "Files"));
+      var fl = el("div", "d-links");
+      n.files.forEach(function (f) { fl.appendChild(link(f, f)); });
+      details.appendChild(fl);
+    }
+    if (n.specs && n.specs.length) {
+      details.appendChild(el("div", "d-sec-label", "Specs & docs"));
+      var sl = el("div", "d-links");
+      n.specs.forEach(function (s) { sl.appendChild(link(s.href, s.label)); });
+      details.appendChild(sl);
+    }
+  }
+
+  function link(href, label) {
+    var row = el("div", "d-link");
+    row.appendChild(el("span", "arrow", "↳"));
+    var a = el("a", null, label);
+    a.href = href;
+    row.appendChild(a);
+    return row;
+  }
+
+  // =========================================================================
+  // helpers
+  // =========================================================================
+  function countStatus(nodes) {
+    var c = { done: 0, active: 0, planned: 0, seam: 0 };
+    nodes.forEach(function (n) { if (c[n.status] != null) c[n.status]++; });
+    return c;
+  }
+  function doneOf(items) { return items.filter(function (i) { return i.status === "done"; }).length; }
+  function esc(s) { return String(s).replace(/[&<>"']/g, function (c) { return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]; }); }
+})();
+</script>
