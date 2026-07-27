@@ -3968,7 +3968,14 @@ during *teardown*, after the work is done, when the script terminates S at the e
 `SIGTERM` would have bash print "Terminated"; "Aborted" means signal 6, so something inside S is
 panicking (or double-panicking) on the way out rather than shutting down cleanly.
 
-**Why it matters despite harming no run.** An abort on every session teardown is a permanent false
+**CORRECTION (2026-07-27, same morning): it is not every teardown — it is ~21%.** Counted across the
+400-run soak: **83 aborts, 0 clean-kill "Terminated" lines**, i.e. when S does not abort it exits 0 and
+the script's `kill` is a no-op. The claim below that "every session in this project has ended by
+crashing" was generalised from two log lines seen minutes apart, which is the third time in two days
+this diary has turned a couple of observations into a rate. The defect is real and worth fixing; its
+frequency was invented.
+
+**Why it matters despite harming no run.** An abort on a fifth of session teardowns is a permanent false
 positive sitting in front of every future investigation: a real crash on shutdown would look exactly
 like this and be dismissed as the usual noise. Today already spent hours on a signature scan that fired
 on payload bytes and on an unattributed `SIGABRT` in the application; this is the same hazard one layer
