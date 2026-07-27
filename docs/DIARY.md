@@ -3991,3 +3991,35 @@ the listener, and not in the link — it needs a **full rendering session** to h
 engine actor and the progress thread live and having done GPU work. That is consistent with the
 suspicion above (a thread panicking on a lock or channel during shutdown) and rules out the cheaper
 explanations. Reproducing it needs a whole ~45 s run, which is a soak slot, so it waits.
+
+### 2026-07-27 (morning) — The soak: 400/400 clean, and the baseline is now a real number
+
+The overnight run finished. **400 real-network runs of the shipping configuration, 0 failures**,
+verified per-attempt (all 400 result files report `frames=120`) rather than from the summary line.
+
+**The baseline, finally worth quoting:**
+
+| configuration | failures / runs | rate (95%) |
+|---|---|---|
+| shipping (all feedback off) | **0 / 480** | **< 0.62%** |
+| semaphore+event+query feedback on | 1 / 92 | 1.1% |
+
+Yesterday this project's strongest available statement about its own reliability was "10/10 clean".
+It is now "zero failures in 480 runs over a real network, bounded under 0.62%". That is the difference
+between a demo that worked when watched and a measured property, and it cost one unattended night.
+
+**What it does to the feedback question.** The two arms still cannot be separated statistically — one
+event against zero proves nothing either way — but the *shape* has changed. The shipping path is now
+known clean through 480 runs, so a single loss in the feedback arm is no longer comfortably absorbed
+by "everything is a bit flaky"; it stands out against a floor that has been measured. That is not
+proof, and the honest position from two entries ago is unchanged: the failure remains unattributed.
+But if anyone returns to the 1.23×, the experiment to run is now obvious and cheap — the same harness,
+the feedback arm, 400 runs — and it would settle in one night what argument could not settle at all.
+
+**Housekeeping, recorded because the alternative is finding it later.** Three orphaned daemons
+(`rayland-s` ×2, `rayland-c`) were left behind by the teardown probes, not the soak — `setsid`'d,
+reparented to PID 1, holding no ports, alive for ~2h40m. The soak's own per-iteration cleanup worked
+correctly throughout. They were attributable with certainty (this session's build path, orphaned, from
+probes run minutes before) and were reaped by exact PID. The lesson is small and repeatable: a
+group-kill of a `setsid`'d process group does not always reap children that have themselves detached,
+and the check that catches it is `ps` after the run, not the exit code of the kill.
