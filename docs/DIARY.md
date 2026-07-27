@@ -4075,3 +4075,46 @@ teardown. It happens on about one in five (83/400 in the soak, 2/10 and then 0/1
 generalised from two log lines seen minutes apart — the third time in two days this diary turned a
 couple of observations into a rate, and the reason the correction is recorded above rather than
 silently fixed.
+
+### 2026-07-27 — 4.3 part 2: the design is now exact, and two details the plan does not mention
+
+Went to write the `wl_buffer` path and stopped at the point where writing it would have been guessing.
+The reconnaissance is worth more than the code would have been, because it found two things that
+change the shape of the work.
+
+**1. S must *synthesize* the `add`, not replay it.** The obvious reading of 4.3 is "resolve the token
+and let the request replay". It cannot: C's proxy intercepts `zwp_linux_buffer_params_v1.add` and
+**drops the fd** — that is the whole point of buffer-by-token, and `wayland_proxy.rs` says so. So
+`add` never crosses, and S's params object (created by the relayed `create_params`, which *does*
+cross) has no planes on it when `create_immed` arrives. S therefore has to *originate* an `add`
+carrying the retained descriptor before replaying `create_immed`. That is a request S invents rather
+than relays, which is a first for this module — every other request it sends is a translation of one
+the application made.
+
+**2. The token does not carry stride.** `BufferToken` has `resource_id`, `width`, `height`,
+`drm_format`, `modifier` — and `add` needs `plane_idx`, `offset`, `stride`. Offset is 0 and plane_idx
+is 0 for these single-plane LINEAR images, but stride has to be *derived*, and the only available
+derivation is `width × bpp` with bpp inferred from the fourcc. That is exactly the class of assumption
+the plan flagged as producing "corrupted or garbled pixels rather than a clean failure" when it is
+wrong. It may well be right for `DRM_FORMAT_ARGB8888` here; it is an assumption either way, and it
+belongs in the token rather than in a guess on S — C knows the real stride, since Mesa passed it to
+`add` before the proxy dropped it.
+
+**The rest of the sequence, for whoever picks this up.** On a request whose args contain
+`WaylandArg::Buffer(token)`: resolve `token.resource_id` through `Applier::exported_fd` (landed, part 1);
+`send_request` an `add` (opcode 1) on the S-side params object with
+`[Fd, Uint(0), Uint(0), Uint(stride), Uint(mod_hi), Uint(mod_lo)]`; then let the existing path replay
+`create_immed`, which already handles the `NewId` and the `app_id ↔ s_id` mapping. The descriptor must
+be resolved and cloned **while holding the applier lock, and the lock released before any
+`send_request`** — a Wayland call under that lock would put the relay's own mutex behind a compositor
+round trip.
+
+**Why it is not written.** It needs a plumbing change (`handle_request` must reach `Applier`, and they
+are held separately in `serve`), a stride decision that should probably be a wire change instead, and
+it cannot be verified without vkcube reaching `attach` — which needs a compositor and a GPU and a
+working `--gpu_number 0` run. Writing ~100 lines of protocol code that compiles, passes no test that
+exercises it, and rests on a derived stride would be the "silent nothing" this branch has shipped
+before: it would look done. The honest state is that part 1 is landed and tested, part 2 is specified
+to the argument list, and the one open decision — put stride on the `BufferToken` or derive it — is a
+five-minute change that should be made deliberately rather than by whoever is closest to the keyboard
+at 4 a.m.
