@@ -4118,3 +4118,52 @@ before: it would look done. The honest state is that part 1 is landed and tested
 to the argument list, and the one open decision — put stride on the `BufferToken` or derive it — is a
 five-minute change that should be made deliberately rather than by whoever is closest to the keyboard
 at 4 a.m.
+
+### 2026-07-27 — Session close: where to pick this up
+
+The owner is away for two weeks and may continue on a different machine (`dogstar`). Everything is on
+`origin/wp0-wayland-proxy`; this entry is the map back in.
+
+**What changed in the last two days, in one list.**
+- `find_destroy_device` no longer fires on payload bytes (and the (c)1 §7 exception that cost is
+  recorded at four sites rather than absorbed).
+- The three-day `vkQueueSubmit` wall: **`VK_ERROR_DEVICE_LOST`, never a Rayland bug**, and
+  NVIDIA-specific (7/14 against Intel 0/10). vkcube picks the discrete GPU by default; `--gpu_number 0`
+  avoids it.
+- Venus's **out-of-line command streams** are relayed — every blob except the ring is now synchronised,
+  so `vkExecuteCommandStreamsMESA` needs no decode on the relay path and (c)1 §7 stays intact.
+- The **black window** is fixed and presentation follows a live render: an unmodified application on C,
+  drawn by S's GPU, animating on S's screen (`scripts/icosa-remote-demo.sh`).
+- `rayland-icosa-gpu` runs over the relay, bit-identical, at **~41 ms/frame against 283** — the
+  mapped-write volume *was* the dominant cost.
+- The shipping configuration's failure rate is **measured**: 0 in 480 real-network runs, < 0.62%.
+- The ~21% teardown `SIGABRT` is fixed (libepoxy, reached from `virgl_renderer_cleanup`).
+- WP0 **4.3 part 1** landed (S retains each blob's exported dma-buf descriptor); part 2 is specified.
+
+**What can be done away from the two-machine setup**, since `dogstar` has neither apollo nor this GPU:
+- **WP0 4.3 part 2** — the design is exact (see the entry above it) and the code is writable anywhere.
+  The one decision to make first: put `stride` on `BufferToken` (C knows it; Mesa passes it to
+  `params.add` before the proxy drops it) or derive it as `width × bpp` on S. Prefer the former; a
+  wrong stride garbles pixels rather than failing cleanly. Note the non-obvious part: **S must
+  synthesize the `add`**, because C drops the fd by design.
+- Anything in `rayland-relay`, `rayland-vtest`, `rayland-venus-proto` — all pure, all unit-tested, no
+  GPU. `cargo test -p rayland-vtest -p rayland-relay -p rayland-venus-proto` runs anywhere.
+- Reading: this diary, `project-map.js` (open `project-map.html` from disk), and the WP0 spec.
+
+**What needs the two machines** (so, on return):
+- Any e2e or presentation verification, including 4.3 part 2's.
+- `scripts/soak-failure-rate.sh` — and the **cheapest queued experiment**: run it with
+  `VN_PERF_SETTING=no_multi_ring,no_fence_feedback` for 400 runs. That is the semaphore/event/query
+  feedback arm, worth **1.23×**, currently condemned by exactly one unexplained failure (1/92) against
+  a shipping arm now clean through 480. One night settles it either way.
+
+**Harnesses preserved.** They lived in a scratchpad that does not survive the session, so the two
+worth keeping are now in the tree: `scripts/soak-failure-rate.sh` (the rate harness, with what it
+measured in its header) and `tools/parse_vkqueuesubmit.py` (field-by-field decode of a captured
+submit, which is what cracked the device-lost mystery). The patched-`virgl_render_server` recipe — the
+instrument that actually named `VK_ERROR_DEVICE_LOST` — is written out step by step in the
+2026-07-26 entry: archive-pool tarball, meson/ninja/pyyaml in a venv, the distro's `fix-c23.patch`,
+`RENDER_SERVER_EXEC_PATH`. No root needed.
+
+**Not merged to `main`, deliberately.** The branch is mid-project: 4.3 is half done and the WP0 arc is
+unfinished. Merging is the owner's call, not a housekeeping step to take on the way out.
