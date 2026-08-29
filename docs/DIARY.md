@@ -4677,3 +4677,43 @@ The logs do settle two things worth carrying forward: vkcube never errors and ne
 idle when the script's timer kills it. Whether the *window* vanished before that timer or only when
 the app was killed is not in the logs, and it is the single most useful thing for a watcher to note
 next time.
+
+### 2026-08-29 (night) — The human watched, and the window vanishing is a stale `ObjectId` — mine
+
+Asked the owner to watch the screen during a five-minute run, which is what I should have done hours
+ago. Report: *"vkcube window appeared for a brief moment then disappeared. Too short to see any
+movement."* The app process stayed alive the whole time.
+
+That is a different failure from anything I had been chasing, and the log says exactly what it is:
+
+```
+WP0 4.3: step 1/3 create_params failed for resource 19: Invalid ObjectId
+WP0 4.3: step 1/3 create_params failed for resource 20: Invalid ObjectId
+WP0 replay: send_request (obj 3 opcode 1) failed: Invalid ObjectId      <- obj 3 = wl_surface, opcode 1 = attach
+```
+
+**Twelve `zwp_linux_dmabuf_v1` binds in that run; four buffers built.** The first swapchain works. Then
+the application rebuilds its swapchain — and every `create_params` after that fails, because
+`WaylandReplay::dmabuf` holds the S-side `ObjectId` of a dmabuf global **the application has since
+destroyed**. With no params object there is no `wl_buffer`; the subsequent `attach` names a buffer S
+never created and fails too; a `wl_surface` with no valid buffer is unmapped by definition, so the
+compositor takes the window off the screen. Hence: appears, then vanishes, while the process lives on.
+
+**This is my bug, from the token→`wl_buffer` task.** That brief's decision 4 said to record the bound
+dmabuf object at bind time because nothing in a `create_immed` identifies the global, and I did
+exactly that — and stored a reference that outlives the object it names. Which is, precisely, *the
+same class of defect as the recycled-id race I fixed this afternoon*: **a stored object reference
+outliving the object.** I fixed that class in `rayland-c` and introduced it in `rayland-s` in the same
+day, without recognising the pattern. `OVERVIEW.md` §6.4 already carries "an identifier that is reused
+is not an identity"; the sibling it needs is "a handle you cached is not a handle you still have".
+
+**On method, again.** Everything about this was visible from a person glancing at a screen for ten
+seconds, and I spent a long stretch inferring instead — including a confidently wrong "mapped but
+never composited" conclusion built on a single screenshot. The correction I wrote this afternoon said
+*when the missing evidence is something a person can simply see, ask the person.* I then asked, and it
+took one exchange. The lesson is not new; the failure was in not applying it sooner.
+
+**Not fixed here.** The diagnosis is solid and the fix is not obviously one line — S needs a dmabuf
+global that is *live at the moment a token arrives*, and the app binds and destroys many of them, so
+"remember the latest bind" is the wrong shape rather than a wrong line. That deserves specifying
+properly rather than a quick patch at the end of a long session.
