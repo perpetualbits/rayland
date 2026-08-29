@@ -4570,3 +4570,76 @@ rate, but not a one-off either.
 Also fixed in passing, as the brief asked: `scripts/c1-two-machine.sh`'s hardcoded
 `S_IP=192.168.1.192`, which stopped being dop561's address and turned that script's failure into a
 QUIC timeout that reads like a network fault. It now derives the address from the routing table.
+
+### 2026-08-29 (late) — A slot is not an object: the fix works, the callbacks flow, and the cube still does not spin
+
+**The assumption first, because the brief was right to insist.** The whole fix rests on `ObjectId`'s
+equality distinguishing two objects that shared a `protocol_id` at different times. It does:
+`InnerObjectId::eq` compares `id && serial && client_id && interface`, and the server hands out a
+fresh `next_serial()` per object. Checked in the vendored source before writing a line — the
+`create_immed` version bug two sessions ago is a cheap enough reminder of what an unchecked assumption
+about this dependency costs.
+
+**The fix.** `destroyed()` now removes a map entry only when the entry still holds *the object being
+destroyed*. The comment at the site explains the recycling mechanism rather than the comparison,
+because a reader who understands why the number is insufficient will not reintroduce this. `pending`
+got the same treatment via a new `owner: Option<ObjectId>` on `PendingParams` — its values are not
+`ObjectId`s, so it needed its own discriminator. That half has no observed symptom yet, but the
+witness log proves id reuse **crosses interfaces** (app id 24 lived as a
+`zwp_linux_buffer_params_v1`, died, and came back as a `wl_callback`), so a late params destroy
+wiping a new params object's `add` state is the same bug wearing different clothes.
+
+**The regression test, and the part worth recording.** My first attempt **passed against the buggy
+code** — which is to say it was worthless, and it is exactly the failure mode `OVERVIEW.md` §6.4 was
+written about two sessions ago. I had put a `queue.roundtrip()` between the two callbacks, which gave
+the backend time to run `destroyed()` *before* the new object was registered, quietly stepping around
+the race. Real applications do not do that: vkcube asks for its next frame callback from **inside**
+the `done` handler, so the new request reaches the proxy in the same dispatch batch. Moving the
+re-arm into the handler reproduced it.
+
+Then the second lesson, which I nearly shipped. With one cycle the test failed against the bug **2
+runs in 10** — a coin flip that would sit green in CI with the defect present. Whether the race bites
+depends on the backend's dispatch timing, so one cycle is one sample. A real app re-arms every frame,
+so the test now does thirty cycles and asserts every callback got its `done`. Measured: **10/10 fail
+against remove-by-number, 10/10 pass with the fix.** Two mutation rounds to get from "a test that
+feels right" to a test that discriminates.
+
+**A correction to my own previous entry, per the house pattern — the earlier text stands.** The
+2026-08-29 (evening) entry and its report called `rayland-s`'s `IdMaps` an "accidentally safe latent
+twin" carrying the same hazard, and said it was safe "only because its `destroyed()` is a deliberate
+no-op, which is a fragile reason to be correct". **That is backwards, and acting on it would have
+imported this bug into S.** `IdMaps::insert` writes both directions at object *creation*, so a
+recycled id is refreshed by its new owner; nothing ever removes by number, and that is precisely why
+there is nothing to get wrong. The no-op `destroyed()` is load-bearing, not an oversight. Nor does
+never removing leak: growth is bounded by the app's peak live-object count, because ids are recycled
+— the same property that made recycling dangerous on C makes it safe on S. Both facts are now
+comments in the code, where the next person to "tidy up" that no-op will meet them.
+
+**And now the result, which is not the one I wanted.** Criterion 3 passed cleanly: **zero
+`drop:unknown-object` in every run**, and in the run where callbacks flowed, S emitted **9**
+`wl_callback.done` and C delivered **9**. The app went from 1 attach to 9 attaches, 9 frame requests,
+10 commits. The plumbing is fixed and the witness says so exactly.
+
+**The cube still does not spin.** Three captures six seconds apart: **0 differing pixels of 202,500**,
+the same measurement that meant "frozen" last session. And the reason it is still static is not the
+one just fixed — the app had already done all nine of its attaches within the first ~18 seconds, and
+every photograph was taken after it had stopped.
+
+**Five runs, and the stall has moved upstream — this is the next diagnosis, not a conclusion.** Four
+of the five got **one** frame, with S's compositor emitting **zero** `wl_surface.frame` callbacks at
+all. The fifth got nine, then the app stopped *asking* — no tenth `frame` request — having received
+only **2 `wl_buffer.release` events for 9 attaches**.
+
+Both shapes point at the same place, and it is outside anything Rayland relays: **a compositor emits a
+frame callback only when it actually composites the surface, and releases a buffer only when it stops
+using one.** Zero callbacks means S's compositor is not drawing the replayed surface. The run-to-run
+variance fits window placement and visibility rather than anything in the relay, and the one run that
+*did* animate is the one whose window I photographed and could see. That is a hypothesis with an
+obvious test and I am deliberately not running it here; the brief said to end with the next diagnosis
+rather than force this one, and it was right to.
+
+Worth flagging for whoever picks this up: `cosmic-screenshot` became unresponsive partway through the
+session — it worked for the first runs and then hung past a 30 s timeout, so the later one-frame runs
+have no photograph. The evidence that a window exists at all in those runs is therefore missing, and
+"no window" versus "window present but never composited" is exactly the split the next session needs.
+Getting that observation is the first thing to do, and it may need a human at the screen again.

@@ -262,11 +262,30 @@ struct GlobalEntry {
 /// id space and must resolve them back to the app's numeric ids (`reverse`). The reverse map is keyed by the
 /// S-side object's `protocol_id` (a `u32`, unique within S's connection) rather than the `ObjectId` itself,
 /// so it needs no `Hash` on `ObjectId`.
+/// # Why nothing is ever removed from these maps — and why that is deliberate, not an oversight
+///
+/// A Wayland protocol id is a **slot number, not an object identity**: it is unique only among objects
+/// alive at one instant, and is recycled the moment an object dies. `rayland-c`'s proxy learned this the
+/// hard way — its object map pruned by bare `protocol_id`, and a destroyed object's *late* cleanup deleted
+/// the live object that had since inherited the slot, silently unregistering the application's frame
+/// callback and freezing its window after one frame (`docs/data/2026-08-29-wp0-event-witness/`).
+///
+/// These maps are immune to that, and the reason is exactly that **nothing removes by number**.
+/// [`Self::insert`] writes both directions when an object is *created*, so a recycled id simply
+/// overwrites the stale pair and every lookup resolves to the object that currently holds the slot. The
+/// entry is refreshed by the newcomer rather than deleted by the departed.
+///
+/// **Adding a removal here would import that bug**, not tidy the code. [`ReplayObjectData::destroyed`] is
+/// a deliberate no-op for this reason; it is load-bearing.
+///
+/// Nor does never removing leak. Growth is bounded by the application's **peak live-object count**,
+/// because ids are recycled — the same property that made recycling dangerous on C makes it safe here.
 #[derive(Default)]
 struct IdMaps {
-    /// App object id → the S-side [`ObjectId`] the replay created for it.
+    /// App object id → the S-side [`ObjectId`] the replay created for it. Overwritten, never removed.
     forward: HashMap<u32, ObjectId>,
-    /// S-side object `protocol_id` → the app object id it stands for. The inverse of `forward`.
+    /// S-side object `protocol_id` → the app object id it stands for. The inverse of `forward`, and
+    /// likewise overwritten rather than removed — see the type's own docs for why that is the safe choice.
     reverse: HashMap<u32, u32>,
 }
 
@@ -369,8 +388,18 @@ impl ObjectData for ReplayObjectData {
         makes_object.then(|| self.child())
     }
 
-    /// The object was destroyed; nothing to release (the id maps are pruned lazily — a stale forward entry
-    /// is harmless, and the reverse entry only ever matches a live S-side object).
+    /// The object was destroyed. **Deliberately a no-op, and that is load-bearing — do not "fix" it.**
+    ///
+    /// The tempting change is to prune [`IdMaps`] here, by the destroyed object's `protocol_id`. That is
+    /// precisely the bug `rayland-c`'s proxy shipped: a protocol id is a **slot number, not an object
+    /// identity**, this callback arrives *after* the backend has dispatched the requests that followed the
+    /// destruction, and by then the slot may already belong to a different, live object — which the
+    /// removal would then delete. On C that silently unregistered the application's frame callback and
+    /// froze its window after a single frame.
+    ///
+    /// `IdMaps` needs no pruning because [`IdMaps::insert`] overwrites both directions when an object is
+    /// created, so a recycled id is always refreshed by its new owner. See that type's docs for the full
+    /// argument, including why never removing does not leak.
     fn destroyed(&self, _object_id: ObjectId) {}
 }
 

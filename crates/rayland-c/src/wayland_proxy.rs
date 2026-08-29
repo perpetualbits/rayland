@@ -294,6 +294,19 @@ pub trait ResourceResolver: Send + Sync {
 /// full [`BufferToken`] can be assembled.
 #[derive(Default)]
 struct PendingParams {
+    /// The `zwp_linux_buffer_params_v1` object this state belongs to, as an **identity** rather than a
+    /// number.
+    ///
+    /// # Why the map key is not enough
+    /// `pending` is keyed by the params object's `protocol_id`, and a protocol id is a **slot number**,
+    /// not an object identity — it is unique only among objects alive at one instant, and Wayland reuses
+    /// it the moment the object dies. The witness log of 2026-08-29 shows app id 24 living as a
+    /// `zwp_linux_buffer_params_v1`, dying, and being reborn as a `wl_callback`, so reuse here crosses
+    /// interfaces too. Without this field, a *late* destroy of an old params object would wipe the state
+    /// a **new** one had just accumulated, and its `create_immed` would refuse the buffer as UNRESOLVED —
+    /// a missing frame behind a plausible-looking log line. `None` only until the first request that
+    /// identifies the object.
+    owner: Option<ObjectId>,
     /// The S-side resource id the passed memfd resolved to (`None` until a successful `add`, or if the fd
     /// did not correspond to a tracked resource).
     resource_id: Option<u32>,
@@ -419,6 +432,18 @@ fn first_new_id(msg: &Message<ObjectId, OwnedFd>) -> Option<u32> {
     })
 }
 
+/// The `ObjectId` of the object a request creates, or `None` if it creates none.
+///
+/// The identity-carrying counterpart of [`first_new_id`]: that returns the protocol id, which is a slot
+/// number and cannot distinguish two objects that occupied the slot at different times. Anything that must
+/// still be correct after the slot is recycled needs this instead.
+fn first_new_object(msg: &Message<ObjectId, OwnedFd>) -> Option<ObjectId> {
+    msg.args.iter().find_map(|arg| match arg {
+        Argument::NewId(id) => Some(id.clone()),
+        _ => None,
+    })
+}
+
 /// Reassemble the 64-bit DRM modifier from a `params.add` request's `modifier_hi`/`modifier_lo` args.
 ///
 /// Per `linux-dmabuf-v1.xml`, `add`'s args are `[fd, plane_idx, offset, stride, modifier_hi, modifier_lo]`,
@@ -515,8 +540,16 @@ fn try_intercept_buffer(data: &mut ProxyState, msg: &Message<ObjectId, OwnedFd>)
     match (iface, msg.opcode) {
         // Step 1: a new params object. Start tracking it; do not forward.
         (IFACE_DMABUF, OP_CREATE_PARAMS) => {
-            if let Some(params_id) = first_new_id(msg) {
-                data.pending.insert(params_id, PendingParams::default());
+            if let (Some(params_id), Some(params_obj)) = (first_new_id(msg), first_new_object(msg)) {
+                // Store the object's identity alongside its state, so a later destroy of a *different*
+                // object that happened to wear this same number cannot discard it.
+                data.pending.insert(
+                    params_id,
+                    PendingParams {
+                        owner: Some(params_obj),
+                        ..PendingParams::default()
+                    },
+                );
                 wp_log(&format!("intercept create_params -> params {params_id}"));
             }
             true
@@ -535,6 +568,9 @@ fn try_intercept_buffer(data: &mut ProxyState, msg: &Message<ObjectId, OwnedFd>)
             let (plane_idx, offset, stride) = params_plane_layout(msg);
             // Record against this params object; `create_immed` will complete the token.
             let entry = data.pending.entry(obj).or_default();
+            // The `add` arm can be the first request to identify this params object (its `create_params`
+            // may have been missed), so record the owner here too — the sender *is* the params object.
+            entry.owner = Some(msg.sender_id.clone());
             // A second `add` on one params object means a multi-plane buffer (each plane gets its own
             // `add`), and a non-zero `plane_idx` says so explicitly. Either way WP0's single-plane
             // assumption has broken, so poison the object rather than silently keeping the last plane's
@@ -852,11 +888,40 @@ impl ObjectData<ProxyState> for ProxyObjectData {
         _client_id: ClientId,
         object_id: ObjectId,
     ) {
-        // Drop any accumulated buffer state keyed by this object's id (no-op unless it was a params object).
-        data.pending.remove(&object_id.protocol_id());
-        // Drop the object from the event-delivery map: its `ObjectId` is now invalid, and a stale entry
-        // would make [`deliver_event`] try to `send_event` on a destroyed object.
-        let was_known = data.objects.remove(&object_id.protocol_id()).is_some();
+        // **A protocol id is a slot number, not an object identity.**
+        //
+        // It is unique only among objects alive at one instant: the moment an object dies, libwayland
+        // hands its number to the next object the application creates. And this cleanup runs *late* —
+        // the backend reports a destruction after it has already dispatched the requests that followed
+        // it — so by the time we get here, the slot may already belong to a **different, live** object.
+        //
+        // Removing by number therefore deletes whoever currently holds the slot, which is how the
+        // application's second frame callback was silently unregistered and its `wl_callback.done`
+        // dropped as `unknown-object`, freezing vkcube's cube after a single frame
+        // (`docs/data/2026-08-29-wp0-event-witness/`). Every component involved was individually
+        // correct; the bug lived entirely in this composition.
+        //
+        // So: remove only when the entry still holds *the object being destroyed*. A mismatch means the
+        // slot has been refilled and the newcomer must survive.
+        let slot = object_id.protocol_id();
+        // Buffer state first (a no-op unless this was a params object). Its identity lives in the value's
+        // `owner` field, since the value is not itself an `ObjectId` — see `PendingParams::owner`.
+        if data
+            .pending
+            .get(&slot)
+            .is_some_and(|p| p.owner.as_ref() == Some(&object_id))
+        {
+            data.pending.remove(&slot);
+        }
+        // Then the event-delivery map, whose values *are* `ObjectId`s and compare directly. `ObjectId`'s
+        // `PartialEq` includes an internal per-client serial as well as the number, so two objects that
+        // shared a slot at different times compare unequal — which is the property this rests on.
+        let was_known = match data.objects.get(&slot) {
+            Some(live) if *live == object_id => data.objects.remove(&slot).is_some(),
+            // The slot is empty, or has already been refilled by a newer object: nothing of *this*
+            // object's remains, and the newcomer's entry must be left exactly where it is.
+            _ => false,
+        };
         // The other half of the witness. A `wl_callback` is destroyed by delivering its own `done`, so this
         // fires *during* event delivery — and whether a later id of the same number is this object coming
         // back or a different object entirely is exactly what a `drop:unknown-object` turns on.

@@ -482,11 +482,44 @@ again until it does.
 S is entirely correct throughout: it emitted both `done`s, and mapped both callbacks consistently
 (`map s_obj=13 app_obj=24` twice — both ends recycle the same ids in step).
 
-**The shape of the fix** (deliberately not applied in the session that found this, so it can be
-specified against the evidence): a Wayland protocol id is **not unique over time**, so `destroyed()`
-must remove an entry only if the stored `ObjectId` is still the object being destroyed, rather than
-removing by number. `rayland-s`'s `IdMaps.reverse` is keyed the same way and has the same latent
-hazard; it is accidentally safe today only because its `destroyed()` is a deliberate no-op.
+**FIXED 2026-08-29.** `destroyed()` now removes an entry only when it still holds the object being
+destroyed — `ObjectId`'s equality includes a per-client serial, so two objects that shared a slot at
+different times compare unequal. `PendingParams` got the same treatment via an `owner: ObjectId`
+field, since its values are not `ObjectId`s; that half has no observed symptom yet, but the witness
+log proves id reuse crosses interfaces, so a late params destroy wiping a new params object's `add`
+state is the same bug in different clothes. Guarded by `wayland_proxy_recycled_id.rs`, which drives
+thirty callback cycles and fails **10/10** against remove-by-number.
+
+**Correction to the previous account:** this document and the 2026-08-29 report called `rayland-s`'s
+`IdMaps` an "accidentally safe latent twin". That was **wrong**, and acting on it would have imported
+the bug into S. `IdMaps::insert` writes both directions at object *creation*, so a recycled id is
+refreshed by its new owner; nothing removes by number, which is exactly why nothing can go wrong. The
+no-op `destroyed()` there is **load-bearing**. Nor does never removing leak — growth is bounded by the
+app's peak live-object count, because ids are recycled.
+
+**Verified, and it did not make the cube spin.** Zero `drop:unknown-object` in every run; in the run
+where callbacks flowed, S emitted 9 `wl_callback.done` and C delivered 9, and the app went from 1
+attach to 9 attaches / 9 frame requests / 10 commits. But three captures six seconds apart still
+differ by **0 pixels of 202,500** — because the app had done all nine attaches within ~18 s and
+every photograph came after it stopped. See §6.1.2.
+
+### 6.1.2 The stall after the recycled-id fix — the current wall, 2026-08-29
+
+**Five runs.** Four got **one** frame with S's compositor emitting **zero** `wl_surface.frame`
+callbacks at all. The fifth got nine, and then the app stopped *asking* — no tenth `frame` request —
+having received only **2 `wl_buffer.release` events for 9 attaches**.
+
+Both shapes point outside anything Rayland relays: **a compositor emits a frame callback only when it
+actually composites the surface, and releases a buffer only when it stops using one.** Zero callbacks
+means S's compositor is not drawing the replayed surface. The run-to-run variance fits window
+placement and visibility rather than the relay, and the one run that animated is the one whose window
+was photographed and visibly on screen.
+
+**That is a hypothesis with an obvious test, deliberately not run yet.** The first thing the next
+session needs is the observation that splits it: in a one-frame run, is there **no window**, or a
+**window present but never composited**? Note `cosmic-screenshot` became unresponsive partway through
+this session — it worked for the early runs then hung past a 30 s timeout — so that observation may
+need a human at the screen.
 
 **Two other findings from the same run, neither implicated in the stall:**
 
@@ -561,6 +594,15 @@ real regressions. It is an argument about what a test can and cannot witness:
 - A test can witness **internal consistency** — that the code does what its author meant.
 - A test cannot witness **a fact about the world** the author did not know.
 
+**A second worked example, from the session that fixed the recycled-id race.** The first regression
+test written for it **passed against the buggy code**, because it did a round-trip between the two
+callbacks — which let the destruction land before the new object was registered, quietly stepping
+around the race. It tested what its author imagined the sequence to be. Even after it was made to
+reproduce, it failed against the bug only **2 runs in 10**: a single sample of a race is a coin flip,
+and a test that catches a defect a fifth of the time will sit green in CI with the defect present.
+Driving thirty cycles, as a real application does, took it to **10/10 failing against the bug and
+10/10 passing with the fix**. Both rounds were found by mutation, not by inspection.
+
 The countermeasures this project already uses, and should keep using:
 
 - **Mutation-check every new assertion.** Break the implementation the test exists to forbid and
@@ -570,6 +612,12 @@ The countermeasures this project already uses, and should keep using:
 - **Prefer a witness to an argument.** When a component's behaviour is in question, instrument it and
   read what it says. The three-day `vkQueueSubmit` wall, the stale-frame misdiagnosis, and this
   session's frame-callback stall were all settled by an instrument after theories had failed.
+- **A Wayland protocol id is a slot number, not an object identity** — the third hazard of this
+  family, and the one that cost a frozen window. An id is unique only among objects alive at one
+  instant; the moment an object dies, the next one gets its number. Any map keyed by such an id must
+  remove **by identity**, never by number, because cleanup runs late and the slot may already have a
+  new, live owner. The general form: *an identifier that is reused is not an identity, and code that
+  treats it as one is correct only until something dies.*
 - **Treat "no errors in the log" as evidence only about paths that can log.** §6.1.1's stall sat
   behind four bare `return`s that reported nothing; the previous report's "no S-side replay errors"
   was true and meant nothing.
