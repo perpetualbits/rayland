@@ -786,6 +786,15 @@ impl ObjectData<ProxyState> for ProxyObjectData {
         for arg in &msg.args {
             if let Argument::NewId(id) = arg {
                 data.objects.insert(id.protocol_id(), id.clone());
+                // Part of the return-path witness: an event can only be delivered to an object that is in
+                // this map, so its comings and goings are the ground truth behind every
+                // `drop:unknown-object`. Short-lived objects (a `wl_callback`, destroyed by its own `done`)
+                // make this a live question rather than bookkeeping.
+                wp_log(&format!(
+                    "objects+ app_obj={} {}",
+                    id.protocol_id(),
+                    id.interface().name
+                ));
             }
         }
         // The one special case first: buffer-by-token interception on the dmabuf path. If it consumed the
@@ -847,7 +856,15 @@ impl ObjectData<ProxyState> for ProxyObjectData {
         data.pending.remove(&object_id.protocol_id());
         // Drop the object from the event-delivery map: its `ObjectId` is now invalid, and a stale entry
         // would make [`deliver_event`] try to `send_event` on a destroyed object.
-        data.objects.remove(&object_id.protocol_id());
+        let was_known = data.objects.remove(&object_id.protocol_id()).is_some();
+        // The other half of the witness. A `wl_callback` is destroyed by delivering its own `done`, so this
+        // fires *during* event delivery — and whether a later id of the same number is this object coming
+        // back or a different object entirely is exactly what a `drop:unknown-object` turns on.
+        wp_log(&format!(
+            "objects- app_obj={} {} (was_known={was_known})",
+            object_id.protocol_id(),
+            object_id.interface().name
+        ));
     }
 }
 
@@ -1064,11 +1081,45 @@ fn drain_events(
 /// # Failure modes
 /// An unknown target object (destroyed, or never created) drops the event with a log. A `send_event`
 /// failure (the client vanished) is logged; it is not fatal to the proxy.
+/// `"<interface>.<event>"` for an event on `object`, or `"<interface>.#<opcode>"` if the opcode has no
+/// descriptor.
+///
+/// # Why by name
+/// This is the C-side half of the WP0 return-path witness, and it exists so the two ends' logs diff
+/// directly. An opcode is an index into one interface's event list, and the two ends log against two
+/// different id spaces, so a bare `opcode 0` in each log says nothing about whether it is the *same* event.
+/// `wl_callback.done` present on S and absent on C is an answer.
+///
+/// # Failure mode
+/// Out-of-range opcodes return the `#n` form rather than panicking: the opcode originates on S's
+/// compositor, so an interface version newer than this build's descriptor can legitimately produce one.
+/// Losing the name must never cost the log line.
+fn event_label(object: &ObjectId, opcode: u16) -> String {
+    let interface = object.interface();
+    match interface.events.get(opcode as usize) {
+        Some(desc) => format!("{}.{}", interface.name, desc.name),
+        None => format!("{}.#{}", interface.name, opcode),
+    }
+}
+
+/// Report an event the proxy refused to deliver to the application.
+///
+/// **Unconditional, unlike [`wp_log`].** A dropped event is rare and each one is a finding — an event S's
+/// compositor emitted that the application will never see — so it must not depend on a diagnostic switch
+/// being set. This mirrors `rayland-s`'s drop reporting exactly, so the two ends' drops are comparable
+/// without having to arrange for matching environments.
+fn wp_drop(msg: &str) {
+    eprintln!("[wp-event][C] {msg}");
+}
+
 fn deliver_event(handle: &Handle, state: &ProxyState, msg: WaylandMessage) {
     // The event's target object, in the app's id space, must be one the proxy created and still holds.
     let Some(sender) = state.objects.get(&msg.object_id).cloned() else {
-        wp_log(&format!(
-            "drop event for unknown object {} (opcode {}): no live proxy object",
+        // No live proxy object with that app-side id. **What this means for the app:** the event is lost,
+        // and if the app is blocked on it, this is the reason. The interface cannot be named here — the id
+        // is precisely what could not be resolved — so the raw opcode is all there is to report.
+        wp_drop(&format!(
+            "drop:unknown-object app_obj={} opcode={}: no live proxy object",
             msg.object_id, msg.opcode
         ));
         return;
@@ -1093,49 +1144,67 @@ fn deliver_event(handle: &Handle, state: &ProxyState, msg: WaylandMessage) {
             WaylandArg::Object(id) => match state.objects.get(id).cloned() {
                 Some(obj) => args.push(Argument::Object(obj)),
                 None => {
-                    wp_log(&format!(
-                        "drop event (obj {} opcode {}): references unknown object {id}",
-                        msg.object_id, msg.opcode
+                    // **What this means for the app:** the whole event is lost, not just the argument.
+                    // Delivering a dangling reference would be worse — the app would resolve it against
+                    // one of its own unrelated objects.
+                    wp_drop(&format!(
+                        "drop:unmapped-object-arg app_obj={} {}: references unknown object {id}",
+                        msg.object_id,
+                        event_label(&sender, msg.opcode)
                     ));
                     return;
                 }
             },
             // A compositor-created object: unsupported in WP0's return path; drop the whole event.
             WaylandArg::NewId { id, interface, .. } => {
-                wp_log(&format!(
-                    "drop event (obj {} opcode {}): carries a NewId ({interface} {id}) which WP0 does not \
-                     deliver back yet",
-                    msg.object_id, msg.opcode
+                // **What this means for the app:** lost. WP0's return path cannot mint an object in the
+                // app's id space, so anything delivered this way never arrives. S drops these too, before
+                // they reach the link — seeing one here would mean the two ends disagree about the rule.
+                wp_drop(&format!(
+                    "drop:carries-new-id app_obj={} {}: NewId ({interface} {id}) is not delivered back yet",
+                    msg.object_id,
+                    event_label(&sender, msg.opcode)
                 ));
                 return;
             }
             // A buffer token in a compositor→app event is never expected; drop rather than mis-deliver.
             WaylandArg::Buffer(_) => {
-                wp_log(&format!(
-                    "drop event (obj {} opcode {}): unexpected Buffer token in an event",
-                    msg.object_id, msg.opcode
+                // A buffer token travels app→S, never back. **What this means for the app:** lost, and it
+                // also means something upstream is confused, since nothing constructs such an event.
+                wp_drop(&format!(
+                    "drop:unexpected-buffer-token app_obj={} {}",
+                    msg.object_id,
+                    event_label(&sender, msg.opcode)
                 ));
                 return;
             }
         }
     }
+    // Built before `sender` is moved into the message below: success and failure must name the event
+    // identically, and after the move the interface is no longer reachable.
+    let label = event_label(&sender, msg.opcode);
+    let arg_count = msg.args.len();
     let event = Message {
         sender_id: sender,
         opcode: msg.opcode,
         args: args.into_iter().collect(),
     };
     if let Err(e) = handle.send_event(event) {
-        wp_log(&format!(
-            "send_event for object {} opcode {} failed: {e:?}",
-            msg.object_id, msg.opcode
+        // The event was well-formed and still did not reach the app: a socket-level failure, not a
+        // translation one. Unconditional for the same reason the drops are — the app is missing an event.
+        wp_drop(&format!(
+            "drop:send-event-failed app_obj={} {}: {e:?}",
+            msg.object_id, label
         ));
     } else {
-        wp_log(&format!(
-            "delivered event to app object {} opcode {} ({} args)",
-            msg.object_id,
-            msg.opcode,
-            msg.args.len()
-        ));
+        // The witness's answer line: this event **reached the application**. Its counterpart is S's
+        // `emit`; an S `emit` with no C `delivered` means the event was lost on the link between them.
+        if std::env::var_os("RAYLAND_WP_LOG").is_some() {
+            eprintln!(
+                "[wp-event][C] delivered app_obj={} {} args={}",
+                msg.object_id, label, arg_count
+            );
+        }
     }
 }
 

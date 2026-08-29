@@ -374,6 +374,95 @@ impl ObjectData for ReplayObjectData {
     fn destroyed(&self, _object_id: ObjectId) {}
 }
 
+/// Whether the per-event return-path trace is on, read from `RAYLAND_S_EVENT_LOG`.
+///
+/// # Why a separate switch from `RAYLAND_S_REPLY_LOG`
+/// It follows that variable's shape deliberately (a bare presence check, no parsing), but it is its own
+/// switch because that one turns on the *link and applier* instrumentation, which is high-volume enough to
+/// change the timing it measures. The event return path is a different investigation running on a
+/// different thread, and it must be possible to watch it without also perturbing the ring.
+///
+/// Drops are **not** gated on this: a dropped event is rare and each one is a finding, so it is always
+/// reported. This gates only the trace of events that flow normally.
+fn event_log_enabled() -> bool {
+    std::env::var_os("RAYLAND_S_EVENT_LOG").is_some()
+}
+
+/// The name of the event at `opcode` on `interface`, or `None` if the opcode is outside the descriptor.
+///
+/// # Why by name and not by opcode
+/// An opcode is an index into one interface's event list, so the same number means different things on
+/// different objects, and the two sides of this relay log it against two different id spaces. `opcode 0`
+/// appearing in both logs says nothing; `wl_callback.done` appearing in one and not the other is the whole
+/// answer. This is what makes the two logs diffable.
+///
+/// # Failure mode
+/// Returns `None` rather than panicking when the opcode is out of range. That is not paranoia: the opcode
+/// arrives from S's compositor, and a compositor advertising an interface version newer than the linked
+/// descriptor can legitimately send an event this build has no name for. Losing the name must never lose
+/// the event, so callers fall back to printing the raw number.
+fn event_name(interface: &Interface, opcode: u16) -> Option<&'static str> {
+    interface.events.get(opcode as usize).map(|desc| desc.name)
+}
+
+/// `"<interface>.<event>"`, or `"<interface>.#<opcode>"` when the opcode has no descriptor.
+///
+/// Allocates, so callers must build it **outside** any held lock — see [`translate_and_emit`], whose whole
+/// shape exists to keep string formatting off the maps lock.
+fn event_label(interface: &Interface, opcode: u16) -> String {
+    match event_name(interface, opcode) {
+        Some(name) => format!("{}.{}", interface.name, name),
+        None => format!("{}.#{}", interface.name, opcode),
+    }
+}
+
+/// Why an event S's compositor emitted was not delivered to the application.
+///
+/// Deliberately `Copy` and free of any borrow: it is produced **inside** the maps lock and rendered into a
+/// message **after** the lock is released, so that reporting a drop cannot extend the critical section that
+/// the compositor-reader thread shares with the message thread.
+#[derive(Debug, Clone, Copy)]
+enum EventDrop {
+    /// The sending object is not in the S→app map, so there is no app-side object to address the event to.
+    ///
+    /// **What this means for the app:** usually nothing — this is how S's own registry and display chatter
+    /// is filtered out, since the replay never created those objects. But if it names an object the replay
+    /// *did* create, the reverse map has a hole and the app is missing an event it is entitled to.
+    UnmappedSender,
+    /// An `Object` argument names an S-side object the app never learned of.
+    ///
+    /// **What this means for the app:** the whole event is lost, not just the argument. Delivering it with
+    /// a dangling reference would be worse — the app would resolve it to one of its own unrelated objects.
+    UnmappedObjectArg {
+        /// The unresolvable object's protocol id in **S's** id space.
+        s_object: u32,
+    },
+    /// The event carries a `NewId` — S's compositor creating an object for the app.
+    ///
+    /// **What this means for the app:** the event is lost. WP0's return path cannot mint an object in the
+    /// app's id space, so anything delivered this way (a data offer, a dmabuf feedback object) never
+    /// arrives. If the app is blocked on such an event, this branch is the reason.
+    CarriesNewId,
+    /// The event carries a file descriptor.
+    ///
+    /// **What this means for the app:** the event is lost, and it cannot be otherwise — an fd does not
+    /// survive the network, which is the founding constraint of the whole project. An app blocked here
+    /// needs a token-style substitution of its own, as the buffer path got.
+    CarriesFd,
+}
+
+impl EventDrop {
+    /// A short, stable tag for the log, so the two ends' logs can be grepped and diffed by reason.
+    fn tag(self) -> &'static str {
+        match self {
+            EventDrop::UnmappedSender => "unmapped-sender",
+            EventDrop::UnmappedObjectArg { .. } => "unmapped-object-arg",
+            EventDrop::CarriesNewId => "carries-new-id",
+            EventDrop::CarriesFd => "carries-fd",
+        }
+    }
+}
+
 /// Translate one compositor event S→app and emit it, or drop it if it cannot be represented.
 ///
 /// See [`ReplayObjectData::event`] for the drop rules. Holds the maps lock only for the translation, never
@@ -389,47 +478,124 @@ fn translate_and_emit(
     // `format` (opcode 0) / `modifier` (opcode 1) events are duplicates — and, sent across the app's many
     // transient probe binds, they arrive in the hundreds and congest the return link the ring's replies
     // share, which can stall the command ring. The proxy owns this capability; S stays out of it.
+    // The witness's first line: *everything* S's compositor emitted on a replayed object, before any
+    // filtering. Without it, "the app never got X" cannot be told apart from "S's compositor never sent X",
+    // and those call for opposite investigations. Gated, because it is one line per event.
+    let trace = event_log_enabled();
+    if trace {
+        eprintln!(
+            "[wp-event][S] from-compositor s_obj={} {} args={}",
+            msg.sender_id.protocol_id(),
+            event_label(msg.sender_id.interface(), msg.opcode),
+            msg.args.len()
+        );
+    }
     if msg.sender_id.interface().name == ZwpLinuxDmabufV1::interface().name
         && (msg.opcode == 0 || msg.opcode == 1)
     {
+        // Suppressed on purpose, not lost. Traced so the diff shows why the app never saw it, rather than
+        // leaving a gap someone has to rediscover this rule to explain.
+        if trace {
+            eprintln!(
+                "[wp-event][S] suppressed s_obj={} {} (dmabuf format/modifier: the C proxy answers this locally)",
+                msg.sender_id.protocol_id(),
+                event_label(msg.sender_id.interface(), msg.opcode)
+            );
+        }
         return;
     }
-    // Build the app-space message under the lock; emit it after releasing the lock.
-    let app_msg = {
+    // Build the app-space message under the lock; emit it — and report any drop — after releasing it.
+    //
+    // The `Result` is the whole point of this shape: every failure path below used to be a bare `return`
+    // inside the lock, so a dropped event left no trace at all, and "no errors in S's log" was not evidence
+    // about a path that was silent by construction. Carrying the reason out as a `Copy` value lets it be
+    // *formatted* outside the critical section, so the witness cannot slow the section it is watching.
+    let outcome: Result<WaylandMessage, EventDrop> = {
         let maps = maps.lock().expect("the WP0 id maps lock is never poisoned");
         // The sender must be an object the replay created; S's own registry/display objects are not, so
         // their events (the global advertisements, the roundtrip callback) resolve to nothing and drop.
-        let Some(app_object) = maps.to_app(&msg.sender_id) else {
-            return;
-        };
-        let mut args = Vec::with_capacity(msg.args.len());
-        for arg in &msg.args {
-            match arg {
-                Argument::Int(v) => args.push(WaylandArg::Int(*v)),
-                Argument::Uint(v) => args.push(WaylandArg::Uint(*v)),
-                Argument::Fixed(v) => args.push(WaylandArg::Fixed(*v)),
-                // Bytes without the trailing NUL; `None` stays the wire's absent-string case.
-                Argument::Str(s) => {
-                    args.push(WaylandArg::Str(s.as_ref().map(|c| c.as_bytes().to_vec())))
+        match maps.to_app(&msg.sender_id) {
+            None => Err(EventDrop::UnmappedSender),
+            Some(app_object) => {
+                let mut args = Vec::with_capacity(msg.args.len());
+                let mut drop_reason = None;
+                for arg in &msg.args {
+                    match arg {
+                        Argument::Int(v) => args.push(WaylandArg::Int(*v)),
+                        Argument::Uint(v) => args.push(WaylandArg::Uint(*v)),
+                        Argument::Fixed(v) => args.push(WaylandArg::Fixed(*v)),
+                        // Bytes without the trailing NUL; `None` stays the wire's absent-string case.
+                        Argument::Str(s) => {
+                            args.push(WaylandArg::Str(s.as_ref().map(|c| c.as_bytes().to_vec())))
+                        }
+                        Argument::Array(bytes) => args.push(WaylandArg::Array((**bytes).clone())),
+                        // An object reference: translate S→app. If the app never learned of it, drop the
+                        // whole event rather than name an object the app cannot resolve.
+                        Argument::Object(id) => match maps.to_app(id) {
+                            Some(app_id) => args.push(WaylandArg::Object(app_id)),
+                            None => {
+                                drop_reason = Some(EventDrop::UnmappedObjectArg {
+                                    s_object: id.protocol_id(),
+                                });
+                                break;
+                            }
+                        },
+                        // A compositor-created object, or an fd: outside WP0's event set; drop the event.
+                        Argument::NewId(_) => {
+                            drop_reason = Some(EventDrop::CarriesNewId);
+                            break;
+                        }
+                        Argument::Fd(_) => {
+                            drop_reason = Some(EventDrop::CarriesFd);
+                            break;
+                        }
+                    }
                 }
-                Argument::Array(bytes) => args.push(WaylandArg::Array((**bytes).clone())),
-                // An object reference: translate S→app. If the app never learned of it, drop the whole
-                // event rather than name an object the app cannot resolve.
-                Argument::Object(id) => match maps.to_app(id) {
-                    Some(app_id) => args.push(WaylandArg::Object(app_id)),
-                    None => return,
-                },
-                // A compositor-created object, or an fd: outside WP0's event set; drop the event.
-                Argument::NewId(_) | Argument::Fd(_) => return,
+                match drop_reason {
+                    Some(reason) => Err(reason),
+                    None => Ok(WaylandMessage {
+                        object_id: app_object,
+                        opcode: msg.opcode,
+                        args,
+                    }),
+                }
             }
         }
-        WaylandMessage {
-            object_id: app_object,
-            opcode: msg.opcode,
-            args,
-        }
     };
-    sink.emit(app_msg);
+
+    // The lock is released. Format freely from here.
+    match outcome {
+        Ok(app_msg) => {
+            if trace {
+                eprintln!(
+                    "[wp-event][S] emit s_obj={} app_obj={} {} args={}",
+                    msg.sender_id.protocol_id(),
+                    app_msg.object_id,
+                    event_label(msg.sender_id.interface(), msg.opcode),
+                    app_msg.args.len()
+                );
+            }
+            sink.emit(app_msg);
+        }
+        // **Unconditional**, matching the C proxy's drop reporting. Each of these is an event S's
+        // compositor sent that the application will never see, and if the app is blocked waiting for it,
+        // this line is the answer. See `EventDrop`'s variants for what each means for the app.
+        Err(reason) => {
+            let detail = match reason {
+                EventDrop::UnmappedObjectArg { s_object } => {
+                    format!(" (argument names S object {s_object}, unknown to the app)")
+                }
+                _ => String::new(),
+            };
+            eprintln!(
+                "[wp-event][S] drop:{} s_obj={} {}{}",
+                reason.tag(),
+                msg.sender_id.protocol_id(),
+                event_label(msg.sender_id.interface(), msg.opcode),
+                detail
+            );
+        }
+    }
 }
 
 /// The compositor-reader thread body: dispatch S's compositor connection so its events reach
@@ -815,10 +981,22 @@ impl WaylandReplay {
             Ok(Ok(s_new_id)) => {
                 // Map the app's new object to the S-side one the compositor just created.
                 if let Some(app_id) = new_app_id {
+                    // Witness: the reverse map is keyed by the S-side *protocol id*, and Wayland recycles
+                    // those after an object is destroyed. So a later event arriving on this number resolves
+                    // through whichever mapping was written last — which is precisely what decides whether
+                    // an event reaches the app or is addressed to a dead app object. Logged (gated) so the
+                    // mapping can be read back rather than reasoned about.
+                    let s_protocol = s_new_id.protocol_id();
                     self.maps
                         .lock()
                         .expect("the WP0 id maps lock is never poisoned")
                         .insert(app_id, s_new_id);
+                    if event_log_enabled() {
+                        eprintln!(
+                            "[wp-event][S] map s_obj={s_protocol} app_obj={app_id} (from obj {} opcode {opcode})",
+                            msg.object_id
+                        );
+                    }
                 }
             }
             Ok(Err(e)) => eprintln!(
@@ -1064,6 +1242,40 @@ mod tests {
         }
         // An interface WP0 does not handle resolves to None, so its request is skipped, not mis-created.
         assert!(interface_by_name("wl_data_device_manager").is_none());
+    }
+
+    /// Event-name lookup resolves a real opcode and refuses an out-of-range one instead of panicking.
+    ///
+    /// The out-of-range half is the one that matters. The opcode arrives from S's compositor, which may
+    /// advertise an interface version newer than the descriptor this binary linked, so an event with no
+    /// name here is a thing that can genuinely happen at runtime. Indexing blindly would turn "an event we
+    /// have no name for" into a panic on the compositor-reader thread — losing the whole return path in
+    /// order to log one line.
+    #[test]
+    fn event_names_resolve_and_out_of_range_opcodes_do_not_panic() {
+        // `wl_callback` has exactly one event, `done` at opcode 0 — the event the WP0 frame-callback path
+        // depends on, and the reason this lookup exists at all.
+        let callback = WlCallback::interface();
+        assert_eq!(event_name(callback, 0), Some("done"));
+        assert_eq!(
+            event_label(callback, 0),
+            "wl_callback.done",
+            "the label is what both ends' logs are diffed on"
+        );
+
+        // One past the end, and far past it: both must be `None`, not a panic.
+        let past_end = callback.events.len() as u16;
+        assert_eq!(event_name(callback, past_end), None);
+        assert_eq!(event_name(callback, u16::MAX), None);
+        assert_eq!(
+            event_label(callback, past_end),
+            format!("wl_callback.#{past_end}"),
+            "an unnamed opcode still prints its number, so the event is never invisible"
+        );
+
+        // A multi-event interface, so the lookup is proven to index rather than always return the first.
+        let buffer = WlBuffer::interface();
+        assert_eq!(event_name(buffer, 0), Some("release"));
     }
 
     /// The reverse map resolves an S-side object back to the app id it stands for, and drops the events of

@@ -4482,3 +4482,91 @@ split and the version inheritance are covered by a pure unit test, teeth-checked
 (swap the halves, derive the stride, assume offset zero — each fails its own assertion and nothing
 else). The compositor-facing half is **one clean run**, and one run is one run, not a rate. 4.5 is not
 reached and is not claimed.
+
+### 2026-08-29 (evening) — The witness answers in one line: a recycled Wayland id, and a `destroyed` that arrives too late
+
+The brief was unusually disciplined about method: *stop generating explanations, build the independent
+witness, run it, report what it saw, and do not fix anything you find.* It also pointed at the exact
+asymmetry that made the previous session's evidence weaker than it looked — `rayland-c`'s
+`deliver_event` logs every reason it drops an event, while `rayland-s`'s `translate_and_emit` had
+**four bare `return`s and logged none of them**. So the last report's "no S-side replay errors in the
+log" was a true statement about a path that was silent by construction. That is a good lesson and it
+generalises: *"no errors in the log" is evidence only about the parts that can log.*
+
+**What was built.** Both ends now emit a comparable line — same field order, the object id in its own
+id space, and the event **by name** rather than by opcode. The naming matters more than it sounds. An
+opcode is an index into one interface's event list, and the two ends log against two different id
+spaces, so `opcode 0` in both logs says nothing about whether it is the same event. `wl_callback.done`
+present on one side and absent on the other is the entire answer.
+
+The `Result<WaylandMessage, EventDrop>` shape in `translate_and_emit` exists for one reason: the four
+drop branches sit **inside** the maps lock, and the brief was explicit that the instrument must not
+extend a critical section the compositor-reader thread shares with the message thread. So the reason
+comes out as a `Copy` value and is *formatted* after the lock is released. Drops report
+unconditionally; the successful traffic is gated behind `RAYLAND_S_EVENT_LOG`.
+
+One small tree-versus-plan correction, reported as instructed: the brief said C's drops log
+unconditionally "matching C". They did not — they went through the env-gated `wp_log`. Since the whole
+point was symmetry, I gave C a `wp_drop` that always speaks. Now both ends genuinely match.
+
+**The screen, which the brief rightly insisted on.** `grim` fails on COSMIC, but
+`cosmic-screenshot --interactive=false` works, so this is a committed artifact rather than my
+recollection. **The cube is on dop561's screen.** An unmodified vkcube running on apollo, drawn by
+dop561's GPU, in its own window on dop561's compositor. That is the whole project in one picture and
+it is in `docs/data/2026-08-29-wp0-event-witness/cube-on-dop561.png`.
+
+And it is **frozen**. Two captures 17 seconds apart, the 450×450 interior **pixel-identical: 0 of
+202,500 differing**. Which is the brief's first branch exactly — the surface mapped and composited, so
+the compositor *did* have reason to emit a frame callback, and the loss is downstream of it.
+
+**Then the witness answered, and it took one grep.** S's compositor emitted `wl_callback.done`
+**twice**. C delivered the first and dropped the second, with the only C-side drop of the entire run:
+`drop:unknown-object app_obj=24 opcode=0: no live proxy object`.
+
+At that point I had *where*, but two candidate *whys*, and I could not tell them apart: either the app
+had made its second callback with a different id and S's reverse map was stale, or the app had reused
+id 24 and something on C had removed it. I nearly reported the ambiguity. Instead I added two more
+instrument lines — C says when an object enters and leaves its delivery map, S says what it mapped for
+each new object — and re-ran. That was the right call: instrument, not fix, still squarely inside the
+brief, and it converted a two-way guess into a fact.
+
+**The fact, from C's own log, in order:**
+
+```
+objects+ app_obj=24 wl_callback                    <- frame callback #1 created
+delivered app_obj=24 wl_callback.done              <- #1 delivered ... and done DESTROYS a wl_callback
+objects+ app_obj=24 wl_callback                    <- #2 created, REUSING the id just freed
+objects- app_obj=24 wl_callback (was_known=true)   <- #1's destroyed() finally runs, removing #2
+drop:unknown-object app_obj=24                     <- #2's done has nothing to deliver to
+```
+
+**A Wayland protocol id is not unique over time.** `ProxyState::objects` is keyed by bare
+`protocol_id`, and `destroyed()` removes by that number — so when the backend gets round to reporting
+callback #1's destruction, it deletes callback #2, which happens to wear the same number. The
+application then waits forever for a frame callback that was delivered to nobody.
+
+I like this one because every component behaved *correctly in isolation*. libwayland is right to
+recycle a freed id. The backend is right to report the destruction. C is right to prune destroyed
+objects. And S — which I had privately suspected, since the previous session's stale-reverse-map
+theory was mine — is completely exonerated: it emitted both events and mapped both callbacks
+consistently (`map s_obj=13 app_obj=24`, twice). The bug lives only in the *composition*, in an
+assumption nobody wrote down: that an id names one object for the process's life.
+
+**Not fixed, per decision 4.** The shape is clear — remove only if the stored `ObjectId` is still the
+object being destroyed, rather than removing by number — but it gets its own task, specified against
+this evidence. Worth flagging that `rayland-s`'s `IdMaps.reverse` is keyed the same way and carries
+the same latent hazard; it is accidentally safe today only because its `destroyed()` is a deliberate
+no-op, which is a fragile reason to be correct.
+
+**Two other things the witness saw, neither implicated.** `wl_keyboard.keymap` is dropped on S because
+it carries a file descriptor — no relayed application will ever have a keymap until that gets a
+token-style substitution like the buffer path did. And of the 1004 events S's compositor emitted,
+**960 were the deliberately suppressed dmabuf `format`/`modifier` pair**: the suppression is correct
+and documented, but it means ~96% of the return path's event traffic exists only to be discarded.
+
+**Run count, precisely: two runs, both stalled, identical behaviour and the same single drop.** Not a
+rate, but not a one-off either.
+
+Also fixed in passing, as the brief asked: `scripts/c1-two-machine.sh`'s hardcoded
+`S_IP=192.168.1.192`, which stopped being dop561's address and turned that script's failure into a
+QUIC timeout that reads like a network fault. It now derives the address from the routing table.

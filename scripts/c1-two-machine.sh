@@ -34,7 +34,13 @@ set -euo pipefail
 
 # ---- Configuration (override via environment) ----------------------------------------------
 C_HOST="${C_HOST:-apollo}"                 # machine C: where the app runs (ssh name)
-S_IP="${S_IP:-192.168.1.192}"              # machine S's LAN address, as C must dial it
+# Machine S's LAN address, as C must dial it. DERIVED, not hardcoded: this line used to read
+# `192.168.1.192`, which stopped being dop561's address, and the script then failed with a QUIC
+# connection timeout that reads exactly like a network fault -- a live landmine in a script this
+# project relies on. Asking the routing table which source address this host would use to reach C
+# cannot go stale. Override by setting S_IP if the two machines are not on a shared LAN.
+C_IP="$(getent ahostsv4 "$C_HOST" | awk '{print $1; exit}')"
+S_IP="${S_IP:-$(ip -4 route get "$C_IP" | grep -oP 'src \K[\d.]+')}"
 PORT="${PORT:-9401}"                       # QUIC (UDP) port S listens on
 TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/rayland-c1-target}"   # isolated so a co-tenant build is untouched
 BIN="$TARGET_DIR/debug"

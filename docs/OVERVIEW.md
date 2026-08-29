@@ -365,7 +365,7 @@ cross the network.**
 | 4.2 — S router, persistent Wayland client, object-id map, session replay | done |
 | **4.3 — token → `wl_buffer`** | **DONE and verified over the real network, 2026-08-29** — S builds real `wl_buffer`s from relayed tokens (4 of 4 swapchain images, no protocol error) |
 | 4.4 — event return path (eventfd wakeup, `send_event`, `S2C::WaylandEvent`, `configure`) | **genuinely working** — measured: vkcube receives both `configure`s through the tunnel and **acks** them |
-| 4.5 — end-to-end: vkcube's spinning cube on S's screen | **NOT reached.** vkcube presents exactly one frame, then stalls — see below |
+| 4.5 — end-to-end: vkcube's spinning cube on S's screen | **Half reached.** The cube *is* on dop561's screen, rendered by S's GPU from an app on apollo — but it is a **still frame**, not spinning. Cause found; see below |
 
 **4.3 part 2 is the immediate next piece of work.** Its shape turned out smaller and different from
 the plan's decomposition: **C's half was already complete** (the `params.add` handler resolves the
@@ -450,17 +450,52 @@ vkcube on apollo, its window replayed onto dop561's compositor:
 - The app then **attached, damaged, requested a frame callback, and committed** — the full present
   sequence, replayed with no S-side error. The proxy trace ran to 64 lines, against the 36 recorded
   on 2026-07-25 when the app died after binding dmabuf six times.
-- **Then it stalls.** One attach, two commits, and no more. The app stays alive; its main thread waits
-  on a futex held by Venus's own `vn_wsi[0,0]` WSI thread, which sits in `poll`. Twelve events were
-  delivered back to it. So the app is waiting on presentation feedback of some kind, and *which* event
-  it wants is the open question.
-- This is **not** the tearing/pacing that the missing commit gate would explain, and it is not a fault
-  in the token path: the buffers exist and the compositor took them. It is the next wall, and it is
-  the fourth successive case of WP0's written plan being short of what the code needs.
+- **Then it stalls — and as of 2026-08-29 the cause is known exactly**, found by instrumenting both
+  halves of the event return path rather than by reasoning about them. See the next subsection.
 
 Note the measured values in this configuration were `offset 0, stride 2000 = width × 4` — i.e. here
 the derivation would have *happened* to be right. That is exactly why the token carries them: the
 fixture proves the path, the configuration does not prove the assumption.
+
+### 6.1.1 The frame-callback stall — located, 2026-08-29, and NOT yet fixed
+
+**The picture arrives; the animation does not.** vkcube's window appears on dop561's screen with the
+cube correctly rendered by S's GPU (`docs/data/2026-08-29-wp0-event-witness/cube-on-dop561.png`), and
+then never updates: the same 450×450 interior was **pixel-identical, 0 of 202 500 differing, across
+two captures 17 s apart**. Two runs, both identical in behaviour.
+
+**Why:** the application never receives its second `wl_surface.frame` callback, and it will not draw
+again until it does.
+
+**Where it is lost — a recycled-id race in C's proxy object map, not anywhere in S:**
+
+1. The app creates frame callback #1 with app id 24; C registers it.
+2. S's compositor fires `done`; S emits it; C delivers it. **A `wl_callback.done` is a *destructor*
+   event** — delivering it destroys the object.
+3. The app immediately creates frame callback #2, and libwayland **reuses the id it just freed**: also
+   24. C registers it.
+4. **Only now** does the backend's `destroyed()` for callback #1 run — and `ProxyState::objects` is
+   keyed by bare `protocol_id`, so `objects.remove(&24)` removes **callback #2's** entry.
+5. Callback #2's `done` arrives and has nothing to deliver to:
+   `drop:unknown-object app_obj=24`. The app waits forever.
+
+S is entirely correct throughout: it emitted both `done`s, and mapped both callbacks consistently
+(`map s_obj=13 app_obj=24` twice — both ends recycle the same ids in step).
+
+**The shape of the fix** (deliberately not applied in the session that found this, so it can be
+specified against the evidence): a Wayland protocol id is **not unique over time**, so `destroyed()`
+must remove an entry only if the stored `ObjectId` is still the object being destroyed, rather than
+removing by number. `rayland-s`'s `IdMaps.reverse` is keyed the same way and has the same latent
+hazard; it is accidentally safe today only because its `destroyed()` is a deliberate no-op.
+
+**Two other findings from the same run, neither implicated in the stall:**
+
+- `wl_keyboard.keymap` is dropped on S (`drop:carries-fd`) — it carries a file descriptor, which
+  cannot cross the network. The app does not block on it, but no relayed application will ever have a
+  keymap until it gets a token-style substitution like the buffer path did.
+- Of 1004 events S's compositor emitted, **960 were the deliberately suppressed dmabuf
+  `format`/`modifier` pair**. That suppression is correct and documented, but it means the return path
+  is ~96% traffic that exists only to be discarded.
 
 **Two recorded reversals to be aware of when planning here.**
 
@@ -508,6 +543,36 @@ it either way. This is the best ratio of information to effort currently on the 
   hardening tracks and audio.
 
 ---
+
+## 6.4 An epistemic hazard this project has now hit twice
+
+**A test written from the same belief as the code it tests can only confirm that belief.** It feels
+like verification and is not; it is the belief being restated in a second file.
+
+The worked example is WP0 4.3's `create_immed` child version. The plan said the `wl_buffer` child is
+version 1. The code said version 1. **The unit test asserted version 1 and passed.** All three were
+wrong in the same way, because all three came from the same source — and `wl_buffer` really does only
+have a version 1, so the belief was *locally* true and merely irrelevant. Only S's real compositor
+knew that a Wayland child inherits its **parent's** version, and it said so by panicking.
+
+This is not an argument against unit tests; the same session's mutation-checked tests caught three
+real regressions. It is an argument about what a test can and cannot witness:
+
+- A test can witness **internal consistency** — that the code does what its author meant.
+- A test cannot witness **a fact about the world** the author did not know.
+
+The countermeasures this project already uses, and should keep using:
+
+- **Mutation-check every new assertion.** Break the implementation the test exists to forbid and
+  confirm *that* test fails and the others do not. It catches a test that asserts nothing — though,
+  note carefully, it would **not** have caught the version bug, because the mutation would have been
+  derived from the same wrong belief.
+- **Prefer a witness to an argument.** When a component's behaviour is in question, instrument it and
+  read what it says. The three-day `vkQueueSubmit` wall, the stale-frame misdiagnosis, and this
+  session's frame-callback stall were all settled by an instrument after theories had failed.
+- **Treat "no errors in the log" as evidence only about paths that can log.** §6.1.1's stall sat
+  behind four bare `return`s that reported nothing; the previous report's "no S-side replay errors"
+  was true and meant nothing.
 
 ## 7. Rules that bind any plan
 

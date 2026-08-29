@@ -76,7 +76,16 @@ TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/rayland-c1-target}"
 BIN="$TARGET_DIR/debug"
 SOCK="/tmp/rl-wp0.sock"                    # C-local vtest socket Mesa connects to (sun_path < 108)
 WL_SOCK="/tmp/rl-wp0-wayland.sock"         # C-local Wayland socket the app connects to instead of a compositor
-S_LOG="/tmp/rayland-s-wp0.log"
+
+# One directory per run, holding BOTH ends' logs. The event return path can only be diagnosed by diffing
+# what S emitted against what C delivered, and a diff needs two files -- terminal scrollback is not an
+# artifact anyone can re-examine, and this project has twice re-run an experiment because its output was
+# only ever printed. RUN_DIR is echoed at the end so the files can be found and committed.
+RUN_DIR="${RUN_DIR:-/tmp/wp0-run-$(date +%Y%m%d-%H%M%S)}"
+mkdir -p "$RUN_DIR"
+S_LOG="$RUN_DIR/rayland-s.log"
+C_LOG="$RUN_DIR/rayland-c.log"
+APP_LOG="$RUN_DIR/vkcube.log"
 
 # ---- Build (S builds both sides; C needs no toolchain) -------------------------------------
 echo "### building rayland-c (for C) and rayland-s (for S) ###"
@@ -108,7 +117,10 @@ trap cleanup EXIT
 # on screen and make "did the app's window appear?" ambiguous. The WP0 replay's window is the
 # one under test, and it does not go through that path at all.
 echo "### starting rayland-s on S (0.0.0.0:$PORT), WP0 replay armed ###"
-RAYLAND_C1_NO_PRESENT=1 RAYLAND_C1_S_LISTEN="0.0.0.0:$PORT" "$BIN/rayland-s" >"$S_LOG" 2>&1 &
+# RAYLAND_S_EVENT_LOG turns on the per-event return-path trace: every event S's compositor emits on a
+# replayed object, and whether it was emitted toward C, suppressed, or dropped. Drops report themselves
+# regardless of this switch; this adds the successful traffic, which is what makes the C diff possible.
+RAYLAND_S_EVENT_LOG=1 RAYLAND_C1_NO_PRESENT=1 RAYLAND_C1_S_LISTEN="0.0.0.0:$PORT" "$BIN/rayland-s" >"$S_LOG" 2>&1 &
 S_PID=$!
 sleep 3
 kill -0 "$S_PID" 2>/dev/null || { echo "rayland-s exited early:"; cat "$S_LOG"; exit 1; }
@@ -133,6 +145,7 @@ C_PID=$(ssh "$C_HOST" "
   RAYLAND_C1_S_ADDR=$S_IP:$PORT \
   RAYLAND_C1_SOCKET=$SOCK \
   RAYLAND_C1_WAYLAND_DISPLAY=$WL_SOCK \
+  RAYLAND_WP_LOG=1 \
   nohup /tmp/rayland-c >/tmp/rayland-c-wp0.log 2>&1 &
   echo \$!
 ")
@@ -151,10 +164,34 @@ APP_PID=$(ssh "$C_HOST" "
 ")
 sleep "$SECONDS_TO_RUN"
 
+# ---- Collect C's logs BEFORE the cleanup trap tears the session down -----------------------
+scp -q "$C_HOST:/tmp/rayland-c-wp0.log" "$C_LOG" 2>/dev/null || true
+scp -q "$C_HOST:/tmp/vkcube.log" "$APP_LOG" 2>/dev/null || true
+
 # ---- Report: the 4.3 bar is in S's log ------------------------------------------------------
 echo
 echo "############ S-side WP0 log ############"
-grep -E 'WP0|4\.3' "$S_LOG" | tail -40 || true
+grep -E 'WP0|4\.3' "$S_LOG" | grep -v '\[wp-event\]' | tail -40 || true
+
+# ---- The event witness: what S emitted vs what C delivered ---------------------------------
+# The question this answers without further reasoning: for each event S's compositor emitted, did it
+# reach the app, and if not, where did it stop? An `emit` on S with no `delivered` on C means the event
+# was lost on the link between them; a `drop:` on either end names the branch that discarded it.
+echo
+echo "############ event return path ############"
+echo "S: from-compositor $(grep -c 'wp-event.\[S\] from-compositor' "$S_LOG" || true) | \
+emit $(grep -c 'wp-event.\[S\] emit' "$S_LOG" || true) | \
+suppressed $(grep -c 'wp-event.\[S\] suppressed' "$S_LOG" || true) | \
+drops $(grep -c 'wp-event.\[S\] drop:' "$S_LOG" || true)"
+echo "C: delivered $(grep -c 'wp-event.\[C\] delivered' "$C_LOG" 2>/dev/null || echo 0) | \
+drops $(grep -c 'wp-event.\[C\] drop:' "$C_LOG" 2>/dev/null || echo 0)"
+echo
+echo "--- S emitted, by event (the app should have received each of these) ---"
+grep -oP 'wp-event.\[S\] emit .*? \K[a-z_0-9]+\.[a-z_#0-9]+' "$S_LOG" | sort | uniq -c | sort -rn || true
+echo "--- C delivered, by event ---"
+grep -oP 'wp-event.\[C\] delivered .*? \K[a-z_0-9]+\.[a-z_#0-9]+' "$C_LOG" 2>/dev/null | sort | uniq -c | sort -rn || true
+echo "--- every drop, both ends (each one is an event the app never saw) ---"
+grep -h 'wp-event.\[[SC]\] drop:' "$S_LOG" "$C_LOG" 2>/dev/null | sed -E 's/ s_obj=[0-9]+//' | sort | uniq -c | sort -rn | head -20 || true
 echo
 echo "############ verdict ############"
 BUILT=$(grep -c 'WP0 4.3: built wl_buffer' "$S_LOG" || true)
@@ -167,6 +204,8 @@ if [ "$BUILT" -gt 0 ] && [ "$PROTO" -eq 0 ]; then
   echo "PASS (4.3): S built a real wl_buffer from a relayed token, with no protocol error."
   echo "            Whether the cube APPEARED is 4.5 and is a separate observation."
 else
-  echo "NOT YET (4.3): see $S_LOG on S and /tmp/rayland-c-wp0.log, /tmp/vkcube.log on $C_HOST."
+  echo "NOT YET (4.3): see the logs in $RUN_DIR."
   exit 1
 fi
+echo
+echo "logs for this run: $RUN_DIR"
