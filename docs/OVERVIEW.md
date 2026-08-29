@@ -309,7 +309,10 @@ reason against rather than re-deriving.
 | Feedback-arm failures | **1 in 92** runs, vs 0 in 20 without — *not* a significant difference |
 | `VK_ERROR_DEVICE_LOST` on `vkQueueSubmit` | NVIDIA RTX A500 **7/14** runs lost; Intel Iris Xe **0/10** |
 | Teardown `SIGABRT` (libepoxy, from `virgl_renderer_cleanup`) | was ~21%, **fixed** |
-| **WP0 return traffic, before / after excluding presented buffers** | **105.25 MB → 184 KB** over ~60 s (~877 KB → ~1.9 KB per frame): **571×** |
+| **WP0 return traffic, presented-buffer exclusion off / on** | **307,776 B → 219 B per frame: 1,406×** (5 frame-matched runs a side, A/B inside one binary) |
+| WP0 forward traffic, same A/B | 3,723 B → 3,594 B per frame — **1.04×, i.e. unchanged** |
+| **WP0 end-to-end failure rate** | **59/60 runs clean**; the one failure is a teardown artefact of the definition, so **0 genuine defects in 60** |
+| WP0 frame rate, 20 s runs against headless weston | 261–489 attaches (median 438) = **13–24 fps** |
 
 **Frame time is the synchronous round trip.** With feedback off the app implements `vkWaitForFences`
 by polling `vkGetFenceStatus`, and *every poll is a full C→S→execute→reply→C cycle*. It is not
@@ -558,6 +561,50 @@ whether pixels were crossing the wire, and the answer was one measurement away.
 
 **Not claimed:** any frame rate, any failure rate, or that presentation is correctly paced or
 tear-free. The commit gate remains untouched and this is a handful of runs.
+
+### 6.1.3 WP0 measured, and two defects a second application found — 2026-08-30
+
+**The numbers now come from repetition rather than a pair of runs** (`scripts/wp0-soak.sh`, data in
+`docs/data/2026-08-30-wp0-rate-and-traffic/`).
+
+- **Rate: 59 of 60 runs clean.** The single failure is an artefact of the failure *definition*: two
+  events dropped during the application's final teardown, for objects it had legitimately destroyed,
+  immediately before "session ended cleanly". So **0 genuine defects in 60 runs** — but the definition
+  needs a teardown guard before that number means what it appears to.
+- **Throughput:** 261–489 attaches per 20 s run (median 438) = 13–24 fps, no liveness failure.
+- **Traffic, A/B'd inside one binary:** S→C **307,776 → 219 B/frame (1,406×)**; C→S **3,723 → 3,594
+  B/frame (1.04×)**. The unexplained C→S rise in the 2026-08-29 report **was not an effect** — it came
+  from comparing a 120-frame run against a 96-frame one. Both of that day's traffic figures were
+  uncontrolled comparisons.
+- **The recycled-id fix is load-bearing, not an edge case:** one 20-second run declined **470** stale
+  destroys.
+
+**The soak must run against headless weston, not the desktop, and this is not incidental.** A
+compositor emits frame callbacks only for surfaces it composites, so a desktop soak scores every
+blank, lock and workspace switch as a liveness failure. Three things are required and each was learned
+by getting it wrong: the **GL renderer** (pixman cannot import a dma-buf), **`__EGL_VENDOR_LIBRARY_FILENAMES`
+pinned to Mesa** (weston's EGL otherwise composites on the NVIDIA card while frames render on Intel),
+and **`--idle-time=0`** (weston stops compositing after 300 s, which looks exactly like the application
+stalling — the second time in two days a compositor declining to draw was mistaken for a Rayland bug).
+
+**Two open defects, found by running a second application (`vkgears`) and NOT fixed:**
+
+1. **A bind capped on S is not propagated to its children.** `handle_bind` correctly caps a bind at the
+   version S advertises, but objects created from that global still carry the version **C** stamped —
+   the application's. A Wayland child inherits its parent's version, so the first `get_xdg_surface`
+   panics with `expected version 5 but got 6`. **This is the third instance of the version-inheritance
+   rule** (§6.4), and the first where S's own capping creates the mismatch. vkcube never exposed it
+   because nothing was ever capped for it.
+2. **`catch_unwind` around `send_request` does not save the session.** It catches the panic and logs
+   "request dropped, session continues" — then the process **segfaults**, because the panic occurred
+   with the `maps` mutex held, poisoning it, and the next
+   `.expect("the WP0 id maps lock is never poisoned")` finds it poisoned. The comment is false and the
+   reassuring log line is worse than silence.
+
+**`rayland-icosa-window` cannot run over WP0, correctly.** It presents via `wl_shm`, which the proxy
+does not advertise, and refuses cleanly. `wl_shm.create_pool` passes a file descriptor — which cannot
+cross a network — and its contents are pixels, ~1 MB/frame, exactly what the presented-buffer
+exclusion removed. It is a `wl_shm` client; WP0 is a dmabuf mechanism.
 
 ## 6.2 The cheapest queued experiment — needs both machines
 

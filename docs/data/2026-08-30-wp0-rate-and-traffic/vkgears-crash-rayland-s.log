@@ -1,0 +1,18 @@
+rayland-s: listening on 0.0.0.0:9409, rendering on /dev/dri/renderD128
+rayland-s: C connected
+rayland-s: WP0 replay connected to S's compositor (20 globals advertised)
+rayland-s: WP0 replay bound `wl_compositor` v1 (app obj 4)
+rayland-s: WP0 replay: S's compositor advertises no `wl_seat`; bind skipped
+rayland-s: WP0 replay: request for unmapped object 5 (opcode 1); skipped
+[wp-event][S] map s_obj=4 app_obj=6 (from obj 4 opcode 0)
+rayland-s: WP0 replay bound `xdg_wm_base` v5 (app obj 12)
+rayland-s: WP0 replay bound `wl_compositor` v4 (app obj 8)
+rayland-s: WP0 replay: S's compositor advertises no `wl_seat`; bind skipped
+
+thread 'main' (2720968) panicked at /home/roland/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wayland-backend-0.3.15/src/rs/client_impl/mod.rs:367:25:
+Error when sending request xdg_wm_base@5.get_xdg_surface: expected version 5 but got 6
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+rayland-s: WP0 replay: send_request (obj 12 opcode 2) panicked — likely a translation bug; request dropped, session continues
+
+thread 'main' (2720968) panicked at /home/roland/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wayland-backend-0.3.15/src/rs/client_impl/mod.rs:115:30:
+called `Result::unwrap()` on an `Err` value: PoisonError { .. }

@@ -4779,3 +4779,93 @@ tests were green through all of it.
 rendered by another machine's GPU, animating in its own window on that machine's screen, with commands
 crossing the network and **pixels no longer doing so**. Not claimed: any frame rate, any failure rate,
 pacing or tear-freedom — the commit gate is still untouched and this is a handful of runs.
+
+### 2026-08-30 — Numbers instead of adjectives: a rate, a traffic A/B, and a crash the second application found
+
+The brief was to apply yesterday's hazard — *a claim in a comment is not a measurement* — to yesterday's
+own claims. It did, and then the day produced three findings nobody planned for.
+
+**The compositor is a participant in this measurement, and I keep forgetting it.** A soak cannot run
+on the desktop: a compositor emits frame callbacks only for surfaces it composites, so every blank,
+lock and workspace switch would score as a liveness failure. `cosmic-comp` has no headless backend, so
+headless weston it is — and the brief's uncertainty (can it import a dma-buf?) resolves **yes**: GL
+renderer, "dmabuf support: modifiers", 801 attaches in 40 s with zero errors.
+
+Two things had to be forced, and the second cost an hour. Weston's EGL picks the **NVIDIA** card by
+default while `rayland-s` renders on Intel, making every import cross-GPU; pinning
+`__EGL_VENDOR_LIBRARY_FILENAMES` to Mesa fixes that. And weston **idles out after 300 s and stops
+compositing**. Without `--idle-time=0` my first runs did 400+ attaches and every later one did exactly
+**1** — S's log showing the frame callback simply never arriving. I spent a while suspecting the
+relay. That is the *second time in two days* a compositor declining to draw has been mistaken for a
+Rayland defect, and I did not recognise the pattern the second time either.
+
+**The rate: 60 runs, 59 pass, 1 fail.** Attaches per 20 s run ranged 261–489 (median 438), so 13–24
+fps with no liveness failure anywhere.
+
+The one failure is the interesting part, and it is **my failure definition's fault, not the code's**.
+Run 13 dropped two events — and both landed *during the application's final teardown*, after every
+object had been legitimately destroyed and immediately before "session ended cleanly". S had events in
+flight for objects the app had finished with. That is benign, and scoring it as a failure is the
+definition quietly measuring the wrong thing. So: **as defined, 1 in 60; on inspection, 0 genuine
+defects in 60**, and the definition needs a teardown guard before the number means what it looks like.
+
+That same run also shows my recycled-id fix working **470 times** — 470 stale destroys correctly
+declined in twenty seconds. It is not a rare edge case being guarded; it is load-bearing every frame.
+
+**The C→S question, answered by A/B rather than argument.** Five runs a side, frame-matched, with the
+exclusion switched inside one binary:
+
+| per frame | exclusion ON | exclusion OFF |
+|---|---:|---:|
+| C→S | **3,594 B** (3,509–3,708) | **3,723 B** (3,671–3,758) |
+| S→C | **219 B** (211–5,058) | **307,776 B** (306,299–309,172) |
+
+C→S ratio **1.04×** — inside either arm's spread. So the 2.5×-per-frame rise yesterday's report could
+not explain **was never an effect**: it came from comparing a 120-frame run against a 96-frame one and
+dividing. The return-path saving, measured properly, is **1,406×**, where the unmatched pair said 571×.
+Both of yesterday's traffic numbers were wrong in the same way — not by much, and not in a direction
+that flattered us, but wrong because the comparison was not controlled.
+
+One exclusion-ON run in five shipped ~1 MB where the others shipped ~50 KB: about one frame's worth,
+consistent with the swapchain being written before `create_immed` claims the resource. Reported with
+the spread rather than smoothed away.
+
+**Then the owner asked about our own icosa demo, and that question was worth more than the soak.**
+
+`rayland-icosa-window` cannot go over WP0, and the reason is structural rather than a bug: it presents
+via **`wl_shm`**, and the C proxy advertises no such global. It refuses cleanly —
+`wl_shm unavailable: the requested global was not found in the registry`, exit 0, `rayland-s`
+untouched. That is the correct outcome: `wl_shm.create_pool` passes a file descriptor, which cannot
+cross a network, and if it *were* proxied its contents are literally pixels — a megabyte a frame,
+exactly the traffic removed the day before.
+
+But the question prompted the better experiment: **`vkgears`**, a real second Vulkan WSI client, was
+sitting on apollo unused. It **crashes `rayland-s`**, and it took thirty seconds to find.
+
+```
+bound global xdg_wm_base v6 -> object 12            (C advertises the descriptor max)
+WP0 replay bound `xdg_wm_base` v5 (app obj 12)      (weston offers v5, so the bind is capped)
+panicked: xdg_wm_base@5.get_xdg_surface: expected version 5 but got 6
+```
+
+`handle_bind` correctly caps a bind at what S advertises. But the *children* created from that global
+still carry the version **C** stamped, which is the app's, not the capped one — and a Wayland child
+inherits its parent's version. **This is the third time the version-inheritance rule has bitten this
+project**, and the first where S's own capping creates the mismatch. vkcube never exposed it because
+nothing was ever capped for it.
+
+And underneath that, a worse one. The `catch_unwind` caught the panic and logged *"request dropped,
+session continues"* — and then the process **segfaulted**, because the panic happened while the `maps`
+mutex was held, poisoning it, and the very next `.expect("the WP0 id maps lock is never poisoned")`
+found it poisoned. The comment is false, the reassuring log line is worse than silence, and the
+protection I have been relying on since the token task does not actually protect anything. Yesterday's
+hazard, in code rather than in prose.
+
+**Neither is fixed here**, per the brief: this was a measurement session. Both are the next task, and
+they are better specified for having been found by an application rather than by reasoning.
+
+**Deviations reported:** I installed `weston` (4 packages, nothing removed; `sudo apt remove weston`
+undoes it) — the brief assumed it was present. And `vkcube --c N`, the obvious way to fix a frame
+count, **stalls at a single attach** under this path while the same binary free-running sustains ~20
+fps; the harness imposes the count itself by watching C's request trace instead. That `--c` behaviour
+is a real observation and is recorded, not chased.
