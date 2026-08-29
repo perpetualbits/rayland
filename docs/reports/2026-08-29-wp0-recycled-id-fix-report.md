@@ -125,3 +125,38 @@ photograph**. That observation may need a human at the screen.
 | The `pending` half of the fix | No symptom was ever observed; it is guarded by reasoning and the same identity rule, not by a test |
 | Pacing / tearing | Still untouched; the commit gate is still out of scope |
 | Any rate | Five runs |
+
+---
+
+## Addendum, same day — §7's question is answered: **window present, not visible**
+
+The split §7 asked for is settled, and it is the second branch.
+
+**A window exists and is mapped in every run, including the one-frame ones.** All six runs delivered
+`wl_keyboard.enter` to the app — a compositor only gives keyboard focus to a **mapped** surface — each
+followed by a `wl_keyboard.leave`. So "no window" is ruled out without needing a photograph.
+
+**But the window is not on screen.** A sixth run (10 attaches, 10 `wl_callback.done`, the *animating*
+case) was photographed at 22 s while the app was live: **no vkcube window anywhere in the full-screen
+capture** — the desktop showed only the machine owner's other windows. The screenshot portal recovered
+for this run, so this is direct evidence rather than inference.
+
+**So the picture is:** the surface is mapped, is briefly given keyboard focus, then loses it, and is
+**not composited on the visible workspace** — and a compositor emits frame callbacks only for surfaces
+it actually draws. That accounts for both observed shapes: zero callbacks when it is never drawn, and
+a handful when it briefly is. It also explains the run-to-run variance, which never fitted anything in
+the relay.
+
+**Most likely mechanism, untested:** COSMIC places the new toplevel on a **different workspace** (or
+fully behind the full-screen terminals), so it is mapped but never drawn. The earlier session that
+photographed the cube successfully is the case where it happened to land visibly.
+
+**What this means for WP0:** the remaining stall is very likely **not a Rayland defect at all** — it is
+correct compositor behaviour toward a window nobody is looking at. The next step is to make the window
+land somewhere visible and watch it, rather than to debug the relay: run with the target workspace
+empty and focused, or set an app id / use a compositor rule to place it, then re-measure whether frames
+continue for as long as it stays visible.
+
+**Not claimed:** that this is the *whole* explanation. In the 9-frame run the app also stopped asking
+for frames with only 2 `wl_buffer.release` for 9 attaches, and buffer release is likewise tied to
+compositing. Whether that resolves once the window is genuinely visible is the measurement to take.
