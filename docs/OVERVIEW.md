@@ -278,7 +278,7 @@ fully supersedes it.
 | C0 · Venus first light — unmodified app via Mesa's Venus ICD, PNG bit-identical to native | **done** |
 | (c)1 · The network | **done** |
 | (c)2 · Mapped memory and the readback return path | **done** |
-| **WP0 · Wayland proxy first light** | **ACTIVE — the live front** |
+| **WP0 · Wayland proxy first light** | **ACTIVE** — 4.3 and 4.5 done; commit gating and hardening remain |
 | (c)3 · Content-addressed assets | planned |
 | (c)4 · Real/complex applications; GL via Zink | planned |
 | SP4 · Adaptive L3, session/security (SSH bootstrap, sandboxing) | planned |
@@ -309,6 +309,7 @@ reason against rather than re-deriving.
 | Feedback-arm failures | **1 in 92** runs, vs 0 in 20 without — *not* a significant difference |
 | `VK_ERROR_DEVICE_LOST` on `vkQueueSubmit` | NVIDIA RTX A500 **7/14** runs lost; Intel Iris Xe **0/10** |
 | Teardown `SIGABRT` (libepoxy, from `virgl_renderer_cleanup`) | was ~21%, **fixed** |
+| **WP0 return traffic, before / after excluding presented buffers** | **105.25 MB → 184 KB** over ~60 s (~877 KB → ~1.9 KB per frame): **571×** |
 
 **Frame time is the synchronous round trip.** With feedback off the app implements `vkWaitForFences`
 by polling `vkGetFenceStatus`, and *every poll is a full C→S→execute→reply→C cycle*. It is not
@@ -365,7 +366,7 @@ cross the network.**
 | 4.2 — S router, persistent Wayland client, object-id map, session replay | done |
 | **4.3 — token → `wl_buffer`** | **DONE and verified over the real network, 2026-08-29** — S builds real `wl_buffer`s from relayed tokens (4 of 4 swapchain images, no protocol error) |
 | 4.4 — event return path (eventfd wakeup, `send_event`, `S2C::WaylandEvent`, `configure`) | **genuinely working** — measured: vkcube receives both `configure`s through the tunnel and **acks** them |
-| 4.5 — end-to-end: vkcube's spinning cube on S's screen | **Half reached.** The cube *is* on dop561's screen, rendered by S's GPU from an app on apollo — but it is a **still frame**, not spinning. Cause found; see below |
+| 4.5 — end-to-end: vkcube's spinning cube on S's screen | **REACHED 2026-08-29**, confirmed by a human watching the screen — and with **pixels no longer crossing the network** (S→C fell 571×). See §6.1.2 |
 
 **4.3 part 2 is the immediate next piece of work.** Its shape turned out smaller and different from
 the plan's decomposition: **C's half was already complete** (the `params.add` handler resolves the
@@ -503,55 +504,62 @@ attach to 9 attaches / 9 frame requests / 10 commits. But three captures six sec
 differ by **0 pixels of 202,500** — because the app had done all nine attaches within ~18 s and
 every photograph came after it stopped. See §6.1.2.
 
-### 6.1.2 The stall after the recycled-id fix — the current wall, 2026-08-29
+### 6.1.2 WP0 reaches end-to-end — and the pixel stream that was hiding behind it
 
-**Five runs.** Four got **one** frame with S's compositor emitting **zero** `wl_surface.frame`
-callbacks at all. The fifth got nine, and then the app stopped *asking* — no tenth `frame` request —
-having received only **2 `wl_buffer.release` events for 9 attaches**.
+**Reached 2026-08-29, confirmed by a human watching the screen.** An unmodified `vkcube` runs on
+apollo, is rendered by dop561's GPU, and **spins in its own window on dop561's screen**. Two defects
+stood between the recycled-id fix and that result, and the second is the more important.
 
-Both shapes point outside anything Rayland relays: **a compositor emits a frame callback only when it
-actually composites the surface, and releases a buffer only when it stops using one.** Zero callbacks
-means S's compositor is not drawing the replayed surface. The run-to-run variance fits window
-placement and visibility rather than the relay, and the one run that animated is the one whose window
-was photographed and visibly on screen.
+**1. The vanishing window — a cached handle to a destroyed object.** `WaylandReplay` recorded the
+S-side `ObjectId` of the `zwp_linux_dmabuf_v1` global at the moment the *application* bound it. The
+application binds that global repeatedly while probing formats — **twelve times** in one measured run
+— and **destroys each one**. The cached id therefore named a dead object as soon as the app moved on:
+every later `create_params` failed with `Invalid ObjectId`, so no `wl_buffer` existed, so the app's
+`attach` failed too — and **a `wl_surface` with no valid buffer is unmapped by definition**, so the
+compositor removed the window from the screen while the application carried on unaware.
 
-**That is a hypothesis with an obvious test, deliberately not run yet.** The first thing the next
-session needs is the observation that splits it: in a one-frame run, is there **no window**, or a
-**window present but never composited**? Note `cosmic-screenshot` became unresponsive partway through
-this session — it worked for the early runs then hung past a 30 s timeout — so that observation may
-need a human at the screen.
+S now binds **its own** dmabuf global, once, and never destroys it: it needs *a* factory, not the
+application's factory. This is §6.4's identifier hazard in its second form — *a handle you cached is
+not a handle you still have* — and it was introduced in `rayland-s` on the same day its twin was fixed
+in `rayland-c`.
 
-**Two other findings from the same run, neither implicated in the stall:**
+**2. S was shipping every rendered frame back to C.** Measured with C's own per-channel counters, same
+workload before and after, ~60 s per run:
 
-- `wl_keyboard.keymap` is dropped on S (`drop:carries-fd`) — it carries a file descriptor, which
-  cannot cross the network. The app does not block on it, but no relayed application will ever have a
-  keymap until it gets a token-style substitution like the buffer path did.
-- Of 1004 events S's compositor emitted, **960 were the deliberately suppressed dmabuf
-  `format`/`modifier` pair**. That suppression is correct and documented, but it means the return path
-  is ~96% traffic that exists only to be discarded.
+| | Before | After |
+|---|---:|---:|
+| C→S total (commands) | 804,814 B | 1,626,138 B |
+| **S→C total** | **105,254,034 B** | **184,311 B** |
+| **S→C per frame** | **~877 KB** | **~1.9 KB** |
 
-**Two recorded reversals to be aware of when planning here.**
+A 500×500×4 frame is 1,000,000 bytes. That is a **frame-sized payload per frame, crossing the network
+to a machine with no display**, where nothing consumed it — in the project whose entire thesis is that
+pixels do not cross the network.
 
-*First, the zero-copy question.* Task 4.0 concluded "zero-copy is structurally unreachable; take the
-readback→`wl_shm` path", reasoning from virglrenderer source that guest blobs have no host fd.
-**That was wrong** and is left in place per the honesty rule: it conflated C's local placeholder
-memfd with the *S-side* resource. Task 4.0-bis overturned it with two source reads plus an empirical
-run — Venus requests the swapchain image as `HOST3D` with `VkExportMemoryAllocateInfo{DMA_BUF}`
-**unconditionally**, and on S resources 4–7 exported `fd_type=1` (DMABUF). **WP0 presentation is
-zero-copy dma-buf.** The surviving build note is 4.3 part 1's reason for existing: the export happens
-**once at blob creation**, so the descriptor must be retained, not re-requested.
+**The mechanism.** The (c)2 return path ships back whatever S's GPU wrote into any blob. That is
+correct for a **readback** — an application that maps a GPU-written buffer and reads it — and it has no
+way to distinguish that from a **swapchain image**, which the application only ever *shows*. Only the
+WP0 token path knows which is which. So it now says: building a `wl_buffer` from a resource marks that
+resource **presented**, and presented resources are excluded from the return path exactly as rings
+already are. **571× less return traffic.**
 
-*Second, the wall that blocked 4.3 for days.* The `WaylandArg::Buffer(_)` arm was at one point simply
-**unreachable** — vkcube died after binding `zwp_linux_dmabuf_v1`, never calling `create_params`.
-Once past that it was reachable but blocked behind a `vkQueueSubmit` that "did not decode". An
-enormous elimination followed (ring proven byte-exact over 253 deltas with independent
-double-implemented fingerprints; every app blob byte-identical; the staging pool exonerated
-experimentally) — and the answer was **outside Rayland entirely**: `VK_ERROR_DEVICE_LOST`, NVIDIA-
-specific. Two claims made along the way are explicitly marked **measured false** in the project map
-and diary. The lesson the project drew, and which should shape plans here, is stated in the diary as:
-**make the components say what they are doing, rather than reasoning about which is at fault.**
+The exclusion is narrow by construction — an offscreen fixture never populates the set, so the (c)2
+readback path is untouched and its GPU loopback e2e still passes. **Known limit, written into the code
+rather than left implicit:** an application that both *presents* a buffer and *reads it back* would now
+be denied the readback. None is known here, since a presented swapchain image is `DEVICE_LOCAL` and
+never mapped.
 
-### 6.2 The cheapest queued experiment — needs both machines
+**Why it survived so long, which is the part worth learning from.** The display was *already* correct:
+S's compositor imports S's own dma-buf, and no pixel is needed to make the window appear. The waste had
+**no symptom**. Every test passed. The demo looked exactly like the thesis working. And
+`scripts/wp0-vkcube-two-machine.sh`'s own header asserted "**No pixels cross the network**" — a claim
+that was false on every run. It was found only because the repository owner, watching the demo, asked
+whether pixels were crossing the wire, and the answer was one measurement away.
+
+**Not claimed:** any frame rate, any failure rate, or that presentation is correctly paced or
+tear-free. The commit gate remains untouched and this is a handful of runs.
+
+## 6.2 The cheapest queued experiment — needs both machines
 
 ```
 TRIES=400 VN_PERF_SETTING=no_multi_ring,no_fence_feedback scripts/soak-failure-rate.sh
@@ -618,6 +626,11 @@ The countermeasures this project already uses, and should keep using:
   remove **by identity**, never by number, because cleanup runs late and the slot may already have a
   new, live owner. The general form: *an identifier that is reused is not an identity, and code that
   treats it as one is correct only until something dies.*
+- **A claim in a comment is not a measurement.** `scripts/wp0-vkcube-two-machine.sh`'s header asserted
+  "No pixels cross the network" while the running system shipped ~877 KB per frame across it, and
+  `CLAUDE.md` repeated the claim. Nothing was lying; the sentence described the *design*, and no test
+  distinguished design from behaviour. Where a document states a quantity — no pixels, zero copies,
+  bounded memory — something must **measure** it, or it is a wish with good grammar.
 - **Treat "no errors in the log" as evidence only about paths that can log.** §6.1.1's stall sat
   behind four bare `return`s that reported nothing; the previous report's "no S-side replay errors"
   was true and meant nothing.

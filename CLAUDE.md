@@ -457,11 +457,14 @@ effort goes next:
   C rather than to a compositor, its `wl_surface`/`xdg_toplevel` requests are relayed to S's real
   compositor, and the one thing that cannot cross a network — the swapchain `wl_buffer`'s fd — is
   replaced by a **`BufferToken`** naming the S-side resource the command relay already rendered. **No
-  pixels cross the network.** Presentation is **zero-copy dma-buf**: Venus requests the swapchain
+  pixels cross the network** — a claim that was *false in practice* until 2026-08-29, when it was finally
+  measured: the (c)2 return path was shipping every presented frame back to C at ~877 KB/frame, because it
+  cannot tell a swapchain image from a readback. Presented resources are now excluded and S→C fell 571×, to
+  ~1.9 KB/frame. The display was always zero-copy, so the waste had no symptom and every test passed. Presentation is **zero-copy dma-buf**: Venus requests the swapchain
   image as `HOST3D` with `VkExportMemoryAllocateInfo{DMA_BUF}` unconditionally, so the S-side
   resource really does export a compositor-importable dma-buf (measured: `fd_type=1`). Note Task 4.0
   first concluded the opposite and was **overturned by Task 4.0-bis**; both are left in the plan.
-  **State:** 4.1 (C-side wiring) and 4.2 (S router, replay, object-id map) done; **4.4 (the event
+  **State (2026-08-29): 4.3 and 4.5 DONE — an unmodified vkcube on C spins in its own window on S's screen, confirmed by a human watching it, with pixels no longer crossing the wire.** 4.1 (C-side wiring) and 4.2 (S router, replay, object-id map) done; **4.4 (the event
   return path) genuinely works** — vkcube receives both `configure` events through the tunnel and
   acks them; **4.3 is the open piece** — C's half is complete, S part 1 (retaining each blob's
   exported dma-buf descriptor, which `mem->exported` permits exactly once, at creation) is landed,

@@ -4717,3 +4717,65 @@ took one exchange. The lesson is not new; the failure was in not applying it soo
 global that is *live at the moment a token arrives*, and the app binds and destroys many of them, so
 "remember the latest bind" is the wrong shape rather than a wrong line. That deserves specifying
 properly rather than a quick patch at the end of a long session.
+
+### 2026-08-29 (night) — WP0 works: the cube turns on S's screen, and the pixel stream that nobody noticed
+
+Two fixes and a measurement, and at the end of them an unmodified `vkcube` runs on apollo, is drawn by
+dop561's GPU, and **spins in its own window on dop561's screen** — confirmed by a human watching it,
+which is the only confirmation that counts for this claim.
+
+**Fix one: the vanishing window.** `WaylandReplay` cached the S-side `ObjectId` of the
+`zwp_linux_dmabuf_v1` global at the moment the *application* bound it. The application binds that
+global repeatedly while probing formats — twelve times in one run — and destroys each one, so the
+cached id named a corpse as soon as the app moved on. Every later `create_params` failed
+`Invalid ObjectId`; with no params object there is no `wl_buffer`; the app's `attach` then failed too;
+and a `wl_surface` with no valid buffer is unmapped **by definition**, so the compositor took the
+window off the screen while the application carried on unaware.
+
+S now binds **its own** dmabuf global, once, and never destroys it. It needs *a* factory, not the
+application's factory. That is the recycled-id lesson in its other form — *a handle you cached is not a
+handle you still have* — and I introduced it in `rayland-s` on the same day I fixed its twin in
+`rayland-c`, without recognising the pattern.
+
+**Fix two, and this is the one that matters.** With the cube finally turning, the owner asked a
+question I had not thought to ask: *"We are cheating now, if I understand correctly; because pixels are
+now crossing the wire, true?"*
+
+They were right, and it took one measurement to find out:
+
+| | Before | After |
+|---|---:|---:|
+| C→S (commands) | 805 KB | 1.63 MB |
+| **S→C** | **105.25 MB** | **184 KB** |
+| **S→C per frame** | **~877 KB** | **~1.9 KB** |
+
+A 500×500×4 frame is 1,000,000 bytes. **S was shipping every rendered frame back to C** — a machine
+with no display, where nothing consumed the bytes at all.
+
+The mechanism is almost tidy in its wrongness. The (c)2 return path ships back whatever S's GPU wrote
+into any blob, which is exactly right for a *readback* — an application that maps a GPU-written buffer
+and reads it — and it has no way to tell that apart from a *swapchain image*, which the application
+only ever shows. Only the WP0 token path knows which is which. So it now says so: building a
+`wl_buffer` from a resource marks it presented, and presented resources are excluded from the return
+path exactly as rings already are. 571× less traffic.
+
+**Why this sat there unseen is the interesting part.** The display was *already* correct — S's
+compositor imports S's own dma-buf, and no pixel is needed to make the window appear. So the waste had
+no symptom. Every test passed. The demo looked like the thesis working. And the script header I wrote
+myself says "**No pixels cross the network**", which was false in practice every time it ran. A claim
+in a comment is not a measurement, and this project has now been caught by that twice in one day.
+
+**On how this went, honestly.** The owner was on a roof and kept coming in to look at the screen. In
+one afternoon their glances overturned two of my conclusions: that the window was "mapped but never
+composited" (built on a single screenshot — it was visible, they saw it), and that the demo was
+finished (it was shipping a megabyte a frame). I had written, that same afternoon, *when the missing
+evidence is something a person can simply see, ask the person* — and then did not, twice. The lesson is
+not new. The failure was in not applying it.
+
+Their last message is worth keeping in the record: *"Glad I pushed you to do this demo."* So am I. The
+tests were green through all of it.
+
+**Where WP0 stands.** 4.3 done and 4.5 **reached**: an unmodified Vulkan application on one machine,
+rendered by another machine's GPU, animating in its own window on that machine's screen, with commands
+crossing the network and **pixels no longer doing so**. Not claimed: any frame rate, any failure rate,
+pacing or tear-freedom — the commit gate is still untouched and this is a handful of runs.
