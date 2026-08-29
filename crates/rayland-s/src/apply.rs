@@ -290,6 +290,23 @@ pub struct Applier {
     /// `vkSetReplyCommandStreamMESA` to learn its `res_id` is **silently unsound**, because the reply
     /// pool mints a new id when it grows. So the choice is this coarse split or no ordering at all.
     venus_internal: std::collections::HashSet<u32>,
+    /// Resources WP0 has turned into a real `wl_buffer` on S's compositor — **presentation buffers**.
+    ///
+    /// # Why these must never be shipped back to C
+    /// A presented resource lives on S, is rendered by S's GPU, and is imported by S's compositor
+    /// straight from S's own dma-buf. **C has no use for its contents and no display to put them on.**
+    /// Shipping them anyway is what the return path did until 2026-08-29, and it was measured at
+    /// ~877 KB per frame for a 500x500 window — a *pixel stream crossing the network* in a project
+    /// whose entire thesis is that pixels do not cross the network. The display was already correct and
+    /// zero-copy; the bytes were pure waste, invisible because nothing consumed them.
+    ///
+    /// The exclusion is deliberately narrow: only resources the WP0 token path has actually claimed.
+    /// An offscreen fixture never populates this set, so the (c)2 readback path is untouched.
+    ///
+    /// **Known limit:** an application that both *presents* a buffer and *reads it back* would now be
+    /// denied the readback. No such application is known here — a presented swapchain image is
+    /// `DEVICE_LOCAL` and never mapped — but the assumption is written down rather than left implicit.
+    presented: std::collections::HashSet<u32>,
     /// The context C created, remembered because [`C2S::CreateBlob`] does not carry one and
     /// `RenderEngine::create_blob_resource` needs one. `None` until [`C2S::CreateContext`] arrives.
     ctx_id: Option<u32>,
@@ -899,6 +916,8 @@ impl Applier {
                 // a descriptor naming it is of no further use and holding it would leak a file-table
                 // entry for the rest of the session.
                 self.exported_fds.remove(&res_id);
+                // The resource is gone; so is any claim WP0 had on it as a presentation buffer.
+                self.presented.remove(&res_id);
                 self.rings.remove(&res_id);
                 // Forget the send-order classification too. virglrenderer is free to hand the same
                 // `res_id` to a later blob, and a leftover entry here would silently sort a fresh
@@ -1363,7 +1382,11 @@ impl Applier {
             .blobs
             .keys()
             .copied()
-            .filter(|id| !self.rings.contains_key(id) && self.venus_internal.contains(id))
+            .filter(|id| {
+                !self.rings.contains_key(id)
+                    && self.venus_internal.contains(id)
+                    && !self.presented.contains(id)
+            })
             .collect();
         // The reply arena keeps the fine byte grain (gap 0): it is small, and shipping a byte
         // S did not write there could clobber the application's — the grain's whole reason to exist.
@@ -1390,6 +1413,14 @@ impl Applier {
     /// - `None` if the resource was never created, or has been unref'd — both of which a correct
     ///   caller may see, since a token can outlive its resource if the application destroys the
     ///   swapchain while a frame is in flight.
+    /// Record that WP0 built a `wl_buffer` from `res_id`, so its bytes stop crossing the network.
+    ///
+    /// Idempotent — a swapchain image is presented every frame and this is called each time. See the
+    /// [`Self::presented`] field for why the exclusion exists and what it assumes.
+    pub fn note_presented(&mut self, res_id: u32) {
+        self.presented.insert(res_id);
+    }
+
     pub fn exported_fd(&self, res_id: u32) -> Option<BorrowedFd<'_>> {
         self.exported_fds.get(&res_id).map(|fd| fd.as_fd())
     }
@@ -1492,7 +1523,12 @@ impl Applier {
         let mut ids: Vec<(u32, u64)> = self
             .blobs
             .iter()
-            .filter(|(id, _)| !self.rings.contains_key(id) && !self.venus_internal.contains(id))
+            .filter(|(id, _)| {
+                // Presented buffers are excluded for the same reason rings are: they are not C's news.
+                !self.rings.contains_key(id)
+                    && !self.venus_internal.contains(id)
+                    && !self.presented.contains(id)
+            })
             .map(|(&id, blob)| (id, blob.size()))
             .collect();
         // Largest first — the readback buffer (megabytes) must lead the feedback word (bytes) so the

@@ -49,6 +49,8 @@ impl ExportedFdSource for NoExports {
     fn dup_exported_fd(&self, _resource_id: u32) -> Option<OwnedFd> {
         None
     }
+    // No buffer is ever built in these tests, so nothing is ever presented.
+    fn note_presented(&self, _resource_id: u32) {}
 }
 
 #[test]

@@ -455,6 +455,15 @@ struct ApplierFdSource {
 }
 
 impl ExportedFdSource for ApplierFdSource {
+    fn note_presented(&self, resource_id: u32) {
+        // Same lock discipline as `dup_exported_fd`: take it, record, release — never held across a
+        // compositor round trip.
+        self.applier
+            .lock()
+            .expect("the applier lock is never poisoned")
+            .note_presented(resource_id);
+    }
+
     fn dup_exported_fd(&self, resource_id: u32) -> Option<OwnedFd> {
         // Lock, borrow, duplicate, release — all three inside this expression, so nothing downstream can
         // hold the applier while talking to the compositor.

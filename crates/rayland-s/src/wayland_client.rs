@@ -144,6 +144,18 @@ const NO_BUFFER_FLAGS: u32 = 0;
 pub trait ExportedFdSource: Send + Sync {
     /// Duplicate S's exported dma-buf descriptor for `resource_id`, or `None` if there is none.
     fn dup_exported_fd(&self, resource_id: u32) -> Option<OwnedFd>;
+
+    /// Record that this resource is now a **presentation buffer**, so its bytes stop being shipped to C.
+    ///
+    /// # Why the replay has to say this
+    /// A presented resource is rendered by S's GPU and imported by S's compositor from S's own dma-buf.
+    /// C has no use for its contents and no display to put them on — but the (c)2 return path ships back
+    /// whatever S's GPU wrote, and cannot tell a readback the application will *read* from a swapchain
+    /// image it will only *show*. Only the WP0 path knows which is which, so only the WP0 path can say.
+    ///
+    /// Measured before this existed: ~877 KB per frame crossing the network for a 500x500 window, in a
+    /// project whose thesis is that pixels do not cross the network. Called on every present; idempotent.
+    fn note_presented(&self, resource_id: u32);
 }
 
 /// One request in the synthesized buffer-creation sequence: what to send, and what object it creates.
@@ -1270,6 +1282,9 @@ impl WaylandReplay {
             .expect("the WP0 id maps lock is never poisoned")
             .insert(app_buffer_id, s_buffer);
 
+        // The buffer is real and on S's compositor, so this resource is now shown rather than read:
+        // stop the return path shipping its pixels to a machine that has no screen.
+        self.fd_source.note_presented(token.resource_id);
         eprintln!(
             "rayland-s: WP0 4.3: built wl_buffer (app obj {app_buffer_id}) from resource {} \
              ({}x{} fmt {:#x} offset {} stride {} modifier {:#x})",
