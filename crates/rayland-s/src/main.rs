@@ -66,7 +66,9 @@ use rayland_engine::{EngineClient, spawn_engine, virgl_available};
 use rayland_relay::{C2S, S2C, WaylandMessage, read_msg, write_msg};
 // The message applier: everything this daemon actually knows how to do.
 use rayland_s::apply::Applier;
-use rayland_s::wayland_client::{EventSink, WaylandReplay};
+use std::os::fd::OwnedFd;
+
+use rayland_s::wayland_client::{EventSink, ExportedFdSource, WaylandReplay};
 // Presentation: finding the application's readback buffer among S's blobs, and putting it on S's
 // screen. See that module's docs for why finding it is the one guess (c)1 has to make.
 use rayland_s::present::{
@@ -432,6 +434,42 @@ fn ship(tx: &Arc<Mutex<QuicSend>>, msgs: &[S2C]) -> Result<(), ()> {
     }
     link_log("w<", &format!("batch of {}", msgs.len()));
     Ok(())
+}
+
+/// The WP0 buffer-token fd source: resolves a token's resource id to a duplicate of the dma-buf S
+/// exported for that resource, by asking the [`Applier`] that holds it.
+///
+/// # Why a newtype rather than handing the replay the `Arc<Mutex<Applier>>`
+/// The rule this exists to enforce is *the applier lock is never held across a `send_request`*. A Wayland
+/// request is a round trip to S's compositor; holding the relay's applier mutex across one would put the
+/// entire ring session behind the compositor's scheduling — the same class of self-inflicted stall this
+/// project has already shipped twice with instrumentation. Because `dup_exported_fd` takes the lock,
+/// duplicates, and returns, **the guard cannot escape this function**, and no caller can violate the rule
+/// even by accident.
+///
+/// The duplicate matters too: `Applier` must keep its own descriptor, because virglrenderer exports a
+/// resource exactly once (`mem->exported`) and the export cannot be repeated.
+struct ApplierFdSource {
+    /// The session state holding every resource's creation-time exported descriptor.
+    applier: Arc<Mutex<Applier>>,
+}
+
+impl ExportedFdSource for ApplierFdSource {
+    fn dup_exported_fd(&self, resource_id: u32) -> Option<OwnedFd> {
+        // Lock, borrow, duplicate, release — all three inside this expression, so nothing downstream can
+        // hold the applier while talking to the compositor.
+        let session = self.applier.lock().expect("the applier lock is never poisoned");
+        let borrowed = session.exported_fd(resource_id)?;
+        match borrowed.try_clone_to_owned() {
+            Ok(fd) => Some(fd),
+            Err(e) => {
+                // A dup failure is an fd-table exhaustion, not a missing resource: say which it was, since
+                // the caller's refusal message cannot distinguish them.
+                eprintln!("rayland-s: WP0 4.3: dup of resource {resource_id}'s dma-buf failed: {e}");
+                None
+            }
+        }
+    }
 }
 
 /// The WP0 event-return sink: ships each translated compositor event to C as an [`S2C::WaylandEvent`].
@@ -813,9 +851,15 @@ fn main() -> Result<()> {
     // so an offscreen session never touches a compositor. Owned by the message thread, which is the only
     // thing that dispatches relayed Wayland requests. Its event sink ships compositor events back to C over
     // the shared link, so the app receives `xdg_surface.configure`, `wl_buffer.release`, and the rest.
-    let mut wl_replay = WaylandReplay::new(Arc::new(LinkEventSink {
-        tx: Arc::clone(&tx),
-    }));
+    let mut wl_replay = WaylandReplay::new(
+        Arc::new(LinkEventSink {
+            tx: Arc::clone(&tx),
+        }),
+        // Task 4.3: how the replay turns a token's resource id into a real dma-buf to hand the compositor.
+        Arc::new(ApplierFdSource {
+            applier: Arc::clone(&applier),
+        }),
+    );
     // **Presentation runs alongside the session, not after it.**
     //
     // It used to run only once `serve` returned, which is correct for one still frame and useless

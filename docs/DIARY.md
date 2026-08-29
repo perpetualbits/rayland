@@ -4395,3 +4395,90 @@ Map checked: no node's *status* changed — 4.3 part 1 is still `done`, part 2 s
 part-2 node's description asserted that `BufferToken` carries no stride and that this must be decided
 first, which this change makes false. Updated that text; `project.updated` bumped, since the map's own
 content changed.
+
+### 2026-08-29 (later) — 4.3 lands: S builds real `wl_buffer`s from tokens, and the brief's third gap was real
+
+The second brief of the day, and the one that needed the hardware. It asked S to turn a `BufferToken`
+into an actual `wl_buffer` on S's compositor. It warned, in as many words, that WP0's written plan had
+twice been found short of what the code required and that I should **assume there is a third such
+gap**. There was. There were two.
+
+**Gap one, which the brief itself had already caught: the plan is short by a whole request.** Every
+other request in this module is a *translation* of something the app did. A buffer token is not, and
+cannot be: the app's `wl_buffer` names a dma-buf fd, C drops that fd by design — that *is*
+buffer-by-token — so there is nothing to translate. Worse, C's proxy intercepts the app's
+`create_params` and never forwards it, so when a `create_immed` carrying a token arrives, S has no
+params object at all and the app-side params id is not in the id map. A faithful implementation of
+the old plan would have been refused at the sender lookup before it ever saw the token. S has to
+originate all three requests. That also meant the token check has to happen **before** the sender
+lookup in `handle_request`, which is a small reordering with a load-bearing reason.
+
+**Gap two, which nothing had caught, and which the first two-machine run found in about four
+seconds.** The plan says step 3 creates a `wl_buffer` with `a child_spec of wl_buffer v1`. I
+implemented exactly that, with a constant and a confident comment saying the interface has only ever
+had version 1 — which is *true* and is not the question. The run died instantly:
+
+```
+thread 'main' panicked: Error when sending request
+zwp_linux_buffer_params_v1@9.create_immed: expected version 3 but got 1
+```
+
+A Wayland object **inherits the version of the object that created it**, and `wayland-backend`
+enforces it (`rs/client_impl/mod.rs:367`): the `child_spec` version must equal the *sender's*
+version, not the child interface's own maximum. The params object was created at the dmabuf global's
+v3, so its `wl_buffer` child is v3 too. The version is a statement about lineage, not capability.
+This is the kind of thing that reads as obviously right in a plan and is obviously wrong the moment
+real code meets a real compositor, and it is precisely why the brief's author refused to write this
+blind on 2026-07-27: *"code that compiles while exercising no test would look done."* It would have.
+It did — my planner test asserted `version == 1` and passed, because I wrote the test from the same
+wrong belief as the code. Only the compositor knew.
+
+Two things came out of that beyond the one-line fix. First, the planner test now asserts the
+*inheritance* rather than the constant, so the rule is pinned rather than the value. Second — and
+more important — **the synthesis path had no `catch_unwind`**. The generic replay path has one,
+because `send_request` panics rather than returning an error on a protocol violation, and I had not
+carried that discipline into the new path. So a version mismatch in a Wayland request took down the
+daemon's *main thread* and with it the entire ring session. A refused buffer must cost the frame, not
+the session. All three sends are wrapped now.
+
+**What the run then showed, and it is a real result.** Four of four swapchain images became real
+`wl_buffer`s on S's compositor — 500×500 XRGB8888 LINEAR, built from relayed tokens against dma-bufs
+S had exported at resource-creation time. No protocol error. That last part is stronger evidence than
+it looks: `create_immed` is the *immediate* variant, which raises a **fatal** protocol error if the
+buffer is bad. A compositor that accepts it silently has actually imported the dma-buf. Pixels
+rendered on S's GPU, named across the network by nothing but a resource id, and handed to S's
+compositor as a real buffer. That is WP0's thesis in one log line.
+
+The app then attached, damaged, asked for a frame callback, and committed. Sixty-four lines of proxy
+trace, against the thirty-six recorded on 2026-07-25 when vkcube died after binding dmabuf six times.
+
+**And then it stalls, and I am reporting that rather than chasing it.** One attach, two commits, then
+nothing. The app stays alive; its main thread waits on a futex held by Venus's own `vn_wsi[0,0]`
+thread, which sits in `poll`. Twelve events came back to it. So it is waiting for presentation
+feedback of some kind and I do not yet know which. What I *can* say is what it is **not**: not the
+token path (the buffers exist and the compositor took them), not an S-side replay error (there are
+none in the log), and not the missing commit gate, which would produce tearing or an early frame,
+not silence. I checked the one thing that could have been my own bug — whether a `wl_buffer.release`
+from S could route back — and `IdMaps::insert` populates both directions for the objects I create, so
+that path is intact. Beyond that it is a new investigation and belongs to a new brief.
+
+**A methodological note I want on the record**, because it is the second time today I reached a wrong
+conclusion by reading the wrong artifact. I first declared "the app never attaches" on the strength of
+`grep -icE "attach|commit"` returning 0 against the C proxy's log. The proxy logs opcodes
+**numerically** — `forward obj 3 opcode 1` *is* the attach. The trace had been telling me the app
+presented; I had asked it the wrong question and believed the answer. The fix both times was the same:
+read the artifact, not a summary of it.
+
+**Two incidental findings, neither in scope, both worth someone's time.** `scripts/c1-two-machine.sh`
+hardcodes `S_IP=192.168.1.192`, which is no longer dop561's address (it is `.150`) — that script fails
+today with a connection timeout rather than an obvious error. The new
+`scripts/wp0-vkcube-two-machine.sh` derives the address by asking the routing table which source
+address this host would use to reach C, which cannot go stale. And `vkcube` is not installed on
+apollo, but it links only libc and libm and dlopens everything else, so the script copies the binary
+across exactly as it does our own.
+
+**What was verified, precisely.** The three-request shape, the argument positions, the modifier hi/lo
+split and the version inheritance are covered by a pure unit test, teeth-checked by three mutations
+(swap the halves, derive the stride, assume offset zero — each fails its own assertion and nothing
+else). The compositor-facing half is **one clean run**, and one run is one run, not a rate. 4.5 is not
+reached and is not claimed.

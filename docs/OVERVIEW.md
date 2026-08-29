@@ -363,9 +363,9 @@ cross the network.**
 | 4.0 spike — can S export a compositor-importable dma-buf? | **done**, and its first answer was wrong (see below) |
 | 4.1 — C-side wiring (link-backed sink, inode→res_id resolver, proxy as a 4th thread) | done |
 | 4.2 — S router, persistent Wayland client, object-id map, session replay | done |
-| **4.3 — token → `wl_buffer`** | **C's half done (incl. plane layout on the token, 2026-08-29); S part 1 done; S part 2 SPECIFIED BUT NOT WRITTEN** |
+| **4.3 — token → `wl_buffer`** | **DONE and verified over the real network, 2026-08-29** — S builds real `wl_buffer`s from relayed tokens (4 of 4 swapchain images, no protocol error) |
 | 4.4 — event return path (eventfd wakeup, `send_event`, `S2C::WaylandEvent`, `configure`) | **genuinely working** — measured: vkcube receives both `configure`s through the tunnel and **acks** them |
-| 4.5 — end-to-end: vkcube's spinning cube on S's screen | not started |
+| 4.5 — end-to-end: vkcube's spinning cube on S's screen | **NOT reached.** vkcube presents exactly one frame, then stalls — see below |
 
 **4.3 part 2 is the immediate next piece of work.** Its shape turned out smaller and different from
 the plan's decomposition: **C's half was already complete** (the `params.add` handler resolves the
@@ -379,18 +379,42 @@ already happened at creation.
 Part 2 is unwritten. `crates/rayland-s/src/wayland_client.rs:592` still logs *"buffer-token request
 (obj N opcode M) deferred to 4.3; skipped"* and drops the whole request.
 
-**The specified sequence** (design is exact; from the 2026-07-27 diary entries and the map):
+**The sequence as built, with two corrections to what this document previously said.** Both are
+recorded rather than silently rewritten, because the planning side reasoned from the old version.
 
-1. Resolve `token.resource_id` through `Applier::exported_fd`.
-2. **`send_request` an `add` (opcode 1)** on the S-side `zwp_linux_buffer_params_v1` object, with
-   arguments `[Fd, Uint(0) plane_idx, Uint(0) offset, Uint(stride), Uint(mod_hi), Uint(mod_lo)]`.
-3. Let the existing path replay `create_immed` with the token's width/height/format.
-4. Map the app's buffer id to it in the existing `app_id ↔ s_id` table; the subsequent
-   `attach`/`commit` then replays through the path that already works.
-5. **The commit wants gating on the frame's completion** — reuse the (c)2 G' signal that already
-   gates the readback.
+> **Correction 1 — it is three requests, not two.** The earlier text had S synthesizing only the
+> `add` and letting "the existing path replay `create_immed`". There is no such path: C's proxy
+> intercepts `zwp_linux_dmabuf_v1.create_params` and **does not forward it**, so when a
+> `create_immed` arrives S has no `zwp_linux_buffer_params_v1` object at all, and the app-side params
+> id is not in the id map. The request would be refused at the sender lookup before anything looked
+> at the token. S must originate the whole sequence.
+>
+> **Correction 2 — the `wl_buffer` child is declared at the *params object's* version, not v1.** A
+> Wayland object inherits the version of the object that created it, and `wayland-backend` enforces
+> it: `send_request` **panics** unless `child_spec`'s version equals the sender's. The first
+> two-machine run of this code died on exactly that (`expected version 3 but got 1`), taking the
+> daemon's main thread with it. `wl_buffer` has only ever *had* version 1, which makes this
+> genuinely counter-intuitive; the version is a statement about lineage, not capability.
 
-**Three details a plan must decide or respect, none of which the written plan mentions:**
+1. Resolve `token.resource_id` to an **owned duplicate** of S's exported dma-buf, through the
+   `ExportedFdSource` trait. The trait exists so the lock rule is structural: the applier guard
+   cannot escape `dup_exported_fd`, so no caller can hold it across a compositor round trip.
+2. **`create_params` (opcode 1)** on the bound `zwp_linux_dmabuf_v1`, child
+   `zwp_linux_buffer_params_v1` at the bound dmabuf version. Map the app's params id to the result.
+3. **`add` (opcode 1)** with `[Fd, Uint(0) plane_idx, Uint(offset), Uint(stride), Uint(mod_hi),
+   Uint(mod_lo)]` — offset and stride from the token, never derived.
+4. **`create_immed` (opcode 3)** with `[NewId(null), Int(width), Int(height), Uint(format),
+   Uint(0) flags]`, child `wl_buffer` **at the params object's version**. Map the app's buffer id to
+   the result; the app's own `attach`/`commit` then replay through the path that already works.
+5. **The commit still wants gating on the frame's completion** — the (c)2 G' signal. Deliberately not
+   built with the token path: shipping both together would make any failure ambiguous between them.
+
+All three sends are wrapped in `catch_unwind`, matching the generic replay path, because
+`send_request` panics rather than erring on a protocol violation and a refused buffer must cost the
+frame, not the session.
+
+**Three details a plan must decide or respect, none of which the written plan mentioned — all three
+are now settled and built:**
 
 1. **S must *synthesize* the `add`, not translate it.** C intercepts `add` and drops the fd by design
    — that *is* buffer-by-token — so S's params object has **no planes** when `create_immed` arrives.
@@ -411,14 +435,32 @@ Part 2 is unwritten. `crates/rayland-s/src/wayland_client.rs:592` still logs *"b
    `send_request`.** A Wayland call made under that lock puts the relay's mutex behind a compositor
    round trip.
 
-**An open plumbing question:** `WaylandReplay` needs access to `Applier`'s descriptors, and the two
-are held separately in `serve`. That is a design choice the author deliberately left to be made
-*with a test in front of it*.
+**The plumbing question is settled.** `WaylandReplay` reaches `Applier`'s descriptors through the
+`ExportedFdSource` trait, implemented by a newtype over the `Arc<Mutex<Applier>>` in `main.rs`. This
+was chosen over handing the replay the `Arc` directly so the lock discipline is enforced by the type
+rather than by a comment.
 
-**Why it was left unwritten is itself a planning fact.** It is not an oversight: 4.3 part 2 cannot be
-verified without a compositor and a GPU (and vkcube reaching `attach`, which needs `--gpu_number 0`).
-The author's stated reason for stopping was that *"code that compiles while exercising no test would
-look done"*. A plan that schedules this work should schedule its verification with it.
+**What the real-network run showed, 2026-08-29 (`scripts/wp0-vkcube-two-machine.sh`, one run).**
+vkcube on apollo, its window replayed onto dop561's compositor:
+
+- **4 of 4 swapchain images became real `wl_buffer`s** from relayed tokens — 500×500, XRGB8888,
+  LINEAR — with **no protocol error**. Because `create_immed` is the *immediate* variant, which
+  raises a fatal protocol error on a bad buffer, S's compositor accepting it silently is positive
+  evidence that the dma-buf imported correctly.
+- The app then **attached, damaged, requested a frame callback, and committed** — the full present
+  sequence, replayed with no S-side error. The proxy trace ran to 64 lines, against the 36 recorded
+  on 2026-07-25 when the app died after binding dmabuf six times.
+- **Then it stalls.** One attach, two commits, and no more. The app stays alive; its main thread waits
+  on a futex held by Venus's own `vn_wsi[0,0]` WSI thread, which sits in `poll`. Twelve events were
+  delivered back to it. So the app is waiting on presentation feedback of some kind, and *which* event
+  it wants is the open question.
+- This is **not** the tearing/pacing that the missing commit gate would explain, and it is not a fault
+  in the token path: the buffers exist and the compositor took them. It is the next wall, and it is
+  the fourth successive case of WP0's written plan being short of what the code needs.
+
+Note the measured values in this configuration were `offset 0, stride 2000 = width × 4` — i.e. here
+the derivation would have *happened* to be right. That is exactly why the token carries them: the
+fixture proves the path, the configuration does not prove the assumption.
 
 **Two recorded reversals to be aware of when planning here.**
 

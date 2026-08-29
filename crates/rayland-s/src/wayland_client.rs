@@ -32,10 +32,34 @@
 //!   of the request path's app→S map) and emits it through an [`EventSink`] as a
 //!   [`rayland_relay::S2C::WaylandEvent`]. C's proxy re-encodes it onto the app's own socket.
 //!
+//! # Buffer tokens (Task 4.3): the one sequence S **originates** rather than replays
+//! Every other request here is a translation of something the app did. A buffer token is not: the app's
+//! `wl_buffer` names a dma-buf fd, and **C drops that fd by design** (that is what buffer-by-token *is*),
+//! so there is nothing to translate. S must construct the whole buffer-creation sequence itself, against
+//! the dma-buf **it already exported** for that resource at creation.
+//!
+//! It is **three** requests, not one — the point that is easy to get wrong. C's proxy intercepts
+//! `zwp_linux_dmabuf_v1.create_params` and does **not** forward it, so when a `create_immed` carrying a
+//! token arrives, S has no `zwp_linux_buffer_params_v1` object at all and the app-side params id is not in
+//! the id map. A naive implementation reaches the sender lookup and refuses the request as "unmapped"
+//! before it ever sees the token. So [`WaylandReplay::handle_request`] checks for a token **first**, and
+//! [`plan_buffer_requests`] lays out the sequence:
+//!
+//! 1. `zwp_linux_dmabuf_v1.create_params` on the bound dmabuf global → the params object. The app's params
+//!    id is mapped to it here, which is what makes the following two requests addressable.
+//! 2. `zwp_linux_buffer_params_v1.add` with the duplicated dma-buf fd and the token's **carried** plane
+//!    layout — `offset` and `stride` come from the token, never from `width × bpp`, because a wrong stride
+//!    garbles the image instead of failing (see `rayland_relay::BufferToken::stride`).
+//! 3. `zwp_linux_buffer_params_v1.create_immed` → the `wl_buffer`, mapped to the app's buffer id, after
+//!    which the app's own `attach`/`commit` replay through the ordinary path.
+//!
+//! Any of those failing refuses the whole buffer and logs **which** step failed; a partially built buffer
+//! is never attached.
+//!
 //! # What this module does *not* do yet
-//! - **Buffer tokens (4.3).** A request carrying a [`rayland_relay::WaylandArg::Buffer`] (the swapchain
-//!   `wl_buffer`) cannot be replayed until the token is resolved to S's dma-buf; such a request is logged
-//!   and skipped here.
+//! - **Commit gating.** The app's `commit` replays as soon as it arrives, with no wait on the (c)2
+//!   completion signal, so a presented frame may be early or torn. That is a separate task by design:
+//!   shipping it with the token path would make any failure ambiguous between the two.
 //! - **Compositor-created objects in events.** An event carrying a `NewId` (a compositor creating an object
 //!   for the app, e.g. a data offer) is not relayed back; the WP0 event set carries none.
 
@@ -45,7 +69,7 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 
-use rayland_relay::{WaylandArg, WaylandMessage};
+use rayland_relay::{BufferToken, WaylandArg, WaylandMessage};
 use wayland_client::Connection;
 use wayland_client::Proxy;
 use wayland_client::backend::protocol::{Argument, Interface, Message};
@@ -70,6 +94,143 @@ const OP_DISPLAY_GET_REGISTRY: u16 = 1;
 const OP_REGISTRY_BIND: u16 = 0;
 /// `wl_registry.global` event opcode: `[name: uint, interface: string, version: uint]`.
 const EV_REGISTRY_GLOBAL: u16 = 0;
+
+/// `zwp_linux_dmabuf_v1.create_params` request opcode — creates a `zwp_linux_buffer_params_v1`.
+const OP_DMABUF_CREATE_PARAMS: u16 = 1;
+/// `zwp_linux_buffer_params_v1.add` request opcode — supplies one plane's fd and layout.
+const OP_PARAMS_ADD: u16 = 1;
+/// `zwp_linux_buffer_params_v1.create_immed` request opcode — creates the `wl_buffer` synchronously.
+const OP_PARAMS_CREATE_IMMED: u16 = 3;
+/// The plane index every synthesized `add` names.
+///
+/// Always zero, and that is a guarantee rather than a simplification: C **refuses** a buffer whose `add`
+/// names any other plane, or which supplies more than one, so a token that reaches S describes exactly one
+/// plane by construction (see `rayland_c`'s `try_intercept_buffer`).
+const SINGLE_PLANE: u32 = 0;
+/// The `flags` argument of `create_immed` — no y-invert, no interlacing. WP0's swapchain images are plain
+/// top-down LINEAR buffers, and the app's own request carried no flags for C to forward.
+const NO_BUFFER_FLAGS: u32 = 0;
+// (No `wl_buffer` version constant: a child object's version is **inherited from its parent**, not taken
+// from the child interface's own maximum. See `plan_buffer_requests`' "the version rule" note.)
+
+/// Resolves a [`BufferToken`]'s resource id to a **duplicate** of the dma-buf descriptor S exported for
+/// that resource when it was created.
+///
+/// # Why this is a trait rather than a borrowed `Applier`
+/// The plan's lock rule is *resolve and clone the fd under the applier lock, and release the lock before
+/// any `send_request`* — because a Wayland call is a round trip to the compositor, and holding the relay's
+/// applier mutex across one would put the whole ring session behind the compositor's scheduling. Expressed
+/// as a comment, that rule is one refactor away from being violated. Expressed as this trait it is
+/// **structural**: the lock guard cannot escape `dup_exported_fd`, so there is no way to hold the applier
+/// across a compositor round trip even deliberately.
+///
+/// It also mirrors the house pattern on the other side of the wire (`rayland_c`'s `ResourceResolver` and
+/// `WaylandSink`), and it gives the pure tests a fake to inject.
+///
+/// # Contract
+/// - Returns an **owned duplicate**. The `Applier`'s own descriptor must stay alive and unmoved: the
+///   export cannot be repeated, because virglrenderer's `mem->exported` guard permits exactly one export
+///   per resource and it already happened at creation.
+/// - `None` when the resource was never created, or has been unref'd — which a correct caller may well
+///   see, since a token can outlive its resource if the app tears the swapchain down with a frame in
+///   flight. The caller must refuse the buffer, not guess.
+pub trait ExportedFdSource: Send + Sync {
+    /// Duplicate S's exported dma-buf descriptor for `resource_id`, or `None` if there is none.
+    fn dup_exported_fd(&self, resource_id: u32) -> Option<OwnedFd>;
+}
+
+/// One request in the synthesized buffer-creation sequence: what to send, and what object it creates.
+///
+/// Deliberately carries no sender: the sender of steps 2 and 3 is the params object that step 1 *creates*,
+/// so it cannot be known when the sequence is planned. [`WaylandReplay::synthesize_buffer`] threads it in.
+/// Keeping senders out is also what makes the planner a pure function that a test can assert on without a
+/// live compositor connection to mint `ObjectId`s from.
+#[derive(Debug)]
+pub struct SynthesizedRequest {
+    /// The request's opcode within its interface.
+    pub opcode: u16,
+    /// The wire arguments, in order. `NewId` slots are null — the backend fills them from `child`.
+    pub args: Vec<Argument<ObjectId, RawFd>>,
+    /// The interface and version of the object this request creates, or `None` if it creates none.
+    pub child: Option<(&'static Interface, u32)>,
+}
+
+/// Lay out the three requests that turn a [`BufferToken`] into a `wl_buffer` on S's compositor.
+///
+/// # Inputs
+/// - `token`: what C sent. Its `offset` and `stride` are used **verbatim**; recomputing them from `width`
+///   and the format is the derivation that garbles rather than fails.
+/// - `dmabuf_version`: the version the `zwp_linux_dmabuf_v1` global was bound at, so the params object is
+///   created at a matching version rather than a guessed one.
+/// - `fd`: the raw descriptor to hand to `add`. The **caller keeps ownership**: the pure-Rust
+///   `wayland-backend` in this tree dups the fd inside `write_message`
+///   (`BorrowedFd::borrow_raw(fd).try_clone_to_owned()`), so `send_request` neither consumes nor closes
+///   it. The caller must hold its `OwnedFd` until the send returns and then let it drop, or leak.
+///
+/// # Output
+/// Exactly three requests, in the order they must be sent. This is a pure function — no I/O, no locks, no
+/// compositor — so its shape is checkable in a unit test, which is where the modifier hi/lo split and the
+/// argument ordering are actually pinned down.
+///
+/// # Domain pitfall 1: the modifier's halves
+/// The modifier is a 64-bit value split across two `uint` arguments, high half first. Getting the halves
+/// the wrong way round produces a valid-looking request that describes a tiling layout nothing uses; the
+/// compositor may reject the buffer, or import it and show noise.
+///
+/// # Domain pitfall 2: the version rule — **both children take the *parent's* version**
+/// A Wayland object created by a request **inherits the version of the object that created it**, and
+/// `wayland-backend` enforces exactly that: `send_request` **panics** unless `child_spec`'s version equals
+/// the *sender's* version (`rs/client_impl/mod.rs:367`, "expected version N but got M").
+///
+/// So `create_immed`'s `wl_buffer` child is declared at `dmabuf_version`, **not** at 1. That is
+/// counter-intuitive — the `wl_buffer` interface has only ever *had* version 1 — and it is what the first
+/// two-machine run of this code died on: WP0's written plan specified `wl_buffer` v1, and against a v3
+/// params object that is an immediate panic. The version here is a statement about *lineage*, not about
+/// the interface's own capabilities.
+pub fn plan_buffer_requests(
+    token: &BufferToken,
+    dmabuf_version: u32,
+    fd: RawFd,
+) -> [SynthesizedRequest; 3] {
+    [
+        // 1. Make the params object. C intercepted the app's own `create_params` and never forwarded it,
+        //    so this object does not exist on S until now.
+        SynthesizedRequest {
+            opcode: OP_DMABUF_CREATE_PARAMS,
+            args: vec![Argument::NewId(ObjectId::null())],
+            child: Some((ZwpLinuxBufferParamsV1::interface(), dmabuf_version)),
+        },
+        // 2. Describe the single plane: S's own exported descriptor, plus the layout the app declared.
+        SynthesizedRequest {
+            opcode: OP_PARAMS_ADD,
+            args: vec![
+                Argument::Fd(fd),
+                Argument::Uint(SINGLE_PLANE),
+                Argument::Uint(token.offset),
+                Argument::Uint(token.stride),
+                // High half first, then low — the order `linux-dmabuf-v1.xml` specifies.
+                Argument::Uint((token.modifier >> 32) as u32),
+                Argument::Uint(token.modifier as u32),
+            ],
+            child: None,
+        },
+        // 3. Create the buffer itself. Width/height are protocol `int`s; the token carries them as `u32`
+        //    because a real buffer is never negative.
+        SynthesizedRequest {
+            opcode: OP_PARAMS_CREATE_IMMED,
+            args: vec![
+                Argument::NewId(ObjectId::null()),
+                Argument::Int(token.width as i32),
+                Argument::Int(token.height as i32),
+                Argument::Uint(token.drm_format),
+                Argument::Uint(NO_BUFFER_FLAGS),
+            ],
+            // `dmabuf_version`, not 1 — the params object was created at that version and the buffer
+            // inherits it. See "the version rule" above; getting this wrong panics the backend.
+            child: Some((WlBuffer::interface(), dmabuf_version)),
+        },
+    ]
+}
 
 /// Where S sends compositor events back to C — the mirror of the C proxy's `WaylandSink`.
 ///
@@ -356,14 +517,26 @@ pub struct WaylandReplay {
     sink: Arc<dyn EventSink>,
     /// Whether the compositor-reader thread has been spawned (spawned once, after the connect roundtrip).
     reader_started: bool,
+    /// Resolves a token's resource id to a duplicate of S's exported dma-buf descriptor (Task 4.3).
+    fd_source: Arc<dyn ExportedFdSource>,
+    /// The S-side `zwp_linux_dmabuf_v1` object and the version it was bound at, recorded by
+    /// [`Self::handle_bind`].
+    ///
+    /// # Why this has to be remembered rather than derived
+    /// A `create_immed` names the **params** object, and nothing anywhere in the relayed message identifies
+    /// the dmabuf global that params object descends from — on S the params object does not exist yet at
+    /// all. The bind is the only place S ever learns which object it is. `None` means the app never bound
+    /// `zwp_linux_dmabuf_v1`, in which case a token is refused rather than guessed at.
+    dmabuf: Option<(ObjectId, u32)>,
 }
 
 impl WaylandReplay {
     /// Create an unconnected replay. No compositor connection is made until the first relayed message.
     ///
     /// `sink` is where compositor events are emitted once translated — the link back to C in the daemon, a
-    /// recorder in tests.
-    pub fn new(sink: Arc<dyn EventSink>) -> Self {
+    /// recorder in tests. `fd_source` resolves a buffer token's resource id to a duplicate of the dma-buf
+    /// S exported for it — the `Applier` in the daemon, a fake in tests.
+    pub fn new(sink: Arc<dyn EventSink>, fd_source: Arc<dyn ExportedFdSource>) -> Self {
         WaylandReplay {
             conn: None,
             backend: None,
@@ -372,6 +545,8 @@ impl WaylandReplay {
             maps: Arc::new(Mutex::new(IdMaps::default())),
             sink,
             reader_started: false,
+            fd_source,
+            dmabuf: None,
         }
     }
 
@@ -514,6 +689,12 @@ impl WaylandReplay {
         );
         match result {
             Ok(s_id) => {
+                // The dmabuf global is the sender of the `create_params` S will have to originate for any
+                // buffer token, and the bind is the only place S learns which object that is — a token
+                // names only the params object. Record it (and the negotiated version) here or lose it.
+                if interface == ZwpLinuxDmabufV1::interface().name {
+                    self.dmabuf = Some((s_id.clone(), bind_version));
+                }
                 self.maps
                     .lock()
                     .expect("the WP0 id maps lock is never poisoned")
@@ -537,6 +718,15 @@ impl WaylandReplay {
     /// message thread dying.
     pub fn handle_request(&mut self, msg: WaylandMessage) {
         if !self.ensure_connected() {
+            return;
+        }
+        // **Buffer tokens are handled before the sender lookup, and that ordering is load-bearing.** The
+        // token arrives on a `create_immed` whose sender is the app's *params* object — which S has never
+        // created, because C intercepts `create_params` and does not forward it. So the lookup below would
+        // refuse this request as "unmapped" before anything ever looked at the token. See
+        // [`Self::synthesize_buffer`], which creates that params object as its first act.
+        if msg.args.iter().any(|a| matches!(a, WaylandArg::Buffer(_))) {
+            self.synthesize_buffer(&msg);
             return;
         }
         // The sender must be an object the replay already created (bound global or prior new-id).
@@ -589,10 +779,14 @@ impl WaylandReplay {
                     child_spec = interface_by_name(interface).map(|iface| (iface, *version));
                     new_app_id = Some(*id);
                 }
-                // A buffer token: needs resolution to S's dma-buf (Task 4.3). Skip the whole request.
+                // Unreachable: a message carrying a token was routed to `synthesize_buffer` above. Kept
+                // as a refusal rather than an `unreachable!()` because the generic path genuinely cannot
+                // express a token — there is no fd to translate — and a future edit that reorders the
+                // check should lose the buffer, not kill the message thread.
                 WaylandArg::Buffer(_) => {
                     eprintln!(
-                        "rayland-s: WP0 replay: buffer-token request (obj {} opcode {}) deferred to 4.3; skipped",
+                        "rayland-s: WP0 replay: buffer token reached the generic path (obj {} opcode {}); \
+                         request dropped — this is a routing bug",
                         msg.object_id, msg.opcode
                     );
                     return;
@@ -638,6 +832,167 @@ impl WaylandReplay {
             ),
         }
         self.flush();
+    }
+
+    /// Build a real `wl_buffer` on S's compositor from a relayed [`BufferToken`] — the one sequence S
+    /// **originates** instead of replaying (Task 4.3).
+    ///
+    /// # Why this exists at all
+    /// The app's `wl_buffer` names a dma-buf fd, and C drops that fd by design — that *is* buffer-by-token.
+    /// So there is nothing to translate: S must construct the buffer from the dma-buf **it already
+    /// exported** for the named resource when that resource was created. The pixels never crossed the
+    /// network; only the name of where they already are.
+    ///
+    /// # Inputs
+    /// `msg` is the relayed `create_immed`: its `object_id` is the app's params object, and its arguments
+    /// are the new `wl_buffer`'s app-side id plus the token.
+    ///
+    /// # Failure modes — all of them total, none of them partial
+    /// A buffer is either fully built or not attached at all. Each of these logs which step failed and
+    /// returns, leaving the app with a `wl_buffer` S is simply never told to present:
+    /// - the message is malformed (no token, or no new-id for the buffer);
+    /// - the app never bound `zwp_linux_dmabuf_v1`, so there is no object to originate `create_params` on;
+    /// - the resource id resolves to no exported descriptor (never created, or already unref'd — which a
+    ///   token can outlive);
+    /// - any of the three `send_request`s fails.
+    ///
+    /// # Domain pitfall: the descriptor's ownership
+    /// `dup_exported_fd` hands back an **owned duplicate**, and the pure-Rust `wayland-backend` in this
+    /// tree dups again inside `write_message` rather than consuming what it is given. So this function
+    /// must hold its `OwnedFd` across the `add` and let it drop afterwards: dropping early would send a
+    /// closed descriptor, and forgetting it would leak one per frame.
+    fn synthesize_buffer(&mut self, msg: &WaylandMessage) {
+        // Pull the two facts the message carries: which resource, and what the app calls the new buffer.
+        let Some(token) = msg.args.iter().find_map(|a| match a {
+            WaylandArg::Buffer(t) => Some(t.clone()),
+            _ => None,
+        }) else {
+            eprintln!("rayland-s: WP0 4.3: buffer request with no token (obj {}); refused", msg.object_id);
+            return;
+        };
+        let Some(app_buffer_id) = msg.args.iter().find_map(|a| match a {
+            WaylandArg::NewId { id, .. } => Some(*id),
+            _ => None,
+        }) else {
+            eprintln!(
+                "rayland-s: WP0 4.3: buffer token for resource {} names no wl_buffer id; refused",
+                token.resource_id
+            );
+            return;
+        };
+        // The dmabuf global, recorded at bind time — nothing in the message identifies it.
+        let Some((dmabuf_id, dmabuf_version)) = self.dmabuf.clone() else {
+            eprintln!(
+                "rayland-s: WP0 4.3: no `zwp_linux_dmabuf_v1` was ever bound; buffer for resource {} refused",
+                token.resource_id
+            );
+            return;
+        };
+        // Resolve the descriptor. This takes and releases the applier lock inside the trait method, so no
+        // lock is held across any of the `send_request`s below — see [`ExportedFdSource`].
+        let Some(fd) = self.fd_source.dup_exported_fd(token.resource_id) else {
+            eprintln!(
+                "rayland-s: WP0 4.3: resource {} has no exported dma-buf (never created, or unref'd); \
+                 buffer refused",
+                token.resource_id
+            );
+            return;
+        };
+
+        // The three requests, laid out by the pure planner so their shape is unit-tested rather than
+        // asserted here. `fd` stays owned by this scope for the whole sequence.
+        let plan = plan_buffer_requests(&token, dmabuf_version, fd.as_raw_fd());
+        let backend = self.backend.as_ref().expect("connected").clone();
+
+        // `send_request` **panics** on a protocol violation rather than returning an error — a version
+        // mismatch on a child_spec, an unknown object, a bad argument shape. The generic replay path wraps
+        // it in `catch_unwind` for exactly that reason and this path must too: the first two-machine run of
+        // this code took the whole daemon's main thread down with "expected version 3 but got 1", losing
+        // the ring session along with the buffer. A refused buffer must cost the frame, not the session.
+        let send = |sender: ObjectId, req: SynthesizedRequest, data: Option<Arc<dyn ObjectData>>| {
+            catch_unwind(AssertUnwindSafe(|| {
+                backend.send_request(
+                    Message {
+                        sender_id: sender,
+                        opcode: req.opcode,
+                        args: req.args.into_iter().collect(),
+                    },
+                    data,
+                    req.child,
+                )
+            }))
+        };
+
+        // Step 1: create the params object on the dmabuf global, and map the app's params id to it — that
+        // mapping is what makes the app's *later* requests against this object (if any) resolvable.
+        let [create_params, add, create_immed] = plan;
+        let s_params = match send(dmabuf_id, create_params, Some(self.object_data() as Arc<dyn ObjectData>)) {
+            Ok(Ok(id)) => id,
+            Ok(Err(e)) => {
+                eprintln!("rayland-s: WP0 4.3: step 1/3 create_params failed for resource {}: {e}", token.resource_id);
+                return;
+            }
+            Err(_) => {
+                eprintln!(
+                    "rayland-s: WP0 4.3: step 1/3 create_params PANICKED for resource {} — a protocol \
+                     violation in the synthesized request; buffer refused, session continues",
+                    token.resource_id
+                );
+                return;
+            }
+        };
+        self.maps
+            .lock()
+            .expect("the WP0 id maps lock is never poisoned")
+            .insert(msg.object_id, s_params.clone());
+
+        // Step 2: describe the plane. No child object, so no object data.
+        match send(s_params.clone(), add, None) {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                eprintln!("rayland-s: WP0 4.3: step 2/3 add failed for resource {}: {e}", token.resource_id);
+                return;
+            }
+            Err(_) => {
+                eprintln!(
+                    "rayland-s: WP0 4.3: step 2/3 add PANICKED for resource {}; buffer refused",
+                    token.resource_id
+                );
+                return;
+            }
+        }
+
+        // Step 3: the buffer itself. Once mapped, the app's own attach/commit replay through the ordinary
+        // path and put this buffer on S's surface.
+        let s_buffer = match send(s_params, create_immed, Some(self.object_data() as Arc<dyn ObjectData>)) {
+            Ok(Ok(id)) => id,
+            Ok(Err(e)) => {
+                eprintln!("rayland-s: WP0 4.3: step 3/3 create_immed failed for resource {}: {e}", token.resource_id);
+                return;
+            }
+            Err(_) => {
+                eprintln!(
+                    "rayland-s: WP0 4.3: step 3/3 create_immed PANICKED for resource {} — check the \
+                     child_spec version against the params object's (they must match); buffer refused",
+                    token.resource_id
+                );
+                return;
+            }
+        };
+        self.maps
+            .lock()
+            .expect("the WP0 id maps lock is never poisoned")
+            .insert(app_buffer_id, s_buffer);
+
+        eprintln!(
+            "rayland-s: WP0 4.3: built wl_buffer (app obj {app_buffer_id}) from resource {} \
+             ({}x{} fmt {:#x} offset {} stride {} modifier {:#x})",
+            token.resource_id, token.width, token.height, token.drm_format, token.offset, token.stride,
+            token.modifier
+        );
+        self.flush();
+        // `fd` drops here, closing this duplicate. The backend already dup'd its own copy when it wrote the
+        // `add`, and the `Applier`'s original is untouched — it must be, since the export cannot be redone.
     }
 
     /// Whether `app_object_id` has been mapped to an S-side object — i.e. the replay has created the
