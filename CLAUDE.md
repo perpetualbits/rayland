@@ -121,6 +121,26 @@ needs no edits; the *data* is what tracks reality. A turn that changed no status
 not churn the `updated` date for nothing) — but you must have *looked*. Every new session learns of the
 map's existence and this rule by reading this file.
 
+## The project overview (the handover surface)
+
+[`docs/OVERVIEW.md`](docs/OVERVIEW.md) is a **single self-contained account of the whole project**,
+written for a reader doing planning and design **without the repository open**. It exists because of
+how this project is now directed: **planning and design happen in Claude.ai**, and sessions in this
+repository receive prompts and report back. Claude.ai cannot see the tree; it sees this document and
+a source snapshot (`~/bin/snapshot.sh`, which packs any repo's source and docs — run it from the repo
+root).
+
+It is not a duplicate of this file. `CLAUDE.md` is binding conventions; `docs/DIARY.md` is 4,000+
+lines of chronology; `OVERVIEW.md` is the *shape* — mechanism, status, measured numbers, what is
+open, and, most importantly, **the discoveries that a plan must not re-propose**, stated as
+discoveries rather than left implicit in the code. Several of this project's central facts overturned
+earlier beliefs; a planner without them will confidently re-specify a dead end.
+
+**The binding rule:** when a turn changes something `OVERVIEW.md` asserts — a phase completing, a
+measured number, a belief overturned, a new open question — **update it in the same turn** and bump
+its "Last brought current" line. It carries the same honesty obligation as the diary: a retired
+design stays visible as retired, rather than vanishing.
+
 ## Repository status and layout
 
 A Cargo workspace of eighteen crates. Each declares its own license per the policy below
@@ -270,7 +290,7 @@ with arc (c) until arc (c) fully supersedes it.
 **Arc (c) — the real-engine pivot: replace that hand-rolled protocol with the reused
 Venus/virglrenderer capture/replay engine, so *unmodified* applications run.**
 
-- **C0 — Venus First Light** *(in progress; substance complete)*: a real, unmodified
+- **C0 — Venus First Light** *(complete)*: a real, unmodified
   Vulkan app, captured by Mesa's Venus ICD, replayed on S's real GPU through our
   virglrenderer-embedding host — PNG bit-identical to native. Same machine, local socket,
   offscreen. See [`docs/c0-venus-first-light.md`](docs/c0-venus-first-light.md).
@@ -430,6 +450,31 @@ effort goes next:
   GPU's problem and the GPU is next to the display — but costs bandwidth *today* only because S presents the
   application's readback buffer, which is what WP0's token → `wl_buffer` path exists to end.
 
+- **WP0 — Wayland proxy first light** *(IN PROGRESS — the active front)*: today S presents the
+  application's **readback buffer** — pixels the GPU wrote, copied back to memory, shipped, and
+  re-uploaded as `wl_shm`. That is a bandwidth tax and the reason resolution costs anything at all.
+  WP0 ends it by proxying the application's **own Wayland protocol**: the app connects to a proxy on
+  C rather than to a compositor, its `wl_surface`/`xdg_toplevel` requests are relayed to S's real
+  compositor, and the one thing that cannot cross a network — the swapchain `wl_buffer`'s fd — is
+  replaced by a **`BufferToken`** naming the S-side resource the command relay already rendered. **No
+  pixels cross the network.** Presentation is **zero-copy dma-buf**: Venus requests the swapchain
+  image as `HOST3D` with `VkExportMemoryAllocateInfo{DMA_BUF}` unconditionally, so the S-side
+  resource really does export a compositor-importable dma-buf (measured: `fd_type=1`). Note Task 4.0
+  first concluded the opposite and was **overturned by Task 4.0-bis**; both are left in the plan.
+  **State:** 4.1 (C-side wiring) and 4.2 (S router, replay, object-id map) done; **4.4 (the event
+  return path) genuinely works** — vkcube receives both `configure` events through the tunnel and
+  acks them; **4.3 is the open piece** — C's half is complete, S part 1 (retaining each blob's
+  exported dma-buf descriptor, which `mem->exported` permits exactly once, at creation) is landed,
+  and **S part 2 (token → `wl_buffer`) is specified but deliberately not written**, because it
+  cannot be verified without a compositor and a GPU and "code that compiles while exercising no test
+  would look done". Two decisions it needs first: **`stride` must go on `BufferToken`** (deriving
+  `width × bpp` garbles pixels rather than failing cleanly), and **S must *synthesize* the
+  `params.add`** rather than replay it, since C drops the fd by design — a request S originates, a
+  first for the replay module. Resolve and clone the fd **under the applier lock and release it
+  before any `send_request`**, or the relay's mutex ends up behind a compositor round trip. Then
+  4.5: vkcube's cube on S's screen. See
+  [`docs/design/2026-07-22-wp0-wayland-proxy-first-light.md`](docs/design/2026-07-22-wp0-wayland-proxy-first-light.md)
+  and its `-plan` companion.
 - **(c)3 — content-addressed assets.**
 - **(c)4 — real/complex applications; GL via Zink.**
 

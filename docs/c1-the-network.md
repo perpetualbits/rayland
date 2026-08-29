@@ -1,5 +1,32 @@
 # (c)1 — The Network (what it costs, and what broke)
 
+> ### ⏱ Status of this document, as of 2026-08-29
+>
+> **This is a measurement report from 2026-07-17, kept as written.** Its numbers and its reasoning
+> are the record of that moment, and per this project's honesty rule nothing below has been edited
+> to match later knowledge. Two things in it have since been overtaken, and you should know which
+> before you act on them:
+>
+> - **§3.1 "The relay silently delivers stale frames" — FIXED.** That bug was the most important
+>   thing in this document when it was written, and it is now closed: **0 stale frames across 20
+>   real-network runs.** The path there was long and is worth reading if you are working on the
+>   return path, because three designs were built or specified and disproved on the way. The fix is
+>   the "G'" completion barrier — see
+>   [`design/2026-07-21-c2-getfencestatus-completion.md`](design/2026-07-21-c2-getfencestatus-completion.md),
+>   with the dead ends in
+>   [`design/2026-07-17-fence-feedback-walking-skeleton.md`](design/2026-07-17-fence-feedback-walking-skeleton.md) §9–§11
+>   and [`design/2026-07-20-c2-fence-empty-submit-finding.md`](design/2026-07-20-c2-fence-empty-submit-finding.md).
+> - **§3.3 "message-rate-bound" — refined, not refuted.** Later measurement located the cost more
+>   precisely: it is the **synchronous round trip** (the application polling `vkGetFenceStatus`
+>   through the network, each poll a full C→S→execute→reply→C cycle), not message count as such.
+>   Readback message volume was separately cut ~5000 → ~180 messages per frame with **no** change in
+>   wall-clock time, which is what pinned it down.
+>
+> Everything else here still stands, including the 3,200× commands-to-memory ratio and the
+> comparison rules in §1.3. For the project's current state, see
+> [`OVERVIEW.md`](OVERVIEW.md).
+
+
 (c)1 is the moment Rayland's command stream crossed a **real network** between two **real machines**,
 and the moment we stopped guessing what that costs.
 

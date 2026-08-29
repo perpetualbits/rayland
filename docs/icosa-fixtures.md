@@ -1,5 +1,29 @@
 # The icosahedron fixtures — what they found
 
+> ### ⏱ Status of this document, as of 2026-08-29
+>
+> **Written 2026-07-16 and kept as written.** Its central finding is unchanged and still the reason
+> to read it: the fixtures were commissioned to fail against Rayland, they did not, and *why* they
+> did not is a finding about where the hard problem actually lives.
+>
+> What has changed since is which half of that problem is solved. (c)2 owned two things, and they
+> have diverged:
+>
+> - **The readback return path is solved.** Both fixtures now render bit-identically across the
+>   relay, over a real network, with 0 stale frames in 20 runs. See
+>   [`design/2026-07-21-c2-getfencestatus-completion.md`](design/2026-07-21-c2-getfencestatus-completion.md).
+> - **The mapped-memory forward path — the thing these fixtures were built for — is still open.**
+>   The reason is exactly the one this document identifies: on loopback, and on the two-machine
+>   setup as currently wired, the fixture's uninterceptable mapped writes still *reach* S. The case
+>   where they cannot has not yet been constructed. **A passing fixture is still not evidence that
+>   this problem is solved**, which is the warning this document was written to give.
+>
+> The measured cost of that mapped-write volume is now known: **283 ms/frame for `icosa-cpu` against
+> ~41 ms for `icosa-gpu`** over a real network — the two fixtures differing only in whether the
+> fractal is computed on the CPU and pushed through mapped memory, or evaluated in a shader. For the
+> project's current state, see [`OVERVIEW.md`](OVERVIEW.md).
+
+
 This is the document (c)2 (mapped-memory coherence) reads first. It records what actually
 happened when `rayland-icosa-cpu` and `rayland-icosa-gpu` — the two fixtures built to make
 `vkMapMemory` bite (design spec:

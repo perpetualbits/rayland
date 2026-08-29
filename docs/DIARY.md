@@ -4201,3 +4201,112 @@ instrument that actually named `VK_ERROR_DEVICE_LOST` — is written out step by
 
 **Not merged to `main`, deliberately.** The branch is mid-project: 4.3 is half done and the WP0 arc is
 unfinished. Merging is the owner's call, not a housekeeping step to take on the way out.
+
+### 2026-08-29 — A handover surface: the overview, and a snapshot script that is repo-agnostic
+
+The project changes shape today, not in what it builds but in how it is directed. From now on
+**planning and design happen in Claude.ai**, and this repository's sessions receive prompts and
+report back. The owner has found this division works better in their other projects. Nothing about
+the architecture changes; what changes is that the reasoning now happens somewhere that cannot see
+the tree, which creates a requirement the project has not had before: **the project must be able to
+explain itself to a reader who does not have it open.**
+
+Two artifacts for that, both delivered this turn.
+
+**`docs/OVERVIEW.md`.** A single self-contained orientation: the thesis, the S/C vocabulary, the
+mechanism, the crate map, the measured numbers, what is open, the binding rules, and an index of
+where to look for what. It is not a summary of `CLAUDE.md` — `CLAUDE.md` is the binding conventions
+document and is denser than a planning reader needs, and the diary is 4200 lines of chronology.
+The overview is the third thing: the *shape* of the project, with the discoveries that a plan must
+not re-propose stated as discoveries rather than left implicit in the code.
+
+That last point drove most of the writing. This project's distinguishing feature is that several of
+its central facts were *found by measurement and overturned earlier beliefs* — the socket carrying
+0% of the commands, the observe-and-diff return path being structurally unserviceable,
+`DMA_BUF_IOCTL_SYNC` being a measured no-op, the "CS error" being `VK_ERROR_DEVICE_LOST` from
+outside Rayland entirely, and Task 4.0's zero-copy verdict being overturned by Task 4.0-bis. A
+planner without those would confidently re-propose retired designs. So the overview carries the dead
+ends with the same weight as the live path, which is the diary's own principle applied to a
+different audience.
+
+**Honesty note on the writing of it.** The first draft got two things wrong, both by inferring from
+file listings rather than reading the record. It said WP0 Task 4.4 was "not started" — the event
+tunnel is in fact **genuinely working**, measured: vkcube receives both `configure` events through it
+and acks them (2026-07-25). And it framed 4.3 part 2 as merely unwritten, when the record is
+specific that it was **deliberately** not written, because it cannot be verified without a compositor
+and a GPU, and *"code that compiles while exercising no test would look done."* Both were corrected
+from the diary and the map before the file was finished. The tell was the same in both cases:
+`crates/rayland-c/tests/wayland_proxy_event_delivery.rs` exists, and existing tests are evidence that
+a task listing does not carry. Reading the artifacts beat reading the directory, which is the whole
+argument for the overview existing.
+
+**`~/bin/snapshot.sh`.** Adapted from the eno version. The only substantive change is that the repo
+is now `git rev-parse --show-toplevel` from the *current directory* rather than derived from the
+script's own location — so one copy on `PATH` serves every repository, and the archive's name and
+its single top-level directory come from the repo's basename. The eno-specific exclusions
+(`downloads/`, `.spnb`) are gone from the default and replaced by a generic non-source pattern plus
+a `SNAPSHOT_EXCLUDE` environment escape hatch for the one-off case. Verified against eno by diffing
+old and new archives: the new script drops **nothing** the old one kept.
+
+Rayland's own snapshot is 1.8 MB / 259 files, or 1.4 MB / 205 with
+`SNAPSHOT_EXCLUDE='^crates/rayland-venus-proto/vendor/'` — that vendored tree is 3.5 MB of Mesa's
+*generated* protocol headers, real source but not reading material, and whether to include it is a
+per-conversation judgement rather than a default worth baking in.
+
+Note the script deliberately lives **outside** the tree, which means it is not in the snapshots it
+makes. That is the right trade for a general tool, and the overview's §10 documents its usage, so
+the knowledge travels even when the file does not.
+
+**No status changed**, so `project-map.js` is left alone and its `updated` date not churned — but it
+was checked, and it was also the source that corrected the 4.3 part 2 account above.
+
+### 2026-08-29 (later) — The documentation had drifted, and the front door was the worst of it
+
+Having written `OVERVIEW.md`, the obvious next question was whether the *rest* of the documentation
+would mislead a planner reading it cold. It would. Four files were wrong in three different ways,
+and the ways matter more than the fixes.
+
+**`README.md` was flatly false.** It still said *"Status: early design + bootstrap… There is no
+working software yet."* — describing a project that demonstrably renders an unmodified Vulkan
+application across a network onto another machine's screen. It had simply never been revisited after
+SP0. This is the file a stranger reads first, and for months it has been telling them the project
+does not exist. Rewritten completely: what works, what is measured, what is honestly still open, how
+the mechanism actually works (including the ring inversion, which is the counter-intuitive part), and
+an index into the documentation. It now leads with the thesis being **proven and running**, and
+immediately qualifies that with what it is not — Vulkan only, a handful of workloads, presentation
+mid-rebuild. A README that oversells is the same failure as one that undersells, just louder.
+
+**`CLAUDE.md` had a hole exactly where the work is.** It marked C0 "in progress" (it is complete),
+and — worse — its arc (c) roadmap listed C0, (c)1, (c)2, (c)3, (c)4 and **no WP0 at all**. The
+currently active phase, the one every recent entry in this diary is about, was missing from the
+binding conventions document's own roadmap. A session reading only `CLAUDE.md` would have concluded
+the next task was (c)3. WP0 now has a full bullet carrying its state per sub-task, the zero-copy
+reversal, and the three decisions 4.3 part 2 needs before it can be written. Also added: a section
+making `OVERVIEW.md` a maintained artifact with a keep-current rule, since a handover document that
+silently rots is worse than none — it would be trusted.
+
+**Two phase reports were accurate about their moment and misleading about now.** `c1-the-network.md`
+leads with "the relay silently delivers stale frames… this is a correctness bug and it is the most
+important thing in this document" — true when written, closed since. `icosa-fixtures.md` warns that
+the fixtures passing is not evidence (c)2 is solved — still true, but half of (c)2 *has* since been
+solved, and a reader cannot tell which half from the document.
+
+The temptation was to edit them. That is exactly what this diary's rules forbid, and the reasoning
+generalises past the diary: a measurement report edited to match later knowledge stops being a
+measurement report. So both got a dated **status banner** at the top instead — what has been
+overtaken, what still stands, and where the resolution is written — with the original text untouched
+below it. This is the same device the WP0 plan uses for its own reversal ("Task 4.0 OUTCOME", then
+"Task 4.0-bis OUTCOME: measurement overturned the earlier spike") and the project map uses for its
+measured-false claims. It is now the house pattern for superseding a document without erasing it,
+and it is worth naming as such.
+
+**One thing found while writing the banners** that is worth recording on its own: `c1-the-network.md`
+§3.3's "the relay is message-rate-bound" was later *refined rather than refuted*. The cost is the
+**synchronous round trip** — each `vkGetFenceStatus` poll a full C→S→execute→reply→C cycle — not
+message count as such. The evidence that separates them is the readback coalescing work: ~5000 → ~180
+messages per frame with **no** change in wall-clock time. A banner that had said "refuted" would have
+lost that distinction, and the distinction is the whole reason adaptive polling and reply batching
+are the candidate directions rather than further message-volume work.
+
+All relative links in the five touched files were checked to resolve. No node status changed, so
+`project-map.js` is untouched and its date not churned — checked, again.

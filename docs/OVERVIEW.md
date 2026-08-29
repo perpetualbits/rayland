@@ -1,0 +1,586 @@
+# Rayland — project overview
+
+**Purpose of this document.** A single, self-contained orientation to the whole project, written
+for a reader who is doing **planning and design** for Rayland without necessarily having the
+repository open. It is the companion to a source snapshot (`snapshot.sh`, see §10): the snapshot
+carries the code, this document carries the meaning.
+
+It is deliberately complete rather than short. Rayland's hard parts are hard in ways that are not
+visible from the code — several of the project's central facts were discovered only by measurement,
+and at least three plausible-sounding designs were built and then disproved. A plan made without
+those facts will re-propose a dead end. They are all recorded here, with pointers to the evidence.
+
+**Last brought current:** 2026-08-29, against commit `4c8ce52` (2026-07-27).
+
+---
+
+## 1. The working arrangement
+
+From 2026-08-29 onward the project runs in two roles:
+
+- **Claude.ai — planning and design.** Discussion, architecture, specification, and the writing of
+  prompts. Reads this document and the snapshot; produces prompts and design decisions.
+- **Claude Code on the laptop — execution and reporting.** Receives those prompts, does the work in
+  the repository against real hardware, and reports back.
+
+This document and the snapshot are the channel from the repository to the planning side. The report
+back is the channel in the other direction.
+
+Two consequences worth stating, because they shape what a plan may assume:
+
+1. **The laptop is the primary copy.** GitHub is backup/publishing. A plan should never assume work
+   exists anywhere but the laptop unless it was pushed.
+2. **Anything end-to-end needs two physical machines** (§9). A plan whose verification step requires
+   the GPU or the display cannot be checked on a travel machine, and should say so explicitly so
+   the work can be sequenced around it.
+
+---
+
+## 2. What Rayland is
+
+**Native remote GPU rendering for Wayland.** An application runs on one machine but is rendered and
+displayed on another — the one with the capable GPU and the monitor the user is actually looking at
+— by sending a **command stream** across the network rather than a **pixel stream**.
+
+It is the modern heir to X11's network-transparent graphics, rebuilt for Vulkan. The name nods to
+Sun Ray (thin client, compute elsewhere, display here) and rhymes with Wayland.
+
+A video-encode fallback for already-rendered pixels is architecturally reserved but is explicitly
+**not the goal**: in the target setup the weak machine is exactly the wrong place to run an
+expensive encoder.
+
+### 2.1 The S / C vocabulary — do not get this backwards
+
+Rayland uses X11-era terms, which are the **reverse** of cloud usage. Every document, comment, and
+identifier in the project depends on this:
+
+| Term | Meaning | Has |
+|---|---|---|
+| **S** — the "server" side | Where the **user sits** | Keyboard, mouse, **display, GPU**, the Wayland compositor, working drivers. The strong machine. |
+| **C** — the "client" side | Where the **application executable runs** | Possibly weak, possibly a different CPU architecture (RISC-V), possibly headless. No good display path. |
+
+The app on **C** emits rendering commands; **S's GPU** does the drawing and shows the result on
+**S's** display.
+
+A hard structural rule follows from this and is enforced by tests: **C must never link a GPU
+stack.** `crates/rayland-c/tests/no_gpu_linkage.rs` asserts `rayland-engine` is absent from C's
+dependency tree. The dependency arrow points `rayland-engine → rayland-vtest` and **must never be
+reversed**.
+
+### 2.2 Why this is hard
+
+Wayland deliberately assumes the application and the compositor share memory and a GPU: the app
+renders into a GPU buffer and passes a **file-descriptor handle** over a local socket. You cannot
+send a file descriptor across a network. Remoteness is therefore not a missing feature — it is an
+**excluded assumption**.
+
+### 2.3 Why it is not hopeless
+
+The hardest component — serializing a Vulkan command stream and replaying it on a remote GPU —
+already exists and is hardened in the virtual-machine world (Venus, virglrenderer, gfxstream; the
+whole stack ships in ChromeOS Crostini), and it is hardened against **exactly Rayland's threat
+model**: an untrusted party driving the host GPU. Rayland's job is largely to swap that stack's
+transport from "shared memory inside one computer" to "a real network", plus the genuinely new
+pieces a network needs.
+
+**Locked decision: Rust for all code Rayland writes.** The Vulkan serialization/replay engine is
+*reused* via FFI behind a clean Rust trait boundary rather than reinvented. "All Rust" means our
+code is 100% Rust; the borrowed engine is an external linked dependency. The trait boundary must
+stay clean enough that the engine could later be Rustified or swapped.
+
+---
+
+## 3. How it actually works
+
+This section is the part most worth reading before designing anything, because the mechanism is
+counter-intuitive and was itself a discovery.
+
+### 3.1 The founding discovery: the socket carries nothing
+
+The first working prototype (arc (s), SP0–SP3) used Rayland's own hand-rolled `postcard` protocol
+and worked end to end. The pivot to the real engine (arc (c)) then produced the finding that
+reshaped the project:
+
+> **The vtest socket carries 0% of the application's Vulkan commands.**
+
+Mesa's Venus ICD does not send commands over its socket. It writes them into a **shared-memory
+ring** whose file descriptor was passed over `SCM_RIGHTS`; the socket carries only a **doorbell**
+(`SUBMIT_CMD2`) saying "the ring has advanced". Neither a shared page nor a file descriptor
+survives a network.
+
+So "(c)1 — the network" was never "swap the socket for QUIC". It was a protocol design problem.
+Evidence: `docs/design/2026-07-15-venus-ring-findings.md`.
+
+### 3.2 The insight that makes it work without patching Mesa
+
+The vtest protocol's "host" is **whoever allocates the ring**. Rayland can be that party.
+
+`rayland-c` is a **local vtest server** that a stock, unmodified Mesa Venus ICD connects to. It
+hands the application plain local memfds for its ring and its blobs. The application then writes
+its commands into memory that *Rayland owns*. No Mesa fork, no patch, no `LD_PRELOAD` of the
+driver — the app and its driver are entirely unmodified.
+
+### 3.3 The forward path, concretely
+
+```
+  C (apollo)                                  network                S (dop561)
+  ┌────────────────────────────┐                                     ┌────────────────────────────┐
+  │ unmodified Vulkan app      │                                     │ rayland-s                  │
+  │   ↓ (stock Mesa Venus ICD) │                                     │   ↓ writes delta INTO its   │
+  │ writes cmds into ring memfd│                                     │   own mirror of the ring's  │
+  │   ↓ doorbell over socket   │      C2S::RingDelta (postcard)      │   memory                    │
+  │ rayland-c watches ring tail│ ──────────── QUIC ────────────────► │   ↓                        │
+  │   relays the raw BYTES     │      C2S::BlobData (all blobs       │ libvirglrenderer's own ring │
+  │                            │              except the ring)       │ thread polls that memory    │
+  │                            │                                     │   ↓                        │
+  │                            │ ◄─────────── QUIC ───────────────── │ real GPU draws              │
+  │ app's readback blob filled │      S2C::BlobData (readback,       │   ↓                        │
+  │ app's fence poll answered  │      reply arena), progress         │ rayland-present → window    │
+  └────────────────────────────┘                                     └────────────────────────────┘
+```
+
+The crucial subtlety, and the thing most easily got wrong when reasoning about `rayland-s`:
+
+> **`rayland-s` does not "receive commands and execute them."** A relayed ring delta is **written
+> into the ring blob's memory**, because that is where virglrenderer's own ring thread polls for it
+> (`vkr_ring.c:33-58` points the ring at the blob's pages; `vkr_ring.c:262-266` loops on them).
+> `RenderEngine::submit` is used only for the *inline* vtest path, which carries the
+> `vkCreateRingMESA` that creates the ring and essentially nothing else.
+
+**Blob synchronisation.** Since 2026-07-26, C synchronises **every blob except the ring**. This was
+forced by Venus's **out-of-line command streams**: any submission larger than `direct_size`
+(`buffer_size >> 4`, so 8 KiB for the 128 KiB ring) is replaced by `vkExecuteCommandStreamsMESA`
+naming *other* shmems. Skipping those made every submission over 8 KiB unrelayable — i.e. most real
+workloads. The ring keeps its own `RingDelta` message (which carries the `tail` that validates its
+bytes, and is sent last). Publishing a region S also writes is safe because of the **baseline**,
+not the blob id: `note_s_wrote` folds each S→C write into the baseline, so S's replies are never
+echoed back.
+
+**A standing design constraint on this path** ((c)1 spec §7): the ring is relayed as **opaque
+bytes** precisely so that a decoding bug cannot become a corruption bug. `rayland-venus-proto` may
+answer "how long is this command?" for framing, but it **may never decide what gets relayed, when,
+or which blobs a delta reads**. Enforced by `crates/rayland-c/tests/decoder_is_not_load_bearing.rs`.
+One deliberate exception exists, **off the relay path**, and is documented at four sites: on
+2026-07-26 `find_destroy_device` was allowed to validate a signature against a decoded command
+boundary, because the bare byte scan was false-positiving on payload bytes. The guard test is
+deliberately *not* widened to cover `rayland-s`, so the discrepancy stays visible rather than
+papered over.
+
+### 3.4 The return path, and why it was the hardest problem
+
+An application that maps a **GPU-written** buffer and reads it back cannot be served by S passively
+observing and diffing that memory. S is a foreign reader with no fence→coherency relationship with
+the GPU. Every patch of the observe-and-diff approach hit a different wall. Two candidate fixes were
+investigated and **both retired by measurement**:
+
+- The fenced engine-side read (`virgl_renderer_transfer_read_iov`) is a **hardcoded stub** for the
+  Venus/render-server path in virglrenderer 1.2.0 **and** 1.3.0 — there is no engine-level
+  coherence API at all.
+- `DMA_BUF_IOCTL_SYNC` on the readback dma-buf is a **measured no-op**: byte-identical to the raw
+  read in 6561/6561 samples. The memory is already CPU-coherent, so **the tearing was never a
+  cache-coherence problem.**
+
+The conclusion was that correctness needs the host GPU work retired through an **engine call** — and
+that call takes Rayland's single global engine lock, which is exactly what contends with the
+message-thread doorbell (ring-stall `SIGABRT`). That architectural deadlock is **solved by the
+engine actor** (`crates/rayland-engine/src/actor.rs`): one thread owns virglrenderer, and an
+`EngineClient` implements `RenderEngine` by messaging it, so the fence and the doorbell cooperate on
+one thread instead of deadlocking.
+
+**The barrier that finally worked ("G'", 2026-07-21), after three recorded dead ends:**
+
+With fence feedback off, the application releases itself by polling `vkGetFenceStatus` until the
+reply reads `VK_SUCCESS`. virglrenderer writes that reply into the reply arena as `[38][0]`, which
+means the app's submit **and its readback copy** are complete on S's GPU.
+`Applier::reply_arena_fence_signaled` scans the **live** arena for that pattern (the shipped diff
+fragments the reply into per-changed-byte runs, so the contiguous pattern is invisible there). It is
+safe against a lingering prior success because the app polls `VK_NOT_READY` (`[38][1]`) *during* a
+copy's DMA, so a live `[38][0]` means a fence just signalled. `progress_thread` then ships the
+readback **before** the reply arena and the head-advance that release the app. No S-issued fence, no
+timing heuristic; the progress thread no longer touches the engine.
+
+The three dead ends, all left in the record deliberately:
+1. An empty-submit context fence **retires before the readback DMA** (`T2 < T4`, pervasive).
+2. A "wait-drain" design rested on a false premise — with feedback off Mesa does **not** send
+   `vkWaitForFences`, it polls `vkGetFenceStatus`. Caught by a spike before it was built.
+3. A fingerprint-gated res6-first ordering ("G-lite") killed the staleness but **tore**, having no
+   completion barrier.
+
+**Result: 0 stale frames across 20 real-network runs.**
+
+### 3.5 Presentation
+
+`rayland-present` shows finished pixels in a real `xdg_toplevel` window, via `wl_shm` or zero-copy
+`zwp_linux_dmabuf_v1`. The (c)1/(c)2 path uses **only `wl_shm` and is deliberately not zero-copy**:
+S presents the application's **readback blob**, because it cannot see the app's `DEVICE_LOCAL`
+render target (that produces no blob at all). Ending that is precisely what WP0 exists for.
+
+`present_live()` follows a live render by re-arming a `wl_surface.frame` callback on every commit.
+**Pacing is the compositor's, not the relay's** — the window shows whichever frame S last completed,
+so a slower remote render repeats frames. That keeps presentation from ever blocking the relay, at
+the cost of not being frame-accurate.
+
+---
+
+## 4. Repository layout
+
+A Cargo workspace of **eighteen crates**, ~46k lines of Rust and ~14.5k lines of Markdown docs. All
+crates are `v0.0.x` and pre-stable. Each declares its own license: **library → LGPL-3.0-or-later,
+application/binary → GPL-3.0-or-later.**
+
+### 4.1 The live path — arc (c)
+
+| Crate | Side | Role |
+|---|---|---|
+| `rayland-c` | C | **C's daemon.** Local vtest server for a stock Venus ICD; hands out memfds, watches the ring, relays bytes. Also hosts WP0's Wayland proxy. ~6.9k lines. GPL, unpublished. |
+| `rayland-s` | S | **S's daemon.** Applies relayed messages to a real `libvirglrenderer`; owns the return-path barrier and presentation. ~6.0k lines. GPL, unpublished. |
+| `rayland-relay` | both | The **(c)1 relay wire protocol**: `C2S`/`S2C` messages and `postcard` framing. Pure data — no GPU, no sockets, no async — because C must never link a GPU stack. Also carries the `trace` stage tracer. LGPL. |
+| `rayland-vtest` | both | The **vtest wire protocol** Mesa's Venus ICD speaks, the `RenderEngine`/`VtestTransport` traits, `EngineError`, and `venus_ring/`. **No GPU dependencies by construction.** LGPL, unpublished. |
+| `rayland-venus-proto` | both | **Framing only**: how long is the command at the start of these bytes? Vendors Mesa's *generated* `venus-protocol` headers compiled against a replacement `vkr_cs.h` this crate writes itself, so the borrowed decoders run with no virglrenderer and no Mesa util library. LGPL, unpublished. |
+| `rayland-engine` | S | **The real engine.** FFI-embeds `libvirglrenderer` behind `RenderEngine`, driving a Venus context on S's GPU. Contains the **engine actor**. LGPL. |
+| `rayland-present` | S | On-screen presentation: finished pixels in a real `xdg_toplevel`, `wl_shm` or zero-copy dmabuf. Shared by `rayland-server` and `rayland-s`. LGPL. |
+
+### 4.2 Applications and fixtures — they know nothing about remoting
+
+| Crate | What it is |
+|---|---|
+| `rayland-refapp` | C0's captured workload: an **ordinary** offscreen Vulkan triangle with **zero `rayland-*` dependencies**. Its value is that it is boring and typical; keep it that way. |
+| `rayland-icosa-core` | Shared foundations for the icosa fixtures: geometry, frame-indexed animation schedule, Mandelbrot math, and bit-exact `log2`/`sin`/`cos`. **No dependencies at all**; its correctness is arithmetic. |
+| `rayland-icosa-vk` | The Vulkan scaffolding both fixtures share, so they **cannot drift** in the parts that must be identical for the comparison to mean anything. |
+| `rayland-icosa-cpu` | **Fixture A.** Spinning icosahedron textured with a fractal computed on **its own CPU** and written into persistently-mapped `HOST_COHERENT` memory every frame — no flush, so **no call on the wire** saying a megabyte changed. That is the (c)2 problem stated in executable form. |
+| `rayland-icosa-gpu` | **Fixture B.** Same picture, same schedule, same render loop; only the fractal moves — evaluated in a fragment shader, so ~80 bytes/frame cross mapped memory instead of ~1 MiB. It is the **volume control** for fixture A, not an alternative to it. |
+| `rayland-icosa-window` | **A demo, not a fixture, and must never be mistaken for one.** Live window, human-watchable, nothing reproducible. Exempt from the fixture rules: it *may* depend on `rayland-*` crates and it *has* a compositor-paced redraw loop (which would destroy a fixture's bit-identical comparison). |
+
+**The fixture discipline matters to any plan that touches them:** the two fixtures must be identical
+in everything but the property under study, and they must have **no redraw loop**, or their
+native-vs-remoted comparison stops being bit-exact and stops being evidence.
+
+### 4.3 Arc (s) — the superseded hand-rolled arc, still passing
+
+`rayland-wire` (messages + framing), `rayland-client` (C side), `rayland-server` (S side),
+`rayland-transport` (QUIC stream adapters over `quinn`), and `rayland` (the published crates.io
+name-holder and future facade). SP0–SP3 built Rayland's own protocol end to end; all complete and
+merged. **The code is untouched and its tests still pass**, coexisting with arc (c) until arc (c)
+fully supersedes it.
+
+---
+
+## 5. Where the project stands
+
+### 5.1 Roadmap
+
+| Phase | Status |
+|---|---|
+| SP0 · First light — triangle, TCP, replay on a real GPU, PNG | **done** |
+| SP1 · Onto the screen — live Wayland window on S | **done** |
+| SP2 · Real transport — TCP → QUIC | **done** |
+| SP3 · Zero-copy presentation — dmabuf export, `wl_shm` fallback | **done** |
+| C0 · Venus first light — unmodified app via Mesa's Venus ICD, PNG bit-identical to native | **done** |
+| (c)1 · The network | **done** |
+| (c)2 · Mapped memory and the readback return path | **done** |
+| **WP0 · Wayland proxy first light** | **ACTIVE — the live front** |
+| (c)3 · Content-addressed assets | planned |
+| (c)4 · Real/complex applications; GL via Zink | planned |
+| SP4 · Adaptive L3, session/security (SSH bootstrap, sandboxing) | planned |
+| SP5 · Proxy completeness (Sommelier/waypipe-grade Wayland coverage) | planned |
+| Audio | planned, separate track (transport reservations already made) |
+
+### 5.2 The headline: the thesis is proven
+
+**An unmodified Vulkan application runs on C, is rendered by S's GPU, and animates live in a window
+on S's screen.** `scripts/icosa-remote-demo.sh` does it, apollo → dop561, commands over the wire,
+not pixels. That was the whole bet.
+
+### 5.3 What is measured, not merely believed
+
+The project has an unusually strong measurement discipline; these are the numbers a plan should
+reason against rather than re-deriving.
+
+| Quantity | Value |
+|---|---|
+| Shipping-config failure rate, real network | **0 failures in 480 runs** → <0.62% at 95% (rule of three) |
+| Stale frames after the G' barrier | **0 across 20 real-network runs** |
+| `icosa-gpu` frame time, real network | **~41 ms/frame** |
+| `icosa-cpu` frame time, real network | **283 ms/frame** — mapped-write volume *was* the dominant cost |
+| `icosa-gpu` loopback | ~50 ms/frame with a **78 KB** return path |
+| Readback message count after gap-threshold coalescing | ~5000 → **~180 messages/frame**, still bit-identical, still 0 stale |
+| Batching `ship()`'s per-message lock and flush | **1.03×** — i.e. not the bottleneck |
+| Venus semaphore/event/query feedback, loopback | **1.23×** (median `draw_readback` 48.7 ms → 39.5 ms, 120/120 bit-identical) |
+| Feedback-arm failures | **1 in 92** runs, vs 0 in 20 without — *not* a significant difference |
+| `VK_ERROR_DEVICE_LOST` on `vkQueueSubmit` | NVIDIA RTX A500 **7/14** runs lost; Intel Iris Xe **0/10** |
+| Teardown `SIGABRT` (libepoxy, from `virgl_renderer_cleanup`) | was ~21%, **fixed** |
+
+**Frame time is the synchronous round trip.** With feedback off the app implements `vkWaitForFences`
+by polling `vkGetFenceStatus`, and *every poll is a full C→S→execute→reply→C cycle*. It is not
+bandwidth, not message count, not flush syscalls. The readback is **not** fragmented (`res=5`
+averages 377-byte runs); the one-byte flood is the **reply arena**, whose gap-0 grain is a
+deliberate correctness property — a gap byte is one S did not write.
+
+### 5.4 Two findings that overturned earlier beliefs — do not re-propose the retired versions
+
+1. **The three-day `vkQueueSubmit` "CS error" was never a Rayland bug.** It is `VK_ERROR_DEVICE_LOST`
+   (`VkResult=-4`) from the real submit on S's GPU. Venus reports device loss through a branch that
+   runs only when `flags == 0x0`, so it surfaced as a generic `%s resulted in CS error` with no log
+   of its own. Proved by building a patched `virgl_render_server` and spawning it via
+   `RENDER_SERVER_EXEC_PATH`, which the *system* library honours. **It is GPU-specific**, and vkcube
+   defaults to the discrete GPU — hence the `--gpu_number 0` gotcha.
+
+2. **Venus fence feedback is load-bearing and must stay off; the other three feedbacks are
+   unattributed.** `no_fence_feedback` is required: the G' barrier works by spotting the app's
+   `vkGetFenceStatus` reply, and fence feedback removes that poll — enabling it gives exit 134 and
+   zero frames, immediately and every time. But semaphore/event/query feedback is a different
+   question: worth 1.23×, and its one observed failure was hunted through **82 further clean runs**
+   (including 60 unattended with genuine core capture armed, no core produced). 1/92 vs 0/20 is not
+   significant, and the failure **cannot now be pinned on feedback at all**. The flags remain off
+   because an unexplained total-session loss is unexplained either way — but the reason is "we do
+   not know what that was", not "feedback breaks it". A plausible-sounding explanation ("(c)1 does
+   not relay the feedback pages") was checked and **refuted**: `emit_blob_writes` excludes only
+   rings, and `take_bytes_s_wrote` detects change by diffing a shadow, so it catches writes the GPU
+   makes directly. Measured: S ships back `res=2` and `res=5` and nothing else, traffic within 0.1%.
+   **There is no un-relayed feedback page in this workload.**
+
+---
+
+## 6. What is open
+
+Ranked as the project itself ranks them.
+
+### 6.1 WP0 · Wayland proxy first light — the active front
+
+**The point of WP0:** today S presents the application's *readback buffer* — pixels the GPU wrote,
+copied back to memory, shipped, and re-uploaded as `wl_shm`. That is a bandwidth tax and it is why
+resolution costs anything at all. WP0 replaces it by **proxying the application's real Wayland
+protocol**: the app connects to a proxy on C rather than to a compositor, its
+`wl_surface`/`xdg_toplevel` requests are relayed to S's real compositor, and the one thing that
+cannot cross a network — the swapchain `wl_buffer`'s file descriptor — is replaced by a
+**`BufferToken`** naming the S-side resource the command relay has already rendered. **No pixels
+cross the network.**
+
+**Task state:**
+
+| Task | State |
+|---|---|
+| 4.0 spike — can S export a compositor-importable dma-buf? | **done**, and its first answer was wrong (see below) |
+| 4.1 — C-side wiring (link-backed sink, inode→res_id resolver, proxy as a 4th thread) | done |
+| 4.2 — S router, persistent Wayland client, object-id map, session replay | done |
+| **4.3 — token → `wl_buffer`** | **C's half done; S part 1 done; S part 2 SPECIFIED BUT NOT WRITTEN** |
+| 4.4 — event return path (eventfd wakeup, `send_event`, `S2C::WaylandEvent`, `configure`) | **genuinely working** — measured: vkcube receives both `configure`s through the tunnel and **acks** them |
+| 4.5 — end-to-end: vkcube's spinning cube on S's screen | not started |
+
+**4.3 part 2 is the immediate next piece of work.** Its shape turned out smaller and different from
+the plan's decomposition: **C's half was already complete** (the `params.add` handler resolves the
+passed memfd's inode to an S-side resource id, `create_immed` assembles the full `BufferToken`, and
+an unresolved fd is deliberately *not* forwarded rather than guessed at — the doc comments calling
+this "the next sub-step" are stale). **4.3 is S-side only.** Part 1 is landed: S retains the dma-buf
+descriptor virglrenderer exports per blob, exposed as `Applier::exported_fd() -> BorrowedFd`, a
+borrow and never ownership, because `mem->exported` permits exactly one export per resource and it
+already happened at creation.
+
+Part 2 is unwritten. `crates/rayland-s/src/wayland_client.rs:592` still logs *"buffer-token request
+(obj N opcode M) deferred to 4.3; skipped"* and drops the whole request.
+
+**The specified sequence** (design is exact; from the 2026-07-27 diary entries and the map):
+
+1. Resolve `token.resource_id` through `Applier::exported_fd`.
+2. **`send_request` an `add` (opcode 1)** on the S-side `zwp_linux_buffer_params_v1` object, with
+   arguments `[Fd, Uint(0) plane_idx, Uint(0) offset, Uint(stride), Uint(mod_hi), Uint(mod_lo)]`.
+3. Let the existing path replay `create_immed` with the token's width/height/format.
+4. Map the app's buffer id to it in the existing `app_id ↔ s_id` table; the subsequent
+   `attach`/`commit` then replays through the path that already works.
+5. **The commit wants gating on the frame's completion** — reuse the (c)2 G' signal that already
+   gates the readback.
+
+**Three details a plan must decide or respect, none of which the written plan mentions:**
+
+1. **S must *synthesize* the `add`, not translate it.** C intercepts `add` and drops the fd by design
+   — that *is* buffer-by-token — so S's params object has **no planes** when `create_immed` arrives.
+   This is a request S **originates** rather than replays: a first for the replay module.
+2. **`BufferToken` carries no `stride`, and `add` needs one. Decide this first.** Deriving
+   `width × bpp` is exactly the assumption the plan flags as **garbling pixels rather than failing
+   cleanly**. C knows the real stride (Mesa passes it to `add` before the proxy drops it), so it
+   probably belongs on the token.
+3. **Lock discipline.** Resolve and clone the fd **under the applier lock, and release it before any
+   `send_request`.** A Wayland call made under that lock puts the relay's mutex behind a compositor
+   round trip.
+
+**An open plumbing question:** `WaylandReplay` needs access to `Applier`'s descriptors, and the two
+are held separately in `serve`. That is a design choice the author deliberately left to be made
+*with a test in front of it*.
+
+**Why it was left unwritten is itself a planning fact.** It is not an oversight: 4.3 part 2 cannot be
+verified without a compositor and a GPU (and vkcube reaching `attach`, which needs `--gpu_number 0`).
+The author's stated reason for stopping was that *"code that compiles while exercising no test would
+look done"*. A plan that schedules this work should schedule its verification with it.
+
+**Two recorded reversals to be aware of when planning here.**
+
+*First, the zero-copy question.* Task 4.0 concluded "zero-copy is structurally unreachable; take the
+readback→`wl_shm` path", reasoning from virglrenderer source that guest blobs have no host fd.
+**That was wrong** and is left in place per the honesty rule: it conflated C's local placeholder
+memfd with the *S-side* resource. Task 4.0-bis overturned it with two source reads plus an empirical
+run — Venus requests the swapchain image as `HOST3D` with `VkExportMemoryAllocateInfo{DMA_BUF}`
+**unconditionally**, and on S resources 4–7 exported `fd_type=1` (DMABUF). **WP0 presentation is
+zero-copy dma-buf.** The surviving build note is 4.3 part 1's reason for existing: the export happens
+**once at blob creation**, so the descriptor must be retained, not re-requested.
+
+*Second, the wall that blocked 4.3 for days.* The `WaylandArg::Buffer(_)` arm was at one point simply
+**unreachable** — vkcube died after binding `zwp_linux_dmabuf_v1`, never calling `create_params`.
+Once past that it was reachable but blocked behind a `vkQueueSubmit` that "did not decode". An
+enormous elimination followed (ring proven byte-exact over 253 deltas with independent
+double-implemented fingerprints; every app blob byte-identical; the staging pool exonerated
+experimentally) — and the answer was **outside Rayland entirely**: `VK_ERROR_DEVICE_LOST`, NVIDIA-
+specific. Two claims made along the way are explicitly marked **measured false** in the project map
+and diary. The lesson the project drew, and which should shape plans here, is stated in the diary as:
+**make the components say what they are doing, rather than reasoning about which is at fault.**
+
+### 6.2 The cheapest queued experiment — needs both machines
+
+```
+TRIES=400 VN_PERF_SETTING=no_multi_ring,no_fence_feedback scripts/soak-failure-rate.sh
+```
+
+The semaphore/event/query feedback arm: **worth 1.23×**, currently held back by exactly one
+unexplained failure (1/92) against a shipping arm clean through 480 runs. One night of soak settles
+it either way. This is the best ratio of information to effort currently on the board.
+
+### 6.3 Longer-term open questions
+
+- **The synchronous round trip itself.** Now the *measured* explanation for frame time. Candidate
+  directions: adaptive polling, reply batching. Matters most when latency is high.
+- **Multi-queue support.** The return-path barrier decodes the application's real per-queue
+  `ring_idx` from its `vkGetDeviceQueue2`; a genuinely multi-queue application is unexplored.
+- **The mapped-memory forward break is still not exercised.** This is subtle and important: the
+  `icosa_cpu` fixture renders bit-identical across the loopback relay, but **on loopback the
+  fixture's uninterceptable mapped writes still reach S**. What (c)2 proved is the **readback return
+  path**. The forward case — a true network, where those writes *cannot* reach S — is the fixture's
+  original purpose and is **still waiting**. `docs/icosa-fixtures.md` explains why it did not bite.
+- **(c)3 content-addressed assets**, **(c)4 real applications and GL via Zink**, then the SP4/SP5
+  hardening tracks and audio.
+
+---
+
+## 7. Rules that bind any plan
+
+These are not style preferences; they are enforced or load-bearing.
+
+**Structural:**
+- C links no GPU stack. Ever. Test-enforced.
+- `rayland-engine → rayland-vtest`, never the reverse.
+- The ring crosses the wire as **opaque bytes**; the decoder is not load-bearing on the relay path.
+- The fixtures stay boring: no `rayland-*` dependencies, no redraw loop, and the pair differs only
+  in the property under study.
+
+**Process (from `CLAUDE.md`, binding on every working turn):**
+- **The diary.** `docs/DIARY.md` gets an entry every working turn — the *thinking*, not the diff,
+  including wrong turns. When a belief is overturned, the old entry **stays** and the overturning
+  gets its own entry. Its stated purpose is twofold: a map for whoever tries the idea again if
+  Rayland fails, and trust-material for software written by an AI under human supervision. ~4200
+  lines today, and it is the single best source on why anything is the way it is.
+- **The project map.** `project-map.js` (data) + `project-map.html` (renderer, opened via `file://`)
+  must be checked every turn and updated in the same turn if anything it depicts changed.
+- **Code conventions.** A doc-comment on *every* function, type, trait, and module. An intent
+  comment on every non-trivial line explaining the **why** or the domain meaning, never restating
+  syntax. Code and comments must always agree — a stale comment is a bug fixed in the same edit.
+- **Documentation conventions.** Written for a reader **not** already familiar with the problem
+  space (explicitly including the repository owner). Explain the pitfalls, not just the happy path.
+  **Never omit information for the sake of brevity.**
+
+**Git discipline:** the laptop is primary; never commit or push to `main` from a non-laptop session
+— push to a clearly-named side branch and leave merging to the human.
+
+---
+
+## 8. Standing gotchas
+
+Each of these cost real time to discover.
+
+- **Run vkcube with `--gpu_number 0`.** It defaults to the discrete NVIDIA GPU and provokes
+  `VK_ERROR_DEVICE_LOST`.
+- **Never set `VN_DEBUG=no_abort`.** Mesa's stall abort *is* the stall detector.
+- **Prefix cargo with `CARGO_TARGET_DIR=/home/roland/.cache/rayland-c1-target` on dop561.**
+- **A loopback pass proves nothing about feedback**, and little about the mapped-memory forward
+  path. 120/120 bit-identical frames and 1.23× immediately preceded the one feedback failure.
+- **`README.md` is stale.** It still says "no working software yet". `CLAUDE.md` and the diary carry
+  the current truth.
+
+---
+
+## 9. The physical setup and how to run things
+
+**Two machines, and they are not interchangeable:**
+
+| Host | Role | Has |
+|---|---|---|
+| **apollo** | **C** — runs the application | 16 cores, no display path needed |
+| **dop561** | **S** — GPU and display | NVIDIA RTX A500 + Intel Iris Xe, the monitor, the compositor |
+
+`dogstar` is a travel laptop with neither.
+
+**What runs anywhere** (pure crates, no GPU, no network):
+```sh
+cargo test -p rayland-vtest -p rayland-relay -p rayland-venus-proto     # 83 tests
+```
+
+**What needs both machines:** every end-to-end, presentation, or performance claim.
+
+**The scripts** (`scripts/`), each with a full explanatory header:
+
+| Script | What it does |
+|---|---|
+| `icosa-remote-demo.sh` | **The demo.** Icosahedron computed on apollo, rendered by dop561's GPU, live in a window on dop561's screen. |
+| `c1-two-machine.sh` | (c)1 Task 8 two-machine bring-up: an unmodified Vulkan app renders across a network. |
+| `c2-icosa-two-machine.sh` | (c)2's readback-completion gate, proven over a real network. |
+| `soak-failure-rate.sh` | Measures a configuration's failure rate over many runs. Deliberately does not stop at the first failure — a rate needs its whole denominator. |
+| `c1-sweep.sh` | (c)1 Task 9 measurement sweep: what remoting costs as latency rises (netem). |
+| `c1-trace-analyze.py` | Joins the stage trace from one loopback reproducer run. |
+| `tools/parse_vkqueuesubmit.py` | Field-by-field decode of a captured submit — the instrument that cracked the device-lost mystery. |
+
+**The patched-`virgl_render_server` recipe** (the instrument that named `VK_ERROR_DEVICE_LOST`) is
+written out step by step in the 2026-07-26 diary entry: source from the Ubuntu archive pool over
+plain HTTP (no root, no `deb-src`), `meson`/`ninja`/`pyyaml` in a venv, the distro's own
+`fix-c23.patch`, then `RENDER_SERVER_EXEC_PATH`. **No root needed.**
+
+---
+
+## 10. Snapshots
+
+`~/bin/snapshot.sh` packs the source-y parts of whatever git repository the current directory is in
+— source, docs, configuration; no build trees, no `.git`, no caches. Repo-agnostic: run it from
+`~/git/rayland` and you get `/tmp/rayland.tar.gz`, run it from `~/git/eno` and you get
+`/tmp/eno.tar.gz`.
+
+```sh
+cd ~/git/rayland && snapshot.sh                    # → /tmp/rayland.tar.gz  (~1.8M, 259 files)
+snapshot.sh /some/where/else.tar.gz                # explicit output path
+
+# Optional: drop a large machine-generated tree that is technically source but is noise.
+SNAPSHOT_EXCLUDE='^crates/rayland-venus-proto/vendor/' snapshot.sh   # ~1.4M, 205 files
+```
+
+The list comes from `git ls-files`, so **uncommitted new files are not included** — commit or
+`git add` before snapshotting.
+
+---
+
+## 11. Where to look for what
+
+Ordered by how often a design discussion will want them.
+
+| Question | Document |
+|---|---|
+| Conventions, current status, the crate-by-crate account | **`CLAUDE.md`** — dense and current; the single most information-rich file |
+| Why is anything the way it is? What was tried and failed? | **`docs/DIARY.md`** — ~4200 lines, chronological; the tail entry of 2026-07-27 is the pick-up map |
+| What is shipped / in flight / an open seam, visually | **`project-map.html`** (opened from disk; reads `project-map.js`) |
+| The full architecture, and what exists vs. must be invented | `docs/design/2026-07-13-native-remote-wayland-gpu.md` |
+| **Why the socket carries nothing** — required reading for (c)1 | `docs/design/2026-07-15-venus-ring-findings.md` |
+| The (c)1 network arc | `docs/c1-the-network.md` |
+| Why observe-and-diff cannot work (the walls, in order) | `docs/design/2026-07-17-fence-feedback-walking-skeleton.md` §9–§11 |
+| The engine actor | `docs/design/2026-07-18-c2-engine-actor.md` §8–§9 |
+| The barrier that works (G') | `docs/design/2026-07-21-c2-getfencestatus-completion.md` |
+| WP0's spec and plan, including both 4.0 outcomes | `docs/design/2026-07-22-wp0-wayland-proxy-first-light{,-plan}.md` |
+| The mapped-memory problem stated in executable form | `docs/icosa-fixtures.md` |
+| C0's Venus first light | `docs/c0-venus-first-light.md` |
+| The superseded hand-rolled arc | `docs/sp0-first-light.md` … `docs/sp3-zero-copy-presentation.md` |
+
+There are 31 design documents in `docs/design/`, named by date and subject; the dated filenames make
+the chronology of the investigation readable directly from the directory listing.
