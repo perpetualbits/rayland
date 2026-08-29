@@ -4643,3 +4643,37 @@ session — it worked for the first runs and then hung past a 30 s timeout, so t
 have no photograph. The evidence that a window exists at all in those runs is therefore missing, and
 "no window" versus "window present but never composited" is exactly the split the next session needs.
 Getting that observation is the first thing to do, and it may need a human at the screen again.
+
+### 2026-08-29 (later) — Corrected by the human: the window is visible, and I should have asked
+
+The owner, who was in and out of the house between roofing jobs, saw the vkcube window appear, show a
+cube that **did not rotate**, and disappear after a few moments. That single sentence overturns the
+conclusion I had committed an hour earlier, and the previous entry stands uncorrected above per this
+diary's rule.
+
+**What I got wrong, and how.** I took one full-screen capture at t=22 s, found no vkcube window in it,
+and concluded the surface was "mapped but never composited on the visible workspace" — with a tidy
+supporting mechanism, since a compositor emits frame callbacks only for surfaces it draws. It fitted
+the data I had. But the data I had was *one photograph at one instant*, and absence there does not
+establish that a window was never drawn; it establishes that it was not drawn **then**. I turned a
+negative observation into a mechanism. The `wl_keyboard.enter` half of that argument is still sound —
+a compositor only focuses a mapped surface — but the visibility conclusion built on top of it is not.
+
+**The part that stings is that it was avoidable.** There was a human in the building who had been
+watching the screen, and I never asked. I had even written in the report that the observation "may
+need a human at the screen" — and then went on inferring instead of spending one sentence to ask.
+Cheap, immediate, authoritative evidence was one question away. Noted for the standing habits list:
+when the missing evidence is something a person can simply *see*, ask the person.
+
+**What the corrected picture actually is.** vkcube is a continuously spinning demo — it advances the
+model matrix a few degrees per *frame* and never stops on its own — so a static cube is not a slow
+cube, it is an application that has stopped producing frames. That is exactly what the attach counts
+said all along (9–10 attaches then nothing, or 1 then nothing). The compositor-visibility story was
+never needed to explain the freeze, and it does not explain it. **The stall is unexplained again**,
+and that is the honest state.
+
+The logs do settle two things worth carrying forward: vkcube never errors and never exits on its own
+— two lines of output in every run, and C observes no client disconnect — so the process is alive and
+idle when the script's timer kills it. Whether the *window* vanished before that timer or only when
+the app was killed is not in the logs, and it is the single most useful thing for a watcher to note
+next time.

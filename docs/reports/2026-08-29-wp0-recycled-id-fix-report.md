@@ -160,3 +160,34 @@ continue for as long as it stays visible.
 **Not claimed:** that this is the *whole* explanation. In the 9-frame run the app also stopped asking
 for frames with only 2 `wl_buffer.release` for 9 attaches, and buffer release is likewise tied to
 compositing. Whether that resolves once the window is genuinely visible is the measurement to take.
+
+---
+
+## Correction to the addendum, same day — the window IS visible; I over-read one photograph
+
+**The human watching the screen saw the vkcube window appear, show a cube that did not rotate, and
+disappear after a few moments.** That is direct observation and it overturns the addendum's
+conclusion, which is left standing above per the house rule.
+
+**What was wrong.** The addendum's "mapped but never composited" mechanism rested on a single
+full-screen capture at t=22 s that contained no vkcube window. Absence in one photograph at one
+instant is not evidence that a surface was never drawn — the window may simply have come and gone
+before the shutter. I turned a negative observation into a mechanism, which is the same over-reach
+this project has recorded before, and it was avoidable: **a human was in the building and I did not
+ask.** The `wl_keyboard.enter` evidence (mapped in every run) stands; the visibility conclusion drawn
+on top of it does not.
+
+**What the corrected picture is.** The window is shown. The cube is **static**, and vkcube is a
+continuously spinning demo — it advances its model matrix by a few degrees *per frame* and never
+stops on its own — so a still cube means the application is not producing frames, which is exactly
+the attach counts already measured (9–10 attaches, or 1, then nothing). The compositor-visibility
+story is therefore **not** the explanation for the stall, and the stall is unexplained again.
+
+**Two facts the logs do settle:** vkcube never errors or exits on its own — its output is two lines in
+every run, and C sees no client disconnect — so the process is alive and idle when the script's timer
+kills it. Whether the *window* vanished before that timer, or only when the app was killed, is not in
+the logs and is the next thing to observe.
+
+**For the next session:** start from "the window is shown, displays a static cube, then goes away",
+not from "the window is never composited". The specific question a watcher can answer in one run:
+**does the window disappear while the run is still going, or exactly when the app is killed?**
