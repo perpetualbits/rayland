@@ -1,0 +1,6 @@
+run	verdict	modes	attaches	c2s_bytes	s2c_bytes	frames
+1	PASS	-	241	847267	51097	4
+2	PASS	-	207	766060	47121	4
+3	PASS	-	226	812250	49484	4
+4	PASS	-	207	767618	1047105	4
+5	PASS	-	242	849277	51012	4

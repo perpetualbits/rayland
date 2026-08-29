@@ -1418,6 +1418,14 @@ impl Applier {
     /// Idempotent — a swapchain image is presented every frame and this is called each time. See the
     /// [`Self::presented`] field for why the exclusion exists and what it assumes.
     pub fn note_presented(&mut self, res_id: u32) {
+        // **Measurement bypass (`RAYLAND_S_SHIP_PRESENTED`).** With it set, presentation buffers are not
+        // recorded, so the return path ships them exactly as it did before the exclusion existed. This is
+        // not a tuning knob: it exists so the two behaviours can be A/B'd *within one binary*, which is
+        // the only way to attribute a traffic difference to this change rather than to a rebuild or to
+        // run-to-run variation. Absent the variable the exclusion is always on. See the `presented` field.
+        if std::env::var_os("RAYLAND_S_SHIP_PRESENTED").is_some() {
+            return;
+        }
         self.presented.insert(res_id);
     }
 
