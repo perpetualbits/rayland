@@ -101,6 +101,13 @@ const OP_DMABUF_CREATE_PARAMS: u16 = 1;
 const OP_PARAMS_ADD: u16 = 1;
 /// `zwp_linux_buffer_params_v1.create_immed` request opcode — creates the `wl_buffer` synchronously.
 const OP_PARAMS_CREATE_IMMED: u16 = 3;
+/// The version S binds its **own** `zwp_linux_dmabuf_v1` at, capped at what the app's proxy advertises.
+///
+/// The C-side proxy caps the application at v3 so Mesa takes the fd-free format path, and matching that
+/// here keeps S on the same, well-exercised request set. It also becomes the params object's version and
+/// then the `wl_buffer`'s, since a Wayland child inherits its parent's version.
+const DMABUF_BIND_VERSION: u32 = 3;
+
 /// The plane index every synthesized `add` names.
 ///
 /// Always zero, and that is a guarantee rather than a simplification: C **refuses** a buffer whose `add`
@@ -714,14 +721,24 @@ pub struct WaylandReplay {
     reader_started: bool,
     /// Resolves a token's resource id to a duplicate of S's exported dma-buf descriptor (Task 4.3).
     fd_source: Arc<dyn ExportedFdSource>,
-    /// The S-side `zwp_linux_dmabuf_v1` object and the version it was bound at, recorded by
-    /// [`Self::handle_bind`].
+    /// **S's own** `zwp_linux_dmabuf_v1` object and the version it was bound at — bound lazily by
+    /// [`Self::ensure_dmabuf`] the first time a buffer token arrives, and never destroyed.
     ///
-    /// # Why this has to be remembered rather than derived
-    /// A `create_immed` names the **params** object, and nothing anywhere in the relayed message identifies
-    /// the dmabuf global that params object descends from — on S the params object does not exist yet at
-    /// all. The bind is the only place S ever learns which object it is. `None` means the app never bound
-    /// `zwp_linux_dmabuf_v1`, in which case a token is refused rather than guessed at.
+    /// # Why S binds its own instead of reusing the application's
+    /// A `create_immed` names the **params** object, and nothing in the relayed message identifies the
+    /// dmabuf global it descends from, so S must supply one. The obvious move — remember the object
+    /// created when the app binds the global — was tried and is **wrong**: the application binds
+    /// `zwp_linux_dmabuf_v1` many times while probing formats (twelve times in one measured run) and
+    /// **destroys** each one. A remembered id therefore names a dead object as soon as the app moves on,
+    /// and every later `create_params` fails with `Invalid ObjectId` — after which no `wl_buffer` exists,
+    /// the app's `attach` fails too, and a `wl_surface` with no valid buffer is unmapped by definition, so
+    /// the window **disappears from the screen** while the application carries on none the wiser. That is
+    /// the failure a human watching the screen reported on 2026-08-29.
+    ///
+    /// Binding S's own object severs the dependency on the application's object lifetime entirely: it is
+    /// created once, owned by the replay, and outlives every swapchain the app builds. This is the same
+    /// lesson as the recycled-id race in `rayland-c`, in its other form — *a handle you cached is not a
+    /// handle you still have.*
     dmabuf: Option<(ObjectId, u32)>,
 }
 
@@ -884,12 +901,6 @@ impl WaylandReplay {
         );
         match result {
             Ok(s_id) => {
-                // The dmabuf global is the sender of the `create_params` S will have to originate for any
-                // buffer token, and the bind is the only place S learns which object that is — a token
-                // names only the params object. Record it (and the negotiated version) here or lose it.
-                if interface == ZwpLinuxDmabufV1::interface().name {
-                    self.dmabuf = Some((s_id.clone(), bind_version));
-                }
                 self.maps
                     .lock()
                     .expect("the WP0 id maps lock is never poisoned")
@@ -1041,6 +1052,73 @@ impl WaylandReplay {
         self.flush();
     }
 
+    /// Ensure S has its **own** `zwp_linux_dmabuf_v1` bound, and return it with its version.
+    ///
+    /// Binds once, from the globals S's compositor advertises, and keeps the object for the session — the
+    /// replay never destroys it, which is the whole point (see the [`Self::dmabuf`] field docs for the bug
+    /// this avoids). Idempotent: later calls return the same object.
+    ///
+    /// # Version
+    /// Capped at [`DMABUF_BIND_VERSION`] and at what S's compositor advertises. The version matters beyond
+    /// the bind itself: a Wayland child inherits its parent's version, so this number becomes the params
+    /// object's version and then the `wl_buffer`'s.
+    ///
+    /// Returns `None` if S's compositor advertises no dmabuf global, or the bind fails — in which case the
+    /// caller refuses the buffer rather than guessing.
+    fn ensure_dmabuf(&mut self) -> Option<(ObjectId, u32)> {
+        if let Some(existing) = &self.dmabuf {
+            return Some(existing.clone());
+        }
+        let iface = ZwpLinuxDmabufV1::interface();
+        // Find the global by interface name; S's registry numbering is its own, so the name is the key.
+        let found = {
+            let globals = self.globals.lock().expect("the WP0 globals lock is never poisoned");
+            globals
+                .iter()
+                .find(|g| g.interface == iface.name)
+                .map(|g| (g.name, g.version.min(DMABUF_BIND_VERSION)))
+        };
+        let Some((name, version)) = found else {
+            eprintln!("rayland-s: WP0 4.3: S's compositor advertises no `{}`", iface.name);
+            return None;
+        };
+        let backend = self.backend.as_ref().expect("connected").clone();
+        let registry = self.registry.clone().expect("connected");
+        let data = self.object_data();
+        // `wl_registry.bind` spells its generic new_id out in full: [name, interface, version, new_id].
+        let iface_arg = CString::new(iface.name).expect("an interface name has no interior NUL");
+        let result = backend.send_request(
+            Message {
+                sender_id: registry,
+                opcode: OP_REGISTRY_BIND,
+                args: [
+                    Argument::Uint(name),
+                    Argument::Str(Some(Box::new(iface_arg))),
+                    Argument::Uint(version),
+                    Argument::NewId(ObjectId::null()),
+                ]
+                .into_iter()
+                .collect(),
+            },
+            Some(data),
+            Some((iface, version)),
+        );
+        match result {
+            Ok(id) => {
+                eprintln!(
+                    "rayland-s: WP0 4.3: bound S's own `{}` v{version} for buffer creation",
+                    iface.name
+                );
+                self.dmabuf = Some((id.clone(), version));
+                Some((id, version))
+            }
+            Err(e) => {
+                eprintln!("rayland-s: WP0 4.3: binding S's own `{}` failed: {e}", iface.name);
+                None
+            }
+        }
+    }
+
     /// Build a real `wl_buffer` on S's compositor from a relayed [`BufferToken`] — the one sequence S
     /// **originates** instead of replaying (Task 4.3).
     ///
@@ -1087,10 +1165,11 @@ impl WaylandReplay {
             );
             return;
         };
-        // The dmabuf global, recorded at bind time — nothing in the message identifies it.
-        let Some((dmabuf_id, dmabuf_version)) = self.dmabuf.clone() else {
+        // S's own dmabuf global, bound on demand. Deliberately not the application's: the app destroys
+        // the ones it binds, and a reference to a destroyed object fails every later `create_params`.
+        let Some((dmabuf_id, dmabuf_version)) = self.ensure_dmabuf() else {
             eprintln!(
-                "rayland-s: WP0 4.3: no `zwp_linux_dmabuf_v1` was ever bound; buffer for resource {} refused",
+                "rayland-s: WP0 4.3: no usable `zwp_linux_dmabuf_v1` on S; buffer for resource {} refused",
                 token.resource_id
             );
             return;
