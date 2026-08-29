@@ -287,10 +287,11 @@ pub trait ResourceResolver: Send + Sync {
 
 /// Buffer-creation state accumulated across one `zwp_linux_buffer_params_v1` object's request sequence.
 ///
-/// The token the proxy must emit needs facts split across two requests: the resource id and modifier come
-/// from `params.add` (which carries the swapchain memfd and the DRM modifier), while width, height, and
-/// format come from the later `params.create_immed`. This holds the `add`-time facts until `create_immed`
-/// supplies the rest and the full [`BufferToken`] can be assembled.
+/// The token the proxy must emit needs facts split across two requests: the resource id, modifier and
+/// plane layout come from `params.add` (which carries the swapchain memfd, the DRM modifier, and the
+/// offset/stride of one plane), while width, height, and format come from the later
+/// `params.create_immed`. This holds the `add`-time facts until `create_immed` supplies the rest and the
+/// full [`BufferToken`] can be assembled.
 #[derive(Default)]
 struct PendingParams {
     /// The S-side resource id the passed memfd resolved to (`None` until a successful `add`, or if the fd
@@ -298,6 +299,24 @@ struct PendingParams {
     resource_id: Option<u32>,
     /// The DRM format modifier assembled from `add`'s `modifier_hi`/`modifier_lo` (`hi << 32 | lo`).
     modifier: u64,
+    /// The plane's row pitch in bytes, straight from `add`. Carried rather than derived from the geometry
+    /// — see [`BufferToken::stride`] for why `width × bpp` is a garbling assumption rather than a shortcut.
+    stride: u32,
+    /// The plane's byte offset within the dma-buf, straight from `add`. Carried for the same reason.
+    offset: u32,
+    /// Whether an `add` has already been seen for this params object. A **second** `add` means a
+    /// multi-plane buffer, which poisons the object (see `unsupported`); this flag is how that is noticed.
+    add_seen: bool,
+    /// Set when this params object described something WP0's assumptions do not cover — a non-zero
+    /// `plane_idx`, or more than one plane. A poisoned object forwards **no** token at `create_immed`.
+    ///
+    /// # Why refuse rather than approximate
+    /// The proxy advertises exactly two single-plane LINEAR formats ([`ADVERTISED_FORMATS`]), so a
+    /// multi-plane `add` means an assumption underneath WP0 has broken. Keeping the last plane's stride
+    /// and presenting anyway would produce a garbled image with nothing logged; refusing makes the broken
+    /// assumption visible in the log at the moment it breaks, and leaves the app with a locally valid
+    /// `wl_buffer` that S is simply never told to present.
+    unsupported: bool,
 }
 
 /// The dispatch state the backend threads through every callback (`ObjectData::request`,
@@ -414,6 +433,24 @@ fn params_modifier(msg: &Message<ObjectId, OwnedFd>) -> u64 {
     (uint_at(4) << 32) | uint_at(5)
 }
 
+/// Read a `params.add` request's plane layout: `(plane_idx, offset, stride)`.
+///
+/// Per `linux-dmabuf-v1.xml`, `add`'s args are `[fd, plane_idx, offset, stride, modifier_hi, modifier_lo]`,
+/// so these are args 1–3. Companion to [`params_modifier`], which reads args 4–5 of the same request.
+///
+/// Returns zeros for any arg with an unexpected shape, matching the sibling readers' convention. For
+/// `plane_idx` that default is the *permissive* one (plane 0 is the supported case), which is deliberate:
+/// a malformed `add` is not evidence of a multi-plane buffer, and the buffer will be refused anyway if its
+/// fd does not resolve. The caller applies the single-plane rule; this function only reads.
+fn params_plane_layout(msg: &Message<ObjectId, OwnedFd>) -> (u32, u32, u32) {
+    // Read one Uint arg at `idx`, or 0 if it is missing or not a Uint — `add`'s layout args are all uint.
+    let uint_at = |idx: usize| match msg.args.get(idx) {
+        Some(Argument::Uint(v)) => *v,
+        _ => 0,
+    };
+    (uint_at(1), uint_at(2), uint_at(3))
+}
+
 /// Extract `(width, height, drm_format)` from a `params.create_immed` request.
 ///
 /// Per the protocol, `create_immed`'s args are `[buffer_id(new_id), width(int), height(int), format(uint),
@@ -450,17 +487,27 @@ fn immed_geometry(msg: &Message<ObjectId, OwnedFd>) -> (u32, u32, u32) {
 /// # The sequence (Mesa's Venus WSI, `wsi_common_wayland`)
 /// 1. `zwp_linux_dmabuf_v1.create_params` → a new `params` object. Recorded; **not** forwarded — S builds
 ///    its own params object from the token in Task 4, so the app's is purely local bookkeeping here.
-/// 2. `params.add(fd, …, modifier_hi, modifier_lo)` → the swapchain memfd and its modifier. The fd is
-///    `fstat`ed, its inode resolved to an S-side resource id, and both stashed in [`PendingParams`]. The
-///    fd is **dropped** — it never crosses the network.
+/// 2. `params.add(fd, plane_idx, offset, stride, modifier_hi, modifier_lo)` → the swapchain memfd, its
+///    plane layout, and its modifier. The fd is `fstat`ed, its inode resolved to an S-side resource id,
+///    and all of it stashed in [`PendingParams`]. The fd is **dropped** — it never crosses the network.
+///    `offset` and `stride` are carried on the token rather than recomputed on S, because a wrong stride
+///    garbles the image instead of failing (see [`BufferToken::stride`]).
 /// 3. `params.create_immed(buffer_id, width, height, format, flags)` → the app names the `wl_buffer`. Now
 ///    all the token's facts are in hand: it is assembled and forwarded as the message
 ///    `{ object_id: params, opcode: create_immed, args: [NewId(buffer_id), Buffer(token)] }`, which names
 ///    the buffer and the resource it denotes without any pixels or fd crossing.
 ///
-/// A `create_immed` whose fd never resolved (no matching resource, or a missing `add`) forwards nothing and
-/// logs — the app still gets its `wl_buffer` object locally (the backend created it from the `NewId`), but
-/// S is not told to present a resource it cannot identify.
+/// # Multi-plane buffers are refused, not approximated
+/// A single [`BufferToken`] describes exactly one plane. If a params object receives a **second** `add`,
+/// or one whose `plane_idx` is not `0`, it is poisoned and its `create_immed` forwards nothing. The proxy
+/// advertises only single-plane LINEAR formats ([`ADVERTISED_FORMATS`]), so either of those means an
+/// assumption underneath WP0 has broken; presenting the last plane's layout anyway would garble the image
+/// silently, while refusing makes the break visible in the log where it happens.
+///
+/// A `create_immed` that forwards nothing — because its fd never resolved (no matching resource, or a
+/// missing `add`), or because the params object was poisoned — still leaves the app with a locally valid
+/// `wl_buffer` (the backend created it from the `NewId`); S is simply never told to present it. The log
+/// names which of the two refusals occurred, since they call for different investigations.
 fn try_intercept_buffer(data: &mut ProxyState, msg: &Message<ObjectId, OwnedFd>) -> bool {
     let iface = msg.sender_id.interface().name;
     // The params/buffer objects live in the app's id space, keyed by the sending object's protocol id.
@@ -484,12 +531,30 @@ fn try_intercept_buffer(data: &mut ProxyState, msg: &Message<ObjectId, OwnedFd>)
                 _ => None,
             };
             let modifier = params_modifier(msg);
+            // The plane's own layout, which the token carries verbatim rather than deriving on S.
+            let (plane_idx, offset, stride) = params_plane_layout(msg);
             // Record against this params object; `create_immed` will complete the token.
             let entry = data.pending.entry(obj).or_default();
+            // A second `add` on one params object means a multi-plane buffer (each plane gets its own
+            // `add`), and a non-zero `plane_idx` says so explicitly. Either way WP0's single-plane
+            // assumption has broken, so poison the object rather than silently keeping the last plane's
+            // layout and presenting a garbled image. See `PendingParams::unsupported`.
+            if entry.add_seen || plane_idx != 0 {
+                entry.unsupported = true;
+                wp_log(&format!(
+                    "intercept params {obj}.add -> UNSUPPORTED multi-plane buffer (plane_idx {plane_idx}, \
+                     add #{}); this params object will forward no token",
+                    if entry.add_seen { 2 } else { 1 }
+                ));
+            }
+            entry.add_seen = true;
             entry.resource_id = resource_id;
             entry.modifier = modifier;
+            entry.stride = stride;
+            entry.offset = offset;
             wp_log(&format!(
-                "intercept params {obj}.add -> resource {resource_id:?}, modifier {modifier:#x} (fd dropped)"
+                "intercept params {obj}.add -> resource {resource_id:?}, modifier {modifier:#x}, \
+                 offset {offset}, stride {stride} (fd dropped)"
             ));
             true
         }
@@ -499,7 +564,11 @@ fn try_intercept_buffer(data: &mut ProxyState, msg: &Message<ObjectId, OwnedFd>)
             let (width, height, drm_format) = immed_geometry(msg);
             // Consume the accumulated state for this params object.
             let pending = data.pending.remove(&obj).unwrap_or_default();
-            match (buffer_id, pending.resource_id) {
+            // A poisoned params object (multi-plane; see the `add` arm) is treated exactly like an
+            // unresolved fd: no token crosses. Folding it into the same `None` keeps one refusal path
+            // rather than two, which is what the caller and the app already cope with correctly.
+            let resolved = if pending.unsupported { None } else { pending.resource_id };
+            match (buffer_id, resolved) {
                 (Some(buffer_id), Some(resource_id)) => {
                     let token = BufferToken {
                         resource_id,
@@ -507,6 +576,10 @@ fn try_intercept_buffer(data: &mut ProxyState, msg: &Message<ObjectId, OwnedFd>)
                         height,
                         drm_format,
                         modifier: pending.modifier,
+                        // Straight from `add`. Deriving either of these from `width`/`drm_format` on S
+                        // would garble rather than fail — see `BufferToken::stride`.
+                        stride: pending.stride,
+                        offset: pending.offset,
                     };
                     // The proxy-internal encoding of create_immed: the buffer's app-side id and the token
                     // that names its S-side resource. S resolves the token to a real dma-buf (Task 4).
@@ -525,15 +598,24 @@ fn try_intercept_buffer(data: &mut ProxyState, msg: &Message<ObjectId, OwnedFd>)
                         ],
                     };
                     wp_log(&format!(
-                        "intercept params {obj}.create_immed -> buffer {buffer_id} = resource {resource_id} ({width}x{height} fmt {drm_format:#x})"
+                        "intercept params {obj}.create_immed -> buffer {buffer_id} = resource {resource_id} \
+                         ({width}x{height} fmt {drm_format:#x} offset {} stride {})",
+                        pending.offset, pending.stride
                     ));
                     data.sink.forward_request(wire);
                 }
                 _ => {
                     // No resolved resource (a missing/foreign fd): the app keeps its local buffer, but S
                     // is told nothing — a buffer it cannot identify must not be presented.
+                    // Name which of the two refusals happened: an fd that named no tracked resource, or a
+                    // buffer whose plane layout WP0 does not cover. They need different investigations.
+                    let reason = if pending.unsupported {
+                        "UNSUPPORTED (multi-plane)"
+                    } else {
+                        "UNRESOLVED (fd named no tracked resource)"
+                    };
                     wp_log(&format!(
-                        "intercept params {obj}.create_immed -> UNRESOLVED (buffer {buffer_id:?}, resource {:?}); not forwarded",
+                        "intercept params {obj}.create_immed -> {reason} (buffer {buffer_id:?}, resource {:?}); not forwarded",
                         pending.resource_id
                     ));
                 }

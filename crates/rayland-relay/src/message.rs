@@ -249,6 +249,36 @@ pub struct BufferToken {
     /// that produces corrupted or garbled pixels rather than a clean failure, because the
     /// consumer decodes the same bytes under the wrong layout.
     pub modifier: u64,
+    /// The byte distance between the starts of two consecutive pixel rows, as the app's
+    /// `zwp_linux_buffer_params_v1::add` request supplied it.
+    ///
+    /// # Why this is carried rather than computed on S
+    /// S needs a stride to synthesize its own `add`, and the tempting shortcut is to derive it
+    /// as `width × bytes_per_pixel`. **That derivation is the exact failure mode WP0's plan
+    /// warns about**, because a wrong stride does not fail — it *garbles*. The consumer walks
+    /// the same bytes with the wrong row pitch and produces a skewed image, with no error
+    /// anywhere to notice. A driver is free to pad rows for alignment, so `width × bpp` is a
+    /// guess that happens to be right in some configurations and silently wrong in others.
+    ///
+    /// C is in a position to know the true value: Mesa passes it to `params.add` before the
+    /// proxy drops the fd, and that value originates in the image layout Venus queried on
+    /// **S's own GPU**. So this field carries S's own layout, round-tripped through the
+    /// application — not an independent guess made on the machine that has no GPU.
+    ///
+    /// Only plane 0 is ever described: C refuses multi-plane buffers rather than approximating
+    /// them (a second `add`, or a non-zero `plane_idx`, causes the whole buffer to be dropped
+    /// unforwarded), so a token that exists at all describes exactly one plane.
+    pub stride: u32,
+    /// The byte offset of the plane's first pixel within the dma-buf, as the app's
+    /// `zwp_linux_buffer_params_v1::add` request supplied it.
+    ///
+    /// # Why this is carried rather than assumed zero
+    /// The same argument as `stride`, at the same cost of one `u32`. `add` requires an offset,
+    /// C observes the real one, and assuming zero is the same class of assumption as assuming
+    /// the stride: correct in the configurations measured so far, and a garbled image rather
+    /// than an error whenever it is not. Carrying it removes the question instead of answering
+    /// it from the wrong machine.
+    pub offset: u32,
 }
 
 /// A contiguous run of bytes at an offset within a blob.
@@ -574,6 +604,11 @@ mod tests {
                         height: 1080,
                         drm_format: 0x3432_3241, // DRM_FORMAT_AR24, little-endian fourcc bytes 'A','R','2','4'
                         modifier: 0x00ff_ffff_ffff_ffff, // DRM_FORMAT_MOD_INVALID, a representative modifier value
+                        // A stride deliberately NOT equal to width x 4 (1920 x 4 = 7680), and a non-zero
+                        // offset: a round trip that silently dropped either would still pass against a
+                        // fixture whose values could be re-derived from the geometry.
+                        stride: 7936,
+                        offset: 4096,
                     }),
                 ],
             },

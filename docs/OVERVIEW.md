@@ -10,7 +10,7 @@ visible from the code — several of the project's central facts were discovered
 and at least three plausible-sounding designs were built and then disproved. A plan made without
 those facts will re-propose a dead end. They are all recorded here, with pointers to the evidence.
 
-**Last brought current:** 2026-08-29, against commit `4c8ce52` (2026-07-27).
+**Last brought current:** 2026-08-29, against branch `wp0-wayland-proxy`.
 
 ---
 
@@ -363,7 +363,7 @@ cross the network.**
 | 4.0 spike — can S export a compositor-importable dma-buf? | **done**, and its first answer was wrong (see below) |
 | 4.1 — C-side wiring (link-backed sink, inode→res_id resolver, proxy as a 4th thread) | done |
 | 4.2 — S router, persistent Wayland client, object-id map, session replay | done |
-| **4.3 — token → `wl_buffer`** | **C's half done; S part 1 done; S part 2 SPECIFIED BUT NOT WRITTEN** |
+| **4.3 — token → `wl_buffer`** | **C's half done (incl. plane layout on the token, 2026-08-29); S part 1 done; S part 2 SPECIFIED BUT NOT WRITTEN** |
 | 4.4 — event return path (eventfd wakeup, `send_event`, `S2C::WaylandEvent`, `configure`) | **genuinely working** — measured: vkcube receives both `configure`s through the tunnel and **acks** them |
 | 4.5 — end-to-end: vkcube's spinning cube on S's screen | not started |
 
@@ -395,10 +395,18 @@ Part 2 is unwritten. `crates/rayland-s/src/wayland_client.rs:592` still logs *"b
 1. **S must *synthesize* the `add`, not translate it.** C intercepts `add` and drops the fd by design
    — that *is* buffer-by-token — so S's params object has **no planes** when `create_immed` arrives.
    This is a request S **originates** rather than replays: a first for the replay module.
-2. **`BufferToken` carries no `stride`, and `add` needs one. Decide this first.** Deriving
-   `width × bpp` is exactly the assumption the plan flags as **garbling pixels rather than failing
-   cleanly**. C knows the real stride (Mesa passes it to `add` before the proxy drops it), so it
-   probably belongs on the token.
+2. **The plane layout travels on the token. DECIDED and landed, 2026-08-29.** `BufferToken` now
+   carries `stride` **and** `offset`, both taken verbatim from the app's `params.add`. Deriving
+   `width × bpp` was the assumption the plan flags as **garbling pixels rather than failing
+   cleanly**, and assuming `offset = 0` is the same class of assumption at the same cost of one
+   `u32`. C knows both values because Mesa passes them to `add` before the proxy drops the fd, and
+   they originate in the image layout Venus queried on **S's own GPU** — so the token carries S's
+   own layout round-tripped through the application, not a guess made on the machine with no GPU.
+   Shipped with it: C now **refuses** multi-plane buffers rather than approximating them. A second
+   `add`, or one whose `plane_idx` is not `0`, poisons the params object so `create_immed` forwards
+   nothing — the app keeps a locally valid `wl_buffer`, S is never told to present it, and the
+   broken assumption appears in the log where it broke. `plane_idx` is deliberately *not* a carried
+   field: a token describes exactly one plane by construction.
 3. **Lock discipline.** Resolve and clone the fd **under the applier lock, and release it before any
    `send_request`.** A Wayland call made under that lock puts the relay's mutex behind a compositor
    round trip.

@@ -4310,3 +4310,88 @@ are the candidate directions rather than further message-volume work.
 
 All relative links in the five touched files were checked to resolve. No node status changed, so
 `project-map.js` is untouched and its date not churned — checked, again.
+
+### 2026-08-29 — The token carries the plane layout, and the multi-plane case is refused rather than guessed
+
+First task under the new arrangement: planning happens on the other side now, and this session
+received a written brief rather than deciding its own next move. Worth noting how that felt, because
+it is a change in how the project works. The brief was *better specified than the tree deserved* — it
+had already made the decision the diary left open on 2026-07-27 (stride on the token, not derived on
+S), pre-empted the obvious wrong turn, and named the acceptance criteria in a form that could be
+checked rather than asserted. Very little of this session was decision-making. That is the point.
+
+**What was built.** `BufferToken` gains `stride` and `offset`, both read straight from the
+application's `zwp_linux_buffer_params_v1.add` and carried verbatim. C records them per params object
+alongside the resource id and modifier it already kept.
+
+The reasoning for carrying rather than computing is worth restating because it is the kind that looks
+like over-engineering until it bites. S needs a stride to synthesize its own `add`. The obvious
+shortcut is `width × bytes_per_pixel`. That shortcut **cannot fail loudly**: a driver is free to pad
+rows for alignment, and if it has, the consumer walks the same bytes with the wrong row pitch and
+produces a *skewed image* — no error, no log line, nothing to notice except a human looking at a
+wrong picture. And C is in the better position anyway: Mesa hands it the true value before the proxy
+drops the fd, and that value originated in the image layout Venus queried **on S's own GPU**. So the
+token round-trips S's own layout back to S through the application. The machine with no GPU never
+guesses about GPU memory. `offset` travels for the same reason and the same one `u32`.
+
+**The part that was a genuine decision rather than plumbing: multi-plane.** A token describes exactly
+one plane — one offset, one stride. A planar or compressed buffer supplies each plane with its own
+`add`. Three options: carry a plane vector, carry `plane_idx` and let S sort it out, or refuse.
+
+Refusing is right, and the reason is specific rather than general laziness. The proxy advertises
+exactly two single-plane LINEAR formats, so a multi-plane `add` does not mean "a case we have not
+built yet" — it means **an assumption underneath WP0 has broken**, and the interesting thing to do is
+make that visible at the moment it breaks. The alternative failure mode is grim: keep the last
+plane's stride, forward it, and put a garbled image on S's screen with nothing logged anywhere. This
+project has shipped that shape of defect before (the black window, the silently stale frame) and each
+time the cost was days of looking in the wrong place. So a second `add`, or a `plane_idx` that is not
+zero, poisons the params object and `create_immed` forwards nothing. The app keeps a locally valid
+`wl_buffer`; S is simply never told to present it; the log says which of the two refusals happened,
+because "the fd named no tracked resource" and "this buffer has more planes than we model" call for
+completely different investigations.
+
+Note `plane_idx` is deliberately **not** a field on the token. Carrying it would imply the design
+handles more than one, and a reader would reasonably conclude a plane-1 token could exist. It cannot.
+
+**The teeth check, and why the test constants changed.** The existing token test drove
+`stride = width × 4` and `offset = 0` — which is to say it would have passed just as happily against
+an implementation that derived the stride and assumed the offset, the very implementation this change
+exists to prevent. That is not a test, it is a coincidence with an assertion attached. The fixture now
+uses a padded stride of 320 against a width of 64 (so `width × 4` is 256, and no derivation can
+produce 320) and a non-zero offset of 4096.
+
+Then the check that matters: mutate the implementation and confirm the right test fails. Deriving
+`stride: width * 4` and `offset: 0` fails the token test on the stride assertion and nothing else.
+Replacing the poison condition with `if false` fails **both** refusal tests and neither of the others.
+Restored, all four pass. Three mutations, three correctly-targeted failures — the tests bite where
+they claim to.
+
+**One cleanup taken on the way.** The test file had grown four copies of the same thirty-line
+proxy-and-connect dance, and this change was about to add a fifth and sixth. Factored into one
+`start_proxy(tag)` harness returning `Option<Harness>`, so a caller's `let Some(...) else { return }`
+reads as the skip-if-no-libwayland case the sibling tests already use. The `tag` matters and is not
+cosmetic: these tests run in parallel threads of one process, and a shared socket path would have
+them fight over the same listener.
+
+**Nothing was overturned, and nothing surprised me** — which is itself worth recording, because it is
+rare in this diary. The brief warned that the planning side had twice found WP0's written plan short
+of what the code required, and told me to assume a third such gap. On *this* task there was none: C's
+`try_intercept_buffer` was exactly the shape the brief described, `params_modifier` was exactly the
+function to model the new plane-layout reader on, and the "unresolved fd" refusal path already existed
+to fold the multi-plane refusal into. The gap the brief was worried about is presumably still waiting
+in the S-side task.
+
+**What this does not claim.** 4.3 is *not* done. Nothing here has been near a compositor: this is the
+value arriving on the wire correctly, and whether S can build a real `wl_buffer` from it needs a GPU
+and a compositor and is the next brief. `rayland-s` compiles against the wider token and reads neither
+new field yet.
+
+**Deviation from the brief, reported as instructed.** It said to work on `wp0-wayland-proxy`. That
+branch was merged into `main` on 2026-07-27 and is strictly behind it, so working on it as it stood
+would have meant working without the last month's documentation. Fast-forwarded the branch to `main`
+and worked there, which keeps the name the brief asked for and the content the tree actually has.
+
+Map checked: no node's *status* changed — 4.3 part 1 is still `done`, part 2 still `planned` — but the
+part-2 node's description asserted that `BufferToken` carries no stride and that this must be decided
+first, which this change makes false. Updated that text; `project.updated` bumped, since the map's own
+content changed.

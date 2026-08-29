@@ -38,6 +38,17 @@ const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241; // fourcc 'AR24'
 const MODIFIER_HI: u32 = 0x0123_4567;
 const MODIFIER_LO: u32 = 0x89ab_cdef;
 const MODIFIER: u64 = ((MODIFIER_HI as u64) << 32) | MODIFIER_LO as u64;
+/// The plane's row pitch, **deliberately not `WIDTH * 4`** (which would be 256).
+///
+/// This is the point of the whole stride field. A driver may pad rows for alignment, and S must use the
+/// value the application actually declared rather than recomputing `width × bpp` — a wrong stride skews
+/// the image instead of raising an error. A fixture whose stride *happened* to equal the derived value
+/// would pass just as well against an implementation that derives it, which is exactly the implementation
+/// this field exists to prevent. So the fixture picks a padded stride that no derivation can produce.
+const STRIDE: u32 = 320;
+/// The plane's byte offset within the dma-buf, **deliberately non-zero**, for the same reason: an
+/// implementation that assumed zero would pass against an all-zero fixture.
+const OFFSET: u32 = 4096;
 
 /// A sink that records forwarded requests, so the test can inspect the emitted token.
 #[derive(Default)]
@@ -87,11 +98,32 @@ ignore_events!(ZwpLinuxDmabufV1, ());
 ignore_events!(ZwpLinuxBufferParamsV1, ());
 ignore_events!(WlBuffer, ());
 
-/// Run the swapchain buffer-creation sequence through the proxy and assert the emitted `BufferToken`.
-#[test]
-fn create_immed_emits_a_correct_buffer_token_and_never_asserts() {
-    let socket_path: PathBuf = std::env::temp_dir()
-        .join(format!("rayland-wp-proxy-token-{}.sock", std::process::id()));
+/// Everything one test needs to drive the buffer-creation sequence: a running proxy, a client connected
+/// to it with the dmabuf global bound, and the collector recording whatever the proxy forwards.
+struct Harness {
+    /// Records forwarded requests, so a test can assert on the token — or on its absence.
+    collector: Arc<Collector>,
+    /// The client's event queue; `roundtrip` on it flushes requests and surfaces protocol errors.
+    queue: wayland_client::EventQueue<AppData>,
+    /// The bound `zwp_linux_dmabuf_v1`, the object every buffer-creation sequence starts from.
+    dmabuf: ZwpLinuxDmabufV1,
+    /// The memfd standing in for a swapchain image, kept alive for the test's duration: the proxy
+    /// `fstat`s the fd it receives, and the resolver only recognises *this* file's inode.
+    memfd: OwnedFd,
+}
+
+/// Start a proxy on its own socket, connect a client, and bind the dmabuf global.
+///
+/// `tag` distinguishes the socket path, because these tests run in parallel threads of one process and a
+/// shared path would have them fight over the same listener.
+///
+/// Returns `None` when the wayland-client backend cannot start — the same skip the sibling tests take
+/// where libwayland is absent — so a caller's `let Some(h) = ... else { return }` reads as "skip".
+fn start_proxy(tag: &str) -> Option<Harness> {
+    let socket_path: PathBuf = std::env::temp_dir().join(format!(
+        "rayland-wp-proxy-{tag}-{}.sock",
+        std::process::id()
+    ));
 
     // A memfd standing in for a swapchain image's `memfd:rayland-blob`. Its inode is what the resolver
     // recognises; the same inode arrives at the proxy when the client passes this fd over `params.add`.
@@ -114,26 +146,48 @@ fn create_immed_emits_a_correct_buffer_token_and_never_asserts() {
         Ok(conn) => conn,
         Err(e) => {
             eprintln!("skipping: cannot init wayland-client backend (libwayland absent?): {e}");
-            return;
+            return None;
         }
     };
 
-    let (globals, mut queue) =
+    let (globals, queue) =
         registry_queue_init::<AppData>(&conn).expect("registry round-trips against the proxy");
-    let qh = queue.handle();
-
     // Bind the dmabuf global at a version that supports create_immed (since v2) and modifiers (since v3).
     let dmabuf: ZwpLinuxDmabufV1 = globals
-        .bind(&qh, 3..=3, ())
+        .bind(&queue.handle(), 3..=3, ())
         .expect("proxy lets the client bind zwp_linux_dmabuf_v1");
+
+    Some(Harness { collector, queue, dmabuf, memfd })
+}
+
+/// The `BufferToken` the proxy forwarded, or `None` if it forwarded no token at all.
+///
+/// Both refusal tests below assert on `None`, which is the whole point: a refused buffer must leave S
+/// with nothing to present rather than with an approximation.
+fn forwarded_token(collector: &Collector) -> Option<rayland_relay::BufferToken> {
+    collector.messages.lock().unwrap().iter().find_map(|m| {
+        m.args.iter().find_map(|a| match a {
+            WaylandArg::Buffer(tok) => Some(tok.clone()),
+            _ => None,
+        })
+    })
+}
+
+/// Run the swapchain buffer-creation sequence through the proxy and assert the emitted `BufferToken`.
+#[test]
+fn create_immed_emits_a_correct_buffer_token_and_never_asserts() {
+    let Some(Harness { collector, mut queue, dmabuf, memfd }) = start_proxy("token") else {
+        return; // no libwayland — skip, as the sibling tests do
+    };
+    let qh = queue.handle();
 
     // The swapchain buffer-creation sequence Mesa's WSI runs, driven explicitly here.
     let params: ZwpLinuxBufferParamsV1 = dmabuf.create_params(&qh, ());
     params.add(
         memfd.as_fd(),
-        0,                       // plane_idx
-        0,                       // offset
-        (WIDTH as u32) * 4,      // stride (ARGB8888 = 4 bytes/pixel)
+        0,      // plane_idx — the single supported plane
+        OFFSET, // offset — non-zero, so an implementation assuming 0 fails here
+        STRIDE, // stride — padded, so an implementation deriving width x bpp fails here
         MODIFIER_HI,
         MODIFIER_LO,
     );
@@ -147,16 +201,9 @@ fn create_immed_emits_a_correct_buffer_token_and_never_asserts() {
         .expect("round-trip after create_immed — no create_immed protocol error");
 
     // Exactly one message should have been forwarded (the token); create_params/add do not cross.
-    let messages = collector.messages.lock().unwrap();
-    let token = messages
-        .iter()
-        .find_map(|m| {
-            m.args.iter().find_map(|a| match a {
-                WaylandArg::Buffer(tok) => Some(tok.clone()),
-                _ => None,
-            })
-        })
-        .unwrap_or_else(|| panic!("no BufferToken was forwarded; messages: {messages:?}"));
+    let token = forwarded_token(&collector).unwrap_or_else(|| {
+        panic!("no BufferToken was forwarded; messages: {:?}", collector.messages.lock().unwrap())
+    });
 
     // The token must name the resolved resource and carry create_immed's geometry and add's modifier.
     assert_eq!(token.resource_id, RESOURCE_ID, "wrong resource id in token");
@@ -164,9 +211,18 @@ fn create_immed_emits_a_correct_buffer_token_and_never_asserts() {
     assert_eq!(token.height, HEIGHT as u32, "wrong height in token");
     assert_eq!(token.drm_format, DRM_FORMAT_ARGB8888, "wrong format in token");
     assert_eq!(token.modifier, MODIFIER, "wrong modifier in token");
+    // The two fields with teeth. STRIDE is not WIDTH*4 and OFFSET is not 0, so neither of these can be
+    // satisfied by a derivation from the geometry — only by carrying what `add` actually supplied.
+    assert_eq!(
+        token.stride, STRIDE,
+        "wrong stride in token — a derived width x bpp would be {}",
+        (WIDTH as u32) * 4
+    );
+    assert_eq!(token.offset, OFFSET, "wrong offset in token — an assumed offset would be 0");
 
     // And the message must also name the new wl_buffer (its app-side id, interface `wl_buffer`) so S can
     // create the buffer object for the token.
+    let messages = collector.messages.lock().unwrap();
     let named_buffer = messages.iter().any(|m| {
         m.args
             .iter()
@@ -179,41 +235,13 @@ fn create_immed_emits_a_correct_buffer_token_and_never_asserts() {
 /// no token is forwarded, and no protocol error is raised (the request is consumed, not mis-forwarded).
 #[test]
 fn async_create_is_refused_without_forwarding_a_token() {
-    let socket_path: PathBuf = std::env::temp_dir()
-        .join(format!("rayland-wp-proxy-async-{}.sock", std::process::id()));
-
-    let memfd = make_memfd();
-    let (dev, ino) = fd_inode(&memfd).expect("fstat the test memfd");
-
-    let collector = Arc::new(Collector::default());
-    let proxy_path = socket_path.clone();
-    let proxy_sink = collector.clone();
-    let resolver = Arc::new(FixedResolver { dev, ino });
-    std::thread::spawn(move || {
-        if let Err(e) = rayland_c::wayland_proxy::run(proxy_path, proxy_sink, resolver) {
-            eprintln!("proxy exited with error: {e:#}");
-        }
-    });
-
-    let stream = connect_with_retry(&socket_path, Duration::from_secs(2))
-        .expect("connect to the proxy socket within the timeout");
-    let conn = match Connection::from_socket(stream) {
-        Ok(conn) => conn,
-        Err(e) => {
-            eprintln!("skipping: cannot init wayland-client backend (libwayland absent?): {e}");
-            return;
-        }
+    let Some(Harness { collector, mut queue, dmabuf, memfd }) = start_proxy("async") else {
+        return; // no libwayland — skip
     };
-
-    let (globals, mut queue) =
-        registry_queue_init::<AppData>(&conn).expect("registry round-trips against the proxy");
     let qh = queue.handle();
-    let dmabuf: ZwpLinuxDmabufV1 = globals
-        .bind(&qh, 3..=3, ())
-        .expect("proxy lets the client bind zwp_linux_dmabuf_v1");
 
     let params: ZwpLinuxBufferParamsV1 = dmabuf.create_params(&qh, ());
-    params.add(memfd.as_fd(), 0, 0, (WIDTH as u32) * 4, MODIFIER_HI, MODIFIER_LO);
+    params.add(memfd.as_fd(), 0, OFFSET, STRIDE, MODIFIER_HI, MODIFIER_LO);
     // The async variant: no new_id in the request; the wl_buffer would arrive via a `created` event.
     params.create(WIDTH, HEIGHT, DRM_FORMAT_ARGB8888, Flags::empty());
 
@@ -229,6 +257,72 @@ fn async_create_is_refused_without_forwarding_a_token() {
     assert!(
         messages.is_empty(),
         "async create path forwarded something (expected nothing); messages: {messages:?}"
+    );
+}
+
+/// A `params.add` naming a plane other than 0 must refuse the whole buffer: no token is forwarded.
+///
+/// # Why refusal is the right behaviour rather than a best effort
+/// A [`rayland_relay::BufferToken`] describes exactly one plane — one `offset`, one `stride`. A
+/// multi-plane buffer (planar YUV, or an auxiliary compression plane) cannot be expressed by it, and the
+/// proxy advertises only single-plane LINEAR formats, so a non-zero `plane_idx` means an assumption
+/// underneath WP0 has broken. Forwarding one plane's layout and calling it the buffer would put a garbled
+/// image on S's screen with nothing logged anywhere; refusing puts the break in the log at the moment it
+/// happens, and leaves the app with a locally valid `wl_buffer` that S is simply never told to present.
+#[test]
+fn a_non_zero_plane_index_refuses_the_buffer() {
+    let Some(Harness { collector, mut queue, dmabuf, memfd }) = start_proxy("plane") else {
+        return; // no libwayland — skip
+    };
+    let qh = queue.handle();
+
+    let params: ZwpLinuxBufferParamsV1 = dmabuf.create_params(&qh, ());
+    // plane_idx 1: the second plane of a multi-plane buffer. Everything else is the supported shape, so
+    // this test isolates the plane index as the single reason for refusal.
+    params.add(memfd.as_fd(), 1, OFFSET, STRIDE, MODIFIER_HI, MODIFIER_LO);
+    let _buffer: WlBuffer =
+        params.create_immed(WIDTH, HEIGHT, DRM_FORMAT_ARGB8888, Flags::empty(), &qh, ());
+
+    // The refusal must be clean: consumed by the proxy, so the app sees no protocol error at all.
+    queue
+        .roundtrip(&mut AppData)
+        .expect("round-trip after a refused create_immed — the refusal must not be a protocol error");
+
+    assert!(
+        forwarded_token(&collector).is_none(),
+        "a plane_idx != 0 buffer was forwarded to S; it must be refused, not approximated. messages: {:?}",
+        collector.messages.lock().unwrap()
+    );
+}
+
+/// A second `params.add` on the same params object must refuse the whole buffer: no token is forwarded.
+///
+/// This is the same single-plane rule as [`a_non_zero_plane_index_refuses_the_buffer`], reached the other
+/// way: a well-formed multi-plane buffer supplies each plane with its own `add`, all of which may name
+/// plane indices the proxy would accept individually. Only the *count* gives it away. Without this rule
+/// the last `add` would silently win and its stride would describe the whole buffer.
+#[test]
+fn a_second_add_refuses_the_buffer() {
+    let Some(Harness { collector, mut queue, dmabuf, memfd }) = start_proxy("twoadd") else {
+        return; // no libwayland — skip
+    };
+    let qh = queue.handle();
+
+    let params: ZwpLinuxBufferParamsV1 = dmabuf.create_params(&qh, ());
+    // Two adds, each individually acceptable — plane 0, a resolvable fd. The pair is what is refused.
+    params.add(memfd.as_fd(), 0, OFFSET, STRIDE, MODIFIER_HI, MODIFIER_LO);
+    params.add(memfd.as_fd(), 0, OFFSET, STRIDE, MODIFIER_HI, MODIFIER_LO);
+    let _buffer: WlBuffer =
+        params.create_immed(WIDTH, HEIGHT, DRM_FORMAT_ARGB8888, Flags::empty(), &qh, ());
+
+    queue
+        .roundtrip(&mut AppData)
+        .expect("round-trip after a refused create_immed — the refusal must not be a protocol error");
+
+    assert!(
+        forwarded_token(&collector).is_none(),
+        "a multi-plane (two-add) buffer was forwarded to S; it must be refused. messages: {:?}",
+        collector.messages.lock().unwrap()
     );
 }
 
