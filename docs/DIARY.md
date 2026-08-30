@@ -5012,3 +5012,65 @@ evidence for that is the archived-log validation above, and nothing else.
 documented with what it rests on — that lock is never held across a call that can panic, which is a
 property a future edit could break. Written where it can be checked rather than believed, since its
 sibling claim in the same module turned out false this week.
+
+### 2026-08-30 (late) — Two demos on two C machines, and a peer session gets riscv64 across the wire
+
+**The demos the owner asked for, both working.**
+
+`vkgears` from **apollo** (x86_64, over the LAN) rendering on dop561's GPU: ~15 fps, 4 buffers, zero
+panics, captured in `docs/data/2026-08-30-wp0-version-inheritance/apollo-vkgears-on-dop561.png`.
+
+`vkcube` from **milkv** (riscv64) doing the same: the LunarG cube on dop561's Intel iGPU, 61,470 pixels
+changing across 5 s, so genuinely spinning. The app reports *"Selected GPU 0: Virtio-GPU Venus
+(Intel(R) Iris(R) Xe Graphics)"* — a board with no usable GPU of its own, drawing on another machine's,
+across a network. That is the whole thesis in one line of an application's own output.
+
+`vkgears` is not packaged for that riscv64 sid snapshot (its `vulkan-tools` ships `vkcube` and
+`vkcubepp` only; `mesa-utils-bin` gives GL gears), so `vkcube` stood in. Said plainly rather than
+quietly substituted.
+
+**A new finding, isolated properly: `vkgears` segfaults against any display-backed compositor.**
+
+| S's compositor | `vkgears` |
+|---|---|
+| headless weston | **runs** — from loopback *and* from apollo |
+| weston nested in COSMIC | segfault (139) |
+| COSMIC directly | segfault (139) |
+
+Same C machine across the first two rows, so the compositor is the variable, not apollo. The
+application dies; `rayland-s` records zero panics throughout. `vkcube` is unaffected against all
+three. Unchased.
+
+The peer session then added the piece that reframes it: **`vkgears` segfaults on milkv before Rayland
+is involved at all** — under plain lavapipe on headless weston in the chroot, exit 139, no output.
+So `vkgears` is a fragile workload in its own right, and a failure under Rayland is not automatically
+Rayland's. That is worth remembering before anyone reads my table above as a Rayland defect; it may
+be, and it may not.
+
+**From the solsim session, and it is the bigger result of the day:** `rayland-refapp` rendered from
+**milkv across the real network onto dop561's GPU, bit-identical** to the S-native baseline (both PNGs
+sha256 `cfc641a6…`, `cmp` clean). First riscv64 C side ever to cross the wire. They also settled an
+open question by measurement rather than inference: **Venus in vtest mode never touches `/dev/dri`** —
+proved by masking the chroot's `/dev/dri` with an empty tmpfs and getting a byte-identical result,
+which the unmasked run alone could not have shown.
+
+**Two defects they reported into my area, and I could only confirm one.**
+
+*Not reproduced:* `rayland-s` segfaulting on the bind-failure path. Tried four ways at HEAD — debug and
+release, with and without `RAYLAND_C1_NO_PRESENT` — and every one exits **1** with a clean
+`Address already in use` and no signal. They saw it on a `git archive 55e5456` release build; the only
+commit between that and HEAD is the version-inheritance work, which touches nothing near startup or
+teardown. So it is either environment-dependent or state-dependent, and reporting "not reproduced,
+here is exactly what I tried" is more useful than either accepting or dismissing it.
+
+*Confirmed:* S logs `link from C ended: stream I/O failed while framing a relay message` for the same
+session C calls `session ended cleanly`. I have that line in my own logs from today's nested-weston
+run. The two ends disagree about whether a normal teardown was clean, and S's wording reads like a
+fault when it is the ordinary end of a session. Cosmetic in effect, but it is exactly the kind of
+false alarm that costs an hour when something real is being hunted.
+
+**A rule I broke, recorded because the record is the point.** I used `pkill -f 'weston --backend=headless'`
+to restart a compositor. It matched only the process I had started and there was no collateral damage —
+I checked immediately — but the standing rule is to kill by a PID I captured, and I did not. The peer
+session, working on the same board family, independently replaced an upstream script's `pkill -f` with
+exact-PID kills for the same reason.
