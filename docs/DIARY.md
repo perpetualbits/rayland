@@ -5074,3 +5074,45 @@ to restart a compositor. It matched only the process I had started and there was
 I checked immediately — but the standing rule is to kill by a PID I captured, and I did not. The peer
 session, working on the same board family, independently replaced an upstream script's `pkill -f` with
 exact-PID kills for the same reason.
+
+### 2026-08-30 (night) — Correction: the bind-failure abort is real, and it is the libepoxy assertion again
+
+**A dated correction; the previous entry stands.** I reported the peer session's bind-failure crash as
+**not reproduced**, on the strength of four single-shot runs across debug/release and with/without
+`RAYLAND_C1_NO_PRESENT`. That conclusion was wrong, and the reason is arithmetic: against a ~7% race,
+four runs miss it about **three times in four**. I had the clean side of a coin and reported it as a
+result.
+
+This is the third time this project has recorded that error, and the first time I have committed it
+after writing the rule down myself. *One run is one run, not a rate* — and four runs are not a rate
+either. The peer ran 30; I then ran 30 and got **2 abnormal exits, both SIGABRT (134)**, which sits
+squarely on their 3/30.
+
+**Located on the first gdb attempt, and it is a familiar assertion:**
+
+```
+rayland-s: ../src/dispatch_common.c:872: epoxy_get_proc_address:
+    Assertion `0 && "Couldn't find current GLX or EGL context."' failed.
+Thread 2 "rayland-s-engin" received signal SIGABRT
+```
+
+`rayland-engine`'s `actor.rs` module docs already name this exact abort — it is the reason the actor
+exists at all. virglrenderer's EGL winsys binds its context to the thread that ran
+`virgl_renderer_init`, and a GL call from any other thread hits this assertion, which the docs
+correctly describe as *"not a recoverable `EngineError`, it is a `SIGABRT` that takes the whole
+process down."*
+
+But the invariant is **not** violated here: the abort is on `rayland-s-engin`, the actor's own thread.
+So this is the same assertion reached by a different route — when the listen bind fails, `main` returns
+`Err` and the process starts exiting **while the actor thread is still inside
+`virgl_renderer_cleanup`**. The ~7% rate is the signature of a process teardown racing a live thread,
+not a deterministic ordering bug. It is a sibling of the ~21% teardown SIGABRT fixed on 2026-07-27,
+which covered the *session-end* path; the *startup-failure* path was never covered.
+
+**Not fixed** — there is no prompt for it, and changing engine teardown is not a thing to do at the end
+of a long session. But it is now specified rather than suspected, in
+`docs/data/2026-08-30-wp0-version-inheritance/bind-failure-abort.md`.
+
+**One trap worth carrying forward**, which the peer found and which would have hidden this from me
+permanently: under `setsid … &` the shell reaps `setsid`, which forks and returns 0, so exit codes are
+meaningless and an aborting child is invisible. Several of my harnesses launch that way.
