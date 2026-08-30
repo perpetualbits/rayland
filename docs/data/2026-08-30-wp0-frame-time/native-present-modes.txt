@@ -1,0 +1,4 @@
+pm=0 n=300 elapsed=.326719642
+pm=0 n=900 elapsed=.621284472
+pm=2 n=300 elapsed=7.728187120
+pm=2 n=900 elapsed=22.950699877

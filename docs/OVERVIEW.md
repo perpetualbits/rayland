@@ -313,6 +313,9 @@ reason against rather than re-deriving.
 | WP0 forward traffic, same A/B | 3,723 B → 3,594 B per frame — **1.04×, i.e. unchanged** |
 | **WP0 end-to-end failure rate** | **59/60 runs clean**; the one failure is a teardown artefact of the definition, so **0 genuine defects in 60** |
 | WP0 frame rate, 20 s runs against headless weston | 261–489 attaches (median 438) = **13–24 fps** |
+| **WP0 frame time, attributed (loopback)** | **65.8 ms** = 0.5 GPU + ~24.9 compositor pacing + **~40.4 Rayland** |
+| Native ceiling, same compositor and app | **25.4 ms/frame (39.4 fps)** — of which 24.9 ms is pacing, so the GPU work is **0.49 ms** |
+| **Synchronous round trips per WP0 frame** | **≈4.4** (S→C replies), ≈6.4 counting control — an *n × RTT* floor on any link |
 
 **Frame time is the synchronous round trip.** With feedback off the app implements `vkWaitForFences`
 by polling `vkGetFenceStatus`, and *every poll is a full C→S→execute→reply→C cycle*. It is not
@@ -562,6 +565,34 @@ whether pixels were crossing the wire, and the answer was one measurement away.
 **Not claimed:** any frame rate, any failure rate, or that presentation is correctly paced or
 tear-free. The commit gate remains untouched and this is a handful of runs.
 
+### 6.1.4 The latency half, measured — 2026-08-30
+
+The bandwidth half of the thesis is settled (~3.6 KB/frame out, 219 B/frame back). The latency half
+had never been examined. Full data: `docs/data/2026-08-30-wp0-frame-time/`. **All loopback.**
+
+**The number that transfers to a real network: ≈4.4 synchronous round trips per frame.** That is an
+*n × RTT* floor no bandwidth saving can remove — 2.2 ms on this LAN (invisible), 22 ms across a city
+(+33%), **132 ms to another country (3× worse), 352 ms transatlantic (fatal)**. It is a *good* number:
+small enough that LAN and metro links work, and the right thing to attack if a WAN is ever the goal.
+
+**The budget, per frame:** 0.49 ms GPU + ~24.9 ms compositor pacing + **~40.4 ms Rayland** = 65.8 ms.
+So **38% of a WP0 frame is pacing that a native client pays too.**
+
+**The ceiling is 39.4 fps, not 60**, and it is entirely weston's pacing — the GPU work is 0.49 ms.
+Any comparison of Rayland against 60 fps would have been wrong.
+
+**Ruled out:** GPU render time (0.7% of the frame), the network (loopback throughout), bandwidth, and
+polling granularity alone (500 µs/200 µs sleeps cannot make 4–8 ms intervals). **Still live:** the
+forward blob-sync volume — 72.5 messages/frame, and milkv's ~3.7×-slower core produced almost exactly
+3.7× fewer frames, which is the signature of per-message cost.
+
+**Not fully decomposed:** the ~40 ms is located, not itemised — the application's submission and the
+`wl_buffer` commit have no trace stations, so two segments of the path are uninstrumented.
+
+**`vkgears` cannot be used for attribution.** It segfaults *natively* against headless weston (both
+ICDs), and the solsim session found it segfaults on milkv under plain lavapipe too. It runs only
+through Rayland's own proxy. Every figure above is `vkcube`'s.
+
 ### 6.1.3 WP0 measured, and two defects a second application found — 2026-08-30
 
 **The numbers now come from repetition rather than a pair of runs** (`scripts/wp0-soak.sh`, data in
@@ -587,8 +618,16 @@ pinned to Mesa** (weston's EGL otherwise composites on the NVIDIA card while fra
 and **`--idle-time=0`** (weston stops compositing after 300 s, which looks exactly like the application
 stalling — the second time in two days a compositor declining to draw was mistaken for a Rayland bug).
 
-**Both defects below were FIXED on 2026-08-30, and `vkgears` now runs end to end** — 345 attaches, 345
-frame callbacks delivered, 10–13 fps, zero panics. A second independent application through WP0.
+**Both defects below were FIXED on 2026-08-30, and `vkgears` now runs end to end ON LOOPBACK** — 345
+attaches, 345 frame callbacks delivered, 10–13 fps, zero panics. A second independent application
+through WP0.
+
+> **Qualifier attached 2026-08-30, and it should travel with this claim wherever it is repeated.**
+> That run was **loopback**, and §7's own rule is that loopback proves little about the forward
+> mapped-memory break or about feedback. The two-machine confirmation of `vkgears` is **owed and not
+> done** — and note it may not be obtainable as stated, since `vkgears` has since been found to
+> segfault natively against headless weston and on milkv under lavapipe. `vkcube` *has* been run
+> apollo→dop561 and milkv→dop561 with a window on screen.
 The guarded soak that followed was 25/25 clean (loopback). The original findings are kept below because
 the *shapes* are what matter:
 

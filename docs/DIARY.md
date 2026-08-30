@@ -5152,3 +5152,61 @@ It does — ~5 fps, cube visible, confirmed by them. Two bad measurements of min
 "headless weston" arm pointed at a socket I had already killed, so it had *no compositor at all* and
 scored zero attaches while COSMIC scored 120. The inverted result is the only reason I looked again.
 Every negative claim I made about milkv's compositor sensitivity was an artefact of my own testing.
+
+### 2026-08-30 (night, last) — Where the 77 milliseconds go, and a ceiling that was never 60
+
+A measurement session, and the baselines changed the shape of the question before any attribution was
+possible — which is exactly why the brief demanded them first.
+
+**The ceiling is 39.4 fps, not 60, and it is pure pacing.** `vkcube` natively against the same headless
+weston: **25.37 ms/frame** with vsync, **0.49 ms/frame** without. So the GPU work is half a
+millisecond and **24.9 ms of every native frame is the client waiting for weston's callback**. Three
+runs agreed to 0.1 fps. Had I compared Rayland's 15 fps against 60, I would have attributed 4.6× to
+Rayland when the honest figure is 2.6×.
+
+**`vkgears` cannot be a baseline at all: it segfaults *natively*** against that weston, with the
+default ICD and pinned to Intel. It runs only *through* Rayland's proxy — which, with the solsim
+session's finding that it also dies on milkv under plain lavapipe, makes it a fragile binary whose
+numbers should not be used for attribution. Every figure in this session is `vkcube`'s. I had been
+quoting vkgears' 10–13 fps for two days.
+
+**The headline number, and the one that transfers off loopback: ≈4.4 synchronous round trips per
+frame.** That is an *n × RTT* floor nothing else can remove — 2.2 ms on this LAN, 22 ms across a city,
+**132 ms to another country, 352 ms transatlantic.** It is a *good* number. It says a LAN is
+unaffected and a metropolitan link is usable, and it says an intercontinental one is not without
+attacking exactly that count. Against it, the 72.5 forward blob-sync messages per frame are
+asynchronous — they cost CPU and bandwidth, not latency floor.
+
+**The budget:** 0.49 ms GPU + ~24.9 ms pacing + **~40.4 ms Rayland** = 65.8 ms observed. So **38% of a
+WP0 frame is pacing a native client pays too.**
+
+Inside Rayland's 40 ms, the existing `RLTRACE` stations on one clock give medians of 2.13 ms
+(S ships a blob → C has it), 3.96 ms (S receives a delta → engine consumes it) and 7.90 ms (S consumed
+→ C is told). They occur 3–5× per frame and overlap, so they locate the time rather than sum to it.
+The **shape** is the interesting part: p90 is 2–4× the median and maxima run 30–150 ms. This is not a
+uniformly slow pipeline, it is a mostly-fast one with a heavy tail — and the brief was right that those
+are different systems with different causes.
+
+**Ruled out by evidence, not by argument:** GPU render time (0.7% of the frame), the network (loopback
+throughout, and the ship→receive interval is still 2.13 ms with no network), bandwidth, and **polling
+granularity alone** — 500 µs and 200 µs sleeps cannot produce 4–8 ms intervals unless something blocks
+many times or genuinely waits, so the planning side's own suspect is not the simple answer.
+
+**Still live, and now with corroboration from an unexpected direction:** the forward blob-sync volume.
+72.5 messages per frame, and milkv's roughly 3.7×-slower core produced almost exactly 3.7× fewer
+frames. That linearity is the signature of per-message cost, and it is the same lever the readback
+coalescing pulled — which famously did *not* move wall-clock on x86, because on a fast core the
+message rate was not what hurt.
+
+**What I could not do**, stated rather than smoothed: `--present_mode 0` through WP0 yields no frames —
+*"Present mode specified is not supported"*, because Venus does not expose IMMEDIATE. So pacing cannot
+be subtracted on the Rayland side the way it can natively, and the ~40 ms is located but not itemised.
+The application's submission and the `wl_buffer` commit have no trace stations; two segments of the
+path remain uninstrumented, and closing that is the next session's job.
+
+**A correction the brief asked for, and it was right to.** The previous report's headline said a second
+application "works end to end through WP0". That run was loopback; §6 said so, the headline did not.
+The qualifier is now attached in `OVERVIEW.md` wherever the claim appears, with the two-machine
+confirmation recorded as **owed** — and noted as possibly unobtainable *as stated*, since `vkgears`
+turns out not to run natively at all. `vkcube` has been run apollo→dop561 and milkv→dop561 with a
+window on screen, which is the claim that survives.
