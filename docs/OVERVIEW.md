@@ -587,15 +587,19 @@ pinned to Mesa** (weston's EGL otherwise composites on the NVIDIA card while fra
 and **`--idle-time=0`** (weston stops compositing after 300 s, which looks exactly like the application
 stalling — the second time in two days a compositor declining to draw was mistaken for a Rayland bug).
 
-**Two open defects, found by running a second application (`vkgears`) and NOT fixed:**
+**Both defects below were FIXED on 2026-08-30, and `vkgears` now runs end to end** — 345 attaches, 345
+frame callbacks delivered, 10–13 fps, zero panics. A second independent application through WP0.
+The guarded soak that followed was 25/25 clean (loopback). The original findings are kept below because
+the *shapes* are what matter:
 
-1. **A bind capped on S is not propagated to its children.** `handle_bind` correctly caps a bind at the
+1. **FIXED — a bind capped on S was not propagated to its children.** `handle_bind` correctly caps a bind at the
    version S advertises, but objects created from that global still carry the version **C** stamped —
    the application's. A Wayland child inherits its parent's version, so the first `get_xdg_surface`
    panics with `expected version 5 but got 6`. **This is the third instance of the version-inheritance
    rule** (§6.4), and the first where S's own capping creates the mismatch. vkcube never exposed it
    because nothing was ever capped for it.
-2. **`catch_unwind` around `send_request` does not save the session.** It catches the panic and logs
+2. **FIXED (behaviour, not survivability) — `catch_unwind` around `send_request` cannot save the
+   session, and no longer claims to.** It catches the panic and logs
    "request dropped, session continues" — then the process **segfaults**, because the panic occurred
    with the `maps` mutex held, poisoning it, and the next
    `.expect("the WP0 id maps lock is never poisoned")` finds it poisoned. The comment is false and the
@@ -667,6 +671,26 @@ The countermeasures this project already uses, and should keep using:
 - **Prefer a witness to an argument.** When a component's behaviour is in question, instrument it and
   read what it says. The three-day `vkQueueSubmit` wall, the stale-frame misdiagnosis, and this
   session's frame-callback stall were all settled by an instrument after theories had failed.
+- **CLOSED BY CONSTRUCTION, 2026-08-30 — the version-inheritance rule.** A Wayland child inherits the
+  version of the object that created it, and `wayland-backend` enforces it by panicking. This bit three
+  times (`create_immed`'s `wl_buffer` child; the params object; `get_xdg_surface`, found by `vkgears`),
+  the last because S *caps* a bind at what its compositor advertises and the children then carried the
+  application's higher version. It is no longer a hazard to remember: `IdMaps` records every object's
+  version, seeded with the capped value at bind and propagated to each child, and `child_spec` is built
+  from **the sender's** version — the wire's is logged and decides nothing. The invariant is *every
+  object's version equals the capped version of the global it descends from*. Kept in this list as a
+  worked example of the shape: three instances of one rule, each fixed as an instance, until the fourth
+  forced fixing the rule.
+- **`catch_unwind` around a dependency's panicking API is not a recovery mechanism** unless that
+  dependency's locks survive the panic. `Backend::send_request` panics on a protocol violation **while
+  holding wayland-backend's own `ConnectionState::protocol` mutex**, and `lock_protocol()` is a bare
+  `.lock().unwrap()` — so the panic poisons it and the *next backend call of any kind* aborts the
+  process. The wrapper duly caught the first panic and logged "session continues"; the process then
+  segfaulted one call later. **It converted an immediate, legible crash into a reassuring line followed
+  by a crash**, which is strictly worse than no wrapper. Ask, before wrapping: *does this API panic with
+  a lock held, and is that lock mine?* Rayland's own map lock is fine — but only because it is never
+  held across a call that can panic, which is a property that has to be maintained, and is now written
+  where it can be checked.
 - **A Wayland protocol id is a slot number, not an object identity** — the third hazard of this
   family, and the one that cost a frozen window. An id is unique only among objects alive at one
   instant; the moment an object dies, the next one gets its number. Any map keyed by such an id must

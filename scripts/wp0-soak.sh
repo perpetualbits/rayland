@@ -91,9 +91,6 @@
 #   MODE=traffic RUNS=5 FRAMES=200 SHIP_PRESENTED=1 scripts/wp0-soak.sh   # exclusion OFF (A/B)
 set -uo pipefail
 
-C_HOST="${C_HOST:-apollo}"
-C_IP="$(getent ahostsv4 "$C_HOST" | awk '{print $1; exit}')"
-S_IP="${S_IP:-$(ip -4 route get "$C_IP" | grep -oP 'src \K[\d.]+')}"
 PORT="${PORT:-9407}"
 MODE="${MODE:-rate}"                       # rate | traffic
 RUNS="${RUNS:-40}"
@@ -103,9 +100,34 @@ MIN_ATTACHES="${MIN_ATTACHES:-$((APP_SECONDS * 2))}"   # the 2 fps floor; see th
 SHIP_PRESENTED="${SHIP_PRESENTED:-}"       # set to 1 to disable the presented-buffer exclusion
 TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/rayland-c1-target}"
 BIN="$TARGET_DIR/debug"
+BIN_EARLY="$BIN"
+
+# C_HOST empty runs the application and rayland-c on THIS machine over loopback.
+#
+# Why that mode exists: the failure rate and the traffic ratio this harness measures are properties of
+# the relay and the replay, not of the wire between two hosts, so loopback measures them faithfully.
+# It was added on a day `apollo` was unreachable, and the alternative was measuring nothing. A run's
+# topology is recorded in its output directory so no figure can later be mistaken for the other case.
+#
+# What loopback does NOT measure, and must not be quoted for: anything about latency, bandwidth, or a
+# genuinely weak C machine.
+C_HOST="${C_HOST-apollo}"
+if [ -n "$C_HOST" ]; then
+  C_IP="$(getent ahostsv4 "$C_HOST" | awk '{print $1; exit}')"
+  S_IP="${S_IP:-$(ip -4 route get "$C_IP" | grep -oP 'src \K[\d.]+')}"
+  # Run a command on machine C. One definition, so the two topologies cannot drift apart.
+  on_c() { ssh "$C_HOST" "$@"; }
+  C_BIN=/tmp
+else
+  S_IP=127.0.0.1
+  on_c() { bash -c "$@"; }
+  C_BIN="$BIN_EARLY"
+fi
 SOCK=/tmp/rl-soak.sock
 WL_SOCK=/tmp/rl-soak-wayland.sock
 WESTON_SOCKET="${WESTON_SOCKET:-wl-soak1}"
+VKCUBE="${VKCUBE:-/usr/bin/vkcube}"
+[ -n "${C_HOST-apollo}" ] && VKCUBE=/tmp/vkcube
 OUT="${OUT:-/tmp/wp0-soak-$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "$OUT"
 
@@ -115,7 +137,7 @@ mkdir -p "$OUT"
 # stalled-looking result that is an artefact of the harness, not of the code under test — which
 # happened once and cost a sweep. Fail loudly instead, and name the PIDs so a human can end them
 # deliberately; this script will not pattern-kill processes it did not start.
-leftovers=$(ssh "$C_HOST" 'ps -o pid=,cmd= -C vkcube -C rayland-c 2>/dev/null')
+leftovers=$(on_c 'ps -o pid=,cmd= -C vkcube -C rayland-c 2>/dev/null')
 if [ -n "$leftovers" ]; then
   echo "REFUSING TO RUN: processes from an earlier sweep are still alive on $C_HOST:"
   echo "$leftovers"
@@ -125,8 +147,10 @@ fi
 
 echo "### building ###"
 CARGO_TARGET_DIR="$TARGET_DIR" cargo build -q -p rayland-c -p rayland-s || exit 1
-scp -q "$BIN/rayland-c" /usr/bin/vkcube "$C_HOST:/tmp/" || exit 1
-ssh "$C_HOST" 'chmod +x /tmp/rayland-c /tmp/vkcube'
+if [ -n "$C_HOST" ]; then
+  scp -q "$BIN/rayland-c" /usr/bin/vkcube "$C_HOST:/tmp/" || exit 1
+  ssh "$C_HOST" 'chmod +x /tmp/rayland-c /tmp/vkcube'
+fi
 
 # ---- The headless compositor, started once and shared by every run --------------------------
 # Started here rather than per-run because compositor startup is ~5 s and is not what is being
@@ -151,8 +175,8 @@ for run in $(seq 1 "$RUNS"); do
   RD="$OUT/run$run"; mkdir -p "$RD"
   S_PID=""; C_PID=""; A_PID=""
   cleanup_run() {
-    [ -n "$A_PID" ] && ssh "$C_HOST" "kill $A_PID 2>/dev/null" || true
-    [ -n "$C_PID" ] && ssh "$C_HOST" "kill $C_PID 2>/dev/null" || true
+    [ -n "$A_PID" ] && on_c "kill $A_PID 2>/dev/null" || true
+    [ -n "$C_PID" ] && on_c "kill $C_PID 2>/dev/null" || true
     [ -n "$S_PID" ] && kill "$S_PID" 2>/dev/null || true
   }
 
@@ -170,9 +194,9 @@ for run in $(seq 1 "$RUNS"); do
     printf '%s\tFAIL\tearly_exit(S)\t0\t0\t0\t0\n' "$run" >> "$OUT/runs.tsv"; continue
   fi
 
-  C_PID=$(ssh "$C_HOST" "rm -f $SOCK $WL_SOCK
+  C_PID=$(on_c "rm -f $SOCK $WL_SOCK
     RAYLAND_WP_LOG=1 RAYLAND_C1_METRICS=1 RAYLAND_C1_S_ADDR=$S_IP:$PORT RAYLAND_C1_SOCKET=$SOCK \
-    RAYLAND_C1_WAYLAND_DISPLAY=$WL_SOCK nohup /tmp/rayland-c >/tmp/soak-c.log 2>&1 & echo \$!")
+    RAYLAND_C1_WAYLAND_DISPLAY=$WL_SOCK nohup $C_BIN/rayland-c >/tmp/soak-c.log 2>&1 & echo \$!")
   sleep 3
 
   # The application always runs FREE. vkcube's own frame-limited mode (`--c N`) was tried for the
@@ -181,11 +205,11 @@ for run in $(seq 1 "$RUNS"); do
   # observation about `--c` and is reported rather than chased; here it only means the frame count has
   # to be imposed by this harness instead, by stopping the app once C's log shows enough attaches.
   APP_ARGS="--gpu_number 0"
-  A_PID=$(ssh "$C_HOST" "export XDG_RUNTIME_DIR=/run/user/\$(id -u)
+  A_PID=$(on_c "export XDG_RUNTIME_DIR=/run/user/\$(id -u)
     WAYLAND_DISPLAY=$WL_SOCK VN_DEBUG=vtest \
     VN_PERF=no_multi_ring,no_fence_feedback,no_semaphore_feedback,no_event_feedback,no_query_feedback \
     VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/virtio_icd.json VTEST_SOCKET_NAME=$SOCK \
-    env -u VK_LOADER_DRIVERS_SELECT nohup /tmp/vkcube $APP_ARGS >/tmp/soak-app.log 2>&1 & echo \$!")
+    env -u VK_LOADER_DRIVERS_SELECT nohup $VKCUBE $APP_ARGS >/tmp/soak-app.log 2>&1 & echo \$!")
 
   if [ "$MODE" = traffic ]; then
     # Impose the frame count from here: poll C's own request trace until it has forwarded $FRAMES
@@ -193,7 +217,7 @@ for run in $(seq 1 "$RUNS"); do
     # — and a run that hits the bound without reaching $FRAMES is scored on its actual attach count,
     # which the per-run table records, rather than being silently averaged in as if it were complete.
     for _ in $(seq 1 90); do
-      n=$(ssh "$C_HOST" "grep -c 'forward obj 3 opcode 1 ' /tmp/soak-c.log 2>/dev/null || echo 0")
+      n=$(on_c "grep -c 'forward obj 3 opcode 1 ' /tmp/soak-c.log 2>/dev/null || echo 0")
       [ "${n:-0}" -ge "$FRAMES" ] && break
       sleep 2
     done
@@ -202,10 +226,15 @@ for run in $(seq 1 "$RUNS"); do
   fi
 
   # Stop the app first so C's session ends cleanly and reports its byte counters.
-  ssh "$C_HOST" "kill $A_PID 2>/dev/null" || true
+  on_c "kill $A_PID 2>/dev/null" || true
   sleep 4
-  scp -q "$C_HOST:/tmp/soak-c.log" "$RD/c.log" 2>/dev/null || true
-  scp -q "$C_HOST:/tmp/soak-app.log" "$RD/app.log" 2>/dev/null || true
+  if [ -n "$C_HOST" ]; then
+    scp -q "$C_HOST:/tmp/soak-c.log" "$RD/c.log" 2>/dev/null || true
+    scp -q "$C_HOST:/tmp/soak-app.log" "$RD/app.log" 2>/dev/null || true
+  else
+    cp /tmp/soak-c.log "$RD/c.log" 2>/dev/null || true
+    cp /tmp/soak-app.log "$RD/app.log" 2>/dev/null || true
+  fi
   cleanup_run
   sleep 1
 
@@ -213,8 +242,43 @@ for run in $(seq 1 "$RUNS"); do
   m=""
   inv=$(grep -c 'Invalid ObjectId' "$RD/s.log" "$RD/c.log" 2>/dev/null | awk -F: '{s+=$2} END{print s+0}')
   # Every drop except the accepted keymap fd. `grep -v` before counting, so the exclusion is visible.
-  drops=$(grep -h 'wp-event.\[[SC]\] drop:' "$RD/s.log" "$RD/c.log" 2>/dev/null \
-          | grep -vc 'carries-fd wl_keyboard.keymap' || true)
+  # Drops, excluding two cases — and the exclusions are the part to scrutinise, because a soak's
+  # exclusions are where it quietly stops measuring anything.
+  #
+  #   1. `carries-fd wl_keyboard.keymap` — a file descriptor cannot cross a network and no application
+  #      here blocks on it. Known, accepted, and a separate task.
+  #   2. **Anything after the application began destroying its objects.** Run 13 of the 60-run soak
+  #      failed on two drops that landed after every object had been destroyed and immediately before
+  #      "session ended cleanly": S had events in flight for objects the app had legitimately finished
+  #      with. That is benign, and counting it made `1 in 60` mean something it did not.
+  #
+  # The teardown guard is keyed on the app's OWN behaviour, and on the destruction of a
+  # **session-lifetime** object specifically — NOT on elapsed time, and NOT on "any destruction".
+  #
+  # The first draft keyed on the first `objects-` line of any kind, and was badly wrong: a
+  # `wl_callback` is destroyed after every frame, so in the archived run that motivated this guard the
+  # first destruction was at line 62 of 4086 and the guard would have excused essentially the entire
+  # run. That is precisely the failure the commissioning brief warned about — the exclusion is where a
+  # soak quietly stops measuring anything — and it was caught only by running the guard against that
+  # archived log instead of trusting it.
+  #
+  # In that same log, by interface: wl_callback destroyed 471 times, while xdg_surface, xdg_toplevel
+  # and wl_surface were destroyed exactly ONCE each, in a burst at the very end. Those are created once
+  # and destroyed once, so their destruction is a real shutdown signal that per-frame churn cannot
+  # trigger. A time-based guard would silently excuse real late failures; this one excuses only events
+  # arriving after the application has demonstrably begun dismantling its window.
+  teardown_line=$(grep -nE 'objects- app_obj=[0-9]+ (xdg_toplevel|xdg_surface|wl_surface)' \
+                  "$RD/c.log" 2>/dev/null | head -1 | cut -d: -f1)
+  if [ -n "$teardown_line" ]; then
+    # Only drops BEFORE the first destruction count. S's log has no teardown marker of its own, so its
+    # drops are counted in full — which is the conservative choice.
+    c_drops=$(head -n "$teardown_line" "$RD/c.log" 2>/dev/null | grep -c 'wp-event.\[C\] drop:' || true)
+  else
+    c_drops=$(grep -c 'wp-event.\[C\] drop:' "$RD/c.log" 2>/dev/null || true)
+  fi
+  s_drops=$(grep -h 'wp-event.\[S\] drop:' "$RD/s.log" 2>/dev/null \
+            | grep -vc 'carries-fd wl_keyboard.keymap' || true)
+  drops=$(( ${c_drops:-0} + ${s_drops:-0} ))
   proto=$(grep -chE 'protocol error|panicked|PANICKED' "$RD/s.log" 2>/dev/null | awk '{s+=$1} END{print s+0}')
   attaches=$(grep -c 'forward obj 3 opcode 1 ' "$RD/c.log" 2>/dev/null || echo 0)
   c2s=$(grep -oE 'c2s_total_bytes=[0-9]+' "$RD/c.log" 2>/dev/null | tail -1 | cut -d= -f2)

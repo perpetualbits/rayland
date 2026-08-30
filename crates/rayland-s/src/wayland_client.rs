@@ -67,6 +67,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rayland_relay::{BufferToken, WaylandArg, WaylandMessage};
@@ -281,6 +282,21 @@ struct GlobalEntry {
 /// id space and must resolve them back to the app's numeric ids (`reverse`). The reverse map is keyed by the
 /// S-side object's `protocol_id` (a `u32`, unique within S's connection) rather than the `ObjectId` itself,
 /// so it needs no `Hash` on `ObjectId`.
+/// # On `.expect("the WP0 id maps lock is never poisoned")`, re-examined 2026-08-30
+///
+/// That claim is a *conditional* one and it is worth stating what it rests on, because a sibling claim
+/// of the same shape turned out false the same week: `catch_unwind` around `send_request` was asserted
+/// to make the session survivable, and did not, because the **dependency's** mutex is what gets
+/// poisoned.
+///
+/// This lock is different, and still sound, for a reason that can be checked rather than believed:
+/// **it is never held across a call that can panic.** Every acquisition in this module is a short
+/// scope that reads or writes the maps and releases — `translate_and_emit` is shaped around a
+/// `Result` precisely so the drop reason is *formatted* after release, and `synthesize_buffer` takes
+/// and drops it between `send_request`s rather than across them. If a future edit holds this lock
+/// across a backend call, the claim becomes false and the `expect` becomes the second crash rather
+/// than a safe assertion.
+///
 /// # Why nothing is ever removed from these maps — and why that is deliberate, not an oversight
 ///
 /// A Wayland protocol id is a **slot number, not an object identity**: it is unique only among objects
@@ -306,13 +322,48 @@ struct IdMaps {
     /// S-side object `protocol_id` → the app object id it stands for. The inverse of `forward`, and
     /// likewise overwritten rather than removed — see the type's own docs for why that is the safe choice.
     reverse: HashMap<u32, u32>,
+    /// App object id → the **version of the S-side object** the replay created for it.
+    ///
+    /// # Why S has to remember this, and why the wire's version cannot be used
+    /// In Wayland a `new_id` argument **inherits the version of the object that created it**. The one
+    /// exception is `wl_registry.bind`, which carries an explicit version — and which the replay handles
+    /// on its own path ([`WaylandReplay::handle_bind`]).
+    ///
+    /// S cannot simply forward the version C stamped on the wire, because **S may bind a global at a
+    /// lower version than the application did**: `handle_bind` caps at what S's compositor advertises,
+    /// since binding above a global's maximum is a protocol error. Once capped, every version the
+    /// application believes in is too high for S's objects, and `wayland-backend` enforces the
+    /// difference by **panicking** — `client_impl/mod.rs:368`, "expected version 5 but got 6".
+    ///
+    /// Nor can the version be read back off an `ObjectId`: the client-side `ObjectId` API exposes only
+    /// `interface()` and `protocol_id()`. So it is recorded here.
+    ///
+    /// **The invariant this establishes**, which is what makes one lookup sufficient: *every object's
+    /// version equals the capped version of the global it descends from.* Seeded at bind time with the
+    /// capped value, and propagated unchanged to every child.
+    versions: HashMap<u32, u32>,
 }
 
 impl IdMaps {
-    /// Record a mapping in both directions at once, so the two never drift.
-    fn insert(&mut self, app_id: u32, s_id: ObjectId) {
+    /// Record a mapping in both directions at once, plus the S-side object's version, so the three
+    /// never drift.
+    ///
+    /// `version` is the version of the **S-side** object — the capped bind version for a global, or the
+    /// creating object's version for a child. Never the version the application asked for; see the
+    /// [`Self::versions`] field for why that distinction is load-bearing.
+    fn insert(&mut self, app_id: u32, s_id: ObjectId, version: u32) {
         self.reverse.insert(s_id.protocol_id(), app_id);
         self.forward.insert(app_id, s_id);
+        self.versions.insert(app_id, version);
+    }
+
+    /// The version of the S-side object standing for `app_id`, if the replay created it.
+    ///
+    /// This is what a child's `child_spec` must be built from. `None` means the object is unknown, and
+    /// the caller must refuse rather than guess a version — a guess is exactly the panic this exists to
+    /// prevent.
+    fn version_of(&self, app_id: u32) -> Option<u32> {
+        self.versions.get(&app_id).copied()
     }
 
     /// Resolve an app object id to its S-side [`ObjectId`], if the replay has created it.
@@ -659,8 +710,14 @@ fn translate_and_emit(
 /// It mirrors `wayland-client`'s own `roundtrip` loop: flush, then either read-and-dispatch through a
 /// prepared guard (blocking on the fd with `poll`), or drain the backend's inner queue when a guard is
 /// unavailable. It returns when the compositor connection ends (which ends the app's session too).
-fn compositor_reader(conn: Connection) {
+fn compositor_reader(conn: Connection, dead: Arc<AtomicBool>) {
     loop {
+        // Stop the moment the backend's connection state is poisoned: every call below would
+        // unwrap that poisoned mutex. See `WaylandReplay::dead_flag`.
+        if dead.load(Ordering::Relaxed) {
+            eprintln!("rayland-s: WP0 replay: compositor reader stopping — the replay is dead");
+            return;
+        }
         // Push any queued requests before waiting, so a reply the app is blocked on is not held back.
         if let Err(e) = conn.flush() {
             eprintln!("rayland-s: WP0 compositor flush failed, event reader stopping: {e}");
@@ -733,6 +790,34 @@ pub struct WaylandReplay {
     reader_started: bool,
     /// Resolves a token's resource id to a duplicate of S's exported dma-buf descriptor (Task 4.3).
     fd_source: Arc<dyn ExportedFdSource>,
+    /// Shared with the compositor-reader thread so it stops dispatching once the backend is poisoned.
+    ///
+    /// The message thread setting [`Self::replay_dead`] only stops *its own* calls. The reader thread
+    /// dispatches the same backend independently and would unwrap the poisoned mutex on its next turn —
+    /// observed directly in the mutation test, where it panicked alongside the main thread. A panic in a
+    /// spawned thread does not end the process, but a reader spinning on a poisoned lock is noise, so it
+    /// is told to stop.
+    dead_flag: Arc<AtomicBool>,
+    /// Set once a `send_request` panic has been caught, after which the replay issues **no further
+    /// backend call**.
+    ///
+    /// # Why a panic is unrecoverable, and why the wrapper cannot pretend otherwise
+    /// `Backend::send_request` takes `wayland-backend`'s own `ConnectionState::protocol` mutex and
+    /// **holds it across every panic it raises** (`rs/client_impl/mod.rs`: the guard is taken at the top
+    /// of `send_request`, the version and interface panics fire below it). A panic while a `Mutex` guard
+    /// is held **poisons that mutex**, and the backend's `lock_protocol()` is a bare
+    /// `self.protocol.lock().unwrap()` — so the *next* backend call of any kind unwraps a poisoned lock
+    /// and aborts the process.
+    ///
+    /// No lock discipline on Rayland's side changes this: the poisoned mutex is inside the dependency.
+    /// A `catch_unwind` that logged "session continues" and carried on therefore turned an immediate,
+    /// legible crash into a reassuring line followed by a segfault one call later — strictly worse than
+    /// no wrapper. `vkgears` demonstrated exactly that on 2026-08-30.
+    ///
+    /// So the honest behaviour is: catch it, say plainly that the Wayland replay is dead, and stop
+    /// touching the backend. The vtest/ring relay is a separate session and keeps running — the
+    /// application loses its window, not its compute.
+    replay_dead: bool,
     /// **S's own** `zwp_linux_dmabuf_v1` object and the version it was bound at — bound lazily by
     /// [`Self::ensure_dmabuf`] the first time a buffer token arrives, and never destroyed.
     ///
@@ -769,6 +854,8 @@ impl WaylandReplay {
             maps: Arc::new(Mutex::new(IdMaps::default())),
             sink,
             reader_started: false,
+            dead_flag: Arc::new(AtomicBool::new(false)),
+            replay_dead: false,
             fd_source,
             dmabuf: None,
         }
@@ -850,7 +937,10 @@ impl WaylandReplay {
         };
         match std::thread::Builder::new()
             .name("rayland-s-wl-events".into())
-            .spawn(move || compositor_reader(conn))
+            .spawn({
+                let dead = Arc::clone(&self.dead_flag);
+                move || compositor_reader(conn, dead)
+            })
         {
             Ok(_) => self.reader_started = true,
             Err(e) => eprintln!("rayland-s: WP0 could not start the compositor event reader: {e}"),
@@ -864,6 +954,10 @@ impl WaylandReplay {
     /// error), and records `app_object_id → (the S-side object)`. A missing global or unknown interface is
     /// logged and skipped — the app can still run; that object simply will not replay.
     pub fn handle_bind(&mut self, interface: String, version: u32, app_object_id: u32) {
+        // The backend's connection state is poisoned; any further call would abort the process.
+        if self.replay_dead {
+            return;
+        }
         if !self.ensure_connected() {
             return;
         }
@@ -913,10 +1007,12 @@ impl WaylandReplay {
         );
         match result {
             Ok(s_id) => {
+                // Seed the version map with the **capped** value, not the version the application
+                // asked for. Everything descended from this object inherits it.
                 self.maps
                     .lock()
                     .expect("the WP0 id maps lock is never poisoned")
-                    .insert(app_object_id, s_id);
+                    .insert(app_object_id, s_id, bind_version);
                 eprintln!(
                     "rayland-s: WP0 replay bound `{interface}` v{bind_version} (app obj {app_object_id})"
                 );
@@ -935,6 +1031,10 @@ impl WaylandReplay {
     /// `catch_unwind` — a replay bug is logged and the vtest/ring session survives, rather than the whole
     /// message thread dying.
     pub fn handle_request(&mut self, msg: WaylandMessage) {
+        // The backend's connection state is poisoned; any further call would abort the process.
+        if self.replay_dead {
+            return;
+        }
         if !self.ensure_connected() {
             return;
         }
@@ -948,17 +1048,18 @@ impl WaylandReplay {
             return;
         }
         // The sender must be an object the replay already created (bound global or prior new-id).
-        let Some(sender) = self
-            .maps
-            .lock()
-            .expect("the WP0 id maps lock is never poisoned")
-            .to_s(msg.object_id)
-        else {
-            eprintln!(
-                "rayland-s: WP0 replay: request for unmapped object {} (opcode {}); skipped",
-                msg.object_id, msg.opcode
-            );
-            return;
+        let (sender, sender_version) = {
+            let maps = self.maps.lock().expect("the WP0 id maps lock is never poisoned");
+            match (maps.to_s(msg.object_id), maps.version_of(msg.object_id)) {
+                (Some(s), Some(v)) => (s, v),
+                _ => {
+                    eprintln!(
+                        "rayland-s: WP0 replay: request for unmapped object {} (opcode {}); skipped",
+                        msg.object_id, msg.opcode
+                    );
+                    return;
+                }
+            }
         };
 
         // Reconstruct the argument list, translating ids and pulling out the child_spec / new-object id.
@@ -994,7 +1095,26 @@ impl WaylandReplay {
                     version,
                 } => {
                     args.push(Argument::NewId(ObjectId::null()));
-                    child_spec = interface_by_name(interface).map(|iface| (iface, *version));
+                    // **The child's version comes from the SENDER, never from the wire.** A Wayland
+                    // `new_id` inherits the version of the object that creates it, and S may hold that
+                    // object at a *lower* version than the application does, because `handle_bind` caps
+                    // every bind at what S's compositor advertises. `wayland-backend` enforces the
+                    // inheritance by panicking, so using `version` here — the application's view — is a
+                    // crash the moment S caps anything. It cost three separate failures to learn
+                    // (`create_immed`'s `wl_buffer`, the params object, and `get_xdg_surface`); building
+                    // from `sender_version` removes the whole class rather than the third instance.
+                    //
+                    // The wire's `version` is kept and logged because it is genuinely useful — the gap
+                    // between it and the sender's is exactly how much S had to cap — but it decides
+                    // nothing.
+                    if *version != sender_version {
+                        eprintln!(
+                            "rayland-s: WP0 replay: capping child `{interface}` to v{sender_version} \
+                             (the app asked for v{version}; S's `{}` is v{sender_version})",
+                            sender.interface().name
+                        );
+                    }
+                    child_spec = interface_by_name(interface).map(|iface| (iface, sender_version));
                     new_app_id = Some(*id);
                 }
                 // Unreachable: a message carrying a token was routed to `synthesize_buffer` above. Kept
@@ -1010,6 +1130,19 @@ impl WaylandReplay {
                     return;
                 }
             }
+        }
+
+        // **Refuse what would panic, rather than catching it afterwards.** A caught panic is not a
+        // recovery here — it poisons the backend and kills the replay (see `replay_dead`) — so the two
+        // panics that are cheaply predictable are checked first. The version panic is prevented by
+        // construction now that children inherit the sender's version; these are the other two.
+        if let Err(why) = precheck_request(&sender, msg.opcode, child_spec.map(|(i, _)| i)) {
+            eprintln!(
+                "rayland-s: WP0 replay: refusing request (obj {} opcode {}): {why}; dropped rather than \
+                 risking a panic that would kill the replay",
+                msg.object_id, msg.opcode
+            );
+            return;
         }
 
         let backend = self.backend.as_ref().expect("connected");
@@ -1039,10 +1172,12 @@ impl WaylandReplay {
                     // an event reaches the app or is addressed to a dead app object. Logged (gated) so the
                     // mapping can be read back rather than reasoned about.
                     let s_protocol = s_new_id.protocol_id();
+                    // The child inherits the sender's version, which is what keeps the invariant in
+                    // `IdMaps::versions` true for every object the replay ever creates.
                     self.maps
                         .lock()
                         .expect("the WP0 id maps lock is never poisoned")
-                        .insert(app_id, s_new_id);
+                        .insert(app_id, s_new_id, sender_version);
                     if event_log_enabled() {
                         eprintln!(
                             "[wp-event][S] map s_obj={s_protocol} app_obj={app_id} (from obj {} opcode {opcode})",
@@ -1055,11 +1190,27 @@ impl WaylandReplay {
                 "rayland-s: WP0 replay: send_request (obj {} opcode {opcode}) failed: {e}",
                 msg.object_id
             ),
-            Err(_) => eprintln!(
-                "rayland-s: WP0 replay: send_request (obj {} opcode {opcode}) panicked — likely a \
-                 translation bug; request dropped, session continues",
-                msg.object_id
-            ),
+            // **Not a recovery.** See `WaylandReplay::replay_dead`: the panic fired inside
+            // `send_request` with wayland-backend's own connection mutex held, poisoning it, so the very
+            // next backend call would unwrap a poisoned lock and abort the process. The only honest
+            // thing left is to stop calling the backend and say so.
+            Err(_) => {
+                eprintln!(
+                    "rayland-s: WP0 replay: FATAL — send_request (obj {} opcode {opcode}) panicked. \
+                     wayland-backend's connection state is now poisoned, so the Wayland replay is DEAD \
+                     and no further request will be replayed. The vtest/ring relay continues; the \
+                     application keeps rendering but loses its window.",
+                    msg.object_id
+                );
+                self.replay_dead = true;
+                self.dead_flag.store(true, Ordering::Relaxed);
+                // **Return before the flush.** `Connection::flush` is itself a backend call, so
+                // flushing here would immediately unwrap the mutex the panic just poisoned and abort —
+                // turning an honest "the replay is dead" into a crash on the very next line. Found by
+                // the mutation test, which kept dying at `client_impl/mod.rs:115` even after the panic
+                // was being caught.
+                return;
+            }
         }
         self.flush();
     }
@@ -1231,18 +1382,19 @@ impl WaylandReplay {
                 return;
             }
             Err(_) => {
-                eprintln!(
-                    "rayland-s: WP0 4.3: step 1/3 create_params PANICKED for resource {} — a protocol \
-                     violation in the synthesized request; buffer refused, session continues",
-                    token.resource_id
-                );
+                self.declare_replay_dead("step 1/3 create_params", token.resource_id);
                 return;
             }
         };
+        // Same inheritance rule as everywhere else, with the chain spelled out because this path
+        // originates its objects rather than replaying them: the params object's sender is S's own
+        // dmabuf global, so the params object is `dmabuf_version`; the `wl_buffer` below is created by
+        // the params object, so it is `dmabuf_version` too. `plan_buffer_requests` stamps both from the
+        // same number for exactly this reason — there is one rule, not a special case here.
         self.maps
             .lock()
             .expect("the WP0 id maps lock is never poisoned")
-            .insert(msg.object_id, s_params.clone());
+            .insert(msg.object_id, s_params.clone(), dmabuf_version);
 
         // Step 2: describe the plane. No child object, so no object data.
         match send(s_params.clone(), add, None) {
@@ -1252,10 +1404,7 @@ impl WaylandReplay {
                 return;
             }
             Err(_) => {
-                eprintln!(
-                    "rayland-s: WP0 4.3: step 2/3 add PANICKED for resource {}; buffer refused",
-                    token.resource_id
-                );
+                self.declare_replay_dead("step 2/3 add", token.resource_id);
                 return;
             }
         }
@@ -1269,18 +1418,15 @@ impl WaylandReplay {
                 return;
             }
             Err(_) => {
-                eprintln!(
-                    "rayland-s: WP0 4.3: step 3/3 create_immed PANICKED for resource {} — check the \
-                     child_spec version against the params object's (they must match); buffer refused",
-                    token.resource_id
-                );
+                self.declare_replay_dead("step 3/3 create_immed", token.resource_id);
                 return;
             }
         };
+        // The buffer inherits the params object's version — see the note at the params insert above.
         self.maps
             .lock()
             .expect("the WP0 id maps lock is never poisoned")
-            .insert(app_buffer_id, s_buffer);
+            .insert(app_buffer_id, s_buffer, dmabuf_version);
 
         // The buffer is real and on S's compositor, so this resource is now shown rather than read:
         // stop the return path shipping its pixels to a machine that has no screen.
@@ -1294,6 +1440,41 @@ impl WaylandReplay {
         self.flush();
         // `fd` drops here, closing this duplicate. The backend already dup'd its own copy when it wrote the
         // `add`, and the `Applier`'s original is untouched — it must be, since the export cannot be redone.
+    }
+
+    /// Record that a `send_request` panic has killed the Wayland replay, and say so without pretending.
+    ///
+    /// Every caller of this has just caught a panic from inside `send_request`, which means
+    /// wayland-backend's connection mutex is poisoned and any further backend call aborts the process.
+    /// See [`Self::replay_dead`] for the full mechanism. Centralised so that no site can drift into
+    /// claiming a recovery that the dependency's locking makes impossible.
+    fn declare_replay_dead(&mut self, what: &str, resource_id: u32) {
+        eprintln!(
+            "rayland-s: WP0 4.3: FATAL — {what} PANICKED for resource {resource_id}. \
+             wayland-backend's connection state is now poisoned, so the Wayland replay is DEAD and no \
+             further request will be replayed. The vtest/ring relay continues."
+        );
+        self.replay_dead = true;
+        self.dead_flag.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether a `send_request` panic has killed the Wayland replay. See [`Self::replay_dead`].
+    ///
+    /// Exposed so a test can assert the *absence* of that state: "the request was replayed and the
+    /// replay is still alive" is the property the version fix exists to provide, and it is not
+    /// observable from the id map alone.
+    pub fn is_replay_dead(&self) -> bool {
+        self.replay_dead
+    }
+
+    /// The version of the S-side object standing for `app_object_id`, if the replay created it.
+    ///
+    /// Exposed for tests: it is how "S capped this bind" is detected without reaching into the maps.
+    pub fn version_of(&self, app_object_id: u32) -> Option<u32> {
+        self.maps
+            .lock()
+            .expect("the WP0 id maps lock is never poisoned")
+            .version_of(app_object_id)
     }
 
     /// Whether `app_object_id` has been mapped to an S-side object — i.e. the replay has created the
@@ -1316,6 +1497,50 @@ impl WaylandReplay {
             }
         }
     }
+}
+
+/// Would this request make `Backend::send_request` panic? `Ok(())` if not, `Err(reason)` if so.
+///
+/// # Why this exists rather than relying on the `catch_unwind`
+/// `send_request` panics on a protocol violation **while holding wayland-backend's own connection
+/// mutex**, poisoning it — so catching the panic does not save the session, it only delays the abort by
+/// one backend call (see [`WaylandReplay::replay_dead`]). Anything predictable is therefore better
+/// refused than caught.
+///
+/// # What it checks, and what it deliberately does not
+/// - **The opcode exists on the sender's interface.** An unknown opcode is `send_request`'s first
+///   panic, and it is reachable whenever S's linked descriptor is older than the app's.
+/// - **The child interface matches what the descriptor says the request creates.** That is
+///   `send_request`'s other structural panic.
+///
+/// It does **not** check the argument signature: reproducing the backend's own type-by-type validation
+/// here would duplicate logic that can drift out of step with the dependency, which is a worse failure
+/// than the one it would prevent. The version panic is not checked either, because children now inherit
+/// the sender's version and it cannot occur.
+fn precheck_request(
+    sender: &ObjectId,
+    opcode: u16,
+    child: Option<&'static Interface>,
+) -> Result<(), String> {
+    let iface = sender.interface();
+    let Some(desc) = iface.requests.get(opcode as usize) else {
+        return Err(format!(
+            "opcode {opcode} is out of range for `{}` (it has {} requests)",
+            iface.name,
+            iface.requests.len()
+        ));
+    };
+    // Only meaningful when the request creates an object *and* the descriptor names a fixed interface
+    // for it; `wl_registry.bind`'s generic new_id has `child_interface: None` and is handled elsewhere.
+    if let (Some(child), Some(expected)) = (child, desc.child_interface) {
+        if child.name != expected.name {
+            return Err(format!(
+                "`{}.{}` creates a `{}`, but the relayed request names a `{}`",
+                iface.name, desc.name, expected.name, child.name
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Map a Wayland interface name to the linked `&'static Interface` the client backend needs.

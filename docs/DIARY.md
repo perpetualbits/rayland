@@ -4940,3 +4940,75 @@ machine — riscv64, Debian sid chroot with Mesa 26.1.6, solarsim built and veri
 lavapipe. Nothing has crossed the network on it yet, and its `rayland-c` build was still running. It is
 the obvious way to redo these runs genuinely split, and it is a better C machine than apollo for the
 project's purposes — a weak board is what Rayland is *for*.
+
+### 2026-08-30 (evening) — The version rule closed as a class, and a wrapper that was lying
+
+Two fixes, and the more interesting story is how thoroughly the tests corrected me on the way.
+
+**A dated correction first, per the house pattern — the previous entry and report stand.** I attributed
+the segfault to poisoning of *rayland's* `maps` mutex. **That was wrong**, and the brief caught it. The
+poisoned lock is **wayland-backend's own**: `send_request` takes `ConnectionState::protocol` at the top
+and holds it across every panic it raises, and `lock_protocol()` is a bare
+`self.protocol.lock().unwrap()`. So the next backend call of *any* kind unwraps a poisoned mutex and
+dies. I verified that in the dependency's source before touching anything, and then watched it happen
+in a test. No lock discipline of ours could have helped; the poisoned lock is not ours.
+
+**Fix one: a child's version comes from its sender.** `IdMaps` now records every object's version,
+seeded at bind with the **capped** value and inherited by every child, and `child_spec` is built from
+the sender. The wire's version is still logged — the gap between it and the sender's is exactly how
+much S had to cap, which is useful — but it decides nothing.
+
+That closes the class. The rule had bitten three times (`create_immed`'s `wl_buffer`, the params
+object, `get_xdg_surface`) and each time I fixed the instance. The third was the one that made the
+shape obvious, and it took `vkgears` thirty seconds to find what three sessions of reasoning had not.
+
+**Fix two: stop claiming a recovery that cannot happen.** The `catch_unwind` now declares the replay
+**dead**, says so, and issues no further backend call. The relay keeps running — the application loses
+its window, not its compute.
+
+**The mutation test then found two bugs in my own fix, and this is the part worth recording.** I wrote
+the version test as a unit test first: it computed `child = sender_version` in the test body and
+asserted it equalled the capped value. Green, and worthless — it restated the rule instead of
+exercising it, which is §6.4's hazard, hit again by me two days after I wrote it down. It would not
+have failed against the bug. Rewritten as an integration test that drives `handle_bind` +
+`handle_request` against a real compositor, it *did* fail under mutation — and then failed **by
+panicking rather than on my assertion**, which is how I discovered that:
+
+1. I was still calling `flush()` after declaring the replay dead. `flush` is a backend call, so it
+   unwrapped the freshly poisoned mutex and aborted — the honest "the replay is dead" followed
+   immediately by the crash it existed to avoid.
+2. The **compositor-reader thread** touches the same backend independently and panicked alongside the
+   main thread. Setting a flag on the message thread stops only the message thread.
+
+Both fixed. The test now fails on its own assertion — *"S capped xdg_wm_base to v5, the wire said
+v6"* — which is what a regression test is supposed to do.
+
+**And `vkgears` does not merely survive: it runs.** 345 attaches, 345 frame callbacks delivered,
+10–13 FPS, zero panics, `rayland-s` alive. Two cappings fire and chain correctly through two
+generations: `xdg_wm_base` v5 → `xdg_surface` v5 → `xdg_toplevel` v5. **A second independent
+application now works end to end through WP0**, which is a better outcome than the brief expected.
+
+**The soak's teardown guard, and my second wrong first attempt.** I keyed it on "the first object
+destruction C observed" — and then, instead of trusting it, ran it against the archived run 13 that
+motivated it. The first destruction there is at **line 62 of 4086**, because a `wl_callback` is
+destroyed after every frame. My guard would have excused essentially the entire run: exactly the
+"a soak quietly stops measuring anything" failure the commissioning brief named, built by me, one
+session after being warned about it.
+
+The interface census in that log settles the right key: `wl_callback` destroyed **471** times, while
+`xdg_surface`, `xdg_toplevel` and `wl_surface` are destroyed **once each**, in a burst at the end.
+Keying on those excuses a **15-line window** rather than 4024, and still turns run 13 from FAIL to
+PASS. Two drafts, both wrong, both caught by running the thing against real data rather than reasoning
+about it.
+
+**The guarded soak: 25 of 25 clean** (loopback; apollo is still down), 236–393 attaches per 20 s run.
+Rate < 12% at 95% by the rule of three, which is all n=25 can bound. Worth stating plainly: **zero
+post-teardown drops occurred in those 25 runs, so the soak provides no evidence the guard works** — the
+evidence for that is the archived-log validation above, and nothing else.
+
+`rayland-icosa-window` still refuses cleanly on `wl_shm`, `rayland-s` untouched.
+
+**On `.expect("the WP0 id maps lock is never poisoned")`, re-examined as asked:** still true, and now
+documented with what it rests on — that lock is never held across a call that can panic, which is a
+property a future edit could break. Written where it can be checked rather than believed, since its
+sibling claim in the same module turned out false this week.

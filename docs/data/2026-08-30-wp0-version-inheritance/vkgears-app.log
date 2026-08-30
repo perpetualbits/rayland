@@ -1,0 +1,8 @@
+libdecor-gtk-WARNING: Could not get required globals
+Failed to load plugin 'libdecor-gtk.so': failed to init
+No plugins found, falling back on no decorations
+51 frames in 5.0 seconds = 10.178 FPS
+67 frames in 5.0 seconds = 13.365 FPS
+70 frames in 5.0 seconds = 13.916 FPS
+63 frames in 5.0 seconds = 12.491 FPS
+62 frames in 5.1 seconds = 12.243 FPS

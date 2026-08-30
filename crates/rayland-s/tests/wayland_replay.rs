@@ -245,3 +245,102 @@ fn the_synthesized_buffer_requests_have_the_right_shape() {
         "the wl_buffer inherits the params object's version, not the interface's own maximum"
     );
 }
+
+/// A child object created from a **capped** bind is replayed at the capped version, not the wire's.
+///
+/// # Why this is an integration test and not a unit test
+/// The first attempt at this was a unit test that computed `child = sender_version` in the test body
+/// and asserted it equalled the capped value. It passed, and it proved nothing: it restated the rule
+/// rather than exercising the code, which is exactly the hazard `OVERVIEW.md` §6.4 records — *a test
+/// written from the same belief as the code it tests can only confirm that belief*. It would not have
+/// failed if `handle_request` had gone on using the wire version.
+///
+/// So this drives the real path: bind, create a surface, then create an `xdg_surface` from the bound
+/// `xdg_wm_base`, and assert the replay survived and mapped the child.
+///
+/// # The scenario, which is `vkgears`' real one
+/// The application binds `xdg_wm_base` at the descriptor's maximum (C advertises `u32::MAX`, capped to
+/// the descriptor). S's compositor may offer less — headless weston offers v5 — so `handle_bind` caps.
+/// Every object the app then creates from that global must be created at S's version. Using the wire's
+/// makes `wayland-backend` panic, and that panic is **fatal**: it poisons the backend's own connection
+/// mutex, so the replay cannot continue.
+///
+/// # It skips where it cannot be meaningful
+/// Against a compositor that offers the same version the app asked for, nothing is capped and the test
+/// would pass whatever the code did. It detects that and skips, rather than reporting a green that
+/// means nothing. Run it under `WAYLAND_DISPLAY=<headless weston>` to exercise the real case.
+#[test]
+fn a_child_of_a_capped_bind_is_created_at_the_capped_version() {
+    /// The version the application believes in — C advertises the descriptor's maximum.
+    const APP_VERSION: u32 = 6;
+    const COMPOSITOR_APP_ID: u32 = 4;
+    const SURFACE_APP_ID: u32 = 3;
+    const WM_BASE_APP_ID: u32 = 5;
+    const XDG_SURFACE_APP_ID: u32 = 7;
+    /// `wl_compositor.create_surface` — request 0, one new_id.
+    const OP_CREATE_SURFACE: u16 = 0;
+    /// `xdg_wm_base.get_xdg_surface` — request 2, `[new_id, surface]`.
+    const OP_GET_XDG_SURFACE: u16 = 2;
+
+    let mut replay = WaylandReplay::new(Arc::new(Recorder::default()), Arc::new(NoExports));
+
+    replay.handle_bind("wl_compositor".into(), APP_VERSION, COMPOSITOR_APP_ID);
+    let Some(compositor_version) = replay.version_of(COMPOSITOR_APP_ID) else {
+        eprintln!("skipping: no compositor to replay against");
+        return;
+    };
+    replay.handle_bind("xdg_wm_base".into(), APP_VERSION, WM_BASE_APP_ID);
+    let Some(wm_base_version) = replay.version_of(WM_BASE_APP_ID) else {
+        eprintln!("skipping: this compositor advertises no xdg_wm_base");
+        return;
+    };
+
+    if wm_base_version == APP_VERSION && compositor_version == APP_VERSION {
+        eprintln!(
+            "skipping: this compositor offers v{APP_VERSION} for both globals, so nothing was capped \
+             and this test cannot distinguish the sender's version from the wire's. Run it against a \
+             headless weston (which offers xdg_wm_base v5) to exercise the real case."
+        );
+        return;
+    }
+
+    // A surface to hang the xdg_surface on. Its NewId carries the app's version on the wire, which is
+    // precisely the value that must NOT reach child_spec.
+    replay.handle_request(WaylandMessage {
+        object_id: COMPOSITOR_APP_ID,
+        opcode: OP_CREATE_SURFACE,
+        args: vec![WaylandArg::NewId {
+            id: SURFACE_APP_ID,
+            interface: "wl_surface".into(),
+            version: APP_VERSION,
+        }],
+    });
+    // The request that used to kill the process: a child of the capped xdg_wm_base.
+    replay.handle_request(WaylandMessage {
+        object_id: WM_BASE_APP_ID,
+        opcode: OP_GET_XDG_SURFACE,
+        args: vec![
+            WaylandArg::NewId {
+                id: XDG_SURFACE_APP_ID,
+                interface: "xdg_surface".into(),
+                version: APP_VERSION,
+            },
+            WaylandArg::Object(SURFACE_APP_ID),
+        ],
+    });
+
+    assert!(
+        !replay.is_replay_dead(),
+        "the replay died: send_request panicked, which means child_spec carried a version the sender \
+         does not have (S capped xdg_wm_base to v{wm_base_version}, the wire said v{APP_VERSION})"
+    );
+    assert_eq!(
+        replay.version_of(XDG_SURFACE_APP_ID),
+        Some(wm_base_version),
+        "the child must be recorded at its sender's version, so that ITS children inherit correctly"
+    );
+    assert!(
+        replay.is_mapped(XDG_SURFACE_APP_ID),
+        "the xdg_surface should have been created on S's compositor"
+    );
+}
