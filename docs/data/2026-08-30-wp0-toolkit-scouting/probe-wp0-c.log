@@ -1,0 +1,6 @@
+rayland-c: Wayland proxy listening at /tmp/rl-scout-wl.sock; point the app at it with WAYLAND_DISPLAY
+rayland-c: listening at /tmp/rl-scout.sock, relaying to S at 127.0.0.1:9411
+rayland-c: point Mesa at it with:
+  VN_DEBUG=vtest VTEST_SOCKET_NAME=/tmp/rl-scout.sock VK_ICD_FILENAMES=<...>/virtio_icd.x86_64.json <app>
+[wp-proxy] proxy listening at /tmp/rl-scout-wl.sock
+[wp-proxy] application connected: client InnerClientId { id: 0, serial: 1 }

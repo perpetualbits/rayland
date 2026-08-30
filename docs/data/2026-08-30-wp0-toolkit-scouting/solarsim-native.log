@@ -1,0 +1,2 @@
+GPU: Intel(R) Iris(R) Xe Graphics (RPL-P) [IntegratedGpu, Vulkan]
+Build: compiled 1124h ago — POSSIBLY STALE, run: cargo clean -p solarsim && cargo build

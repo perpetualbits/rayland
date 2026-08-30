@@ -1,0 +1,14 @@
+probe: starting (WAYLAND_DISPLAY=Some("wayland-1"))
+probe: creating window
+probe: creating wgpu instance + surface
+probe: requesting adapter
+probe: requesting device
+probe: surface configured 550x550
+probe: presented frame 1
+probe: presented frame 10
+probe: presented frame 20
+probe: presented frame 30
+probe: presented frame 40
+probe: presented frame 50
+probe: presented frame 60
+probe: OK — presented 60 frames, exiting

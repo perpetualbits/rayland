@@ -4869,3 +4869,74 @@ undoes it) — the brief assumed it was present. And `vkcube --c N`, the obvious
 count, **stalls at a single attach** under this path while the same binary free-running sustains ~20
 fps; the harness imposes the count itself by watching C's request trace instead. That `--c` behaviour
 is a real observation and is recorded, not chased.
+
+### 2026-08-30 (later) — What a toolkit actually asks for: one global, and it dies earlier than anyone guessed
+
+A scouting session, and a satisfying one: fix nothing, measure what is missing, and let the answer
+refute the guess.
+
+**Two blockers before any of it.** `apollo` is **down** — both its addresses unreachable, no route —
+which takes away the C machine every run in the brief assumed. And `solarsim` is at `~/git/solsim`,
+not `~/git/solarsim`. The second is trivia; the first needed a decision.
+
+I took the runs to **loopback on dop561**, and the reasoning is worth stating because it is what makes
+the result still valid: the question this session asks is *which services the toolkit asks the proxy
+for*, and that is decided entirely by what `rayland-c` advertises. Whether S is across a network or on
+localhost changes nothing about it. The controls moved to dop561 too, which is a genuine weakening —
+they no longer prove the binaries work *on apollo* — but they still separate "the application is
+broken" from "Rayland is". Reported as a deviation rather than smoothed over.
+
+**The probe.** `tools/wgpu-window-probe`, outside the workspace so the 83-test pure set never pays for
+several hundred `wgpu` crates. A window, a surface, a clear, a present, sixty frames, exit. It took
+two API corrections against `wgpu` 29 — `get_current_texture` returns an enum rather than a `Result`,
+and `RenderPassDescriptor` wants `multiview_mask` — and I got both by **reading solarsim's own source**
+rather than guessing at the version, which is the cheapest possible use of having the real application
+to hand.
+
+**The result, and it is cleaner than I expected.**
+
+| Run | Outcome |
+|---|---|
+| A — solarsim native | works |
+| B — solarsim through the proxy | dies at winit event-loop creation |
+| C — probe native | 60 frames, exit 0 |
+| D — probe through the proxy | **dies identically to B** |
+
+Same file, same line, same error, from two independent applications:
+`WaylandError(Bind(NotPresent))` at `winit-0.30.13/.../event_loop/mod.rs:99`.
+
+And the proxy's own log is the part that makes it unambiguous: **neither application binds a single
+global.** It enumerates the registry, finds a required one absent, and gives up before binding
+anything. It never reaches window creation, never reaches `wgpu`, never reaches solarsim's own code.
+
+**The measured list has exactly one entry: `wl_shm`.** Reading winit 0.30's init in order, only three
+binds are fatal — `wl_compositor`, `wl_shm`, `xdg_wm_base` — and the proxy supplies two of them.
+Everything else there is `.ok()` or a soft `match`.
+
+**Which refutes the prediction in the way that matters.** The design note guessed death at *window
+creation* for want of `wl_shm`, then `wl_output`, then `wl_subcompositor`. `wl_shm` first is right.
+"At window creation" is wrong, and not pedantically so: dying at *event-loop* creation means **nothing
+about window creation has been tested at all**, so no evidence in this session says anything about
+what comes second. And `wl_subcompositor` is a soft bind in winit 0.30 — it logs and continues — while
+`wl_output` is not bound at init either. So the honest statement about entry two is **unknown**, and I
+would rather write that than pad the list from the same source that produced the guess.
+
+That is the third planning-side prediction this week to be wrong in its details, and the third time the
+detail mattered more than the headline.
+
+**A small instrument lesson.** `WAYLAND_DEBUG=1` produced nothing for either application, because both
+reach Wayland through the **pure-Rust** `wayland-client` rather than libwayland. The witness that
+actually answered the question was our own `RAYLAND_WP_LOG` — and its most informative output was an
+absence: a connection line with nothing after it. I nearly read the empty log as a broken instrument.
+
+**Everything else worth recording.** The probe reproduces solarsim's failure exactly, so it is now
+validated as the stand-in it was built to be — the small crate can replace the whole application from
+here. `scripts/wp0-probe.sh` reproduces the finding in one command, and its split-machine path is
+**guarded off** rather than left as an untested branch someone would later trust. Nothing was fixed;
+adding `wl_shm` is the owner's decision and it now has its evidence.
+
+**And a message arrived mid-session from another Claude:** `milkv` has been set up as a replacement C
+machine — riscv64, Debian sid chroot with Mesa 26.1.6, solarsim built and verified there against
+lavapipe. Nothing has crossed the network on it yet, and its `rayland-c` build was still running. It is
+the obvious way to redo these runs genuinely split, and it is a better C machine than apollo for the
+project's purposes — a weak board is what Rayland is *for*.

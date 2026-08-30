@@ -1,0 +1,15 @@
+probe: starting (WAYLAND_DISPLAY=Some("/tmp/rl-scout-wl.sock"))
+[3744745.153]  -> wl_display#1.get_registry(new id wl_registry#2)
+[3744745.175]  -> wl_display#1.sync(new id wl_callback#3)
+[3744745.387] {Display Queue} wl_display#1.delete_id(3)
+[3744745.410] wl_registry#2.global(1, "wl_compositor", 7)
+[3744745.444] wl_registry#2.global(2, "xdg_wm_base", 7)
+[3744745.453] wl_registry#2.global(3, "zwp_linux_dmabuf_v1", 3)
+[3744745.459] wl_registry#2.global(4, "wl_seat", 11)
+[3744745.466] wl_callback#3.done(0)
+[3744745.589]  -> wl_registry#2.bind(1, "wl_compositor", 6, new id [unknown]#3)
+[3744745.616]  -> wl_registry#2.bind(4, "wl_seat", 7, new id [unknown]#4)
+
+thread 'main' (669484) panicked at src/main.rs:228:39:
+could not create a winit event loop: Os(OsError { line: 99, file: "/home/roland/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/winit-0.30.13/src/platform_impl/linux/wayland/event_loop/mod.rs", error: WaylandError(Bind(NotPresent)) })
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

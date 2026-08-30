@@ -1,0 +1,20 @@
+# The WP0 toolkit probe — a standalone crate, deliberately OUTSIDE the Rayland workspace.
+#
+# `wgpu` and `winit` drag several hundred transitive crates. The workspace's 83-test pure set and
+# `cargo build --workspace` are run constantly, including on machines with no GPU, and making them pay
+# that cost to support a probe run by hand on two machines is a bad trade. So this crate is excluded
+# from the workspace (see the root `Cargo.toml`) and built on its own.
+[package]
+name = "wgpu-window-probe"
+version = "0.0.1"
+edition = "2021"
+license = "GPL-3.0-or-later"
+publish = false
+
+[dependencies]
+# Matched to solarsim's major versions on purpose: the probe stands in for that stack, so it must
+# exercise the same one. solarsim pins wgpu 29.0.3 / winit 0.30.
+wgpu = "29.0.3"
+winit = "0.30"
+pollster = "0.4"          # block on wgpu's async adapter/device requests without pulling a runtime
+env_logger = "0.11"       # so wgpu/winit's own diagnostics reach the log this probe exists to read

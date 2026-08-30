@@ -4,6 +4,10 @@
 # member crates. The published name-holder crate now lives at crates/rayland.
 [workspace]
 resolver = "3"                       # resolver 3 is the default for edition 2024; stated explicitly for clarity
+# The WP0 toolkit probe lives in the tree but NOT in the workspace: `wgpu` and `winit` pull several
+# hundred transitive crates, and the pure test set and `cargo build --workspace` run constantly on
+# machines with no GPU. See tools/wgpu-window-probe/Cargo.toml for the full reasoning.
+exclude = ["tools/wgpu-window-probe"]
 members = [
     "crates/rayland",                # the published placeholder / future facade
     "crates/rayland-wire",           # shared wire protocol (this task)
