@@ -5116,3 +5116,39 @@ of a long session. But it is now specified rather than suspected, in
 **One trap worth carrying forward**, which the peer found and which would have hidden this from me
 permanently: under `setsid … &` the shell reaps `setsid`, which forks and returns 0, so exit codes are
 meaningless and an aborting child is invisible. Several of my harnesses launch that way.
+
+### 2026-08-30 (night, later) — Why the riscv64 board only manages 5 fps, and it is not the board
+
+The owner watched `vkcube` from milkv on dop561's screen — *"really low framerate; I am pretty sure
+even the milkv box, with relatively slow CPU should be able to do better than that"* — and was right
+to be suspicious.
+
+Ruled out, in order: **the network** (milkv's RTT to dop561 is 0.508 ms, *faster* than apollo's
+0.838), **board saturation** (load average 1.13 of 4 cores — three idle), and **the application**
+(`vkcube` at 11% CPU).
+
+What is left is `rayland-c`, at **78% of one core on milkv against 33.8% on apollo** — under one core
+on both, so not starved, but doing a fixed amount of per-frame work on a slower core.
+
+The decisive number is per-frame message counts, and they are **the same on both machines**: ~72–76
+C→S blob-sync messages per presented frame, averaging 21–44 bytes each. Same work, ~3.7× slower core,
+~3.7× fewer frames. It is almost linear.
+
+**So this is (c)1's message-rate bound, in its forward direction, and milkv is the machine that makes
+it visible.** The project already fixed the equivalent on the *readback* path with gap-threshold
+coalescing — ~5000 → ~180 messages per frame — and recorded honestly that **wall-clock did not move**,
+which located the real bound elsewhere on x86. On a slow C it moves. 76 messages carrying ~3.3 KB of
+payload per frame is pure per-message overhead, and coalescing the forward path is the obvious next
+optimisation.
+
+That is a nice example of the weak C machine earning its place: a change that measures as worthless on
+apollo is the difference between 5 and something better on the board Rayland exists for. It is also
+why I have written this up as *where to look* rather than *what to fix* — 78% of a core is a profile
+waiting to be taken, and I have guessed wrong often enough this week to want the profile first.
+
+**A correction owed from earlier in the evening.** I told the owner that milkv → COSMIC did not work.
+It does — ~5 fps, cube visible, confirmed by them. Two bad measurements of mine produced that claim: a
+`ps` check immediately after a sleep that raced the process, and then a comparison run whose
+"headless weston" arm pointed at a socket I had already killed, so it had *no compositor at all* and
+scored zero attaches while COSMIC scored 120. The inverted result is the only reason I looked again.
+Every negative claim I made about milkv's compositor sensitivity was an artefact of my own testing.
