@@ -48,10 +48,19 @@ Steady state by slope (300 vs 900 frames; startup 0.12 s). Three native FIFO run
 *native* frame is waiting for weston's callback. Comparing Rayland against 60 fps would have charged
 it 4.6× when the honest figure is 2.6×.
 
-**`vkgears` cannot supply a baseline: it segfaults *natively*** against this weston, with the default
-ICD and pinned to Intel. It runs only through Rayland's proxy. With the solsim session's finding that
-it also dies on milkv under lavapipe, it is a fragile binary and unusable for attribution — **and I
-had been quoting its 10–13 fps for two days.** Every figure here is `vkcube`'s.
+**On `vkgears` — this section's original claim was WRONG and is corrected below** (the original
+sentence is preserved in the diary; the corrected facts are what should be acted on):
+
+> ~~It segfaults natively, so it is a fragile binary unusable for attribution.~~
+
+The root cause is specific, not general. mesa-demos 9.0.0 dereferences the `wl_seat` global
+unconditionally (`vulkan/wsi/wayland.c:236`), so it dies against any **seatless** compositor — and the
+headless weston used here advertises no seat, which S's own log states. **Natively against COSMIC it
+runs at 60.8–61.1 FPS**, so a baseline *is* obtainable.
+
+And its failure *through Rayland* is **a Rayland defect, not vkgears' fragility** — see §7.
+
+Every figure in this report is `vkcube`'s, which is unaffected.
 
 ## 3. The budget (criterion 3)
 
@@ -109,3 +118,33 @@ the time is and knowing what to change.
 
 Then, and only then, the forward blob-sync coalescing — with **milkv as the machine that shows its
 value**, since on apollo the equivalent readback change measured as nothing.
+
+---
+
+## 7. Addendum, same day — the dropped keymap **crashes applications**
+
+Investigating a peer session's correction turned up a defect more serious than anything else in this
+report. Full write-up and logs: `docs/data/2026-08-30-wp0-frame-time/keymap-drop-crashes-applications.md`.
+
+**`wl_keyboard.keymap` has been recorded since the event-witness session as a capability gap** — *"no
+relayed application will have a keyboard"*. It is not a gap. It is a crash:
+
+```
+emit  wl_seat.capabilities            -> the app learns a keyboard exists and creates one
+drop:carries-fd wl_keyboard.keymap    -> WE DROP THE KEYMAP
+delivered wl_keyboard.repeat_info     -> and keep delivering keyboard events
+                                         SIGSEGV in xkb_state_update_mask (backtrace confirmed)
+```
+
+We advertise `wl_seat`, relay `capabilities` so the application creates a `wl_keyboard`, drop the one
+event that initialises it, and then keep feeding it dependent events. **Dropping an event whose
+dependants are still delivered is the bug**, not the drop.
+
+It also explains the "vkgears works on headless weston, dies on COSMIC" table in the earlier report:
+seatless weston never sends a keymap, so nothing depends on the missing one. That table was measuring
+*whether a seat exists to expose our gap*, not a property of compositors.
+
+**Cheap mitigations** (not applied — no prompt, and the choice is a design decision): suppress the
+keyboard bit in relayed `capabilities`, or stop advertising `wl_seat`, either of which stops the crash.
+**The real fix** is substituting the keymap's *content* the way the buffer path substitutes a token — it
+is a bounded string, unlike a swapchain.

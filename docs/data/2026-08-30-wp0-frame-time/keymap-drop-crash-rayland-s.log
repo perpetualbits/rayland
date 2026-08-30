@@ -1,0 +1,1560 @@
+rayland-s: listening on 127.0.0.1:9482, rendering on /dev/dri/renderD128
+rayland-s: C connected
+rayland-s: WP0 replay connected to S's compositor (58 globals advertised)
+rayland-s: WP0 replay bound `wl_compositor` v1 (app obj 4)
+rayland-s: WP0 replay bound `wl_seat` v4 (app obj 5)
+[wp-event][S] map s_obj=5 app_obj=3 (from obj 5 opcode 1)
+[wp-event][S] from-compositor s_obj=4 wl_seat.name args=1
+[wp-event][S] map s_obj=6 app_obj=6 (from obj 4 opcode 0)
+[wp-event][S] emit s_obj=4 app_obj=5 wl_seat.name args=1
+rayland-s: WP0 replay bound `xdg_wm_base` v6 (app obj 12)
+rayland-s: WP0 replay bound `wl_compositor` v4 (app obj 8)
+[wp-event][S] from-compositor s_obj=4 wl_seat.capabilities args=1
+[wp-event][S] emit s_obj=4 app_obj=5 wl_seat.capabilities args=1
+rayland-s: WP0 replay bound `wl_seat` v3 (app obj 13)
+[wp-event][S] from-compositor s_obj=5 wl_keyboard.keymap args=3
+[wp-event][S] drop:carries-fd s_obj=5 wl_keyboard.keymap
+[wp-event][S] from-compositor s_obj=5 wl_keyboard.repeat_info args=2
+[wp-event][S] emit s_obj=5 app_obj=3 wl_keyboard.repeat_info args=2
+[wp-event][S] map s_obj=10 app_obj=11 (from obj 12 opcode 2)
+[wp-event][S] from-compositor s_obj=9 wl_seat.name args=1
+[wp-event][S] map s_obj=11 app_obj=10 (from obj 11 opcode 1)
+[wp-event][S] emit s_obj=9 app_obj=13 wl_seat.name args=1
+[wp-event][S] from-compositor s_obj=9 wl_seat.capabilities args=1
+[wp-event][S] emit s_obj=9 app_obj=13 wl_seat.capabilities args=1
+[wp-event][S] from-compositor s_obj=11 xdg_toplevel.configure_bounds args=2
+[wp-event][S] emit s_obj=11 app_obj=10 xdg_toplevel.configure_bounds args=2
+[wp-event][S] from-compositor s_obj=11 xdg_toplevel.wm_capabilities args=1
+[wp-event][S] emit s_obj=11 app_obj=10 xdg_toplevel.wm_capabilities args=1
+[wp-event][S] from-compositor s_obj=11 xdg_toplevel.configure args=3
+[wp-event][S] emit s_obj=11 app_obj=10 xdg_toplevel.configure args=3
+[wp-event][S] from-compositor s_obj=10 xdg_surface.configure args=1
+[wp-event][S] emit s_obj=10 app_obj=11 xdg_surface.configure args=1
+rayland-s: WP0 replay bound `zwp_linux_dmabuf_v1` v3 (app obj 16)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+rayland-s: WP0 replay bound `zwp_linux_dmabuf_v1` v3 (app obj 16)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+rayland-s: WP0 replay bound `zwp_linux_dmabuf_v1` v3 (app obj 16)
+rayland-s: WP0 replay bound `zwp_linux_dmabuf_v1` v3 (app obj 16)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+rayland-s: WP0 replay bound `zwp_linux_dmabuf_v1` v3 (app obj 16)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=12 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=12 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+rayland-s: WP0 4.3: bound S's own `zwp_linux_dmabuf_v1` v3 for buffer creation
+rayland-s: WP0 4.3: built wl_buffer (app obj 21) from resource 3 (300x300 fmt 0x34325258 offset 0 stride 1200 modifier 0x0)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+[wp-event][S] from-compositor s_obj=13 zwp_linux_dmabuf_v1.modifier args=3
+[wp-event][S] suppressed s_obj=13 zwp_linux_dmabuf_v1.modifier (dmabuf format/modifier: the C proxy answers this locally)
+rayland-s: WP0 4.3: built wl_buffer (app obj 23) from resource 4 (300x300 fmt 0x34325258 offset 0 stride 1200 modifier 0x0)
+rayland-s: WP0 4.3: built wl_buffer (app obj 25) from resource 5 (300x300 fmt 0x34325258 offset 0 stride 1200 modifier 0x0)
+rayland-s: WP0 4.3: built wl_buffer (app obj 27) from resource 6 (300x300 fmt 0x34325258 offset 0 stride 1200 modifier 0x0)
+[wp-event][S] map s_obj=14 app_obj=26 (from obj 6 opcode 3)
+[wp-event][S] from-compositor s_obj=11 xdg_toplevel.configure_bounds args=2
+[wp-event][S] emit s_obj=11 app_obj=10 xdg_toplevel.configure_bounds args=2
+[wp-event][S] from-compositor s_obj=11 xdg_toplevel.configure args=3
+[wp-event][S] emit s_obj=11 app_obj=10 xdg_toplevel.configure args=3
+[wp-event][S] from-compositor s_obj=10 xdg_surface.configure args=1
+[wp-event][S] emit s_obj=10 app_obj=11 xdg_surface.configure args=1
+[wp-event][S] from-compositor s_obj=5 wl_keyboard.enter args=3
+[wp-event][S] emit s_obj=5 app_obj=3 wl_keyboard.enter args=3
+[wp-event][S] from-compositor s_obj=5 wl_keyboard.modifiers args=5
+[wp-event][S] emit s_obj=5 app_obj=3 wl_keyboard.modifiers args=5
+[wp-event][S] from-compositor s_obj=11 xdg_toplevel.configure args=3
+[wp-event][S] emit s_obj=11 app_obj=10 xdg_toplevel.configure args=3
+[wp-event][S] from-compositor s_obj=10 xdg_surface.configure args=1
+[wp-event][S] emit s_obj=10 app_obj=11 xdg_surface.configure args=1
+[wp-event][S] from-compositor s_obj=14 wl_callback.done args=1
+[wp-event][S] emit s_obj=14 app_obj=26 wl_callback.done args=1
+[wp-event][S] map s_obj=14 app_obj=26 (from obj 6 opcode 3)
+[wp-event][S] from-compositor s_obj=15 wl_buffer.release args=0
+[wp-event][S] emit s_obj=15 app_obj=21 wl_buffer.release args=0
+[wp-event][S] from-compositor s_obj=14 wl_callback.done args=1
+[wp-event][S] emit s_obj=14 app_obj=26 wl_callback.done args=1

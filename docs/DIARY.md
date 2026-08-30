@@ -5210,3 +5210,48 @@ The qualifier is now attached in `OVERVIEW.md` wherever the claim appears, with 
 confirmation recorded as **owed** — and noted as possibly unobtainable *as stated*, since `vkgears`
 turns out not to run natively at all. `vkcube` has been run apollo→dop561 and milkv→dop561 with a
 window on screen, which is the claim that survives.
+
+### 2026-08-30 (very late) — The dropped keymap does not just deny a keyboard; it crashes the application
+
+The solsim session withdrew its "vkgears is a false signal on milkv" warning with a root cause and a
+backtrace: mesa-demos 9.0.0 dereferences the `wl_seat` global unconditionally, so vkgears dies against
+any **seatless** compositor. Checking that against my own logs, the headless weston I have been using
+all day says so in `rayland-s`'s own output — *"S's compositor advertises no `wl_seat`; bind skipped"*.
+So my "vkgears segfaults natively, therefore it is a fragile binary unusable for attribution" was
+wrong twice over: the mechanism is specific, and **natively against COSMIC it runs at 61 fps**, so the
+baseline I said was unobtainable was obtainable all along.
+
+Then, rather than accept the rest by symmetry, I re-tested the case the peer said their finding did
+*not* explain: vkgears through Rayland against COSMIC. It still segfaulted. And this time the witness
+and a backtrace between them produced the sequence:
+
+```
+emit  wl_seat.capabilities             -> the app learns a keyboard exists, creates a wl_keyboard
+drop:carries-fd wl_keyboard.keymap     -> WE DROP THE KEYMAP
+delivered wl_keyboard.repeat_info      -> and keep delivering that keyboard's events
+#0 xkb_state_update_mask ()            -> SIGSEGV, on an xkb state never created
+```
+
+**That is our defect, and it is worse than the record has said since the event-witness session.** The
+keymap drop has been carried as a capability gap — *"no relayed application will have a keyboard"* —
+which reads like something absent. It is not absent. We advertise `wl_seat`, relay `capabilities` so
+the application builds a `wl_keyboard`, drop the single event that initialises it, and then keep
+feeding it events that assume it is initialised. **Dropping an event whose dependants are still
+delivered is the bug**, not the drop.
+
+It also retires a table I published this evening. "vkgears runs against headless weston, dies against
+COSMIC, therefore display-backed compositors are the variable" was measuring nothing of the sort: a
+seatless compositor never sends a keymap, so nothing depends on the one we drop. The compositor was
+never the variable — *the presence of a seat to expose our own gap* was.
+
+Two things worth saying about how this went. First, I got here only because I re-tested the case the
+peer explicitly flagged as unexplained by their finding, instead of assuming their root cause covered
+mine. Second, the reason the earlier conclusion survived as long as it did is that every check I ran
+was consistent with it — "works here, dies there" is exactly what both hypotheses predict, and only
+the event sequence distinguishes them. That is the third time this week the witness has separated two
+theories that no amount of re-running the same experiment could.
+
+Not fixed: no prompt, and the choice is a design decision. Suppressing the keyboard bit in relayed
+`capabilities`, or not advertising `wl_seat`, would each stop the crash cheaply; substituting the
+keymap's *content* the way the buffer path substitutes a token is what the capability actually needs,
+and it is a bounded string rather than a swapchain.

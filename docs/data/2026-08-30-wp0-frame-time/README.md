@@ -50,10 +50,20 @@ Three native FIFO runs agreed to within 0.1 fps.
 0.49 ms/frame, so 24.9 ms of every native frame is the client waiting for weston's frame callback.
 Any comparison against 60 fps would have been wrong.
 
-**`vkgears` could not provide a baseline: it segfaults natively** against this weston, with the
-default ICD and when pinned to Intel. It only runs *through* Rayland's proxy. Combined with the
-solsim session's finding that it also segfaults on milkv under plain lavapipe, `vkgears` is a fragile
-binary and its numbers should not be used for attribution. Every figure here is `vkcube`'s.
+**On `vkgears` — CORRECTED the same day, and the original claim was wrong.** This section first said
+`vkgears` "is a fragile binary" whose numbers should not be used. That is not right, and the root cause
+matters:
+
+- `vkgears` segfaults against a **seatless** compositor because mesa-demos 9.0.0 dereferences the
+  `wl_seat` global unconditionally (`src/vulkan/wsi/wayland.c:236`) — an upstream bug found by the
+  solsim session with a backtrace. **The headless weston launched here advertises no `wl_seat`**
+  (S's own log: *"S's compositor advertises no `wl_seat`; bind skipped"*), which is exactly that case.
+- **Natively against COSMIC, which has a seat, `vkgears` runs at 60.8–61.1 FPS.** A native baseline
+  *is* obtainable; the earlier claim that it is not was wrong.
+- Its failure *through Rayland against COSMIC* is a **separate and much more serious defect, and it is
+  ours** — see `keymap-drop-crashes-applications.md`.
+
+Every figure in this document is still `vkcube`'s, which is unaffected by both issues.
 
 `--present_mode 0` through WP0 produces **no frames**: *"Present mode specified is not supported"* —
 Venus does not expose IMMEDIATE. So pacing cannot be subtracted on the Rayland side the way it can

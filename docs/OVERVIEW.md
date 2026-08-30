@@ -589,9 +589,32 @@ forward blob-sync volume — 72.5 messages/frame, and milkv's ~3.7×-slower core
 **Not fully decomposed:** the ~40 ms is located, not itemised — the application's submission and the
 `wl_buffer` commit have no trace stations, so two segments of the path are uninstrumented.
 
-**`vkgears` cannot be used for attribution.** It segfaults *natively* against headless weston (both
-ICDs), and the solsim session found it segfaults on milkv under plain lavapipe too. It runs only
-through Rayland's own proxy. Every figure above is `vkcube`'s.
+**On `vkgears`, corrected same-day:** it segfaults against **seatless** compositors because
+mesa-demos 9.0.0 dereferences the `wl_seat` global unconditionally — an upstream bug, and the headless
+weston used here advertises no seat. Natively against COSMIC it runs at **61 fps**. Its failure
+*through Rayland* is a Rayland defect; see §6.1.5. Every figure above is `vkcube`'s.
+
+### 6.1.5 The dropped `wl_keyboard.keymap` CRASHES applications — 2026-08-30
+
+Recorded since the event-witness session as a capability gap (*"no relayed application will have a
+keyboard"*). **It is not a gap, it is a crash**, and it is ours:
+
+1. C's proxy advertises `wl_seat` unconditionally (`wayland_proxy.rs:998`).
+2. S relays `wl_seat.capabilities`, so the application creates a `wl_keyboard`.
+3. S **drops `wl_keyboard.keymap`** (it carries an fd — correct in isolation) …
+4. … and **keeps relaying that keyboard's other events**. The application dereferences an xkb state
+   that was never created: `SIGSEGV in xkb_state_update_mask`, backtrace confirmed.
+
+**Dropping an event whose dependants are still delivered is the bug**, not the drop itself.
+
+It also retires the earlier "vkgears works against headless weston, dies against COSMIC" table: a
+seatless compositor never sends a keymap, so nothing depends on the missing one. That table was
+measuring whether a seat existed to expose our own gap.
+
+**Cheap mitigations** (unapplied, a design decision): suppress the keyboard bit in relayed
+`capabilities`, or stop advertising `wl_seat`. **The real fix** is substituting the keymap's *content*
+as the buffer path substitutes a token — it is a bounded string, unlike a swapchain.
+Evidence: `docs/data/2026-08-30-wp0-frame-time/keymap-drop-crashes-applications.md`.
 
 ### 6.1.3 WP0 measured, and two defects a second application found — 2026-08-30
 

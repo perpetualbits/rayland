@@ -1,0 +1,109 @@
+rayland-c: Wayland proxy listening at /tmp/rl-gk-wl.sock; point the app at it with WAYLAND_DISPLAY
+rayland-c: listening at /tmp/rl-gk.sock, relaying to S at 127.0.0.1:9482
+rayland-c: point Mesa at it with:
+  VN_DEBUG=vtest VTEST_SOCKET_NAME=/tmp/rl-gk.sock VK_ICD_FILENAMES=<...>/virtio_icd.x86_64.json <app>
+[wp-proxy] proxy listening at /tmp/rl-gk-wl.sock
+[wp-proxy] application connected: client InnerClientId { id: 0, serial: 1 }
+[wp-proxy] bound global wl_compositor v1 -> object 4; forwarding bind to S
+[wp-proxy] bound global wl_seat v4 -> object 5; forwarding bind to S
+[wp-proxy] objects+ app_obj=3 wl_keyboard
+[wp-proxy] forward obj 5 opcode 1 (1 args)
+[wp-proxy] objects+ app_obj=6 wl_surface
+[wp-proxy] forward obj 4 opcode 0 (1 args)
+[wp-proxy] bound global xdg_wm_base v6 -> object 12; forwarding bind to S
+[wp-proxy] bound global wl_compositor v4 -> object 8; forwarding bind to S
+[wp-proxy] bound global wl_seat v3 -> object 13; forwarding bind to S
+[wp-proxy] objects+ app_obj=11 xdg_surface
+[wp-proxy] forward obj 12 opcode 2 (2 args)
+[wp-proxy] objects+ app_obj=10 xdg_toplevel
+[wp-proxy] forward obj 11 opcode 1 (1 args)
+[wp-proxy] forward obj 10 opcode 3 (1 args)
+[wp-proxy] forward obj 10 opcode 2 (1 args)
+[wp-proxy] forward obj 6 opcode 6 (0 args)
+[wp-proxy] forward obj 6 opcode 6 (0 args)
+[wp-event][C] delivered app_obj=5 wl_seat.name args=1
+[wp-event][C] delivered app_obj=5 wl_seat.capabilities args=1
+[wp-event][C] delivered app_obj=3 wl_keyboard.repeat_info args=2
+[wp-event][C] delivered app_obj=13 wl_seat.name args=1
+[wp-event][C] delivered app_obj=13 wl_seat.capabilities args=1
+[wp-event][C] delivered app_obj=10 xdg_toplevel.configure_bounds args=2
+[wp-event][C] delivered app_obj=10 xdg_toplevel.wm_capabilities args=1
+[wp-event][C] delivered app_obj=10 xdg_toplevel.configure args=3
+[wp-event][C] delivered app_obj=11 xdg_surface.configure args=1
+rayland-c: Mesa connected
+rayland-c: watching command ring res_id=1 buffer_size=131072
+[wp-proxy] forward obj 10 opcode 8 (2 args)
+[wp-proxy] forward obj 10 opcode 7 (2 args)
+[wp-proxy] forward obj 11 opcode 3 (4 args)
+[wp-proxy] forward obj 11 opcode 4 (1 args)
+[wp-proxy] bound global zwp_linux_dmabuf_v1 v3 -> object 16; forwarding bind to S
+[wp-proxy] advertised 2 LINEAR dmabuf format(s) to the app on object 16
+[wp-proxy] forward obj 16 opcode 0 (0 args)
+[wp-proxy] objects- app_obj=16 zwp_linux_dmabuf_v1 (was_known=true)
+[wp-proxy] bound global zwp_linux_dmabuf_v1 v3 -> object 16; forwarding bind to S
+[wp-proxy] advertised 2 LINEAR dmabuf format(s) to the app on object 16
+[wp-proxy] forward obj 16 opcode 0 (0 args)
+[wp-proxy] objects- app_obj=16 zwp_linux_dmabuf_v1 (was_known=true)
+[wp-proxy] bound global zwp_linux_dmabuf_v1 v3 -> object 16; forwarding bind to S
+[wp-proxy] advertised 2 LINEAR dmabuf format(s) to the app on object 16
+[wp-proxy] forward obj 16 opcode 0 (0 args)
+[wp-proxy] objects- app_obj=16 zwp_linux_dmabuf_v1 (was_known=true)
+[wp-proxy] bound global zwp_linux_dmabuf_v1 v3 -> object 16; forwarding bind to S
+[wp-proxy] advertised 2 LINEAR dmabuf format(s) to the app on object 16
+[wp-proxy] forward obj 16 opcode 0 (0 args)
+[wp-proxy] objects- app_obj=16 zwp_linux_dmabuf_v1 (was_known=true)
+[wp-proxy] bound global zwp_linux_dmabuf_v1 v3 -> object 16; forwarding bind to S
+[wp-proxy] advertised 2 LINEAR dmabuf format(s) to the app on object 16
+[wp-proxy] objects+ app_obj=20 zwp_linux_buffer_params_v1
+[wp-proxy] intercept create_params -> params 20
+[wp-proxy] intercept params 20.add -> resource Some(3), modifier 0x0, offset 0, stride 1200 (fd dropped)
+[wp-proxy] objects+ app_obj=21 wl_buffer
+[wp-proxy] intercept params 20.create_immed -> buffer 21 = resource 3 (300x300 fmt 0x34325258 offset 0 stride 1200)
+[wp-proxy] forward obj 20 opcode 0 (0 args)
+[wp-proxy] objects- app_obj=20 zwp_linux_buffer_params_v1 (was_known=true)
+[wp-proxy] objects+ app_obj=22 zwp_linux_buffer_params_v1
+[wp-proxy] intercept create_params -> params 22
+[wp-proxy] intercept params 22.add -> resource Some(4), modifier 0x0, offset 0, stride 1200 (fd dropped)
+[wp-proxy] objects+ app_obj=23 wl_buffer
+[wp-proxy] intercept params 22.create_immed -> buffer 23 = resource 4 (300x300 fmt 0x34325258 offset 0 stride 1200)
+[wp-proxy] forward obj 22 opcode 0 (0 args)
+[wp-proxy] objects- app_obj=22 zwp_linux_buffer_params_v1 (was_known=true)
+[wp-proxy] objects+ app_obj=24 zwp_linux_buffer_params_v1
+[wp-proxy] intercept create_params -> params 24
+[wp-proxy] intercept params 24.add -> resource Some(5), modifier 0x0, offset 0, stride 1200 (fd dropped)
+[wp-proxy] objects+ app_obj=25 wl_buffer
+[wp-proxy] intercept params 24.create_immed -> buffer 25 = resource 5 (300x300 fmt 0x34325258 offset 0 stride 1200)
+[wp-proxy] forward obj 24 opcode 0 (0 args)
+[wp-proxy] objects- app_obj=24 zwp_linux_buffer_params_v1 (was_known=true)
+[wp-proxy] objects+ app_obj=26 zwp_linux_buffer_params_v1
+[wp-proxy] intercept create_params -> params 26
+[wp-proxy] intercept params 26.add -> resource Some(6), modifier 0x0, offset 0, stride 1200 (fd dropped)
+[wp-proxy] objects+ app_obj=27 wl_buffer
+[wp-proxy] intercept params 26.create_immed -> buffer 27 = resource 6 (300x300 fmt 0x34325258 offset 0 stride 1200)
+[wp-proxy] forward obj 26 opcode 0 (0 args)
+[wp-proxy] objects- app_obj=26 zwp_linux_buffer_params_v1 (was_known=true)
+[wp-proxy] forward obj 6 opcode 1 (3 args)
+[wp-proxy] forward obj 6 opcode 2 (4 args)
+[wp-proxy] objects+ app_obj=26 wl_callback
+[wp-proxy] forward obj 6 opcode 3 (1 args)
+[wp-proxy] forward obj 6 opcode 6 (0 args)
+[wp-event][C] delivered app_obj=10 xdg_toplevel.configure_bounds args=2
+[wp-event][C] delivered app_obj=10 xdg_toplevel.configure args=3
+[wp-event][C] delivered app_obj=11 xdg_surface.configure args=1
+[wp-event][C] delivered app_obj=3 wl_keyboard.enter args=3
+[wp-event][C] delivered app_obj=3 wl_keyboard.modifiers args=5
+[wp-event][C] delivered app_obj=10 xdg_toplevel.configure args=3
+[wp-event][C] delivered app_obj=11 xdg_surface.configure args=1
+[wp-event][C] delivered app_obj=26 wl_callback.done args=1
+[wp-proxy] forward obj 6 opcode 1 (3 args)
+[wp-proxy] forward obj 6 opcode 2 (4 args)
+[wp-proxy] objects+ app_obj=26 wl_callback
+[wp-proxy] forward obj 6 opcode 3 (1 args)
+[wp-proxy] forward obj 6 opcode 6 (0 args)
+[wp-proxy] objects- app_obj=26 wl_callback (was_known=false)
+[wp-event][C] delivered app_obj=21 wl_buffer.release args=0
+[wp-event][C] delivered app_obj=26 wl_callback.done args=1
+rayland-c: session ended cleanly (context Some(1), 80 inline batches relayed)
+[wp-proxy] objects- app_obj=26 wl_callback (was_known=true)
+[wp-proxy] objects- app_obj=3 wl_keyboard (was_known=true)
+[wp-proxy] 
