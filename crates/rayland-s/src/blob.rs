@@ -367,7 +367,24 @@ impl HostBlob {
         // ran essentially back-to-back and starved the message thread out of the lock; the delta that
         // would have released the application was never applied, and Mesa's ~3.5 s stall abort fired.
         // That is the vkcube "hang". See `docs/DIARY.md`, 2026-07-26.
-        const CHUNK: usize = 64;
+        //
+        // **Why 4096 and not the original 64 (2026-08-30).** The chunk size cannot change *what* this
+        // function returns — a differing chunk is still examined byte by byte, and runs still merge
+        // across chunk boundaries — so it is purely a speed knob, and 64 was leaving most of the win
+        // on the table. At 64 bytes, one call over the 9.4 MiB this scan actually walks (1 MiB reply
+        // arena + 8 MiB staging pool) is ~147,000 slice comparisons, each far too short for `memcmp`
+        // to amortise its setup: measured **4.94 ms median per call**, ~1.9 GB/s, against the >10 GB/s
+        // a vectorised compare reaches on this machine. With the call happening ~4.85 times per frame
+        // and holding the applier lock, that was **~24 ms of a ~40 ms per-frame Rayland budget** —
+        // measured, not estimated; see `docs/data/2026-08-30-wp0-frame-time/`.
+        //
+        // 4096 makes it ~2,300 comparisons of a page each, which is long enough to vectorise properly.
+        // The cost is the mirror image: a chunk containing a single changed byte now byte-scans 4 KiB
+        // instead of 64 B. That is the right trade *here* because the changed regions are sparse — the
+        // reply arena yields a handful of short runs per call, so the extra byte-scanning is kilobytes
+        // while the saving is megabytes. A workload that dirtied most of a large blob would prefer a
+        // smaller chunk, and if one ever appears this is the number to revisit.
+        const CHUNK: usize = 4096;
         let mut i = 0usize;
         while i < live.len() {
             // The tail chunk is short; `min` keeps both slices the same length, which slice equality
