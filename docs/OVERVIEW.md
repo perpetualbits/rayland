@@ -759,6 +759,13 @@ The countermeasures this project already uses, and should keep using:
   remove **by identity**, never by number, because cleanup runs late and the slot may already have a
   new, live owner. The general form: *an identifier that is reused is not an identity, and code that
   treats it as one is correct only until something dies.*
+- **Wording that says "absent" can hide something that crashes.** `wl_keyboard.keymap` was recorded
+  for weeks as a capability gap — *"no relayed application will have a keyboard"* — which reads as
+  something merely missing, a feature nobody has got to yet. It was in fact segfaulting every
+  application that used a seat (§6.1.5). Nothing about the sentence was false; it was the *register*
+  that misled, and it survived several sessions because "will not have a keyboard" sounds like a
+  limitation rather than a defect. When recording a gap, say what happens to a program that hits it,
+  not what it lacks.
 - **A claim in a comment is not a measurement.** `scripts/wp0-vkcube-two-machine.sh`'s header asserted
   "No pixels cross the network" while the running system shipped ~877 KB per frame across it, and
   `CLAUDE.md` repeated the claim. Nothing was lying; the sentence described the *design*, and no test

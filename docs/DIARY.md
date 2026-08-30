@@ -5255,3 +5255,28 @@ Not fixed: no prompt, and the choice is a design decision. Suppressing the keybo
 `capabilities`, or not advertising `wl_seat`, would each stop the crash cheaply; substituting the
 keymap's *content* the way the buffer path substitutes a token is what the capability actually needs,
 and it is a bounded string rather than a swapchain.
+
+### 2026-08-30 (end of day) — An upstream patch, and a lesson about how a defect hid in a sentence
+
+The solsim session wrote, built and verified a guard for the mesa-demos bug: stock `vkgears` exit 139,
+patched exit 124 at 60.062 FPS, same weston, back to back. It guards the unconditional `wl_seat`
+dereference in `init_display()` **and** the matching one in `fini_display()`, which is the easier to
+miss — you only reach the exit path if you survived init. Not our code and not our repository, but
+recorded because it is a real upstream bug that this project found while looking at something else.
+
+**One consequence for our own measurements, which is why it is in `OVERVIEW.md` rather than only
+here:** milkv's chroot now has that patched binary at `/usr/local/bin/vkgears`, ahead of the stock one
+on PATH. Any future figure from that board labelled "vkgears" is not stock unless it names the full
+path. That is exactly the kind of environment drift that turns a comparison into nonsense a month
+later, and it cost nothing to write down now.
+
+**Their closing observation is the one I want kept**, because it generalises past this bug. The keymap
+drop sat in our record for weeks as *"no relayed application will have a keyboard"* — a sentence that
+is entirely true and reads as a feature nobody has got to yet. It was segfaulting every application
+that used a seat. Nothing about the wording was inaccurate; the **register** was wrong, and "will not
+have a keyboard" sounds like a limitation rather than a defect. It is now in §6.4's hazard list as its
+own entry: when recording a gap, say what happens to a program that hits it, not what it lacks.
+
+That is a different failure from the ones already on that list. "A claim in a comment is not a
+measurement" is about unverified quantities; this is about accurate prose that misdirects. Both hide
+things, and this one hid a crash.
