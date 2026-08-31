@@ -78,3 +78,40 @@ mechanism by 5–8× and moved the frame rate by nothing, which is the behaviour
 time is set by something not yet identified. I expect arm D to be within a few percent of arm A, and
 I am writing that down so that a null result cannot be retold afterwards as "expected all along"
 while a positive one gets claimed as a prediction.
+
+---
+
+# Addendum — a second, EXPLORATORY experiment, registered after the first was analysed
+
+The pre-registered experiment above is complete and its result stands on its own. This addendum is a
+**follow-up prompted by that result**, and it is labelled exploratory precisely because its hypothesis
+was formed *after* seeing data. It must not be reported with the same weight.
+
+**What prompted it.** Halving `PARK_SLEEP` (500 → 50 µs) made things ~1.3× *slower*, and the
+mechanism is visible in C's own metrics: ring messages per run rose **323 → 456 (+41%)** while total
+bytes were unchanged. A shorter park wakes the watcher more often, so the same ring bytes leave as
+*more, smaller* deltas — and every delta costs C a full sweep of the blob table (an 8 MiB staging-pool
+`memcmp` among others) and S an applier-lock acquisition on its message thread.
+
+**Hypothesis.** If fragmenting the delta is what hurts, then *lengthening* the park should batch more
+ring bytes per delta and help — until the added forward latency outweighs it. There should be an
+optimum, and 500 µs was never chosen by measurement.
+
+**Design — fixed before running.**
+
+| arm | `PARK_SLEEP` (C) | `PROGRESS_POLL` (S) |
+|---|---|---|
+| **A′** (contemporaneous control) | 500 µs | 200 µs |
+| **E** | 1000 µs | 200 µs |
+| **F** | 2000 µs | 200 µs |
+
+`A′` is re-run alongside rather than compared against the earlier arm A, because machine load drifts
+across an afternoon and the owner is using the machine.
+
+- **n = 10 per arm**, 30 runs, interleaved A′,E,F. Fixed now.
+- Same harness, metrics and analysis as above. Primary metric is again the median inter-frame gap;
+  ring message count is recorded as the mechanism check.
+
+**Prediction.** If the fragmentation account is right, E and F beat A′, with F possibly turning back
+up as forward latency starts to dominate. If E and F are flat, the fragmentation account is wrong and
+arm C's damage has some other cause.
