@@ -1,0 +1,143 @@
+== ab-before-1
+run	verdict	modes	attaches	c2s_bytes	s2c_bytes	frames	stall_gaps	longest_ms	frame_gaps	median_gap_ms
+1	PASS	-	67	443700	31571	4	0	0	66	86
+
+--
+S1LOCKSTAT
+  message thread lock WAIT     n=5868    total_ms=3474.5    hist=0us:807,0us:1519,0us:312,0us:1831,1us:819,2us:196,4us:109,8us:44,16us:27,32us:14,65us:4,131us:3,524us:2,1048us:3,2097us:125,4194us:27,8388us:4,16777us:1,33554us:3,67108us:10,134217us:7,268435us:1,
+  message thread lock HELD     n=5868    total_ms=1398.0    hist=0us:733,1us:1642,2us:411,4us:1621,8us:636,16us:140,32us:120,65us:114,131us:74,262us:30,524us:37,1048us:80,2097us:155,4194us:56,8388us:16,16777us:1,33554us:1,67108us:1,
+  progress thread lock WAIT    n=34509   total_ms=1285.7    hist=0us:343,0us:2522,0us:6200,0us:10310,1us:7056,2us:5678,4us:1659,8us:311,16us:46,32us:31,65us:16,131us:10,262us:9,524us:37,1048us:72,2097us:147,4194us:48,8388us:9,16777us:3,33554us:1,134217us:1,
+    take_ring_progress HELD    n=34510   total_ms=386.0     hist=0us:178,1us:3164,2us:5864,4us:12143,8us:8663,16us:3236,32us:1003,65us:167,131us:59,262us:12,524us:6,1048us:4,2097us:7,4194us:4,
+    venus+fence scan HELD      n=378     total_ms=6446.1    hist=131us:1,1048us:25,2097us:250,4194us:47,8388us:12,16777us:4,33554us:8,67108us:15,134217us:14,268435us:2,
+      take_venus_blob_writes   n=378     total_ms=807.5     hist=131us:3,262us:6,524us:68,1048us:186,2097us:85,4194us:18,8388us:11,16777us:1,
+      reply_arena_fence_signaled n=378     total_ms=5636.8    hist=4us:1,524us:2,1048us:294,2097us:25,4194us:12,8388us:5,33554us:8,67108us:19,134217us:10,268435us:2,
+== ab-before-10
+run	verdict	modes	attaches	c2s_bytes	s2c_bytes	frames	stall_gaps	longest_ms	frame_gaps	median_gap_ms
+1	PASS	-	63	434622	1031094	4	0	0	62	86
+
+--
+S1LOCKSTAT
+  message thread lock WAIT     n=5558    total_ms=1763.6    hist=0us:982,0us:1372,0us:546,0us:1049,1us:1006,2us:237,4us:95,8us:43,16us:31,32us:25,65us:17,131us:3,524us:1,1048us:6,2097us:87,4194us:28,8388us:11,16777us:2,33554us:10,67108us:7,
+  message thread lock HELD     n=5558    total_ms=938.1     hist=0us:804,1us:1543,2us:649,4us:938,8us:828,16us:205,32us:74,65us:96,131us:74,262us:52,524us:28,1048us:54,2097us:185,4194us:23,8388us:4,16777us:1,
+  progress thread lock WAIT    n=30108   total_ms=855.1     hist=0us:1125,0us:3238,0us:5466,0us:5946,1us:6758,2us:4163,4us:2477,8us:460,16us:92,32us:44,65us:33,131us:19,262us:18,524us:26,1048us:52,2097us:167,4194us:19,8388us:4,16777us:1,
+    take_ring_progress HELD    n=30108   total_ms=325.6     hist=1us:1972,2us:7901,4us:7983,8us:8026,16us:2850,32us:1107,65us:189,131us:58,262us:10,524us:6,1048us:4,2097us:3,
+    venus+fence scan HELD      n=360     total_ms=3785.9    hist=524us:1,1048us:30,2097us:211,4194us:53,8388us:22,16777us:1,33554us:29,67108us:13,
+      take_venus_blob_writes   n=360     total_ms=687.1     hist=131us:4,262us:10,524us:58,1048us:194,2097us:75,4194us:15,8388us:3,16777us:1,
+      reply_arena_fence_signaled n=360     total_ms=3097.2    hist=16us:1,524us:8,1048us:233,2097us:51,4194us:24,8388us:1,16777us:4,33554us:25,67108us:13,
+== ab-before-11
+run	verdict	modes	attaches	c2s_bytes	s2c_bytes	frames	stall_gaps	longest_ms	frame_gaps	median_gap_ms
+1	PASS	-	71	454950	32211	4	0	0	70	76
+
+  message thread lock WAIT     n=5725    total_ms=2961.6    hist=0us:10,0us:1142,0us:1139,0us:978,0us:1364,1us:641,2us:120,4us:72,8us:32,16us:28,32us:15,65us:1,262us:2,524us:2,1048us:30,2097us:116,4194us:10,33554us:5,67108us:13,134217us:4,268435us:1,
+  message thread lock HELD     n=5725    total_ms=899.0     hist=0us:1100,1us:1155,2us:1134,4us:1118,8us:491,16us:119,32us:92,65us:121,131us:64,262us:21,524us:86,1048us:60,2097us:130,4194us:27,8388us:2,16777us:5,
+  progress thread lock WAIT    n=25838   total_ms=797.6     hist=0us:616,0us:3455,0us:4746,0us:6171,1us:5430,2us:3747,4us:1157,8us:137,16us:31,32us:28,65us:17,131us:10,262us:22,524us:70,1048us:56,2097us:110,4194us:27,8388us:5,16777us:3,
+    take_ring_progress HELD    n=25838   total_ms=220.2     hist=0us:217,0us:1554,1us:3439,2us:5660,4us:7321,8us:5674,16us:1509,32us:342,65us:74,131us:28,262us:12,524us:1,1048us:4,4194us:2,8388us:1,
+    venus+fence scan HELD      n=381     total_ms=6127.5    hist=524us:1,1048us:82,2097us:234,4194us:19,8388us:1,33554us:11,67108us:22,134217us:9,268435us:2,
+      take_venus_blob_writes   n=381     total_ms=601.2     hist=131us:1,262us:5,524us:107,1048us:204,2097us:58,4194us:5,16777us:1,
+      reply_arena_fence_signaled n=381     total_ms=5524.9    hist=16us:1,524us:77,1048us:251,2097us:6,4194us:1,8388us:1,16777us:1,33554us:11,67108us:21,134217us:9,268435us:2,
+[wp-event][S] map s_obj=10 app_obj=22 (from obj 3 opcode 3)
+[wp-event][S] from-compositor s_obj=11 wl_buffer.release args=0
+== ab-before-12
+run	verdict	modes	attaches	c2s_bytes	s2c_bytes	frames	stall_gaps	longest_ms	frame_gaps	median_gap_ms
+1	PASS	-	68	447811	31691	4	0	0	67	64
+
+--
+S1LOCKSTAT
+  message thread lock WAIT     n=6010    total_ms=2152.7    hist=0us:269,0us:1332,0us:1060,0us:1239,0us:1136,1us:579,2us:123,4us:53,8us:30,16us:16,32us:4,65us:2,131us:4,1048us:30,2097us:91,4194us:19,8388us:1,33554us:11,67108us:10,134217us:1,
+  message thread lock HELD     n=6010    total_ms=644.7     hist=0us:243,0us:1393,1us:974,2us:1307,4us:962,8us:429,16us:142,32us:88,65us:84,131us:54,262us:38,524us:37,1048us:170,2097us:83,4194us:5,8388us:1,
+  progress thread lock WAIT    n=29069   total_ms=590.2     hist=0us:108,0us:2177,0us:4686,0us:6739,0us:5603,1us:4676,2us:2770,4us:1671,8us:273,16us:40,32us:14,65us:9,131us:11,262us:16,524us:36,1048us:169,2097us:63,4194us:5,8388us:3,
+    take_ring_progress HELD    n=29069   total_ms=220.3     hist=0us:487,1us:4523,2us:9986,4us:7441,8us:4630,16us:1313,32us:558,65us:87,131us:23,262us:9,524us:6,1048us:3,2097us:2,4194us:1,
+    venus+fence scan HELD      n=383     total_ms=5583.8    hist=524us:1,1048us:119,2097us:192,4194us:30,8388us:1,33554us:14,67108us:21,134217us:3,268435us:1,536870us:1,
+      take_venus_blob_writes   n=383     total_ms=548.9     hist=131us:2,262us:9,524us:124,1048us:197,2097us:49,4194us:1,8388us:1,
+      reply_arena_fence_signaled n=383     total_ms=5033.6    hist=65us:1,524us:142,1048us:170,2097us:28,4194us:2,33554us:15,67108us:20,134217us:3,268435us:1,536870us:1,
+== ab-before-2
+run	verdict	modes	attaches	c2s_bytes	s2c_bytes	frames	stall_gaps	longest_ms	frame_gaps	median_gap_ms
+1	PASS	-	61	432291	30946	4	0	0	60	73
+
+--
+S1LOCKSTAT
+  message thread lock WAIT     n=5492    total_ms=1209.4    hist=0us:735,0us:1117,0us:669,0us:1886,1us:671,2us:133,4us:49,8us:21,16us:22,32us:14,65us:8,131us:4,262us:3,1048us:22,2097us:102,4194us:10,8388us:6,16777us:10,33554us:10,
+  message thread lock HELD     n=5492    total_ms=984.2     hist=0us:670,1us:1164,2us:888,4us:1635,8us:450,16us:96,32us:77,65us:111,131us:77,262us:33,524us:20,1048us:99,2097us:136,4194us:30,8388us:4,33554us:1,67108us:1,
+  progress thread lock WAIT    n=38851   total_ms=898.7     hist=0us:1092,0us:3389,0us:8774,0us:11767,1us:7896,2us:4649,4us:843,8us:76,16us:35,32us:24,65us:13,131us:17,262us:15,524us:23,1048us:90,2097us:119,4194us:19,8388us:7,16777us:1,33554us:1,67108us:1,
+    take_ring_progress HELD    n=38851   total_ms=259.5     hist=0us:6,0us:859,1us:5477,2us:11896,4us:12112,8us:6873,16us:1246,32us:259,65us:74,131us:26,262us:17,524us:3,1048us:1,2097us:1,4194us:1,
+    venus+fence scan HELD      n=355     total_ms=2815.3    hist=65us:1,1048us:43,2097us:217,4194us:36,8388us:14,16777us:16,33554us:26,67108us:2,
+      take_venus_blob_writes   n=355     total_ms=670.4     hist=65us:2,131us:5,262us:15,524us:71,1048us:183,2097us:59,4194us:15,8388us:4,16777us:1,
+      reply_arena_fence_signaled n=355     total_ms=2143.6    hist=2us:1,524us:16,1048us:258,2097us:17,4194us:21,8388us:1,16777us:14,33554us:26,67108us:1,
+== ab-before-3
+run	verdict	modes	attaches	c2s_bytes	s2c_bytes	frames	stall_gaps	longest_ms	frame_gaps	median_gap_ms
+1	PASS	-	84	484117	33490	4	0	0	83	67
+
+--
+S1LOCKSTAT
+  message thread lock WAIT     n=7235    total_ms=844.0     hist=0us:1618,0us:1106,0us:1488,0us:1671,1us:844,2us:154,4us:78,8us:50,16us:40,32us:7,131us:1,262us:1,524us:1,1048us:36,2097us:116,4194us:9,8388us:1,16777us:14,
+  message thread lock HELD     n=7235    total_ms=845.7     hist=0us:1549,1us:1112,2us:1588,4us:1417,8us:705,16us:222,32us:119,65us:123,131us:80,262us:22,524us:44,1048us:73,2097us:141,4194us:39,8388us:1,
+  progress thread lock WAIT    n=31943   total_ms=771.2     hist=0us:19,0us:2940,0us:4891,0us:8308,0us:8938,1us:4293,2us:1987,4us:141,8us:46,16us:36,32us:11,65us:11,131us:15,262us:27,524us:34,1048us:76,2097us:140,4194us:29,8388us:1,
+    take_ring_progress HELD    n=31943   total_ms=140.8     hist=0us:1513,0us:2646,1us:8817,2us:6924,4us:7583,8us:3728,16us:650,32us:68,65us:8,131us:4,262us:1,1048us:1,
+    venus+fence scan HELD      n=441     total_ms=2054.3    hist=262us:1,1048us:141,2097us:248,4194us:10,16777us:41,
+      take_venus_blob_writes   n=441     total_ms=559.3     hist=65us:2,131us:12,262us:13,524us:163,1048us:224,2097us:27,
+      reply_arena_fence_signaled n=441     total_ms=1493.8    hist=4us:1,524us:136,1048us:256,2097us:7,16777us:41,
+== ab-before-5
+run	verdict	modes	attaches	c2s_bytes	s2c_bytes	frames	stall_gaps	longest_ms	frame_gaps	median_gap_ms
+1	PASS	-	67	445797	31715	4	0	0	66	82
+
+  message thread lock WAIT     n=5588    total_ms=2484.7    hist=0us:821,0us:1057,0us:1022,0us:1065,1us:871,2us:292,4us:145,8us:58,16us:53,32us:22,65us:7,131us:10,262us:4,524us:1,1048us:23,2097us:88,4194us:24,8388us:5,16777us:1,33554us:4,67108us:12,134217us:3,
+  message thread lock HELD     n=5588    total_ms=948.7     hist=0us:802,1us:1042,2us:1088,4us:971,8us:784,16us:256,32us:116,65us:107,131us:66,262us:43,524us:33,1048us:93,2097us:148,4194us:36,8388us:2,33554us:1,
+  progress thread lock WAIT    n=25823   total_ms=863.0     hist=0us:477,0us:2363,0us:3744,0us:5841,1us:5872,2us:4520,4us:2271,8us:269,16us:82,32us:41,65us:27,131us:19,262us:12,524us:36,1048us:79,2097us:139,4194us:28,8388us:2,33554us:1,
+    take_ring_progress HELD    n=25823   total_ms=314.1     hist=0us:6,0us:669,1us:3103,2us:5280,4us:5635,8us:6031,16us:3367,32us:1435,65us:206,131us:58,262us:16,524us:9,1048us:6,2097us:2,
+    venus+fence scan HELD      n=372     total_ms=5560.4    hist=524us:1,1048us:58,2097us:197,4194us:56,8388us:13,16777us:2,33554us:9,67108us:32,134217us:4,
+      take_venus_blob_writes   n=372     total_ms=690.0     hist=131us:2,262us:8,524us:95,1048us:186,2097us:58,4194us:19,8388us:4,
+      reply_arena_fence_signaled n=372     total_ms=4868.6    hist=8us:1,524us:42,1048us:206,2097us:62,4194us:15,8388us:1,33554us:9,67108us:32,134217us:4,
+[wp-event][S] map s_obj=10 app_obj=22 (from obj 3 opcode 3)
+[wp-event][S] from-compositor s_obj=15 wl_buffer.release args=0
+== ab-before-6
+run	verdict	modes	attaches	c2s_bytes	s2c_bytes	frames	stall_gaps	longest_ms	frame_gaps	median_gap_ms
+1	PASS	-	68	447625	31632	4	0	0	67	71
+
+--
+S1LOCKSTAT
+  message thread lock WAIT     n=6002    total_ms=2295.1    hist=0us:997,0us:1202,0us:995,0us:1549,1us:747,2us:167,4us:88,8us:41,16us:28,32us:19,65us:1,131us:2,262us:2,524us:1,1048us:21,2097us:109,4194us:10,8388us:3,16777us:2,33554us:5,67108us:8,134217us:5,
+  message thread lock HELD     n=6002    total_ms=868.3     hist=0us:881,1us:1351,2us:1157,4us:1263,8us:561,16us:187,32us:94,65us:131,131us:42,262us:27,524us:58,1048us:94,2097us:123,4194us:29,8388us:3,33554us:1,
+  progress thread lock WAIT    n=31092   total_ms=770.8     hist=0us:875,0us:3058,0us:4986,0us:9471,1us:6494,2us:4378,4us:1190,8us:254,16us:43,32us:25,65us:8,131us:9,262us:31,524us:41,1048us:88,2097us:110,4194us:28,8388us:2,33554us:1,
+    take_ring_progress HELD    n=31092   total_ms=255.0     hist=0us:122,0us:1022,1us:6071,2us:6699,4us:8038,8us:6520,16us:1890,32us:563,65us:102,131us:40,262us:11,524us:4,1048us:8,2097us:2,
+    venus+fence scan HELD      n=377     total_ms=5267.8    hist=1048us:85,2097us:227,4194us:17,8388us:4,16777us:4,33554us:10,67108us:19,134217us:11,
+      take_venus_blob_writes   n=377     total_ms=555.4     hist=262us:6,524us:113,1048us:214,2097us:39,4194us:3,8388us:2,
+      reply_arena_fence_signaled n=377     total_ms=4711.1    hist=524us:80,1048us:239,2097us:12,4194us:2,16777us:4,33554us:10,67108us:21,134217us:9,
+== ab-before-7
+run	verdict	modes	attaches	c2s_bytes	s2c_bytes	frames	stall_gaps	longest_ms	frame_gaps	median_gap_ms
+1	PASS	-	61	430091	30910	4	0	0	60	84
+
+--
+S1LOCKSTAT
+  message thread lock WAIT     n=5403    total_ms=899.1     hist=0us:1014,0us:1264,0us:870,0us:1128,1us:652,2us:172,4us:59,8us:43,16us:25,32us:22,65us:5,131us:1,262us:1,1048us:19,2097us:90,4194us:19,8388us:5,16777us:9,33554us:5,
+  message thread lock HELD     n=5403    total_ms=742.5     hist=0us:983,1us:1325,2us:893,4us:984,8us:493,16us:151,32us:102,65us:118,131us:74,262us:34,524us:52,1048us:56,2097us:98,4194us:37,8388us:3,
+  progress thread lock WAIT    n=28792   total_ms=681.1     hist=0us:1230,0us:3750,0us:5796,0us:8037,1us:5070,2us:3943,4us:563,8us:57,16us:38,32us:16,65us:20,131us:16,262us:32,524us:52,1048us:45,2097us:89,4194us:34,8388us:4,
+    take_ring_progress HELD    n=28792   total_ms=180.4     hist=0us:611,0us:2334,1us:6030,2us:6171,4us:6582,8us:5074,16us:1720,32us:220,65us:35,131us:7,262us:5,524us:3,
+    venus+fence scan HELD      n=353     total_ms=2332.3    hist=131us:1,1048us:62,2097us:203,4194us:39,8388us:4,16777us:28,33554us:16,
+      take_venus_blob_writes   n=353     total_ms=528.4     hist=65us:2,131us:16,262us:10,524us:87,1048us:177,2097us:55,4194us:5,8388us:1,
+      reply_arena_fence_signaled n=353     total_ms=1802.4    hist=2us:1,524us:58,1048us:216,2097us:31,4194us:3,8388us:1,16777us:28,33554us:15,
+== ab-before-8
+run	verdict	modes	attaches	c2s_bytes	s2c_bytes	frames	stall_gaps	longest_ms	frame_gaps	median_gap_ms
+1	PASS	-	60	429756	30823	4	0	0	59	105
+
+--
+S1LOCKSTAT
+  message thread lock WAIT     n=5414    total_ms=1337.4    hist=0us:543,0us:1761,0us:301,0us:1730,1us:661,2us:146,4us:61,8us:23,16us:18,32us:12,65us:2,131us:3,262us:3,524us:3,1048us:7,2097us:88,4194us:28,8388us:1,16777us:15,33554us:5,67108us:3,
+  message thread lock HELD     n=5414    total_ms=1096.8    hist=0us:429,1us:1875,2us:315,4us:1629,8us:452,16us:111,32us:88,65us:91,131us:83,262us:47,524us:70,1048us:33,2097us:116,4194us:54,8388us:19,16777us:2,
+  progress thread lock WAIT    n=39255   total_ms=1003.7    hist=0us:650,0us:3734,0us:7337,0us:12379,1us:7779,2us:6148,4us:754,8us:87,16us:33,32us:35,65us:13,131us:22,262us:27,524us:51,1048us:33,2097us:100,4194us:56,8388us:15,16777us:2,
+    take_ring_progress HELD    n=39255   total_ms=284.0     hist=0us:297,0us:1776,1us:5163,2us:8589,4us:12673,8us:8775,16us:1583,32us:284,65us:75,131us:24,262us:5,524us:4,1048us:7,
+    venus+fence scan HELD      n=353     total_ms=2791.9    hist=524us:1,1048us:26,2097us:222,4194us:51,8388us:6,16777us:30,33554us:14,67108us:3,
+      take_venus_blob_writes   n=353     total_ms=670.7     hist=65us:1,131us:4,262us:20,524us:57,1048us:166,2097us:88,4194us:11,8388us:6,
+      reply_arena_fence_signaled n=353     total_ms=2119.8    hist=8us:1,524us:5,1048us:271,2097us:22,4194us:8,8388us:5,16777us:25,33554us:13,67108us:3,
+== ab-before-9
+run	verdict	modes	attaches	c2s_bytes	s2c_bytes	frames	stall_gaps	longest_ms	frame_gaps	median_gap_ms
+1	PASS	-	92	502408	34548	4	0	0	91	59
+
+  message thread lock WAIT     n=7405    total_ms=2938.1    hist=0us:58,0us:1749,0us:1054,0us:2167,0us:1047,1us:695,2us:266,4us:108,8us:41,16us:33,32us:12,65us:8,131us:1,524us:1,1048us:34,2097us:77,4194us:24,8388us:6,33554us:3,67108us:17,134217us:4,
+  message thread lock HELD     n=7405    total_ms=977.0     hist=0us:1898,1us:926,2us:2190,4us:911,8us:497,16us:278,32us:116,65us:126,131us:56,262us:42,524us:41,1048us:122,2097us:194,4194us:6,8388us:1,33554us:1,
+  progress thread lock WAIT    n=28094   total_ms=884.7     hist=0us:12,0us:1670,0us:3334,0us:6932,0us:6464,1us:5698,2us:2055,4us:1308,8us:155,16us:52,32us:20,65us:13,131us:17,262us:11,524us:45,1048us:116,2097us:187,4194us:3,8388us:1,33554us:1,
+    take_ring_progress HELD    n=28094   total_ms=211.9     hist=0us:67,0us:573,1us:5137,2us:8554,4us:6733,8us:4427,16us:1814,32us:665,65us:98,131us:21,262us:2,524us:2,1048us:1,
+    venus+fence scan HELD      n=468     total_ms=6003.6    hist=524us:1,1048us:133,2097us:203,4194us:80,8388us:5,16777us:1,33554us:4,67108us:35,134217us:6,
+      take_venus_blob_writes   n=468     total_ms=736.9     hist=262us:8,524us:144,1048us:231,2097us:72,4194us:12,8388us:1,
+      reply_arena_fence_signaled n=468     total_ms=5265.1    hist=8us:1,524us:237,1048us:94,2097us:87,4194us:3,16777us:1,33554us:5,67108us:34,134217us:6,
+[wp-event][S] map s_obj=9 app_obj=22 (from obj 3 opcode 3)
+[wp-event][S] from-compositor s_obj=15 wl_buffer.release args=0

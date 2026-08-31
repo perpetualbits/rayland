@@ -164,8 +164,13 @@ if [ -n "$leftovers" ]; then
   exit 1
 fi
 
-echo "### building ###"
-CARGO_TARGET_DIR="$TARGET_DIR" cargo build -q -p rayland-c -p rayland-s || exit 1
+# `NO_BUILD=1` skips the rebuild, so an A/B can put a deliberately-chosen pair of binaries in place
+# and alternate between them. Without it the two arms of a comparison would both be whatever the tree
+# currently compiles to, which is the same arm twice.
+if [ -z "${NO_BUILD:-}" ]; then
+  echo "### building ###"
+  CARGO_TARGET_DIR="$TARGET_DIR" cargo build -q -p rayland-c -p rayland-s || exit 1
+fi
 if [ -n "$C_HOST" ]; then
   scp -q "$BIN/rayland-c" /usr/bin/vkcube "$C_HOST:/tmp/" || exit 1
   ssh "$C_HOST" 'chmod +x /tmp/rayland-c /tmp/vkcube'
@@ -204,7 +209,7 @@ for run in $(seq 1 "$RUNS"); do
   # common case, and an empty word in an assignment prefix ends the prefix and makes bash read the next
   # word as the command name. `env` swallows the empty expansion harmlessly.
   env WAYLAND_DISPLAY="$WESTON_SOCKET" RAYLAND_S_EVENT_LOG=1 RAYLAND_C1_NO_PRESENT=1 \
-    ${SHIP_PRESENTED:+RAYLAND_S_SHIP_PRESENTED=1} \
+    ${SHIP_PRESENTED:+RAYLAND_S_SHIP_PRESENTED=1} ${LINK_LOG:+RAYLAND_S_REPLY_LOG=1} ${LOCKSTAT:+RAYLAND_S_LOCKSTAT=1} \
     RAYLAND_C1_S_LISTEN="0.0.0.0:$PORT" "$BIN/rayland-s" > "$RD/s.log" 2>&1 &
   S_PID=$!
   sleep 3
@@ -214,7 +219,8 @@ for run in $(seq 1 "$RUNS"); do
   fi
 
   C_PID=$(on_c "rm -f $SOCK $WL_SOCK
-    RAYLAND_WP_LOG=1 RAYLAND_C1_METRICS=1 RAYLAND_C1_S_ADDR=$S_IP:$PORT RAYLAND_C1_SOCKET=$SOCK \
+    RAYLAND_WP_LOG=1 RAYLAND_C1_METRICS=1 ${LINK_LOG:+RAYLAND_C1_LINK_LOG=1} \
+    RAYLAND_C1_S_ADDR=$S_IP:$PORT RAYLAND_C1_SOCKET=$SOCK \
     RAYLAND_C1_WAYLAND_DISPLAY=$WL_SOCK nohup $C_BIN/rayland-c >/tmp/soak-c.log 2>&1 & echo \$!")
   sleep 3
 

@@ -5326,3 +5326,96 @@ Next measurement needs no new code: join the timestamped proxy log against S's e
 same clock, at a stall onset, and see what S was doing in the milliseconds before the app went to
 sleep. The `hrtimer_nanosleep` observation says Mesa's `vn_relax` backoff explains the *duration*;
 nothing yet explains the *onset*.
+
+### 2026-08-31 (afternoon) — Instrumenting the round trip: the two milliseconds were one function, and it was ours
+
+The task was blunt: *instrument the round trip and find the 2 ms.* A swapchain rebuild does ~477
+synchronous round trips and takes ~970 ms, so the whole stall — and, it turns out, a good part of the
+ordinary frame time — is a per-round-trip cost of about two milliseconds that nobody had ever put a
+clock on.
+
+**The instrument.** S has stamped its link reads and writes since yesterday; C had nothing. Adding the
+matching `s>` / `s<` / `r<` markers on C, on the same `CLOCK_MONOTONIC`, makes a loopback round trip
+decomposable into four points: C writes, C flushes, S reads, S replies. That decomposition said,
+immediately and unambiguously:
+
+| segment | median |
+|---|---|
+| C flushes a doorbell → **S reads it** | **3.9 ms** |
+| S reads it → S writes the reply blob | 3.2 ms |
+| S writes the reply → C reads it | 0.67 ms |
+
+On **loopback**, where the wire costs tens of microseconds. Almost four milliseconds for a message to
+travel from one process to another on the same machine is not transport; it is something not
+happening.
+
+**The first hypothesis was wrong, and the log said so.** The obvious reading is head-of-line blocking:
+C sends 5,495 messages per run against 288 doorbells, so a doorbell queues behind roughly nineteen
+blob writes. The census supports the picture beautifully — **5,409 of those 5,495 forward messages
+carry one to three bytes each** — but the timing refutes it as the cause here. Measured queue depth at
+the moment a doorbell is flushed: **median 2**. The doorbell was not stuck behind a crowd. S simply
+was not coming around, and S's message loop blocks on `read_msg` with no sleep in it, which leaves
+exactly one candidate: it is blocked on the applier mutex.
+
+**The second instrument, and the thing this project keeps having to re-learn.** The link trace itself
+took the loopback run from ~20 fps to ~10 — two `eprintln`s per message cost more than the send they
+bracketed. That is the fourth instrument in this project caught perturbing what it measures. So the
+lock measurement was built the other way from the start: `clock_gettime` pairs and one relaxed atomic
+per acquisition, log2-bucketed, printed every five seconds (`crates/rayland-s/src/lockstat.rs`,
+`RAYLAND_S_LOCKSTAT`). A histogram rather than a mean, because "median 224 µs with a 26 ms p99" and
+"flat 224 µs" are different bugs with different fixes.
+
+It named the culprit on the first run. Of a 15-second run, the progress thread held the applier lock
+for **3.0 seconds** inside one pair of calls — and splitting the pair (which mattered: attributing it
+to the wrong half would have sent the fix to the wrong place) put **2.24 s of it in
+`reply_arena_fence_signaled` alone**.
+
+**What that function was doing.** It looks for the two-word pattern `[38][0]` — a `vkGetFenceStatus`
+reply reading `VK_SUCCESS` — which is the (c)2 completion barrier's entire signal. It looked for it by
+reading two `u32`s at *every 4-aligned offset in the whole arena*. The arena is megabytes. So on every
+ring-progress event, S walked a megabyte word by word, holding the lock that the application's next
+doorbell needs, to find eight bytes.
+
+**The fix is a byte search, and it cannot change the answer.** Little-endian, `38u32` is
+`26 00 00 00`, so every match begins with the byte `0x26` at a 4-aligned offset followed by seven
+zeroes. `memchr` finds candidate bytes a vector register at a time; the alignment check and the
+original `u32` comparison then accept exactly the matches the walk accepted. It is the same argument
+that justified the blob-diff chunk size going 64 → 4096: **speed, not meaning**.
+
+I did not want that claim to rest on my own confidence in it, since two tests in the last fortnight
+were written from the same belief as the code they guarded and could only confirm it. So the old walk
+is kept verbatim as a **test oracle** and the two are compared over five thousand adversarial buffers.
+The first version of that test was itself worthless and said so: random bytes spell `[38][0]` almost
+never, so it produced **four positive cases in five thousand** and would have "passed" while
+exercising only the `false` branch. It now plants a candidate reply in half the cases — aligned or
+not, `VK_SUCCESS` or `VK_NOT_READY` — and asserts that both outcomes actually occurred, so it cannot
+quietly decay into a tautology.
+
+**What it bought, measured as an interleaved A/B (11 before / 10 after, alternating, on a laptop its
+owner was using):**
+
+| | before | after | |
+|---|---|---|---|
+| `reply_arena_fence_signaled`, p50 | 1048 µs | **131 µs** | 8× |
+| the same, p99 | 134 ms | **8.4 ms** | 16× |
+| the same, worst bucket | 537 ms | **33.5 ms** | 16× |
+| total lock-held per run, median | 4.7 s | **0.57 s** | 8.3× |
+| message thread's total lock WAIT | 2.15 s | **0.73 s** | 2.9× |
+
+That worst-case number is the one I care most about: **a single fence scan could hold the applier lock
+for over half a second**, which is stall-sized, and the tail of that distribution is precisely the tail
+of the round-trip latency.
+
+**And now the part I have to be careful about.** The end-to-end frame gap moved from a median of 76 ms
+to 69 ms, and attaches in a fixed window from 67 to 79 — both in the right direction, roughly 10–18%.
+**Neither is statistically significant**: Mann-Whitney on the frame gap gives p = 0.46. With three
+before-runs the difference looked convincing; with eleven it does not. I am recording the ~10% as a
+direction, not a result. The mechanism figures above *are* results — they are ratios of 3× to 16×
+against run-to-run ranges that do not overlap — but "we removed the largest lock-holder in S" and "the
+cube spins measurably faster" are two claims, and today only the first one is earned.
+
+The honest reading is that this was one term of several. The instrument that found it is still armed,
+and it already names the next candidates: `take_venus_blob_writes` (~0.6–0.9 s of lock-held time
+remaining), the message thread's own 1.1 s of hold, and the 5,409 one-to-three-byte forward messages
+per run, which cost C about a second inside `send()` — a coalescing problem on the C→S path exactly
+analogous to the one already fixed on S's readback path.

@@ -129,7 +129,6 @@ const DEFAULT_RENDER_NODE: &str = "/dev/dri/renderD128";
 /// point for something with no measurements behind it.
 const PROGRESS_POLL: Duration = Duration::from_micros(200);
 
-
 /// Read an environment variable, falling back to a default.
 fn env_or(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
@@ -274,7 +273,10 @@ fn section_log(what: &str, elapsed: Duration) {
     if !link_log_enabled() || elapsed < REPORT_ABOVE {
         return;
     }
-    eprintln!("[s-section] {what} held the applier lock {} ms", elapsed.as_millis());
+    eprintln!(
+        "[s-section] {what} held the applier lock {} ms",
+        elapsed.as_millis()
+    );
 }
 
 /// A throttled "the progress thread is still looping" line, emitted while holding **no** lock.
@@ -341,7 +343,9 @@ fn c2s_kind(m: &C2S) -> String {
         C2S::Hello { .. } => "Hello".to_string(),
         C2S::CreateContext { .. } => "CreateContext".to_string(),
         C2S::GetCapset { .. } => "GetCapset".to_string(),
-        C2S::CreateBlob { blob_id, size, .. } => format!("CreateBlob blob_id={blob_id} size={size}"),
+        C2S::CreateBlob { blob_id, size, .. } => {
+            format!("CreateBlob blob_id={blob_id} size={size}")
+        }
         C2S::BlobData {
             res_id,
             offset,
@@ -351,7 +355,10 @@ fn c2s_kind(m: &C2S) -> String {
             ring_res_id,
             tail,
             bytes,
-        } => format!("RingDelta ring={ring_res_id} tail={tail} len={}", bytes.len()),
+        } => format!(
+            "RingDelta ring={ring_res_id} tail={tail} len={}",
+            bytes.len()
+        ),
         C2S::SubmitCmd { .. } => "SubmitCmd".to_string(),
         C2S::NotifyRing { .. } => "NotifyRing".to_string(),
         C2S::UnrefResource { res_id } => format!("UnrefResource res={res_id}"),
@@ -420,15 +427,19 @@ fn ship(tx: &Arc<Mutex<QuicSend>>, msgs: &[S2C]) -> Result<(), ()> {
     let stream = &mut *guard;
     for msg in msgs {
         // T6 — transfer packet emitted (design note §7): the point a pixel packet leaves S for C.
-        if let S2C::BlobData { res_id, offset, bytes } = msg {
+        if let S2C::BlobData {
+            res_id,
+            offset,
+            bytes,
+        } = msg
+        {
             rayland_relay::trace::emit(
                 "T6",
                 &format!("side=S res={res_id} off={offset} len={}", bytes.len()),
             );
         }
         link_log("w>", &s2c_kind(msg));
-        if let Err(e) = write_msg(stream, msg).with_context(|| format!("writing {msg:?} to C"))
-        {
+        if let Err(e) = write_msg(stream, msg).with_context(|| format!("writing {msg:?} to C")) {
             eprintln!("rayland-s: shipping to C failed: {e:#}");
             return Err(());
         }
@@ -474,14 +485,19 @@ impl ExportedFdSource for ApplierFdSource {
     fn dup_exported_fd(&self, resource_id: u32) -> Option<OwnedFd> {
         // Lock, borrow, duplicate, release — all three inside this expression, so nothing downstream can
         // hold the applier while talking to the compositor.
-        let session = self.applier.lock().expect("the applier lock is never poisoned");
+        let session = self
+            .applier
+            .lock()
+            .expect("the applier lock is never poisoned");
         let borrowed = session.exported_fd(resource_id)?;
         match borrowed.try_clone_to_owned() {
             Ok(fd) => Some(fd),
             Err(e) => {
                 // A dup failure is an fd-table exhaustion, not a missing resource: say which it was, since
                 // the caller's refusal message cannot distinguish them.
-                eprintln!("rayland-s: WP0 4.3: dup of resource {resource_id}'s dma-buf failed: {e}");
+                eprintln!(
+                    "rayland-s: WP0 4.3: dup of resource {resource_id}'s dma-buf failed: {e}"
+                );
                 None
             }
         }
@@ -547,7 +563,12 @@ fn progress_thread(
         // old-style below (only when the ring moved, venus before progress) so init's reply/head lockstep
         // is exactly the working gate's — that lockstep is load-bearing for initialization.
         let progress = {
+            let waited = std::time::Instant::now();
             let mut session = applier.lock().expect("the applier lock is never poisoned");
+            rayland_s::lockstat::record(
+                &rayland_s::lockstat::table().prog_lock_wait,
+                waited.elapsed(),
+            );
             let t = std::time::Instant::now();
             let p = session.take_ring_progress();
             // DIAGNOSTIC (`RAYLAND_S_REPLY_LOG`): time the critical section. The watchdog showed the
@@ -555,6 +576,7 @@ fn progress_thread(
             // which is not a deadlock but a critical section long enough to starve the message
             // thread past Mesa's ~3.5 s stall abort. This says which call spends it.
             section_log("take_ring_progress", t.elapsed());
+            rayland_s::lockstat::record(&rayland_s::lockstat::table().prog_ring, t.elapsed());
             p
         };
         if !progress.is_empty() {
@@ -564,14 +586,29 @@ fn progress_thread(
             // and the contiguous `[38][0]` is not visible in them (see `Applier::reply_arena_fence_signaled`).
             let (venus, signaled) = {
                 let mut session = applier.lock().expect("the applier lock is never poisoned");
+                // One span across both calls: they are taken under one acquisition, so it is their
+                // combined hold that starves the message thread, not either one alone.
+                let both = std::time::Instant::now();
                 // Timed separately: these two walk every Venus-internal blob — including the 8 MiB
                 // staging pool — byte-granular at gap 0, and they do it with the lock held.
                 let t = std::time::Instant::now();
                 let v = session.take_venus_blob_writes();
                 section_log("take_venus_blob_writes", t.elapsed());
+                rayland_s::lockstat::record(
+                    &rayland_s::lockstat::table().prog_venus_diff,
+                    t.elapsed(),
+                );
                 let t = std::time::Instant::now();
                 let s = session.reply_arena_fence_signaled();
                 section_log("reply_arena_fence_signaled", t.elapsed());
+                rayland_s::lockstat::record(
+                    &rayland_s::lockstat::table().prog_venus_fence,
+                    t.elapsed(),
+                );
+                rayland_s::lockstat::record(
+                    &rayland_s::lockstat::table().prog_venus,
+                    both.elapsed(),
+                );
                 (v, s)
             };
             if signaled {
@@ -702,7 +739,16 @@ fn serve(
         //
         // No deadlock: the progress thread takes `applier` and releases it **before** taking `tx`,
         // so it never holds both, and this is the only path that holds them together.
+        // Timed because a cross-daemon trace (2026-08-31) put a median 3.9 ms between C flushing a
+        // doorbell and S reading it on loopback, with an almost-empty queue — so the delay was this
+        // loop not coming around, and this is the only place it can block other than `read_msg`.
+        let waited = std::time::Instant::now();
         let mut session = applier.lock().expect("the applier lock is never poisoned");
+        rayland_s::lockstat::record(
+            &rayland_s::lockstat::table().msg_lock_wait,
+            waited.elapsed(),
+        );
+        let held = std::time::Instant::now();
         // No engine lock any more: `apply` drives the engine through the client, which messages the
         // actor (the one thread that owns virglrenderer). The applier lock is still held across
         // `apply` and the sends below — its BlobCreated-before-BlobData reason (this function's docs)
@@ -740,6 +786,8 @@ fn serve(
         // link, and holding the applier across that would stop the progress thread dead — it is the
         // only thing that ever releases the application's synchronous Vulkan calls.
         drop(session);
+        // Recorded after the drop, so the span is the whole time the progress thread was locked out.
+        rayland_s::lockstat::record(&rayland_s::lockstat::table().msg_lock_held, held.elapsed());
     }
 }
 
@@ -752,6 +800,9 @@ fn serve(
 /// an S at all, and finding out three messages into a session would surface as an inexplicable
 /// engine error on the machine that is not the problem.
 fn main() -> Result<()> {
+    // Started before anything else so a run killed by the harness — which is how every soak run ends
+    // — still leaves its lock statistics behind. Inert unless `RAYLAND_S_LOCKSTAT` is set.
+    rayland_s::lockstat::start_reporter();
     let listen = env_or(ENV_LISTEN, DEFAULT_LISTEN);
     let render_node = PathBuf::from(env_or(ENV_RENDER_NODE, DEFAULT_RENDER_NODE));
 

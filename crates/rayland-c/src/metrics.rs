@@ -226,6 +226,24 @@ pub struct Metrics {
     /// Nanoseconds from [`Metrics::start`] to the application connecting to C's vtest socket. Zero
     /// means "not yet". See [`Metrics::note_app_connected`] for why this exists at all.
     app_connected_nanos: AtomicU64,
+    /// Total nanoseconds spent inside the link's `send` — serialising a message, handing it to the
+    /// transport, and flushing it — summed over every message C sent.
+    ///
+    /// # Why this is separate from `round_trip_nanos`
+    /// A round trip is time the application waits for an *answer*. This is time C spends getting a
+    /// message *out*, whether or not anything is waiting for it, and it is paid once per message
+    /// rather than once per reply. The two are confusable and were confused: the forward path ships
+    /// thousands of one-byte blob writes per second, so a cost that is negligible per message can
+    /// still dominate the wall clock, and only a per-message total shows that.
+    send_nanos: AtomicU64,
+    /// The same, bucketed by `floor(log2(nanoseconds))`, so the *shape* survives.
+    ///
+    /// A mean hides the thing that matters here. If most sends cost 20 µs and a few cost 5 ms, the
+    /// fix is to find the few; if every send costs 200 µs, the fix is to send fewer messages. Bucket
+    /// `i` counts sends whose duration is in `[2^i, 2^(i+1))` nanoseconds; 32 buckets reach ~4 s,
+    /// past any plausible send, and anything longer saturates into the last one rather than
+    /// panicking or wrapping.
+    send_hist: [AtomicU64; 32],
     /// The instant every duration here is relative to.
     start: Instant,
 }
@@ -257,6 +275,8 @@ pub fn metrics() -> &'static Metrics {
         round_trip_nanos: AtomicU64::new(0),
         first_frame_nanos: AtomicU64::new(0),
         app_connected_nanos: AtomicU64::new(0),
+        send_nanos: AtomicU64::new(0),
+        send_hist: Default::default(),
         start: Instant::now(),
     })
 }
@@ -276,6 +296,37 @@ impl Metrics {
         let c = &self.c2s[Channel::of_c2s(m).idx()];
         c.msgs.fetch_add(1, Ordering::Relaxed);
         c.bytes.fetch_add(framed_bytes as u64, Ordering::Relaxed);
+    }
+
+    /// Fold one completed `send` into the send-cost total and histogram.
+    ///
+    /// # Inputs / outputs
+    /// - `elapsed`: how long the link's `send` took — serialise, write, flush — for one message.
+    ///   The caller must exclude any diagnostic logging from that span, or this measures the
+    ///   instrument.
+    /// - Records nothing when metrics are off, so an unmeasured run pays two atomic-free branches.
+    ///
+    /// # Failure modes
+    /// None that can be observed: the bucket index is clamped, so a pathological duration lands in
+    /// the last bucket instead of indexing out of bounds, and the totals are `Relaxed` because no
+    /// other value is read against them.
+    pub fn record_send_cost(&self, elapsed: Duration) {
+        if !enabled() {
+            return;
+        }
+        // Nanoseconds, saturated: a `Duration` longer than `u64::MAX` ns (584 years) cannot arise
+        // from a socket write, but saturating costs nothing and removes the question.
+        let ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        self.send_nanos.fetch_add(ns, Ordering::Relaxed);
+        // `floor(log2(ns))` via the leading-zero count. Zero has no logarithm, so a sub-nanosecond
+        // send (a coarse clock reading the same value twice) is bucket 0 by definition.
+        let bucket = if ns == 0 {
+            0
+        } else {
+            (63 - ns.leading_zeros()) as usize
+        };
+        // Clamp rather than assert: an instrument must never be the thing that kills the daemon.
+        self.send_hist[bucket.min(self.send_hist.len() - 1)].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record one framed message received S→C, and note the first frame if this is it.
@@ -411,6 +462,21 @@ impl Metrics {
             self.round_trips.load(Ordering::Relaxed),
             self.round_trip_nanos.load(Ordering::Relaxed) / 1_000,
         );
+        // The forward path's own cost, and its shape. Emitted as `low_us:count` pairs for the
+        // non-empty buckets only, because a line with 32 zeroes in it is a line nobody reads.
+        s.push_str(&format!(
+            " send_us={}",
+            self.send_nanos.load(Ordering::Relaxed) / 1_000
+        ));
+        s.push_str(" send_hist=");
+        for (i, b) in self.send_hist.iter().enumerate() {
+            let n = b.load(Ordering::Relaxed);
+            if n > 0 {
+                // The bucket's lower bound in microseconds — `2^i` nanoseconds — which is what a
+                // reader wants; sub-microsecond buckets therefore print as `0`.
+                s.push_str(&format!("{}us:{n},", (1u64 << i) / 1_000));
+            }
+        }
         // Then per-channel bytes and message counts, both directions, in a fixed order.
         for ch in Channel::ALL {
             let c = &self.c2s[ch.idx()];

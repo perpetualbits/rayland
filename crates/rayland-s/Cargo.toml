@@ -32,6 +32,7 @@ rayland-transport = { path = "../rayland-transport" } # SP2's QUIC: the network 
 rayland-present = { path = "../rayland-present" }
 anyhow = { workspace = true }                    # ergonomic top-level errors for the daemon binary
 thiserror = { workspace = true }                 # typed, precise refusals of remote input
+memchr = "2"                                     # SIMD byte search for the reply-arena fence scan; see `Applier::reply_arena_fence_signaled`
 libc = { workspace = true }                       # poll(2) on S's compositor fd for the WP0 event-return reader thread
 # WP0: S replays the app's relayed Wayland session against S's *real* compositor as a client. We use the
 # low-level `wayland_client::backend` (structured `Message`s via `send_request`), the mirror of the

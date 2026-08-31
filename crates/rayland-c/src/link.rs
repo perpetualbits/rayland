@@ -36,6 +36,74 @@
 
 // The relay message set and its framing.
 use rayland_relay::{C2S, S2C, read_msg, write_msg};
+
+/// Whether the C-side link trace is on, read from `RAYLAND_C1_LINK_LOG`.
+///
+/// # Why this exists, and why its markers match S's
+/// A synchronous round trip — the thing that sets both the frame time and the length of a swapchain
+/// rebuild — crosses four points: C writes, S reads, S writes, C reads. S has stamped its two since
+/// 2026-08-31 (`[s-link]`); these are the other two. With both on the same `CLOCK_MONOTONIC` the trip
+/// decomposes into *send + flush*, *wire to S*, *S processing*, and *wire back*, which is the only way
+/// to say where its ~2 ms actually sits rather than guessing. Measured need: a swapchain rebuild does
+/// roughly 477 of these and takes ~970 ms, which is the stall the owner sees on a focus change.
+fn link_log_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RAYLAND_C1_LINK_LOG").is_some())
+}
+
+/// Emit one C-side link event, timestamped on the clock S also uses.
+///
+/// Markers mirror S's so the two logs read as one stream: `s>` before a write, `s<` after the flush
+/// that makes it leave, `r<` when a reply has been read. Inert unless [`link_log_enabled`].
+fn clink(marker: &str, what: &str) {
+    if !link_log_enabled() {
+        return;
+    }
+    eprintln!(
+        "[c-link] t_ns={} {marker} {what}",
+        rayland_relay::trace::monotonic_ns()
+    );
+}
+
+/// A short, payload-free description of a `C2S`, for the link trace.
+///
+/// # Why it names a resource but never its contents
+/// Attributing a round trip needs to know *which* stream a message belongs to — the ring, the reply
+/// arena, or a staging blob all cross this link and only one of them releases the application — so the
+/// resource id and the byte count are carried. The bytes themselves never are: this is a latency
+/// instrument, a megabyte in a log line would destroy the timing it measures, and the payload is the
+/// application's own pixels.
+fn c2s_kind(m: &C2S) -> String {
+    match m {
+        C2S::CreateContext { .. } => "CreateContext".to_string(),
+        C2S::CreateBlob { blob_id, size, .. } => format!("CreateBlob blob={blob_id} size={size}"),
+        C2S::BlobData { res_id, bytes, .. } => format!("BlobData res={res_id} n={}", bytes.len()),
+        C2S::RingDelta {
+            ring_res_id,
+            tail,
+            bytes,
+        } => format!("RingDelta res={ring_res_id} tail={tail} n={}", bytes.len()),
+        C2S::SubmitCmd { .. } => "SubmitCmd".to_string(),
+        C2S::NotifyRing { ring_id, seqno } => format!("NotifyRing ring={ring_id} seq={seqno}"),
+        C2S::UnrefResource { .. } => "UnrefResource".to_string(),
+        C2S::WaylandRequest { .. } => "WaylandRequest".to_string(),
+        C2S::WaylandBind { .. } => "WaylandBind".to_string(),
+        _ => "other".to_string(),
+    }
+}
+
+/// The same for an `S2C`, and for the same reasons.
+fn s2c_kind(m: &S2C) -> String {
+    match m {
+        S2C::BlobCreated { res_id, .. } => format!("BlobCreated res={res_id}"),
+        S2C::BlobData { res_id, bytes, .. } => format!("BlobData res={res_id} n={}", bytes.len()),
+        S2C::RingProgress { consumed_tail, .. } => format!("RingProgress tail={consumed_tail}"),
+        S2C::Error { .. } => "Error".to_string(),
+        S2C::WaylandEvent { .. } => "WaylandEvent".to_string(),
+        _ => "other".to_string(),
+    }
+}
+
 // The transport halves SP2 exposes, and the error type the engine seam speaks.
 use rayland_transport::{QuicRecv, QuicSend};
 use rayland_vtest::EngineError;
@@ -101,15 +169,28 @@ impl crate::relay_engine::RelayLink for QuicSendLink {
     fn send(&mut self, m: &C2S) -> Result<(), EngineError> {
         // `write_msg` reports the framed size — body plus the 4-byte prefix — because it is the only
         // place that knows it without serializing a possibly-megabyte message twice (Task 9).
+        // Stamped before the write and again after the flush, so the trace separates "serialising and
+        // handing to quinn" from "actually on the wire" — a distinction that matters because a request
+        // that has not been flushed is one S has not seen, and the caller is usually blocked on it.
+        clink("s>", &c2s_kind(m));
+        // The cost clock starts *after* the trace line, so an enabled trace inflates nothing but
+        // itself. This is the third instrument in this project to be caught measuring its own
+        // logging, and the fix each time was to move the boundary rather than to trust it.
+        let sending = std::time::Instant::now();
         let framed = write_msg(&mut self.send, m).map_err(|e| EngineError::RelayLinkFailed {
             detail: format!("writing {m:?} to S failed: {e}"),
         })?;
         // Classify and count *after* a successful write: a message that failed to go out is not
         // traffic, and counting it would inflate the byte totals with bytes the network never saw.
         crate::metrics::metrics().record_send(m, framed);
-        self.send.flush().map_err(|e| EngineError::RelayLinkFailed {
+        let flushed = self.send.flush().map_err(|e| EngineError::RelayLinkFailed {
             detail: format!("flushing the link to S failed: {e}"),
-        })
+        });
+        // Recorded even when the write failed above would have returned early — it cannot reach here
+        // in that case — so every duration folded in is one of a message that actually went out.
+        crate::metrics::metrics().record_send_cost(sending.elapsed());
+        clink("s<", &c2s_kind(m));
+        flushed
     }
 
     /// Refused in type: this half cannot receive, and the reader thread must be the only thing that
@@ -159,6 +240,7 @@ impl crate::relay_engine::RelayLink for QuicRecvLink {
         // the return-path total (ring-findings §7's ~12x prediction) trustworthy rather than a
         // sample.
         crate::metrics::metrics().record_recv(&m, framed);
+        clink("r<", &s2c_kind(&m));
         Ok(m)
     }
 }

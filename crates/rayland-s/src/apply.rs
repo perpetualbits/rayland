@@ -84,7 +84,9 @@ pub enum ApplyError {
     /// A WP0 Wayland-proxy message reached the vtest `apply` path. The session router must split the
     /// Wayland channel off to the S-side Wayland client *before* `apply`; one arriving here is an
     /// internal routing bug, surfaced loudly rather than silently mis-decoded as a vtest message.
-    #[error("a Wayland-proxy message reached the vtest apply path; the session router failed to split it")]
+    #[error(
+        "a Wayland-proxy message reached the vtest apply path; the session router failed to split it"
+    )]
     WaylandMessageOnVtestPath,
 
     /// C negotiated a vtest protocol version S does not implement.
@@ -1116,9 +1118,10 @@ impl Applier {
     ///   no queue is latched. Reads `head` with the same acquire load as [`Self::retirement_ring_idx`].
     pub fn queue_ring_drained(&self) -> bool {
         let Some(q) = self.queue else { return false };
-        let (Some(mirror), Some(blob)) =
-            (self.rings.get(&q.ring_res_id), self.blobs.get(&q.ring_res_id))
-        else {
+        let (Some(mirror), Some(blob)) = (
+            self.rings.get(&q.ring_res_id),
+            self.blobs.get(&q.ring_res_id),
+        ) else {
             return false;
         };
         // Equality, not `>=`: `head` can never pass `applied_tail` (the ring thread cannot consume
@@ -1476,9 +1479,9 @@ impl Applier {
     /// - Takes `&self`; scans the live bytes of the reply arena. Returns `true` on the first
     ///   `[38u32][0u32]` little-endian match (aligned scan — Venus encodes 4-byte aligned).
     pub fn reply_arena_fence_signaled(&self) -> bool {
-        // `vkGetFenceStatus`'s command type and the result it reports once the fence has signalled.
-        const GET_FENCE_STATUS: u32 = 38;
-        const VK_SUCCESS: u32 = 0;
+        // The pattern itself, and the reason a whole-arena scan is affordable at all, live in
+        // [`arena_shows_signaled_fence`]. This method's job is only to decide *which* blobs are the
+        // reply arena — a question about `Applier`'s bookkeeping, not about Venus's encoding.
         for (&res_id, blob) in &self.blobs {
             // The reply arena only: Venus-internal (`blob_id == 0`), not the ring, and — crucially —
             // one S has written (`s_written`), which excludes the same-marker staging pool whose
@@ -1489,15 +1492,8 @@ impl Applier {
             {
                 continue;
             }
-            let b = blob.bytes();
-            let mut o = 0;
-            while o + 8 <= b.len() {
-                let ty = u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
-                let res = u32::from_le_bytes(b[o + 4..o + 8].try_into().unwrap());
-                if ty == GET_FENCE_STATUS && res == VK_SUCCESS {
-                    return true;
-                }
-                o += 4;
+            if arena_shows_signaled_fence(blob.bytes()) {
+                return true;
             }
         }
         false
@@ -1605,7 +1601,6 @@ impl Applier {
             .map(|(&res_id, blob)| (res_id, rayland_relay::trace::fingerprint(blob.bytes())))
             .collect()
     }
-
 
     /// **(c)1 Task 9 Probe A support**: how many `C2S::RingDelta` messages have been applied so far.
     ///
@@ -2075,4 +2070,188 @@ fn sparse_fingerprint(bytes: &[u8]) -> (usize, u64) {
         i = end;
     }
     (nonzero, hash)
+}
+
+/// Does this arena currently show a `vkGetFenceStatus` reply reading `VK_SUCCESS`?
+///
+/// # What the pattern means
+/// With fence feedback off, the application implements `vkWaitForFences` by polling
+/// `vkGetFenceStatus`, and virglrenderer writes each answer into the reply arena as two little-endian
+/// `u32`s: the command type (38) followed by the `VkResult`. `[38][0]` — type 38, `VK_SUCCESS` — is
+/// therefore the moment the application's submit **and its readback copy** have completed on S's GPU.
+/// That is the (c)2 completion barrier's whole signal; see `Applier::reply_arena_fence_signaled` for
+/// why it is read from the live arena rather than from the shipped diff, and why a lingering earlier
+/// success cannot be mistaken for a fresh one.
+///
+/// # Why a byte search rather than a walk over every 4-aligned word
+/// The word walk this replaced touched `len / 4` positions, and these arenas are megabytes. Measured
+/// on 2026-08-31 it spent **2.24 s of a 15 s run holding the applier lock** — the single largest
+/// lock-holder in `rayland-s`, and so the largest term in the application's round-trip latency, since
+/// the message thread that reads the next doorbell blocks on that same lock.
+///
+/// Every match begins with the byte `38` at a 4-aligned offset followed by seven zero bytes, so
+/// searching for that byte and verifying the rest visits a superset of the walk's positions and
+/// accepts exactly the same ones. The change is speed, not meaning — and `scan_words` below plus
+/// `same_answer_as_word_walk` exist to keep that claim honest rather than asserted.
+///
+/// # Inputs / outputs
+/// - `b`: the arena's live bytes.
+/// - Returns `true` at the first match. A buffer shorter than 8 bytes can hold no reply and is
+///   `false`.
+fn arena_shows_signaled_fence(b: &[u8]) -> bool {
+    /// `vkGetFenceStatus`'s command type in Venus's reply encoding.
+    const GET_FENCE_STATUS: u32 = 38;
+    /// The `VkResult` that ends the application's poll loop.
+    const VK_SUCCESS: u32 = 0;
+    // The pattern's first byte. Little-endian, `38u32` is `26 00 00 00`, so a match cannot start
+    // anywhere else. The assertions keep that derivation true if either constant is ever changed.
+    const FIRST_BYTE: u8 = GET_FENCE_STATUS as u8;
+    debug_assert_eq!(GET_FENCE_STATUS.to_le_bytes(), [FIRST_BYTE, 0, 0, 0]);
+    debug_assert_eq!(VK_SUCCESS.to_le_bytes(), [0, 0, 0, 0]);
+    for o in memchr::memchr_iter(FIRST_BYTE, b) {
+        // The walk only ever looked at 4-aligned offsets, so an unaligned `38` was never a match and
+        // must not become one here. This is the one line that makes the two implementations agree.
+        if o % 4 != 0 || o + 8 > b.len() {
+            continue;
+        }
+        // Read back as `u32`s rather than compared as raw bytes, so the code still states the
+        // condition in Venus's own terms rather than in the search's.
+        let ty = u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        let res = u32::from_le_bytes(b[o + 4..o + 8].try_into().unwrap());
+        if ty == GET_FENCE_STATUS && res == VK_SUCCESS {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod fence_scan_tests {
+    use super::arena_shows_signaled_fence;
+
+    /// The implementation `arena_shows_signaled_fence` replaced, kept **only** as a test oracle.
+    ///
+    /// This is the exact word walk that shipped until 2026-08-31: read two little-endian `u32`s at
+    /// every 4-aligned offset and accept `[38][0]`. It exists so the optimisation's central claim —
+    /// "same answer, less time" — is checked against the old code rather than against the new code's
+    /// own author, which is a mistake this project has made twice before with tests written from the
+    /// same belief as the code they guarded.
+    fn scan_words(b: &[u8]) -> bool {
+        let mut o = 0;
+        while o + 8 <= b.len() {
+            let ty = u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+            let res = u32::from_le_bytes(b[o + 4..o + 8].try_into().unwrap());
+            if ty == 38 && res == 0 {
+                return true;
+            }
+            o += 4;
+        }
+        false
+    }
+
+    /// The named cases a reader should be able to check by eye, each stating why it matters.
+    #[test]
+    fn recognises_and_rejects_the_obvious_cases() {
+        // A clean signalled reply at the start of the arena.
+        let mut hit = vec![0u8; 64];
+        hit[0] = 38;
+        assert!(arena_shows_signaled_fence(&hit), "[38][0] at offset 0");
+
+        // The same reply further in, still 4-aligned.
+        let mut later = vec![0u8; 64];
+        later[36] = 38;
+        assert!(arena_shows_signaled_fence(&later), "[38][0] at offset 36");
+
+        // `VK_NOT_READY`: the answer the application gets *during* a copy's DMA. Accepting this would
+        // release the application onto a torn frame, which is the defect the barrier exists to stop.
+        let mut not_ready = vec![0u8; 64];
+        not_ready[0] = 38;
+        not_ready[4] = 1;
+        assert!(
+            !arena_shows_signaled_fence(&not_ready),
+            "[38][1] is VK_NOT_READY and must not signal"
+        );
+
+        // A `38` byte that is not a reply boundary. The byte search must not turn stray payload into
+        // a completion signal — this is precisely the false positive the alignment check prevents.
+        let mut unaligned = vec![0u8; 64];
+        unaligned[13] = 38;
+        assert!(
+            !arena_shows_signaled_fence(&unaligned),
+            "an unaligned 38 is payload, not a reply"
+        );
+
+        // Too short to hold a reply at all.
+        assert!(!arena_shows_signaled_fence(&[38, 0, 0, 0, 0, 0, 0]));
+        assert!(!arena_shows_signaled_fence(&[]));
+    }
+
+    /// The differential property: over adversarially-shaped buffers, the byte search and the word
+    /// walk must give the same answer every time.
+    ///
+    /// # Why the buffers are built this way rather than being uniformly random
+    /// A uniformly random buffer almost never contains `[38][0]`, so a random test would pass while
+    /// only ever exercising the `false` branch — it would confirm the belief it was written from. The
+    /// generator below deliberately over-represents the bytes that decide the answer (`38`, `0`, `1`)
+    /// so that both outcomes, and the near-misses between them, occur often. The counters at the end
+    /// assert that they actually did, so this test cannot quietly degrade into a tautology.
+    #[test]
+    fn same_answer_as_word_walk() {
+        // A tiny deterministic PRNG (xorshift64*). Deterministic so a failure is reproducible from
+        // the seed alone, and hand-rolled so the test adds no dependency.
+        let mut state = 0x2026_0831_u64.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let (mut agreed_true, mut agreed_false) = (0u32, 0u32);
+        for case in 0..5_000 {
+            // Lengths from 0 up past two words, so the short-buffer and tail-remainder edges are hit
+            // often rather than once.
+            let len = (next() % 40) as usize;
+            let mut b = vec![0u8; len];
+            for byte in b.iter_mut() {
+                // Weighted towards the deciding bytes; see this test's docs.
+                *byte = match next() % 8 {
+                    0..=2 => 0,
+                    3 | 4 => 38,
+                    5 => 1,
+                    _ => (next() % 256) as u8,
+                };
+            }
+            // Random bytes alone almost never spell `[38][0]` — a first version of this test produced
+            // four positive cases in five thousand, and would have "passed" while exercising only the
+            // `false` branch. So half the cases get a candidate reply planted at a deliberate offset,
+            // aligned or not, signalled or not: that is what puts the two implementations' actual
+            // disagreement surface — alignment and the trailing `VkResult` — under the comparison.
+            if len >= 8 && next() % 2 == 0 {
+                let at = (next() as usize) % (len - 7);
+                b[at] = 38;
+                for z in 1..4 {
+                    b[at + z] = 0;
+                }
+                // The `VkResult` word: usually `VK_SUCCESS`, sometimes `VK_NOT_READY`, occasionally
+                // left as whatever the noise put there.
+                let result: u32 = match next() % 4 {
+                    0 => 1,
+                    1 => next() as u32,
+                    _ => 0,
+                };
+                b[at + 4..at + 8].copy_from_slice(&result.to_le_bytes());
+            }
+            let fast = arena_shows_signaled_fence(&b);
+            let slow = scan_words(&b);
+            assert_eq!(fast, slow, "case {case} disagreed on {b:?}");
+            if fast {
+                agreed_true += 1;
+            } else {
+                agreed_false += 1;
+            }
+        }
+        // Both outcomes must have occurred, or the agreement above proves nothing.
+        assert!(agreed_true > 100, "only {agreed_true} positive cases");
+        assert!(agreed_false > 100, "only {agreed_false} negative cases");
+    }
 }
