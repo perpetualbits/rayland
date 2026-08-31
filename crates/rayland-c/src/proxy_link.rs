@@ -44,7 +44,10 @@ impl WaylandSink for LinkSink {
     /// thread surfaces independently. Locking the mutex briefly matches the ring watcher's discipline.
     fn forward_request(&self, msg: WaylandMessage) {
         // Lock only for the framed send; drop the guard immediately after.
-        let mut link = self.tx.lock().expect("the send-link mutex is never poisoned");
+        let mut link = self
+            .tx
+            .lock()
+            .expect("the send-link mutex is never poisoned");
         if let Err(e) = link.send(&C2S::WaylandRequest { message: msg }) {
             // A failed send is not traffic and not recoverable here; the reader thread will see the
             // link die too. Log so the cause is visible rather than silently dropping the request.
@@ -58,7 +61,10 @@ impl WaylandSink for LinkSink {
     /// `GlobalHandler::bind`, before the object's first request, and the link preserves order — so the
     /// causal ordering (bind, then requests) is maintained.
     fn forward_bind(&self, interface: &str, version: u32, app_object_id: u32) {
-        let mut link = self.tx.lock().expect("the send-link mutex is never poisoned");
+        let mut link = self
+            .tx
+            .lock()
+            .expect("the send-link mutex is never poisoned");
         let bind = C2S::WaylandBind {
             interface: interface.to_string(),
             version,
@@ -98,10 +104,28 @@ impl ResourceResolver for BlobInodeResolver {
     /// matches (a foreign fd the proxy must not turn into a token).
     fn resolve_inode(&self, dev: u64, ino: u64) -> Option<u32> {
         // Scan the table for the blob whose recorded inode matches; its key is the resource id.
-        let blobs = self.blobs.lock().expect("the blob table mutex is never poisoned");
-        blobs
+        // `lock_mut` because a match is also a *decision about that blob's future*: see below.
+        let mut blobs = self
+            .blobs
+            .lock()
+            .expect("the blob table mutex is never poisoned");
+        let found = blobs
             .iter()
-            .find_map(|(res_id, blob)| (blob.inode() == (dev, ino)).then_some(*res_id))
+            .find_map(|(res_id, blob)| (blob.inode() == (dev, ino)).then_some(*res_id))?;
+        // **Mark it presented.** Resolving this inode is C deciding that this blob becomes a
+        // `wl_buffer` on S's compositor — which means S's GPU will render into it and, since the
+        // 2026-08-29 presented-buffer exclusion, will deliberately NOT report those writes back to C.
+        // C's baseline for it is therefore stale by design, and the forward diff must not coalesce
+        // its runs (coalescing re-ships the unchanged gap bytes *from that stale baseline*, laying
+        // C's old news over S's freshly rendered pixels). See `LocalBlob::presented`.
+        //
+        // This runs at `params.add`, before `create_immed` decides whether a token is really emitted,
+        // so it marks a superset of the blobs that truly become buffers. That is the safe direction:
+        // an over-mark costs a missed optimisation, an under-mark costs corrupted pixels.
+        if let Some(blob) = blobs.get_mut(&found) {
+            blob.note_presented();
+        }
+        Some(found)
     }
 }
 
@@ -140,6 +164,58 @@ mod tests {
         assert_eq!(resolver.resolve_inode(odev, oino), None);
 
         // Keep fd_a alive to the end so the memfd (and thus its inode) is unambiguously live.
+        drop(fd_a);
+    }
+
+    /// **Resolving an inode marks that blob presented, and marks no other.**
+    ///
+    /// This is the wiring the C→S coalescing safety rule hangs on, and it is tested separately
+    /// because the rule is *unreachable* without it: `messages_for_delta` asks `is_presented()`, and
+    /// if nothing ever sets the flag then every blob — swapchain images included — gets coalesced and
+    /// C re-ships its stale copy of bytes S rendered. That failure is silent, produces no error, and
+    /// shows up only as corrupted pixels on someone's screen.
+    ///
+    /// Resolving is the right moment because it is exactly when C decides this memfd is the swapchain
+    /// image behind a `params.add`. It is deliberately earlier than `create_immed`, so the mark is a
+    /// superset of the blobs that truly become buffers — an over-mark costs a missed optimisation,
+    /// an under-mark costs pixels.
+    #[test]
+    fn resolving_an_inode_marks_that_blob_presented_and_no_other() {
+        let (blob_a, fd_a) = LocalBlob::create(1, 4096).expect("blob a");
+        let (blob_b, _fd_b) = LocalBlob::create(2, 4096).expect("blob b");
+        let ino_a = blob_a.inode();
+
+        let mut table = HashMap::new();
+        table.insert(77u32, blob_a);
+        table.insert(88u32, blob_b);
+        let blobs = Arc::new(Mutex::new(table));
+        let resolver = BlobInodeResolver::new(blobs.clone());
+
+        // Nothing is presented until something is resolved.
+        {
+            let t = blobs.lock().expect("the blob table");
+            assert!(
+                !t[&77].is_presented(),
+                "nothing is presented before a resolve"
+            );
+            assert!(!t[&88].is_presented());
+        }
+
+        assert_eq!(resolver.resolve_inode(ino_a.0, ino_a.1), Some(77));
+
+        {
+            let t = blobs.lock().expect("the blob table");
+            assert!(
+                t[&77].is_presented(),
+                "the resolved blob must be marked presented, or the forward diff will coalesce a \
+                 swapchain image and re-ship C's stale copy over S's rendered pixels"
+            );
+            assert!(
+                !t[&88].is_presented(),
+                "an unrelated blob must NOT be marked — over-marking every blob would silently \
+                 disable coalescing everywhere and this test would still pass on the line above"
+            );
+        }
         drop(fd_a);
     }
 }

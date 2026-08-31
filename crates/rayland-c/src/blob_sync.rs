@@ -271,8 +271,37 @@ pub fn messages_for_delta(blobs: &BlobTable, ring_res_id: u32, delta: RingDelta)
             // which an earlier experiment did, tripled C's message count and slowed the relay enough
             // that the application never reached the submit under test.
             blob.ensure_baseline();
+            // **How near two changed runs must be for this direction to merge them.**
+            //
+            // Measured 2026-08-31: one loopback `vkcube` run sent 5,495 `C2S::BlobData` of which
+            // **5,409 carried one to three bytes each**, almost all of them the 8 MiB staging pool
+            // fragmenting under a byte-granular diff — about a second of wall clock inside C's
+            // `send()`, per run, to move a few kilobytes. The forward path is message-rate bound for
+            // the same reason the return path was, and this is the same remedy.
+            //
+            // 256 matches the value S's readback path already uses, so the two directions do not
+            // acquire different magic numbers for the same trade.
+            const FORWARD_COALESCE_GAP: usize = 256;
+            // **A presented blob keeps the strict byte grain, and this is the safety condition.**
+            //
+            // Coalescing re-ships the unchanged bytes in a gap, taken from C's baseline — safe only
+            // while that baseline is a faithful model of S's copy. It is faithful because S reports
+            // every byte it writes and `note_s_wrote` folds it in, with exactly one exception: S
+            // excludes **presented** resources from its return path (added 2026-08-29, when S was
+            // found shipping ~877 KB of rendered frame per second back to a machine with no display).
+            // For those, S's GPU writes and never tells C, so C's baseline is stale by design and a
+            // re-shipped gap byte would overwrite S's freshly rendered pixels with C's old news.
+            //
+            // C knows which blobs those are because C is the side that publishes their `BufferToken`s
+            // — `BlobInodeResolver::resolve_inode` marks the blob when it resolves the swapchain
+            // memfd. See `LocalBlob::is_presented` and `rayland_relay::ranges::coalesce_ranges`.
+            let gap = if blob.is_presented() {
+                0
+            } else {
+                FORWARD_COALESCE_GAP
+            };
             // Each run reuses `BlobData`'s offset field; v1 only ever used offset 0 (the whole blob).
-            for run in blob.take_changed_runs() {
+            for run in blob.take_changed_runs(gap) {
                 out.push(C2S::BlobData {
                     res_id,
                     offset: run.offset,
@@ -393,8 +422,7 @@ mod tests {
             })
             .expect("the vertex buffer");
         assert_eq!(
-            *blob.0,
-            0,
+            *blob.0, 0,
             "a uniformly-filled blob diffed against a zero baseline is exactly one run \
              covering the whole blob, so it still starts at offset 0"
         );
@@ -479,7 +507,9 @@ mod tests {
         // `apply_blob_data` and `commit_pending_blob` use — write the bytes, then record them.
         {
             let mut table = blobs.lock().expect("the blob table lock is never poisoned");
-            let blob = table.get_mut(&ARENA_RES).expect("the arena is in the table");
+            let blob = table
+                .get_mut(&ARENA_RES)
+                .expect("the arena is in the table");
             blob.bytes_mut()[64..96].copy_from_slice(&[0xEE; 32]);
             blob.note_s_wrote(64, &[0xEE; 32]);
         }
@@ -562,6 +592,102 @@ mod tests {
         assert!(matches!(msgs[0], C2S::RingDelta { .. }));
     }
 
+    /// **The forward path coalesces nearby changed runs — and a presented blob does not.**
+    ///
+    /// Both halves are asserted in one test on purpose: the interesting claim is not "coalescing
+    /// works" but "coalescing is *withheld* exactly where it would be unsafe", and that is only
+    /// visible as a difference between two blobs in the same relay.
+    ///
+    /// The scenario is the one the safety argument is about. Each blob gets two changed bytes
+    /// separated by a short unchanged gap. For an ordinary blob the gap rides along and one
+    /// `BlobData` crosses, because S reports every byte it writes and C's baseline is therefore a
+    /// true model of S's copy — so re-shipping the gap byte writes what S already holds. For a
+    /// **presented** blob S renders into it and deliberately never reports those writes, C's baseline
+    /// is stale by design, and the gap must stay unshipped: two `BlobData`, byte-granular.
+    #[test]
+    fn nearby_runs_coalesce_except_on_a_presented_blob() {
+        // Two application blobs, identical in every way but the mark.
+        let blobs = table_of(&[
+            (5, VERTEX_BUFFER_BLOB_ID, 64, 0x00),
+            (6, VERTEX_BUFFER_BLOB_ID, 64, 0x00),
+        ]);
+        {
+            let mut table = blobs.lock().expect("the blob table lock");
+            // `res=6` is a swapchain image C has published as a BufferToken.
+            table.get_mut(&6).expect("res 6").note_presented();
+            // The same two-changes-with-a-gap pattern in each: bytes 0 and 4 change, 1..4 do not.
+            for id in [5u32, 6u32] {
+                let blob = table.get_mut(&id).expect("the blob");
+                blob.ensure_baseline();
+                // Drain the birth diff first, so what the relay below sees is only this edit.
+                let _ = blob.take_changed_runs(0);
+                blob.bytes_mut()[0] = 0x11;
+                blob.bytes_mut()[4] = 0x22;
+            }
+        }
+
+        let out = messages_for_delta(&blobs, 1, a_delta());
+        let runs_for = |res: u32| -> Vec<(u64, usize)> {
+            out.iter()
+                .filter_map(|m| match m {
+                    C2S::BlobData {
+                        res_id,
+                        offset,
+                        bytes,
+                    } if *res_id == res => Some((*offset, bytes.len())),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // The ordinary blob: one run covering 0..5, the 3-byte gap re-shipped.
+        assert_eq!(
+            runs_for(5),
+            vec![(0, 5)],
+            "an ordinary blob's two nearby changes must coalesce into one BlobData"
+        );
+        // The presented blob: the byte grain is preserved, so C cannot overwrite S's pixels with the
+        // stale gap bytes. THIS is the safety property; if it ever fails, presented frames corrupt.
+        assert_eq!(
+            runs_for(6),
+            vec![(0, 1), (4, 1)],
+            "a presented blob must keep the byte grain — coalescing would re-ship C's stale copy of \
+             bytes S rendered and never reported back"
+        );
+    }
+
+    /// **A gap wider than the threshold is not merged, on any blob.**
+    ///
+    /// The companion to the test above: coalescing is bounded, so a blob with two genuinely distant
+    /// changes still ships two runs rather than the megabyte between them. Without this, "coalescing
+    /// works" could be satisfied by a broken implementation that merges everything.
+    #[test]
+    fn changes_farther_apart_than_the_threshold_stay_separate() {
+        let blobs = table_of(&[(5, VERTEX_BUFFER_BLOB_ID, 4096, 0x00)]);
+        {
+            let mut table = blobs.lock().expect("the blob table lock");
+            let blob = table.get_mut(&5).expect("the blob");
+            blob.ensure_baseline();
+            let _ = blob.take_changed_runs(0);
+            // 0 and 1000: a 999-byte gap, far past the 256-byte threshold.
+            blob.bytes_mut()[0] = 0x11;
+            blob.bytes_mut()[1000] = 0x22;
+        }
+        let out = messages_for_delta(&blobs, 1, a_delta());
+        let runs: Vec<(u64, usize)> = out
+            .iter()
+            .filter_map(|m| match m {
+                C2S::BlobData { offset, bytes, .. } => Some((*offset, bytes.len())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            runs,
+            vec![(0, 1), (1000, 1)],
+            "a 999-byte unchanged gap is past the threshold and must not be re-shipped"
+        );
+    }
+
     /// The point of the whole change: a blob that has not changed since the last relay must not be
     /// re-shipped. Relaying twice, the second relay carries only the ring delta.
     #[test]
@@ -571,7 +697,9 @@ mod tests {
         // First relay: the vertex buffer's content crosses (baseline was zeros).
         let first = messages_for_delta(&blobs, 1, a_delta());
         assert!(
-            first.iter().any(|m| matches!(m, C2S::BlobData { res_id: 3, .. })),
+            first
+                .iter()
+                .any(|m| matches!(m, C2S::BlobData { res_id: 3, .. })),
             "the first relay must ship the app blob's content"
         );
 
@@ -648,9 +776,6 @@ fn blob_fingerprints(table: &std::collections::HashMap<u32, crate::shm::LocalBlo
         );
     }
 }
-
-
-
 
 /// A blob fingerprint that skips zero regions: `(non-zero byte count, digest of the non-zero bytes)`.
 ///

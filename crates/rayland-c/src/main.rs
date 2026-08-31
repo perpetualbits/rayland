@@ -1073,7 +1073,9 @@ fn main() -> Result<()> {
         // fd's inode into the resource id, by scanning the blob table. Both are clones of the same
         // shared state the reader thread and ring watcher already use.
         let sink = Arc::new(rayland_c::proxy_link::LinkSink::new(Arc::clone(&tx)));
-        let resolver = Arc::new(rayland_c::proxy_link::BlobInodeResolver::new(Arc::clone(&blobs)));
+        let resolver = Arc::new(rayland_c::proxy_link::BlobInodeResolver::new(Arc::clone(
+            &blobs,
+        )));
         let wl_path = std::path::PathBuf::from(wl_socket);
         // The inbox was created above alongside the poster the reader holds; both exist iff the socket does.
         let inbox = wl_inbox.expect("the event inbox is created whenever the proxy socket is set");
@@ -1188,7 +1190,7 @@ mod tests {
         let mut table = blobs.lock().expect("the blob table lock is never poisoned");
         let blob = table.get_mut(&3).expect("the blob committed above");
         assert!(
-            blob.take_changed_runs().is_empty(),
+            blob.take_changed_runs(0).is_empty(),
             "C must not re-ship the bytes S itself just sent back to it"
         );
     }

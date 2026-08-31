@@ -5419,3 +5419,88 @@ and it already names the next candidates: `take_venus_blob_writes` (~0.6–0.9 s
 remaining), the message thread's own 1.1 s of hold, and the 5,409 one-to-three-byte forward messages
 per run, which cost C about a second inside `send()` — a coalescing problem on the C→S path exactly
 analogous to the one already fixed on S's readback path.
+
+### 2026-08-31 (later) — Coalescing the forward path, and the safety check that decided its shape
+
+The round-trip decomposition earlier today left a second finding sitting in the census: of the 5,495
+`C2S::BlobData` one loopback `vkcube` run sends, **5,409 carry one to three bytes each**, costing C
+about a second inside `send()` per run to move a few kilobytes. S's readback path had exactly this
+disease and it was cured in July by gap-threshold coalescing. The obvious move is to do the same
+thing in the other direction. The interesting part is that it is **not** obviously safe, and working
+out why took longer than the change.
+
+**The safety check.** `blob_sync`'s own docs already state the invariant, and reading them carefully
+is what produced the answer rather than a guess: C keeps a **baseline** per blob, which is *C's model
+of what S holds*, and `note_s_wrote` folds every byte arriving from S into it. Coalescing merges two
+changed runs across a gap of unchanged bytes and re-ships the gap — and the gap bytes are shipped
+**from the baseline**. So:
+
+> Re-shipping an unchanged byte is safe exactly when the baseline is a faithful model of the
+> receiver's copy for that byte. If the model is right, the write is a no-op. If the model is stale,
+> the write lays C's old news over S's authoritative bytes.
+
+So the question is not "is coalescing safe?" but "**where can S's copy change without C being
+told?**" I went to S's code rather than its prose, and the answer is exact: `emit_blob_writes` skips
+`self.rings`, and `take_venus_blob_writes` skips `self.rings` and `self.presented`. Rings are already
+excluded from the forward path. **`presented` is the whole hazard** — and it is a hazard we created
+ourselves on 2026-08-29, when S was found shipping ~877 KB of rendered frame per second back to a
+machine with no display and presented resources were excluded from the return path. For those blobs
+S's GPU writes and never reports, so C's baseline is stale *by design*, and coalescing across a gap
+there would overwrite freshly rendered pixels with C's zeros.
+
+That gives a rule with no hand-waving in it: **coalesce everything except blobs C has published as a
+`BufferToken`.** C is the side that publishes them, so C knows. The mark goes on at
+`BlobInodeResolver::resolve_inode` — the moment C decides a memfd is the swapchain image behind a
+`params.add`. That is deliberately *earlier* than `create_immed`, so it marks a superset: an
+over-mark costs a missed optimisation, an under-mark costs corrupted pixels, and only one of those is
+recoverable.
+
+I nearly shipped a weaker version — "only coalesce Venus-internal blobs" — which would have covered
+4,564 of the 5,409 tiny messages with no cross-module knowledge at all. It is tempting because it is
+self-contained. I rejected it because its safety rests on *"vkcube's swapchain images happen never to
+be CPU-written"*, which is a property of one workload, not of the design. The rule above rests on
+what S actually excludes.
+
+**One thing the check turned up that I am not fixing here, and it should be written down.** S's
+*return* path coalesces at gap 256 for application blobs, and its justification is that `res6` is
+"S-written and C-read-only". That is true of the readback buffer and it is not a property of the
+filter — `take_app_blob_writes` selects every non-ring, non-Venus-internal, non-presented blob. A
+blob that both sides write would get S's stale copy of the application's own bytes laid over it at a
+256-byte grain, which is precisely the "false sharing at S's page grain" hazard the byte-granular
+diff was introduced to kill, reintroduced smaller. It does not fire today. It is a latent version of
+the bug I just spent an hour reasoning about in the opposite direction, and it deserves the same
+treatment.
+
+**The shared helper.** Both directions now rest on the same one-paragraph argument, so
+`coalesce_ranges` moved out of `rayland-s` into `rayland-relay` — the crate both already depend on —
+with the rule and the obligation each caller owes written at the top. Two copies of a safety argument
+drift; that is the same reasoning `rayland-icosa-core` exists for.
+
+**Teeth.** Five mutations, each caught: the resolver not marking; the resolver marking *every* blob
+(which would silently disable coalescing everywhere while the naive test still passed); the presented
+gate removed; the gap set to 0; the gap set to `usize::MAX`. The second one is the reason the test
+asserts a *negative* as well as a positive — "blob 88 must NOT be marked" — and it is the mutation I
+would have missed a fortnight ago.
+
+**Measured, interleaved A/B on loopback:**
+
+| | before | after | |
+|---|---|---|---|
+| C→S messages per frame | 90.3 | **14.8** | **6.1×** |
+| time inside C's `send()` per run | 1,644 ms | **303 ms** | **5.4×** |
+| C→S bytes per frame | 5,645 | 6,027 | +6.8% (the bounded trade) |
+| median frame gap | 61 ms | 61 ms | **unchanged** |
+
+**And that last row is the finding, not the disappointment.** This is the *second* fix today to
+collapse a mechanism by 5–8× and move the frame rate by nothing measurable. Two independent large
+reductions in CPU work — S's lock contention this morning, C's send path this afternoon — with no
+end-to-end effect says something specific and useful: **frame time on this machine is not bound by
+CPU work on either side.** It is a serialized latency chain, and what remains in it is the number of
+round trips per frame and the fixed cost each one pays. The 200 µs `PROGRESS_POLL` is now the obvious
+suspect, and — importantly — the experiment that previously refuted it (200→20 µs made things
+*worse*) was run when every poll dragged a 2 ms arena scan behind it. That scan is now 131 µs. The
+refutation was of a different system and the experiment deserves re-running.
+
+The honest caveat on all of the above: it is loopback, on a laptop with a fast CPU, where saving C
+CPU time buys nothing because C has CPU to spare. **The prediction this change makes is about a weak
+C** — the riscv64 milkv board that manages 5 fps — and that prediction is untested as I write this.

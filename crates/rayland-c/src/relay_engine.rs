@@ -903,7 +903,7 @@ mod tests {
         let mut table = blobs.lock().expect("the blob table lock is never poisoned");
         let blob = table.get_mut(&9).expect("the committed blob");
         assert!(
-            blob.take_changed_runs().is_empty(),
+            blob.take_changed_runs(0).is_empty(),
             "S's own born-with-content bytes must be folded into the baseline at commit time, or \
              the next C->S diff would ship them straight back as though the application had \
              written them"

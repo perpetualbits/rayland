@@ -10,7 +10,7 @@ visible from the code — several of the project's central facts were discovered
 and at least three plausible-sounding designs were built and then disproved. A plan made without
 those facts will re-propose a dead end. They are all recorded here, with pointers to the evidence.
 
-**Last brought current:** 2026-08-29, against branch `wp0-wayland-proxy`.
+**Last brought current:** 2026-08-31, against branch `main`.
 
 ---
 
@@ -316,12 +316,35 @@ reason against rather than re-deriving.
 | **WP0 frame time, attributed (loopback)** | **65.8 ms** = 0.5 GPU + ~24.9 compositor pacing + **~40.4 Rayland** |
 | Native ceiling, same compositor and app | **25.4 ms/frame (39.4 fps)** — of which 24.9 ms is pacing, so the GPU work is **0.49 ms** |
 | **Synchronous round trips per WP0 frame** | **≈4.4** (S→C replies), ≈6.4 counting control — an *n × RTT* floor on any link |
+| **Round trip decomposed (loopback, 2026-08-31)** | C flush → **S read 3.9 ms**; S read → S reply 3.2 ms; S reply → C read 0.67 ms |
+| `reply_arena_fence_signaled` lock-held, before / after | p50 **1048 µs → 131 µs**; p99 134 ms → 8.4 ms; worst 537 ms → 33.5 ms |
+| C→S messages per frame, before / after coalescing | **90.3 → 14.8 (6.1×)**; time in `send()` 1,644 → 303 ms (5.4×); bytes +6.8% |
+| Median frame gap across **both** of those fixes | **61 → 61 ms — unchanged** (see the finding below) |
 
 **Frame time is the synchronous round trip.** With feedback off the app implements `vkWaitForFences`
 by polling `vkGetFenceStatus`, and *every poll is a full C→S→execute→reply→C cycle*. It is not
 bandwidth, not message count, not flush syscalls. The readback is **not** fragmented (`res=5`
 averages 377-byte runs); the one-byte flood is the **reply arena**, whose gap-0 grain is a
 deliberate correctness property — a gap byte is one S did not write.
+
+**And as of 2026-08-31 there is a sharper statement available, which a plan must not contradict: frame
+time is not bound by CPU work on either side.** Two independent mechanism fixes landed the same day —
+S's largest lock-holder (`reply_arena_fence_signaled`, a word-by-word walk of a 1 MiB reply arena on
+every ring-progress event, replaced by a `memchr` byte search: **8× at the median, 16× at p99 and at
+the worst case**) and C's forward message flood (5,409 of 5,495 `BlobData` per run carrying 1–3 bytes,
+gap-coalesced: **6.1× fewer messages, 5.4× less time in `send()`**). Each collapsed its mechanism by
+5–8×. **Neither moved the median frame gap measurably.** The chain is *serialized latency*, so what is
+left in it is the **number** of round trips per frame and the fixed cost each pays.
+
+The `PROGRESS_POLL` (200 µs, `rayland-s`) is the standing suspect for that fixed cost. Note carefully
+that the experiment which appears to refute it — 200 µs → 20 µs measured *worse*, 11.2 fps against
+12.5–14.9 — **was run when every poll dragged a ~2 ms arena scan behind it**. That scan is now 131 µs.
+The refutation was of a different system and the experiment needs re-running; do not treat it as
+settled either way.
+
+**The untested prediction.** All of the above is loopback on a fast laptop, where saving C CPU buys
+nothing because C has CPU to spare. The forward-coalescing change predicts a real gain on a **weak C**
+— the riscv64 milkv board that manages 5 fps — and that has not been measured.
 
 ### 5.4 Two findings that overturned earlier beliefs — do not re-propose the retired versions
 
@@ -684,8 +707,18 @@ it either way. This is the best ratio of information to effort currently on the 
 
 ### 6.3 Longer-term open questions
 
-- **The synchronous round trip itself.** Now the *measured* explanation for frame time. Candidate
-  directions: adaptive polling, reply batching. Matters most when latency is high.
+- **The synchronous round trip itself.** Now the *measured* explanation for frame time, and since
+  2026-08-31 it is specifically the round-trip **count** and each trip's fixed cost, not CPU work on
+  either side — see §5.3. Candidate directions: the 200 µs `PROGRESS_POLL` (re-test it; its earlier
+  refutation predates the arena-scan fix), adaptive polling, reply batching. Matters most when
+  latency is high.
+- **A latent coalescing hazard on S's return path**, found by the safety check the C→S coalescing
+  change required and deliberately *not* fixed there. `Applier::take_app_blob_writes` coalesces at
+  gap 256 on the argument that `res6` is "S-written and C-read-only" — but its filter selects every
+  non-ring, non-Venus-internal, non-presented blob. A blob **both** sides write would receive S's
+  stale copy of the application's own bytes at a 256-byte grain: the "false sharing at S's page
+  grain" hazard that byte-granular diffing was introduced to kill, reintroduced smaller. It does not
+  fire on today's workloads.
 - **Multi-queue support.** The return-path barrier decodes the application's real per-queue
   `ring_idx` from its `vkGetDeviceQueue2`; a genuinely multi-queue application is unexplored.
 - **The mapped-memory forward break is still not exercised.** This is subtle and important: the

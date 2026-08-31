@@ -64,4 +64,7 @@ pub use frame::{MAX_FRAME_BYTES, RelayError, read_msg, write_msg};
 // (c)1 Task 9 stage tracing — a shared, env-gated timeline probe used by both daemons to record the
 // return path's stages against one clock. Diagnostic; see the module's own docs for why it lives in
 // this otherwise pure-data crate and how it stays inside the crate's purity contract.
+/// Merging nearly-adjacent changed byte ranges, and the safety rule both directions share.
+pub mod ranges;
+
 pub mod trace;

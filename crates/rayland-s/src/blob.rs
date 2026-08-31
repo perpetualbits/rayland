@@ -307,8 +307,10 @@ impl HostBlob {
         // `coalesce_gap` merges runs separated by up to that many unchanged bytes (re-shipping them),
         // trading a bounded number of redundant bytes for far fewer `S2C::BlobData` messages. It is 0
         // — inert — for every path but the readback, where the grain is not load-bearing (S alone
-        // writes `res6`, C only reads it). See [`coalesce_ranges`].
-        let ranges = coalesce_ranges(self.changed_byte_ranges(), coalesce_gap);
+        // writes `res6`, C only reads it). See [`rayland_relay::ranges::coalesce_ranges`], which holds the
+        // rule and the argument each caller owes it.
+        let ranges =
+            rayland_relay::ranges::coalesce_ranges(self.changed_byte_ranges(), coalesce_gap);
 
         let mut runs = Vec::with_capacity(ranges.len());
         for (start, end) in ranges {
@@ -535,40 +537,6 @@ impl HostBlob {
     }
 }
 
-/// Merge `(start, end)` ranges separated by no more than `gap` unchanged bytes into single ranges,
-/// re-including the gap bytes.
-///
-/// [`HostBlob::changed_byte_ranges`]' byte grain exists to avoid shipping bytes S did not write (which
-/// would clobber the application's own writes — see [`HostBlob::take_bytes_s_wrote`]). This widens it
-/// back **only** for a blob where that grain is not load-bearing: the readback buffer, which S's GPU
-/// alone writes and C only reads, so a re-shipped unchanged byte equals what C already holds
-/// (idempotent). The trade is a bounded number of re-shipped unchanged bytes for far fewer
-/// `S2C::BlobData` messages — the return path is message-rate-bound, not bandwidth-bound (a readback
-/// frame otherwise shatters into thousands of one-byte runs).
-///
-/// # Inputs / outputs
-/// - `ranges`: ascending, non-overlapping half-open ranges, as [`HostBlob::changed_byte_ranges`]
-///   returns.
-/// - `gap`: merge a range into the previous one when its start is within `gap` bytes of that range's
-///   end. `gap == 0` is **inert** — `changed_byte_ranges` never returns adjacent ranges, so nothing
-///   merges and the output equals the input (the property the venus/reply path relies on).
-/// - Returns the coalesced ranges, ascending and non-overlapping.
-fn coalesce_ranges(ranges: Vec<(usize, usize)>, gap: usize) -> Vec<(usize, usize)> {
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for (start, end) in ranges {
-        // Extend the open run if this range begins within `gap` unchanged bytes of its end; otherwise
-        // start a fresh run. `start - last.1` cannot underflow — inputs are ascending and disjoint.
-        if let Some(last) = out.last_mut() {
-            if start - last.1 <= gap {
-                last.1 = end;
-                continue;
-            }
-        }
-        out.push((start, end));
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -579,39 +547,15 @@ mod tests {
     use std::os::fd::AsFd;
 
     #[test]
-    fn coalesce_ranges_merges_ranges_within_the_gap() {
-        // [0,3) then [5,8): a 2-byte unchanged gap (3..5). With a threshold of 2 they merge, so the
-        // gap bytes ride along in one run instead of splitting into two messages.
-        assert_eq!(coalesce_ranges(vec![(0, 3), (5, 8)], 2), vec![(0, 8)]);
-    }
-
-    #[test]
-    fn coalesce_ranges_keeps_ranges_farther_apart_than_the_gap_split() {
-        // Same 2-byte gap, but the threshold is 1: it exceeds the threshold, so the runs stay split
-        // and no unchanged bytes are re-shipped.
-        assert_eq!(coalesce_ranges(vec![(0, 3), (5, 8)], 1), vec![(0, 3), (5, 8)]);
-    }
-
-    #[test]
-    fn coalesce_ranges_with_zero_gap_merges_nothing() {
-        // Gap 0 is the inert case the venus path relies on: `changed_byte_ranges` never returns
-        // adjacent ranges, so nothing merges and the output equals the input.
-        assert_eq!(coalesce_ranges(vec![(0, 3), (4, 8)], 0), vec![(0, 3), (4, 8)]);
-    }
-
-    #[test]
-    fn coalesce_ranges_chains_several_small_gaps_into_one() {
-        // The readback's real pattern: many tiny runs separated by tiny gaps collapse to one run.
-        assert_eq!(
-            coalesce_ranges(vec![(3, 4), (7, 8), (11, 12)], 256),
-            vec![(3, 12)]
-        );
-    }
-
-    #[test]
     fn coalesce_ranges_empty_and_single_are_unchanged() {
-        assert_eq!(coalesce_ranges(Vec::new(), 256), Vec::<(usize, usize)>::new());
-        assert_eq!(coalesce_ranges(vec![(2, 9)], 256), vec![(2, 9)]);
+        assert_eq!(
+            rayland_relay::ranges::coalesce_ranges(Vec::new(), 256),
+            Vec::<(usize, usize)>::new()
+        );
+        assert_eq!(
+            rayland_relay::ranges::coalesce_ranges(vec![(2, 9)], 256),
+            vec![(2, 9)]
+        );
     }
 
     #[test]
@@ -622,7 +566,11 @@ mod tests {
         s_engine_writes(&blob, 3, 0x11, 1);
         // Gap 2 >= the 2-byte hole: one run ships, the unchanged gap bytes riding along.
         let runs = blob.take_bytes_s_wrote(2);
-        assert_eq!(runs.len(), 1, "the 2-byte gap is within the threshold, so one run ships");
+        assert_eq!(
+            runs.len(),
+            1,
+            "the 2-byte gap is within the threshold, so one run ships"
+        );
         assert_eq!(runs[0].offset, 0);
         assert_eq!(runs[0].bytes, vec![0x11, 0x00, 0x00, 0x11]);
     }
@@ -634,7 +582,11 @@ mod tests {
         s_engine_writes(&blob, 3, 0x11, 1);
         // Gap 0 is the venus/reply path's setting: no coalescing, the fine grain is preserved.
         let runs = blob.take_bytes_s_wrote(0);
-        assert_eq!(runs.len(), 2, "gap 0 = no coalescing = the fine grain the reply path relies on");
+        assert_eq!(
+            runs.len(),
+            2,
+            "gap 0 = no coalescing = the fine grain the reply path relies on"
+        );
     }
 
     /// A blob of `size` bytes, mapped exactly as [`crate::apply::Applier`] maps one.

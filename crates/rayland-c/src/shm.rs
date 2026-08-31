@@ -70,8 +70,8 @@ use rayland_vtest::EngineError;
 use rayland_vtest::transport::{ShmMapping, create_memfd};
 // Ring-findings §6's blob_id discrimination, held once for both (c)1 daemons. See
 // `LocalBlob::is_application_memory`.
-use rayland_vtest::venus_ring::is_application_memory;
 use rayland_relay::BlobRun;
+use rayland_vtest::venus_ring::is_application_memory;
 
 /// One blob resource's **local** shared memory: the pages Mesa maps and writes, and that
 /// `rayland-c` reads in order to relay their contents to S.
@@ -123,6 +123,26 @@ pub struct LocalBlob {
     /// which matches S's fresh, zero-filled memfd, so the first diff ships exactly the application's
     /// initial non-zero content and the two copies agree from the first relay onward.
     baseline: Vec<u8>,
+    /// Whether C has published this blob to S as a [`rayland_relay::BufferToken`] — i.e. whether S
+    /// turns it into a `wl_buffer` and shows it on the compositor.
+    ///
+    /// # Why this exists, and why it only ever *disables* something
+    /// It gates one thing: whether the C→S diff may coalesce nearly-adjacent changed runs. Coalescing
+    /// re-ships the unchanged bytes in between, which is safe only while `baseline` is a faithful
+    /// model of S's copy — and it is faithful only because S reports every byte it writes back to C,
+    /// where [`Self::note_s_wrote`] folds it in. **S makes exactly one exception: it excludes
+    /// presented resources from its return path** (`Applier::presented`, added 2026-08-29 when S was
+    /// found shipping ~877 KB of rendered frame per second back to a machine with no display). For
+    /// those blobs S's GPU writes and never tells C, so C's baseline is stale by design, and
+    /// re-shipping a gap byte would lay C's old news over S's freshly rendered pixels.
+    ///
+    /// Set when the proxy resolves this blob's inode for a buffer token, which is **conservative on
+    /// purpose**: the resolve happens at `params.add`, before `create_immed` decides whether a token
+    /// is really emitted, so this marks a superset. Marking too many blobs costs a missed
+    /// optimisation; marking too few costs corrupted pixels, and only one of those is recoverable.
+    /// Once set it is never cleared — a resource that has been a swapchain image does not stop having
+    /// been one.
+    presented: bool,
 }
 
 impl LocalBlob {
@@ -175,6 +195,10 @@ impl LocalBlob {
                 blob_id,
                 inode,
                 baseline,
+                // Nothing has been presented yet; the proxy marks this when it resolves the blob's
+                // inode for a buffer token. See the field's docs for why the default is the
+                // permissive one and the mark only ever restricts.
+                presented: false,
             },
             fd,
         ))
@@ -211,6 +235,23 @@ impl LocalBlob {
     /// [`crate::blob_sync`]'s module docs for why C keeps it and S could not use it.
     pub fn is_application_memory(&self) -> bool {
         is_application_memory(self.blob_id)
+    }
+
+    /// Record that this blob has been published to S as a [`rayland_relay::BufferToken`].
+    ///
+    /// Called by `BlobInodeResolver::resolve_inode` — the moment C decides this blob's memfd is the
+    /// swapchain image behind a `zwp_linux_buffer_params_v1.add`. Idempotent, and one-way: see
+    /// [`Self::presented`] for why marking early and never clearing is the safe direction.
+    pub fn note_presented(&mut self) {
+        self.presented = true;
+    }
+
+    /// Whether [`Self::note_presented`] has ever been called for this blob.
+    ///
+    /// The single consumer is [`crate::blob_sync::messages_for_delta`], which must pass a zero
+    /// coalescing gap for such a blob. See [`Self::presented`] for the full argument.
+    pub fn is_presented(&self) -> bool {
+        self.presented
     }
 
     /// The blob's pages, for reading — the ring's control words and command buffer, or an
@@ -259,6 +300,34 @@ impl LocalBlob {
         }
     }
 
+    /// Give this blob a zero baseline if it does not have one, so [`Self::take_changed_runs`] will
+    /// diff it.
+    ///
+    /// # Why this is not simply part of `create`, and why it is now called for every blob
+    /// It began as a door opened for one named resource by an experiment (`RAYLAND_C1_SHIP_BLOB`),
+    /// and the 2026-07-26 out-of-line command stream work made it the normal case: `messages_for_delta`
+    /// now calls it on **every** blob but the ring, because Venus puts any submission over 8 KiB in
+    /// the staging pool (`blob_id == 0`), which the application-memory-only rule skipped. The
+    /// paragraph below is why it is still a separate call rather than something `create` does.
+    /// A Venus-internal blob is created with no baseline, and that empty baseline is the backstop
+    /// that makes `take_changed_runs` return nothing for it (see [`crate::blob_sync`]). Opening that
+    /// door is therefore a deliberate act at the call site rather than a default, and it is the
+    /// *incremental* form that matters: shipping the pool's contents on every relay tripled C's blob messages and slowed the
+    /// relay enough that the application never reached the submit under test, which invalidated the
+    /// first attempt entirely. Diffing against a baseline makes the steady-state cost one chunked
+    /// comparison and no traffic.
+    ///
+    /// Zero is the right initial value for the same reason it is for an application blob: S's copy is
+    /// a fresh zero-filled memfd, so the first diff ships exactly the current non-zero content.
+    ///
+    /// # Inputs / outputs
+    /// - Returns nothing; idempotent, and a no-op once a baseline of the right length exists.
+    pub fn ensure_baseline(&mut self) {
+        if self.baseline.len() != self.mapping.len() {
+            self.baseline = vec![0u8; self.mapping.len()];
+        }
+    }
+
     /// The byte-runs of this blob that differ from the baseline, re-baselining as it goes — the C→S
     /// incremental sync. Empty for an unchanged blob, and empty for a Venus-internal blob (which has
     /// no baseline). See `docs/design/2026-07-25-c1-incremental-blob-sync.md`.
@@ -283,31 +352,30 @@ impl LocalBlob {
     /// A torn read (the application mid-write) ships a torn intermediate; it is transient and the next
     /// relay's diff corrects it. This is the same inherent raciness [`Self::bytes`] documents and the
     /// remote-`vkMapMemory` problem (c)2 owns — not this method's to solve.
-    /// Give this blob a zero baseline if it does not have one, so [`Self::take_changed_runs`] will
-    /// diff it — used **only** by the staging-pool experiment (`RAYLAND_C1_SHIP_BLOB`).
     ///
-    /// # Why this is not simply part of `create`
-    /// A Venus-internal blob deliberately has no baseline, because C has no business publishing S's
-    /// reply arena and the empty baseline is the backstop that makes `take_changed_runs` return
-    /// nothing for it (see [`crate::blob_sync`]). This opens that door for one named resource, on
-    /// purpose, for an experiment — and it is the *incremental* form of that experiment, which
-    /// matters: shipping the pool's contents on every relay tripled C's blob messages and slowed the
-    /// relay enough that the application never reached the submit under test, which invalidated the
-    /// first attempt entirely. Diffing against a baseline makes the steady-state cost one chunked
-    /// comparison and no traffic.
+    /// # `coalesce_gap`, and the safety argument this caller owes
+    /// Runs separated by at most `coalesce_gap` unchanged bytes are merged into one, **re-shipping
+    /// the unchanged bytes in between**. That trades a bounded number of redundant bytes for far
+    /// fewer messages, which is the trade that matters because the forward path is message-rate
+    /// bound: measured 2026-08-31, one loopback `vkcube` run sent 5,495 `BlobData` of which **5,409
+    /// carried one to three bytes each**, costing C about a second inside `send()`.
     ///
-    /// Zero is the right initial value for the same reason it is for an application blob: S's copy is
-    /// a fresh zero-filled memfd, so the first diff ships exactly the current non-zero content.
+    /// It is legal only where C's baseline is a faithful model of S's copy, because a gap byte is
+    /// shipped *from the baseline*: if the model is right the write is a no-op, and if it is stale
+    /// the write lays C's old news over S's authoritative bytes. The model is faithful because S
+    /// reports every byte it writes and [`Self::note_s_wrote`] folds it in — with exactly one
+    /// exception, presented resources, which S renders into and deliberately never returns. Those
+    /// must be passed `0`; see [`Self::is_presented`] and
+    /// [`rayland_relay::ranges::coalesce_ranges`], which holds the rule both directions share.
+    ///
+    /// `coalesce_gap == 0` is inert: the diff never produces adjacent ranges, so nothing merges and
+    /// the output is byte-granular exactly as before.
     ///
     /// # Inputs / outputs
-    /// - Returns nothing; idempotent, and a no-op once a baseline of the right length exists.
-    pub fn ensure_baseline(&mut self) {
-        if self.baseline.len() != self.mapping.len() {
-            self.baseline = vec![0u8; self.mapping.len()];
-        }
-    }
-
-    pub fn take_changed_runs(&mut self) -> Vec<BlobRun> {
+    /// - `coalesce_gap`: the merge threshold in unchanged bytes, per the argument above.
+    /// - Returns one [`BlobRun`] per (possibly coalesced) run of bytes differing from the baseline,
+    ///   ascending by offset. Empty for an unchanged blob, and empty for a blob with no baseline.
+    pub fn take_changed_runs(&mut self, coalesce_gap: usize) -> Vec<BlobRun> {
         let len = self.mapping.len();
         // Only application blobs carry a baseline sized to the mapping; a Venus-internal blob has an
         // empty one and is never diffed.
@@ -322,7 +390,11 @@ impl LocalBlob {
         // `u8` has no invalid patterns; and `live` is disjoint from `self.baseline`, so mutating the
         // baseline below does not alias it. The concurrent-writer race is documented above.
         let live: &[u8] = unsafe { std::slice::from_raw_parts(ptr, len) };
-        let mut runs = Vec::new();
+        // Half-open `[start, end)` ranges of differing bytes, ascending and non-overlapping — the
+        // shape `rayland_relay::ranges::coalesce_ranges` requires. Collected as ranges rather than
+        // materialised runs so the coalescing pass below can widen one over the unchanged bytes
+        // between two of them without a second walk.
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
         // The start of a changed run still being extended, if any. Carried across chunk boundaries so
         // a run that straddles one is emitted as a single run, exactly as the byte-at-a-time version
         // did — the chunking below is an optimisation, and must not change what is produced.
@@ -346,10 +418,7 @@ impl LocalBlob {
             // Whole chunk agrees with what S has: nothing to ship, and any run ends here.
             if live[i..chunk_end] == self.baseline[i..chunk_end] {
                 if let Some(start) = open.take() {
-                    runs.push(BlobRun {
-                        offset: start as u64,
-                        bytes: self.baseline[start..i].to_vec(),
-                    });
+                    ranges.push((start, i));
                 }
                 i = chunk_end;
                 continue;
@@ -364,26 +433,34 @@ impl LocalBlob {
                         open = Some(j);
                     }
                 } else if let Some(start) = open.take() {
-                    runs.push(BlobRun {
-                        offset: start as u64,
-                        bytes: self.baseline[start..j].to_vec(),
-                    });
+                    ranges.push((start, j));
                 }
             }
             i = chunk_end;
         }
         // A run still open at the end of the mapping.
         if let Some(start) = open {
-            runs.push(BlobRun {
-                offset: start as u64,
-                // From `self.baseline`, not `live`: the loop above just wrote `live[start..len]` into
-                // `self.baseline[start..len]`, so the two agree right now. Reading `live` again here
-                // would be a second, later look at memory Mesa may still be writing — see the doc
-                // comment above for why that reopens the exact gap this method exists to close.
-                bytes: self.baseline[start..len].to_vec(),
-            });
+            ranges.push((start, len));
         }
-        runs
+        // **Widen the runs over short unchanged gaps, when the caller has earned it.** The rule and
+        // the argument each caller owes live in `rayland_relay::ranges::coalesce_ranges`; in this
+        // direction it is that S reports every byte it writes (folded in by `note_s_wrote`) except
+        // for presented resources, so a gap byte is one S already holds with that exact value and
+        // writing it again is a no-op. `coalesce_gap == 0` is inert and leaves the byte grain exactly
+        // as it was.
+        let ranges = rayland_relay::ranges::coalesce_ranges(ranges, coalesce_gap);
+        // Materialise from `self.baseline`, not from `live`. The loop above wrote every differing
+        // byte into the baseline, so for a changed byte the two agree right now; for a gap byte they
+        // agreed already. Reading `live` again here would be a second, later look at memory Mesa may
+        // still be writing — see the doc comment above for why that reopens the exact gap this method
+        // exists to close.
+        ranges
+            .into_iter()
+            .map(|(start, end)| BlobRun {
+                offset: start as u64,
+                bytes: self.baseline[start..end].to_vec(),
+            })
+            .collect()
     }
 
     /// Fold bytes S wrote (arriving over the S→C return path) into the baseline, so the next
@@ -483,14 +560,15 @@ mod tests {
             let (mut blob, fd) = LocalBlob::create(APP_BLOB_ID, SIZE).expect("a local blob");
             blob.ensure_baseline();
             // Drain the initial state so the baseline matches the mapping and the case starts clean.
-            let _ = blob.take_changed_runs();
+            let _ = blob.take_changed_runs(0);
 
             // Write through a second mapping of the same memfd, playing the part of Mesa.
             let mapping = ShmMapping::map(fd.as_fd(), SIZE).expect("second mapping");
             // SAFETY: `mapping` is a live MAP_SHARED mapping of exactly SIZE bytes that outlives this
             // borrow, and `u8` has no invalid patterns.
-            let live_writer: &mut [u8] =
-                unsafe { std::slice::from_raw_parts_mut(mapping.as_ptr() as *mut u8, SIZE as usize) };
+            let live_writer: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(mapping.as_ptr() as *mut u8, SIZE as usize)
+            };
             for &i in &changed {
                 live_writer[i] = 0xAB;
             }
@@ -504,7 +582,7 @@ mod tests {
             let expected = reference(&live_copy, &mut baseline_copy);
 
             let got: Vec<(u64, Vec<u8>)> = blob
-                .take_changed_runs()
+                .take_changed_runs(0)
                 .into_iter()
                 .map(|r| (r.offset, r.bytes))
                 .collect();
@@ -525,11 +603,19 @@ mod tests {
         // SAFETY: zeroed stat is a valid target; fstat populates it on success, read only after.
         let (dev, ino) = unsafe {
             let mut st: libc::stat = std::mem::zeroed();
-            assert_eq!(libc::fstat(fd.as_fd().as_raw_fd(), &mut st), 0, "fstat the memfd");
+            assert_eq!(
+                libc::fstat(fd.as_fd().as_raw_fd(), &mut st),
+                0,
+                "fstat the memfd"
+            );
             (st.st_dev as u64, st.st_ino as u64)
         };
 
-        assert_eq!(blob.inode(), (dev, ino), "captured inode must match the fd's");
+        assert_eq!(
+            blob.inode(),
+            (dev, ino),
+            "captured inode must match the fd's"
+        );
         assert_ne!(blob.inode(), (0, 0), "a real memfd has a nonzero inode");
     }
 
@@ -629,7 +715,7 @@ mod tests {
         // differ, so the first diff is exactly one run covering the whole blob.
         let (mut blob, _fd) = LocalBlob::create(APP_BLOB_ID, 64).expect("an app blob");
         blob.bytes_mut().fill(0x33);
-        let runs = blob.take_changed_runs();
+        let runs = blob.take_changed_runs(0);
         assert_eq!(runs.len(), 1, "a wholly-written blob is one run");
         assert_eq!(runs[0].offset, 0);
         assert_eq!(runs[0].bytes, vec![0x33; 64]);
@@ -640,9 +726,9 @@ mod tests {
         // Once a diff has run it has re-baselined; a second diff of the untouched blob ships nothing.
         let (mut blob, _fd) = LocalBlob::create(APP_BLOB_ID, 64).expect("an app blob");
         blob.bytes_mut().fill(0x33);
-        let _ = blob.take_changed_runs(); // ships and re-baselines
+        let _ = blob.take_changed_runs(0); // ships and re-baselines
         assert!(
-            blob.take_changed_runs().is_empty(),
+            blob.take_changed_runs(0).is_empty(),
             "an unchanged blob must ship nothing on the next relay"
         );
     }
@@ -652,9 +738,9 @@ mod tests {
         // After the baseline holds 0x33, changing bytes [10..20] yields one run at offset 10.
         let (mut blob, _fd) = LocalBlob::create(APP_BLOB_ID, 64).expect("an app blob");
         blob.bytes_mut().fill(0x33);
-        let _ = blob.take_changed_runs();
+        let _ = blob.take_changed_runs(0);
         blob.bytes_mut()[10..20].fill(0x44);
-        let runs = blob.take_changed_runs();
+        let runs = blob.take_changed_runs(0);
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].offset, 10);
         assert_eq!(runs[0].bytes, vec![0x44; 10]);
@@ -666,11 +752,15 @@ mod tests {
         // coalesced run, which would re-ship the unchanged bytes the diff exists to skip.
         let (mut blob, _fd) = LocalBlob::create(APP_BLOB_ID, 64).expect("an app blob");
         blob.bytes_mut().fill(0x33);
-        let _ = blob.take_changed_runs();
+        let _ = blob.take_changed_runs(0);
         blob.bytes_mut()[5..10].fill(0x44);
         blob.bytes_mut()[20..25].fill(0x55);
-        let runs = blob.take_changed_runs();
-        assert_eq!(runs.len(), 2, "disjoint changes must not coalesce across unchanged bytes");
+        let runs = blob.take_changed_runs(0);
+        assert_eq!(
+            runs.len(),
+            2,
+            "disjoint changes must not coalesce across unchanged bytes"
+        );
         assert_eq!((runs[0].offset, runs[0].bytes.len()), (5, 5));
         assert_eq!((runs[1].offset, runs[1].bytes.len()), (20, 5));
     }
@@ -681,7 +771,7 @@ mod tests {
         // even when written, so `messages_for_delta` never ships them by this path.
         let (mut blob, _fd) = LocalBlob::create(INTERNAL_BLOB_ID, 64).expect("an internal blob");
         blob.bytes_mut().fill(0x11);
-        assert!(blob.take_changed_runs().is_empty());
+        assert!(blob.take_changed_runs(0).is_empty());
     }
 
     /// `note_s_wrote` must be a documented no-op on a Venus-internal blob, not a panic — even though
@@ -695,7 +785,7 @@ mod tests {
         // An offset/length pair that would be in-range for the mapping but has no baseline to land in.
         blob.note_s_wrote(0, &[0x11; 64]);
         assert!(
-            blob.take_changed_runs().is_empty(),
+            blob.take_changed_runs(0).is_empty(),
             "an internal blob has no baseline to disturb, and must still diff to nothing"
         );
     }
@@ -710,7 +800,7 @@ mod tests {
         blob.bytes_mut().fill(0x77);
         blob.note_s_wrote(0, &[0x77; 64]);
         assert!(
-            blob.take_changed_runs().is_empty(),
+            blob.take_changed_runs(0).is_empty(),
             "C must not re-ship the bytes S itself wrote"
         );
     }
