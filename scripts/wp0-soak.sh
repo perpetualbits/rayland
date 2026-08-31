@@ -218,10 +218,17 @@ for run in $(seq 1 "$RUNS"); do
     printf '%s\tFAIL\tearly_exit(S)\t0\t0\t0\t0\n' "$run" >> "$OUT/runs.tsv"; continue
   fi
 
+  # `C_WRAP` prefixes the rayland-c launch, so a run can put the daemon under a CPU quota or a
+  # `taskset`. Why that exists: two mechanism fixes on 2026-08-31 cut C's send cost 5.4x and S's
+  # lock-held time 8.3x and moved the frame rate by nothing measurable, on a laptop where C has CPU to
+  # spare. The claim those fixes make is about a machine where C does NOT — the riscv64 board that
+  # manages 5 fps — and starving C here is the safe way to test that claim without installing a Vulkan
+  # stack onto a board whose root filesystem is 92% full. Example:
+  #   C_WRAP='systemd-run --user --scope -q -p CPUQuota=15% -p AllowedCPUs=0 --'
   C_PID=$(on_c "rm -f $SOCK $WL_SOCK
     RAYLAND_WP_LOG=1 RAYLAND_C1_METRICS=1 ${LINK_LOG:+RAYLAND_C1_LINK_LOG=1} \
     RAYLAND_C1_S_ADDR=$S_IP:$PORT RAYLAND_C1_SOCKET=$SOCK \
-    RAYLAND_C1_WAYLAND_DISPLAY=$WL_SOCK nohup $C_BIN/rayland-c >/tmp/soak-c.log 2>&1 & echo \$!")
+    RAYLAND_C1_WAYLAND_DISPLAY=$WL_SOCK nohup ${C_WRAP:-} $C_BIN/rayland-c >/tmp/soak-c.log 2>&1 & echo \$!")
   sleep 3
 
   # The application always runs FREE. vkcube's own frame-limited mode (`--c N`) was tried for the

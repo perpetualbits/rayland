@@ -342,9 +342,24 @@ that the experiment which appears to refute it — 200 µs → 20 µs measured *
 The refutation was of a different system and the experiment needs re-running; do not treat it as
 settled either way.
 
-**The untested prediction.** All of the above is loopback on a fast laptop, where saving C CPU buys
-nothing because C has CPU to spare. The forward-coalescing change predicts a real gain on a **weak C**
-— the riscv64 milkv board that manages 5 fps — and that has not been measured.
+**The weak-C prediction, tested by simulation and NOT confirmed as a speedup.** All of the above is
+loopback on a fast laptop, where saving C CPU buys nothing because C has CPU to spare. Running
+`rayland-c` under a hard CPU quota (15% of one core, so C is unambiguously the bottleneck at ~300 ms
+per frame) keeps the mechanism win — **5.8× fewer messages, 2.6× less time in `send()`** — but the
+median frame gap moves only **307 → 298 ms (1.03×)**. The distributions *do* differ significantly
+(Mann-Whitney p = 0.021, 13 pairs), and the reason is a regime rather than a rate: the un-coalesced
+arm falls into a ~400 ms regime in **5 runs of 13**, the coalesced arm in **1 of 13**. So coalescing
+buys a starved C *robustness against the slow regime*, not a faster median. Do not quote it as a
+frame-rate win.
+
+An earlier read of the same experiment at n = 7 showed a clean-looking 1.28× and was wrong — the
+second time in one day that a small sample flattered a hoped-for result (the fence-scan fix did the
+same at n = 3). Decide sample size before looking.
+
+**The decisive test is still not run**, and is blocked outside Rayland: milkv has rebooted and now has
+neither `vkcube` nor Mesa's virtio (Venus) ICD, and its root filesystem is 92% full (1.3 GB free)
+against a 9 GB debug target directory. `rayland-c` cross-compiles cleanly for
+`riscv64gc-unknown-linux-gnu` from the laptop, so only the board's Vulkan stack is missing.
 
 ### 5.4 Two findings that overturned earlier beliefs — do not re-propose the retired versions
 

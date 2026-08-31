@@ -5504,3 +5504,61 @@ refutation was of a different system and the experiment deserves re-running.
 The honest caveat on all of the above: it is loopback, on a laptop with a fast CPU, where saving C
 CPU time buys nothing because C has CPU to spare. **The prediction this change makes is about a weak
 C** — the riscv64 milkv board that manages 5 fps — and that prediction is untested as I write this.
+
+### 2026-08-31 (end of day) — Testing the weak-C prediction, and what it actually showed
+
+The coalescing entry above ended by naming its own untested prediction: the change should matter on a
+**weak C**, and all the evidence was from a fast laptop. Leaving that hanging overnight seemed wrong,
+so I went after it.
+
+**The real test is blocked, and not by Rayland.** milkv — the riscv64 board that manages 5 fps — has
+rebooted since it last ran vkcube; `/tmp` was cleared and it now has neither `vkcube` nor Mesa's
+virtio (Venus) ICD, only `radeon_icd.riscv64.json`. Building there is out: a full debug target
+directory for this workspace is **9 GB** and the board has **1.3 GB free on a 92%-full root
+filesystem**. Installing a Vulkan stack onto it is a decision for its owner, not for me at the end of
+a measurement. `rayland-c` itself is not the obstacle — it cross-compiles cleanly for
+`riscv64gc-unknown-linux-gnu` from this laptop, toolchain and std both already present, and I built
+both arms to check.
+
+**So I tested the causal claim instead**, which is available here: put `rayland-c` under a hard CPU
+quota (15% of one core, via a new `C_WRAP` hook in the soak harness) so that C is unambiguously the
+bottleneck — the frame gap goes from ~61 ms to ~300 ms — and see whether the reduced send cost
+converts into frame rate. Thirteen interleaved pairs.
+
+The mechanism survives starvation, as it must: **5.8× fewer messages, 2.6× less time in `send()`**.
+And then the frame gap did something I would have mis-reported if I had stopped at n=7.
+
+At seven pairs the medians looked like 401 ms against 314 — a clean-looking 1.28×, and I nearly wrote
+it down as the prediction confirmed. At thirteen the medians are **307 against 298, a ratio of 1.03**.
+The early runs had simply drawn more of the slow arm.
+
+But the distributions *do* differ, significantly (Mann-Whitney p = 0.021), and the raw values say why:
+
+```
+before: 299 299 301 304 304 306 307 316 | 395 398 401 402 403
+after:  206 289 292 293 297 297 298 302 309 310 312 314 | 384
+```
+
+The un-coalesced arm falls into a **~400 ms regime in 5 runs of 13**; the coalesced arm enters it
+**once in 13**. So what coalescing buys a starved C is **not a faster median — it is not falling into
+the slow regime**. That is a real property and a useful one, and it is a different claim from "the
+frame rate goes up". I am recording it as the narrower thing it is. (Taken alone, 5/13 against 1/13
+is only p ≈ 0.16 by Fisher; the significant result is the whole distribution, and I am not going to
+quote the sharper-sounding half of that.)
+
+Three things I want on the record from this, because they are about method rather than about Rayland:
+
+1. **n = 7 lied, in the direction I wanted.** This is the second time today a small sample looked
+   convincing and dissolved under more data — the fence-scan fix did the same thing, looking like a
+   real speedup at three before-runs and like nothing at eleven. Both times the bias ran towards the
+   result I was hoping for. That is not a coincidence, it is what an underpowered comparison does to
+   whoever is running it, and the only defence is to decide the sample size before looking.
+2. **A CPU quota is a simulation of a weak C, not a weak C.** It starves cycles without reproducing
+   riscv64's memory bandwidth, cache behaviour or instruction throughput, and it starves `rayland-c`
+   alone while the application beside it runs at full speed. It is evidence about the mechanism, not
+   about milkv.
+3. **The day's headline stands unchanged and is worth stating plainly:** three large mechanism wins
+   — S's lock-held time 8.3×, C's message count 6.1×, C's send time 5.4× — and *no reliable
+   frame-rate movement anywhere*. Frame time is a serialized latency chain. The next thing to try is
+   the one the morning's work newly unblocked: re-run the `PROGRESS_POLL` experiment, whose earlier
+   refutation was measured when every poll dragged a 2 ms arena scan behind it.
