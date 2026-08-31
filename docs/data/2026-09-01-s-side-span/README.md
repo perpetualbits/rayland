@@ -77,9 +77,20 @@ End to end, 11 interleaved pairs:
 | median inter-frame gap | **80.0 ms** | **45.0 ms** |
 | range | 46–140 | 28–67 |
 
-**1.78× faster, Mann-Whitney p = 0.0025.** This is the first change in a week of perf work that moved
-the frame rate at all — the four preceding ones each collapsed a mechanism by 5–8× and moved nothing,
-because none of them was on the critical path and this one is.
+1.78× faster, Mann-Whitney p = 0.0025 — **on DEBUG binaries, which is what this harness built by
+default, and that qualification turns out to matter more than the number.**
+
+> **CORRECTION, same day.** Re-run on **release** binaries on this same laptop, the difference
+> disappears: **35 → 37 ms, p = 0.38, n = 13 per arm — a clean null.** Debug Rust keeps the bounds
+> checks and per-iteration overhead of a byte loop, so it exaggerates exactly the cost this change is
+> about. The 1.78× above is a true statement about a debug build and was wrong to publish as a
+> headline.
+>
+> **The change is still right, and the evidence for it is the riscv64 board**, where it measures
+> **105 → 71 ms, 1.48×, complete separation, p = 0.0015** in *release* — see
+> `docs/data/2026-09-01-milkv-ab/`. That is the shape this project should expect: C is the weak
+> machine by design, and a fixed per-delta scan costs it far more than it costs a fast x86_64 laptop
+> whose optimiser can hide it.
 
 ## The guard test had two blind spots, both found by mutation
 

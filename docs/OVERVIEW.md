@@ -784,10 +784,19 @@ it either way. This is the best ratio of information to effort currently on the 
   `LocalBlob::take_changed_runs` compared it 64 bytes at a time. **S's identical routine was raised to
   4096 in August and C's was never changed with it**, on the side where it costs more and which in the
   real deployment is the weak machine. Raising `shm::DIFF_CHUNK` to 4096 is a speed change only
-  (guarded against a naive reference). **Measured: stage 9.13 → 2.17 ms (4.2×); end to end 80 → 45 ms
-  median across 11 interleaved pairs, 1.78×, p = 0.0025.** The first change in a week of perf work to
-  move the frame rate — the four before it were each 5–8× on a mechanism that was not on the critical
-  path. See `docs/data/2026-09-01-s-side-span/`.
+  (guarded against a naive reference). **Measured: stage 9.13 → 2.17 ms (4.2×).** End to end the answer
+  depends on the machine, and that is the finding rather than a caveat:
+  **riscv64 milkv, release, real network — 105 → 71 ms, 1.48×, complete separation (U = 56/56),
+  p = 0.0015**; **x86_64 laptop, release, loopback — 35 → 37 ms, p = 0.38, a clean null.** C is the
+  weak machine by design, and a fixed 13.2 MiB per-delta scan costs it far more than it costs a fast
+  laptop whose optimiser hides the loop overhead. See `docs/data/2026-09-01-milkv-ab/` and
+  `docs/data/2026-09-01-s-side-span/`.
+- **A published number was corrected the same day, and the lesson is bigger than the number.** This
+  entry first said **1.78×, p = 0.0025** on the laptop. That was measured on **debug** binaries —
+  `scripts/wp0-soak.sh` had built `debug` for its whole life — and it does not survive a release
+  build on the same machine. **Every duration ratio this harness has produced is a debug-build
+  figure** unless it says otherwise; ratios of *counts* (messages, bytes, lock acquisitions) are
+  unaffected and stand. The harness now takes `PROFILE=release`, and timing work must set it.
 - **Still open, and now a design question rather than a constant.** Stage 1a is still 2.17 ms three
   times a frame, near the memory-bandwidth floor for a 13.2 MiB `memcmp`. Going further means not
   walking 13.2 MiB per delta at all — the four 1 MB swapchain images are re-diffed every time to

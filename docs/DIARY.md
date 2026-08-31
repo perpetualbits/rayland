@@ -5828,3 +5828,68 @@ images the application never CPU-writes**, diffed on every delta to discover eve
 changed. Real dirty-page tracking (soft-dirty via `/proc/PID/clear_refs`, or `userfaultfd`) would end
 the scan entirely, and it is the same mechanism (c)2 has always needed for the mapped-memory problem —
 so this is not a detour from the roadmap, it is the roadmap arriving from an unexpected direction.
+
+### 2026-09-01 (night) — The milkv A/B, and the number I published this afternoon was a debug build
+
+The chunk fix removed ~10 ms of CPU per ring delta on **C**, and C is the machine this whole project
+says may be weak. So the obvious test was the riscv64 board, and it is now a two-minute cross-build
+and a scripted sweep rather than the impossibility I wrongly called it yesterday.
+
+**On milkv it is unambiguous.** Eight interleaved pairs, release binaries, real network:
+
+```
+BEFORE (chunk 64):   97  97 102 104 106 110 111 115   median 105 ms
+AFTER  (chunk 4096): 68  69  71  71  79  81  82       median  71 ms
+```
+
+**1.48×, and the distributions do not overlap at all** — every AFTER run beats every BEFORE run,
+U = 56 of 56, p = 0.0015. 7.45 fps to 9.98 fps. Zero stalls.
+
+**And then the part that matters more.** This afternoon I published **1.78×, p = 0.0025** for the same
+change on the laptop. Before writing the milkv result up I noticed the two sweeps had used different
+build profiles — the board got release binaries because that is what its rig uses, the laptop got
+debug because `wp0-soak.sh` has built `debug` for its entire life. So I re-ran the laptop in release,
+thirteen pairs a side:
+
+```
+BEFORE:  25 25 25 26 29 31 35 36 41 42 49 54 68   median 35 ms
+AFTER:   25 25 27 31 37 37 37 39 45 49 64 66 81   median 37 ms      p = 0.38
+```
+
+**A clean null.** The 1.78× does not survive a release build on the machine it was measured on. Debug
+Rust keeps the bounds checks and per-iteration overhead of a byte loop, which is exactly the cost this
+change is about, so debug inflates it. My headline was a true statement about a debug build and the
+wrong thing to publish as a result.
+
+**But the change is right, and the two numbers together say something better than either alone.** A
+fixed 13.2 MiB per-delta scan costs a 4-core riscv64 board far more than it costs a laptop whose
+optimiser hides the loop overhead. Neutral on the developer's machine, 1.48× on the target hardware —
+that is precisely the asymmetry Rayland exists for, and it would have been *dismissed as noise* if the
+laptop had been the only machine measured in release. The weak-C prediction I made yesterday and could
+not test is now tested, and it holds, on the machine it was about.
+
+**The scope of the correction is wider than one number, and I would rather say so than let it be found
+later.** Every *duration* ratio this harness has produced is a debug figure unless it says otherwise —
+this week's fence-scan and coalescing timings included. Ratios of *counts* — messages, bytes, lock
+acquisitions, stage occurrences — do not depend on the build profile and stand unchanged, which is
+most of what those entries actually rested on. `wp0-soak.sh` now takes `PROFILE=release` with the
+reasoning written at the constant, and timing work must set it.
+
+Two corrections in two days, both the same shape: a measurement taken under conditions I had not
+examined, reported as a property of the thing measured. Yesterday it was one filesystem standing in
+for a machine; today a debug build standing in for the software. Neither was a reasoning error — both
+were an *unchecked premise* dressed up as a result, and in both cases the check was one command.
+
+**One run in sixteen is unexplained and I am not hiding it.** `pair6-AFTER` ended after 9.9 s of a
+25 s run with zero frames, while every other run went 29.5–29.8 s. No error, no panic, no protocol
+refusal anywhere in its logs; the app printed its two startup lines, C wrote a normal final metrics
+line, the proxy tore down cleanly. The BEFORE run immediately before it was also the slowest of its
+arm, so that period on the board looks disturbed. Excluded from the rate statistics and reported;
+1 in 8 against 0 in 8 is p = 1.0 by Fisher and is not attributable to the change. It resembles the
+recorded, still-unfixed startup-path abort, but nothing in these logs says so.
+
+Also worth keeping: the board is unreachable by ssh unless the agent is allowed to offer its keys.
+The owner's config sets `IdentitiesOnly yes` globally with no `Host milkv` entry, so earlier sessions
+only worked by riding a ten-minute `ControlPersist` master and every "connection refused" after that
+looks like the board being down. The harness passes `-o IdentitiesOnly=no` and does not touch the
+owner's configuration.

@@ -118,7 +118,21 @@ FRAMES="${FRAMES:-200}"                    # traffic mode: fixed frame count (vk
 MIN_ATTACHES="${MIN_ATTACHES:-$((APP_SECONDS * 2))}"   # the 2 fps floor; see the header
 SHIP_PRESENTED="${SHIP_PRESENTED:-}"       # set to 1 to disable the presented-buffer exclusion
 TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/rayland-c1-target}"
-BIN="$TARGET_DIR/debug"
+# **`PROFILE=release` for any figure that will be quoted as a performance result.**
+#
+# This defaulted to `debug` for its whole life, and on 2026-09-01 that was found to have inverted a
+# published conclusion. The blob-diff chunk change measured **1.78x faster (p = 0.0025)** on debug
+# binaries here and, re-run on release binaries on the same machine, measured **nothing at all**
+# (35 -> 37 ms, p = 0.38) — while on the riscv64 board, in release, it measured **1.48x with complete
+# separation**. Debug Rust leaves the bounds checks and the per-iteration overhead of a byte loop in
+# place, so it exaggerates exactly the kind of cost that change was about.
+#
+# What that does and does not invalidate: *ratios of counts* (messages, bytes, lock acquisitions) are
+# unaffected by the build profile and stand. *Ratios of durations* measured on `debug` are figures
+# about a debug build and must say so. Timing work should set `PROFILE=release`; `debug` remains the
+# default only because the failure-rate and correctness sweeps want the assertions.
+PROFILE="${PROFILE:-debug}"
+BIN="$TARGET_DIR/$PROFILE"
 BIN_EARLY="$BIN"
 
 # C_HOST empty runs the application and rayland-c on THIS machine over loopback.
@@ -169,7 +183,8 @@ fi
 # currently compiles to, which is the same arm twice.
 if [ -z "${NO_BUILD:-}" ]; then
   echo "### building ###"
-  CARGO_TARGET_DIR="$TARGET_DIR" cargo build -q -p rayland-c -p rayland-s || exit 1
+  CARGO_TARGET_DIR="$TARGET_DIR" cargo build -q ${PROFILE:+$([ "$PROFILE" = release ] && echo --release)} \
+    -p rayland-c -p rayland-s || exit 1
 fi
 if [ -n "$C_HOST" ]; then
   scp -q "$BIN/rayland-c" /usr/bin/vkcube "$C_HOST:/tmp/" || exit 1
