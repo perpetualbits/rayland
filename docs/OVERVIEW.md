@@ -765,16 +765,27 @@ it either way. This is the best ratio of information to effort currently on the 
   either side — see §5.3. Candidate directions: adaptive polling, reply batching. Matters most when
   latency is high. **Both poll intervals are now excluded** by the sweep in §5.3 — do not re-propose
   tuning them.
-- **The leading untested hypothesis for frame time: Mesa's own back-off, not Rayland.** Four large
-  interventions on our own code — S's lock contention (8.3×), C's message rate (6.1×),
-  `PROGRESS_POLL` (3× more polling), `PARK_SLEEP` (both directions) — moved the frame rate by nothing.
-  With feedback off the application implements `vkWaitForFences` by polling `vkGetFenceStatus`, and
-  the gap between polls is chosen by Mesa's `vn_relax`: yield for 16 iterations, then an exponentially
-  growing sleep from 10 µs (`vkr_ring.c:190-210`). If the app sleeps in `vn_relax` between polls, every
-  microsecond Rayland saves is absorbed by the app waiting longer before it next asks — which is
-  exactly the signature observed. **This is a hypothesis, not a finding.** The test needs no new code:
-  point the existing link trace at the *arrival times* of the application's successive ring writes and
-  compare the distribution against `vn_relax`'s schedule.
+- **TESTED AND REFUTED: frame time is NOT Mesa's back-off — it is ours, and it is now localised.**
+  This entry previously named "Mesa's `vn_relax` back-off absorbs whatever we save" as the leading
+  hypothesis, on the strength of four null results. That framing was itself a mistake worth naming:
+  *four things not being the cause is not evidence for any particular fifth thing.* Measured
+  (`docs/data/2026-08-31-vn-relax/`, 5 runs, 312 frames, 26.8 s attributed, every interval charged
+  once to whoever ended it): **APP 9.6% · COMPOSITOR 13.7% · RAYLAND 76.7%**. Any `vn_relax` sleep
+  lives inside the app's 9.6%, so deleting all of it — sleeping and thinking alike — buys under a
+  tenth. A second hypothesis, virglrenderer's *host-side* `vkr_ring_relax` back-off, was formed and
+  killed in the same data: a longer idle before a delta barely predicts a longer wait for its reply
+  (Spearman ρ = +0.117, n = 1351), and even with **no** preceding idle the wait is 11.5 ms.
+- **The actual target, with a number for the first time: ~3.1 ring-delta round trips per frame at
+  ~16 ms each.** 91% of Rayland's share sits in intervals over 5 ms, and 90.5% of *that* is in
+  intervals beginning with a ring delta going out. Three round trips at sixteen milliseconds is
+  essentially the whole 57 ms frame — on **loopback**, where the network costs microseconds.
+  Everything previously suspected is excluded by measurement: the network, S's lock contention, C's
+  send path, both poll intervals, Mesa's back-off, virglrenderer's back-off. The 16 ms is entirely
+  inside *what S does between reading a delta and the first reply reaching C* — the one span nothing
+  has instrumented. It crosses `virgl_render_server` (a separate process), a real `vkQueueSubmit`, the
+  GPU, and the swapchain; **`vkAcquireNextImageKHR` blocking until the compositor releases a buffer is
+  a live candidate**, and one C physically cannot see. That span is entirely on S, which already has a
+  stage tracer and a lock histogram to point at it.
 - **A latent coalescing hazard on S's return path**, found by the safety check the C→S coalescing
   change required and deliberately *not* fixed there. `Applier::take_app_blob_writes` coalesces at
   gap 256 on the argument that `res6` is "S-written and C-read-only" — but its filter selects every

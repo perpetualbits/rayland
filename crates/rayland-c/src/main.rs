@@ -711,6 +711,10 @@ fn apply_blob_data(blobs: &BlobTable, res_id: u32, offset: u64, bytes: &[u8]) ->
     // stale baseline and ship S's own bytes back to S — the last-writer-wins wobble (c)1 Task 5b fixed
     // in the S→C direction, here in its C→S twin. See `docs/design/2026-07-25-c1-incremental-blob-sync.md`.
     blob.note_s_wrote(start, bytes);
+    // The application's answer is now visible in its own mapping. Paired with `RingShipped` below,
+    // this brackets the poll cycle into "our latency" and "the app's own back-off" — see
+    // `relaxstat`. One clock read and one array store, and nothing at all unless gated on.
+    rayland_c::relaxstat::note(rayland_c::relaxstat::Event::ReplyApplied);
 
     // **T7 — packet installed on C** (design note §7): the moment S's bytes are in the pages Mesa
     // mapped. The `res`/`off` match the S-side T6 so the join can pair departure with installation
@@ -854,6 +858,9 @@ fn ring_watcher_thread(
                 .lock()
                 .expect("the progress lock is never poisoned")
                 .note_relayed(tail);
+            // The application's request is on its way. Recorded at the same seam the stall clock
+            // uses, so the two agree about when a delta left. See `relaxstat`.
+            rayland_c::relaxstat::note(rayland_c::relaxstat::Event::RingShipped);
 
             // Decide what must accompany this delta, and in what order. `messages_for_delta` copies
             // the application's mapped blobs out under the blob lock and releases it before
@@ -1006,6 +1013,9 @@ fn env_or(name: &str, default: &str) -> String {
 /// session fails. A stalled ring is *not* reported here — it exits the process from the watcher
 /// thread, because by then this thread is blocked inside [`serve_vtest`] and cannot be signalled.
 fn main() -> Result<()> {
+    // Records the application's poll cycle when `RAYLAND_C1_RELAXSTAT` is set, and reports
+    // periodically so a run the harness kills still leaves its record. Inert otherwise.
+    rayland_c::relaxstat::start_reporter();
     let socket_path = env_or(ENV_VTEST_SOCKET, DEFAULT_VTEST_SOCKET);
     let s_addr = env_or(ENV_S_ADDR, DEFAULT_S_ADDR);
     // A malformed timeout is a silent misconfiguration if it falls back quietly, so say so.

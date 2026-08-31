@@ -1189,6 +1189,12 @@ fn deliver_event(handle: &Handle, state: &ProxyState, msg: WaylandMessage) {
         ));
         return;
     };
+    // A `wl_callback.done` (the only event `wl_callback` has, opcode 0) is the compositor telling the
+    // application it may draw again. Recorded so the poll-cycle decomposition can charge time spent
+    // waiting for the compositor to the compositor rather than to Rayland — see `relaxstat::Event`.
+    if sender.interface().name == "wl_callback" && msg.opcode == 0 {
+        crate::relaxstat::note(crate::relaxstat::Event::FrameCallback);
+    }
     // Rebuild the argument list in the backend's `send_event` form (`Argument<ObjectId, RawFd>`).
     let mut args: Vec<Argument<ObjectId, RawFd>> = Vec::with_capacity(msg.args.len());
     for arg in &msg.args {

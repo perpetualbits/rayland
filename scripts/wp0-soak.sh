@@ -228,7 +228,7 @@ for run in $(seq 1 "$RUNS"); do
   #   C_WRAP='systemd-run --user --scope -q -p CPUQuota=15% -p AllowedCPUs=0 --'
   C_PID=$(on_c "rm -f $SOCK $WL_SOCK
     RAYLAND_WP_LOG=1 RAYLAND_C1_METRICS=1 ${LINK_LOG:+RAYLAND_C1_LINK_LOG=1} \
-    ${PARK_US:+RAYLAND_C1_PARK_SLEEP_US=$PARK_US} \
+    ${PARK_US:+RAYLAND_C1_PARK_SLEEP_US=$PARK_US} ${RELAXSTAT:+RAYLAND_C1_RELAXSTAT=1} \
     RAYLAND_C1_S_ADDR=$S_IP:$PORT RAYLAND_C1_SOCKET=$SOCK \
     RAYLAND_C1_WAYLAND_DISPLAY=$WL_SOCK nohup ${C_WRAP:-} $C_BIN/rayland-c >/tmp/soak-c.log 2>&1 & echo \$!")
   sleep 3

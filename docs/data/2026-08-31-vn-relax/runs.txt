@@ -1,0 +1,5 @@
+/tmp/rx-1/runs.tsv: 1	PASS	-	73	444638	32472	4	0	0	72	59
+/tmp/rx-2/runs.tsv: 1	PASS	-	63	424589	31640	4	0	0	62	50
+/tmp/rx-3/runs.tsv: 1	PASS	-	71	440277	32126	4	0	0	70	63
+/tmp/rx-4/runs.tsv: 1	PASS	-	94	489579	35109	4	0	0	93	50
+/tmp/rx-5/runs.tsv: 1	PASS	-	79	455831	33170	4	0	0	78	67

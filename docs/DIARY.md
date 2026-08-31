@@ -5688,3 +5688,70 @@ that prediction actually gets tested. Also worth carrying forward from the solsi
 would silently corrupt a figure: the chroot's `/usr/local/bin/vkgears` is **patched** with a NULL-seat
 guard and shadows stock `/usr/bin/vkgears.riscv64-linux-gnu` on `PATH`, so any `vkgears` number from
 that board must name the full path.
+
+### 2026-08-31 (late) — The `vn_relax` test: my hypothesis was wrong, and the real target finally has a number
+
+I ended the poll-interval entry believing frame time was Mesa's, not ours. Four large mechanism wins
+had moved nothing, and the obvious reading was that the application sleeps in `vn_relax` between
+`vkGetFenceStatus` polls, absorbing whatever we save. The owner asked me to test it.
+
+**It is wrong.** The application's own time — every interval that ends with the app writing to the
+ring, which is where any back-off sleep must live — is **9.6% of the wall clock**. The compositor is
+13.7%. **Rayland is 76.7%.** Even deleting the application's entire share, sleeping and thinking
+alike, would buy under a tenth.
+
+So the four nulls were never evidence that the time isn't ours. It is overwhelmingly ours. That makes
+them *more* puzzling, not less, and resolving that is the useful part of tonight.
+
+**Two instrument bugs first, because both would have produced a confident wrong answer.** The
+recorder reported every 10 s and dumped the whole log each time; two of three captures were **lost
+entirely** because the run ended before the first tick, and I nearly drew conclusions from n=1
+without noticing the other two were empty. And my first analysis collapsed event bursts into "poll
+cycles" — but a single ring delta carries *many* application commands, so it was measuring batches
+and calling them polls. The fix was to stop assuming any structure: charge every interval to whoever
+*ended* it. That needs no theory of batching and it is what produced the table above.
+
+I also nearly charged the compositor's time to ourselves. The first capture put 25.0 ms between
+successive ring deltas, and the native ceiling for this app and compositor was separately measured at
+25.4 ms/frame *of which 24.9 ms is pacing*. Those numbers are too close to be a coincidence, so I
+added a third event — `wl_callback.done` as C delivers it — before believing anything. Without it,
+time the application spends legitimately blocked on the compositor is indistinguishable from time we
+cost it. It turned out to be 13.7%, which is not nothing.
+
+**Where our 76.7% is, and it is beautifully concentrated.** 91% of it sits in the 11.6% of intervals
+longer than 5 ms — and **90.5% of that long time is in intervals that begin with a ring delta going
+out**. That is the C→S→execute→reply→C round trip. There are about **3.1 per frame, at roughly 16 ms
+each**, on loopback, where the network costs microseconds. Three round trips times sixteen
+milliseconds is the entire fifty-seven millisecond frame.
+
+**The second hypothesis, formed and killed in the same sitting.** If ours is the round trip, maybe the
+delay is virglrenderer's *host-side* ring thread in a grown back-off — `vkr_ring_relax`, yield ×16
+then an exponentially growing sleep from 10 µs. That predicts a longer idle before a delta should
+mean a longer wait for its reply, and the data already had both numbers. Spearman ρ = **+0.117**
+(z = +4.3, n = 1351): real, and far too small to be the explanation. Even with essentially no
+preceding idle, where the ring thread should still be spinning, the wait is 11.5 ms. **There is a
+fixed ~11–16 ms floor that idle history does not explain.**
+
+Symmetry worth noting: I predicted a client-side back-off, found it was 9.6%, immediately proposed a
+host-side back-off, and that was ~1% too. Two back-off hypotheses in one evening, both wrong, both
+attractive for the same reason — they would have explained the four nulls without requiring me to
+find anything new.
+
+**What this changes.** For the first time the frame time is localised to a specific, countable unit
+rather than a suspicion: *~3.1 ring round trips per frame at ~16 ms each*. Everything previously
+suspected is now excluded by measurement — the network, S's lock contention, C's send path, both poll
+intervals, Mesa's back-off, virglrenderer's back-off. The remaining 16 ms is entirely inside "what S
+does between reading a delta and the first reply reaching C", which is the one span nothing has
+instrumented, and it crosses a separate process (`virgl_render_server`), a real `vkQueueSubmit`, the
+GPU, and the swapchain. `vkAcquireNextImageKHR` blocking until the compositor releases a buffer is a
+live candidate and one C physically cannot see.
+
+That is the next measurement, and unlike tonight's it has an obvious instrument: S already has a
+stage tracer and a lock histogram, and the span in question is entirely on S.
+
+A last note on method, since two hypotheses died tonight. Both were *good* hypotheses — they fit the
+evidence I had and they were cheap to test. The failure mode I want to avoid is not "guessed wrong",
+it is what I did after the poll experiment: I wrote the back-off idea into `OVERVIEW.md` as "the
+leading hypothesis" on the strength of four nulls, with no positive evidence for it whatsoever. Four
+things not being the cause is not evidence for any particular fifth thing. That framing is now
+corrected there.

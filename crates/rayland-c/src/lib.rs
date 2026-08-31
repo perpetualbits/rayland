@@ -46,6 +46,9 @@
 //! the same stall provoked deterministically in a unit test costs a minute.
 
 // The local memfd shadows Mesa maps and writes its command stream into.
+/// Splitting the application's poll cycle into our latency and Mesa's own `vn_relax` back-off.
+pub mod relaxstat;
+
 pub mod shm;
 // The ring watcher: notices Mesa's writes, extracts them, and owns the park/wake decision.
 pub mod ring;
