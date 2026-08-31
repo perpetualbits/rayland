@@ -172,6 +172,33 @@ const DEFAULT_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// an unbounded one degrades to a hang. The cost of being wrong should not be unbounded.
 const PARK_SLEEP: Duration = Duration::from_micros(500);
 
+/// The park sleep actually used, allowing `RAYLAND_C1_PARK_SLEEP_US` to override it.
+///
+/// # Why this is tunable at all
+/// This and S's `PROGRESS_POLL` are the two poll intervals on the application's synchronous round
+/// trip — how fast C notices the app wrote to the ring, and how fast S notices the ring moved. An
+/// earlier experiment changed **both** by editing constants and rebuilding, so it could not attribute
+/// its result to either, and it compared two separately-built binaries. Reading them from the
+/// environment makes a factorial comparison possible from one binary.
+///
+/// The default is unchanged, so a run that does not set the variable is the shipping configuration.
+///
+/// # Inputs / outputs
+/// - Reads `RAYLAND_C1_PARK_SLEEP_US` once, as a whole number of microseconds. Zero yields instead of
+///   sleeping.
+/// - An unparseable or absent value leaves [`PARK_SLEEP`] in place, for the reason its S-side twin
+///   gives: a typo must not silently become the busiest setting.
+fn park_sleep() -> Duration {
+    static SLEEP: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *SLEEP.get_or_init(|| {
+        std::env::var("RAYLAND_C1_PARK_SLEEP_US")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_micros)
+            .unwrap_or(PARK_SLEEP)
+    })
+}
+
 /// How long the ring watcher sleeps while waiting for Mesa to allocate its ring.
 ///
 /// Coarser than [`PARK_SLEEP`] because nothing is happening yet: this runs once, during startup,
@@ -928,7 +955,13 @@ fn ring_watcher_thread(
                 // The claim now stands, and step 1 owes Mesa its retraction the moment we drain
                 // anything. This is the only place that becomes true.
                 idle_published = true;
-                std::thread::sleep(PARK_SLEEP);
+                // Zero means "yield instead of sleep"; see `park_sleep`.
+                let nap = park_sleep();
+                if nap.is_zero() {
+                    std::thread::yield_now();
+                } else {
+                    std::thread::sleep(nap);
+                }
             }
             // Mesa wrote while we were announcing. `decide_park` has already retracted IDLE on our
             // behalf, so record that and go straight back.

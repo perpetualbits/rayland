@@ -129,6 +129,35 @@ const DEFAULT_RENDER_NODE: &str = "/dev/dri/renderD128";
 /// point for something with no measurements behind it.
 const PROGRESS_POLL: Duration = Duration::from_micros(200);
 
+/// The progress poll interval actually used, allowing `RAYLAND_S_PROGRESS_POLL_US` to override it.
+///
+/// # Why this is tunable at all
+/// [`PROGRESS_POLL`]'s own docs mark its value `[INFERENCE]` — "never measured" — while stating that
+/// on a loopback link it becomes *the dominant term*. That is a claim worth settling with numbers
+/// rather than reasoning, and settling it needs the interval varied without varying anything else.
+/// It was once varied by editing the constant and rebuilding, together with C's `PARK_SLEEP`, which
+/// confounded the two knobs and compared two different binaries; an environment variable removes
+/// both problems.
+///
+/// The default is unchanged, so a run that does not set the variable is the shipping configuration.
+///
+/// # Inputs / outputs
+/// - Reads `RAYLAND_S_PROGRESS_POLL_US` once, as a whole number of microseconds. **Zero is
+///   meaningful**: it makes the loop yield rather than sleep, which is the busiest end of the trade.
+/// - An unparseable or absent value leaves [`PROGRESS_POLL`] in place. An experiment knob must never
+///   be able to kill the daemon, and a typo silently becoming 0 µs would burn a core while looking
+///   like the default.
+fn progress_poll() -> Duration {
+    static POLL: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *POLL.get_or_init(|| {
+        std::env::var("RAYLAND_S_PROGRESS_POLL_US")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_micros)
+            .unwrap_or(PROGRESS_POLL)
+    })
+}
+
 /// Read an environment variable, falling back to a default.
 fn env_or(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
@@ -653,7 +682,14 @@ fn progress_thread(
             }
         }
 
-        std::thread::sleep(PROGRESS_POLL);
+        // Zero means "yield instead of sleep": `thread::sleep(0)` is not a yield on Linux, and the
+        // busiest arm of the poll-interval experiment needs to actually be the busiest.
+        let poll = progress_poll();
+        if poll.is_zero() {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(poll);
+        }
     }
 }
 

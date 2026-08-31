@@ -210,6 +210,7 @@ for run in $(seq 1 "$RUNS"); do
   # word as the command name. `env` swallows the empty expansion harmlessly.
   env WAYLAND_DISPLAY="$WESTON_SOCKET" RAYLAND_S_EVENT_LOG=1 RAYLAND_C1_NO_PRESENT=1 \
     ${SHIP_PRESENTED:+RAYLAND_S_SHIP_PRESENTED=1} ${LINK_LOG:+RAYLAND_S_REPLY_LOG=1} ${LOCKSTAT:+RAYLAND_S_LOCKSTAT=1} \
+    ${POLL_US:+RAYLAND_S_PROGRESS_POLL_US=$POLL_US} \
     RAYLAND_C1_S_LISTEN="0.0.0.0:$PORT" "$BIN/rayland-s" > "$RD/s.log" 2>&1 &
   S_PID=$!
   sleep 3
@@ -227,6 +228,7 @@ for run in $(seq 1 "$RUNS"); do
   #   C_WRAP='systemd-run --user --scope -q -p CPUQuota=15% -p AllowedCPUs=0 --'
   C_PID=$(on_c "rm -f $SOCK $WL_SOCK
     RAYLAND_WP_LOG=1 RAYLAND_C1_METRICS=1 ${LINK_LOG:+RAYLAND_C1_LINK_LOG=1} \
+    ${PARK_US:+RAYLAND_C1_PARK_SLEEP_US=$PARK_US} \
     RAYLAND_C1_S_ADDR=$S_IP:$PORT RAYLAND_C1_SOCKET=$SOCK \
     RAYLAND_C1_WAYLAND_DISPLAY=$WL_SOCK nohup ${C_WRAP:-} $C_BIN/rayland-c >/tmp/soak-c.log 2>&1 & echo \$!")
   sleep 3
