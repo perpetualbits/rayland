@@ -5280,3 +5280,49 @@ own entry: when recording a gap, say what happens to a program that hits it, not
 That is a different failure from the ones already on that list. "A claim in a comment is not a
 measurement" is about unverified quantities; this is about accurate prose that misdirects. Both hide
 things, and this one hid a crash.
+
+### 2026-08-31 — Contamination is now reported, not averaged; and the stall survives moving the app off the machine
+
+Two tasks the owner approved: make every measurement declare whether it was disturbed, and find the
+trigger with a method that works the same on both topologies.
+
+**The contamination check cost me three attempts, and the first two were the same mistake.** Sampling
+the presented-frame count on a 100 ms timer meant `grep -c` over a growing log ten times a second —
+O(file) per sample — and it took the frame rate from 213 attaches to 98. An offset-carrying rewrite
+that read only new bytes still spawned four processes per sample and was no better. Both were
+instruments that changed what they measured, which is a trap this diary has recorded against other
+people's code and has now caught me twice in one hour.
+
+The third version costs nothing, and it was available all along: the proxy already logs a line per
+forwarded request under `RAYLAND_WP_LOG`, so **stamping that line with the monotonic clock makes the
+timeline derivable offline**. Exact inter-frame gaps instead of 100 ms buckets, no sampler, and
+identical on both topologies because nothing is polled. The lesson is not "sampling is bad" but
+"instrument the event, not the aggregate".
+
+One more self-inflicted wound worth recording: the first scoring pass counted the tail *after* the
+application is stopped, since the sampler outlives it. On a completely idle machine that reported a
+**3,400 ms stall** in a run the hand-rolled timeline had called perfectly clean. A check that
+manufactures the defect it is looking for is worse than no check, and it took a result that was
+obviously wrong — not a review — to catch it.
+
+The check now reports stalls **and** the median gap, because those are different claims. A uniformly
+loaded machine produces a low frame rate with no abnormal gap at all, and a stall-only check would
+call that clean. It is clean *of stalls*; the median says whether it was also fast.
+
+**The trigger: stalls survive moving the application to another machine.** With the app and
+`rayland-c` on apollo and only `rayland-s` and COSMIC on dop561, a run still showed a **1.8 s** stall.
+That cannot be the app competing for CPU with the compositor, because they are not on the same
+computer — so **CPU contention is now the second leading hypothesis to survive poorly**, after the
+input-relay one I refuted yesterday. Median gaps are 51–57 ms in every cell, so nothing is *slower*;
+the pipeline stops and restarts.
+
+**What I cannot claim, and it is the honest limit of today's work.** My "idle" cells are not
+controlled: the owner is working at dop561 throughout, so "I did not move the mouse" is not "the
+mouse did not move". Those rows contain stalls, and that does *not* prove stalls happen undisturbed.
+The one genuinely clean run — 439 frames in 20 s, zero abnormal gaps, taken in a quiet moment — is
+what proves stall-free operation is achievable at all.
+
+Next measurement needs no new code: join the timestamped proxy log against S's event witness on the
+same clock, at a stall onset, and see what S was doing in the milliseconds before the app went to
+sleep. The `hrtimer_nanosleep` observation says Mesa's `vn_relax` backoff explains the *duration*;
+nothing yet explains the *onset*.
