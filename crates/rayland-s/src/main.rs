@@ -318,7 +318,14 @@ fn link_log(marker: &str, what: &str) {
     if !link_log_enabled() {
         return;
     }
-    eprintln!("[s-link] {marker} {what}");
+    // Timestamped on the same `CLOCK_MONOTONIC` the C-side proxy log uses, so the two daemons' lines
+    // join directly. That join is the whole point: a stall is visible as a gap in C's frame timeline,
+    // and the question it raises — was S still shipping the `RingProgress` that releases the
+    // application, or had it stopped? — can only be answered by putting both on one clock.
+    eprintln!(
+        "[s-link] t_ns={} {marker} {what}",
+        rayland_relay::trace::monotonic_ns()
+    );
 }
 
 /// Describe a `C2S` in one short line — **never** its payload.
