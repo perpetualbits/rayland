@@ -76,6 +76,25 @@
 #   binary, so the A/B attributes a traffic difference to that change rather than to a rebuild.
 #
 # ------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------
+# EVERY RUN REPORTS ITS OWN CONTAMINATION, and this is not optional decoration
+#   On 2026-08-30 the repository owner pointed out that vkcube stalls for seconds whenever the
+#   mouse enters or leaves its window, and that this invalidates any frame-rate figure taken while
+#   somebody is using the machine. It does. Measured: with NO pointer movement, 439 frames in 20 s
+#   and **zero** 100 ms buckets containing no frames. With five synthetic pointer moves, a clean
+#   500 ms hole. During such a stall the application's main thread sits in `hrtimer_nanosleep` —
+#   Mesa's `vn_relax` ring-wait backoff — so a brief hiccup is amplified into a long one.
+#
+#   An averaged fps number hides that completely: 21.9 and 20.6 fps look like the same measurement.
+#   So every run here samples the presented-frame count at a fixed 100 ms cadence and reports the
+#   number of EMPTY buckets and the longest run of them. **0 empty buckets means the figure is
+#   clean; anything else means it is not, and the run says so rather than averaging it away.**
+#
+#   THE SAMPLER RUNS ON C, IN BOTH TOPOLOGIES. An earlier attempt polled C's log over one ssh per
+#   sample, which paced at ~250 ms rather than 100 ms and produced a two-machine number that could
+#   not be compared with a loopback one. That result was discarded. Sampling locally on C and
+#   fetching the timeline once at the end makes the two topologies measure the same thing.
+#
 # *** vkcube MUST RUN WITH `--gpu_number 0` *** — it defaults to the discrete NVIDIA GPU, whose
 #   real vkQueueSubmit returns VK_ERROR_DEVICE_LOST (7/14 runs, against 0/10 on the Intel iGPU).
 #   That cost this project three days and was never a Rayland bug. See DIARY.md, 2026-07-26.
@@ -169,7 +188,7 @@ grep -q 'Using GL renderer' "$OUT/weston.log" 2>/dev/null || \
 pass=0; fail=0
 declare -A modes=()
 : > "$OUT/runs.tsv"
-printf 'run\tverdict\tmodes\tattaches\tc2s_bytes\ts2c_bytes\tframes\n' >> "$OUT/runs.tsv"
+printf 'run\tverdict\tmodes\tattaches\tc2s_bytes\ts2c_bytes\tframes\tstall_gaps\tlongest_ms\tframe_gaps\tmedian_gap_ms\n' >> "$OUT/runs.tsv"
 
 for run in $(seq 1 "$RUNS"); do
   RD="$OUT/run$run"; mkdir -p "$RD"
@@ -211,6 +230,8 @@ for run in $(seq 1 "$RUNS"); do
     VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/virtio_icd.json VTEST_SOCKET_NAME=$SOCK \
     env -u VK_LOADER_DRIVERS_SELECT nohup $VKCUBE $APP_ARGS >/tmp/soak-app.log 2>&1 & echo \$!")
 
+
+
   if [ "$MODE" = traffic ]; then
     # Impose the frame count from here: poll C's own request trace until it has forwarded $FRAMES
     # surface attaches, then stop. Bounded, so a stalled run ends the wait instead of hanging the sweep
@@ -231,9 +252,11 @@ for run in $(seq 1 "$RUNS"); do
   if [ -n "$C_HOST" ]; then
     scp -q "$C_HOST:/tmp/soak-c.log" "$RD/c.log" 2>/dev/null || true
     scp -q "$C_HOST:/tmp/soak-app.log" "$RD/app.log" 2>/dev/null || true
+    scp -q "$C_HOST:/tmp/soak-timeline.dat" "$RD/timeline.dat" 2>/dev/null || true
   else
     cp /tmp/soak-c.log "$RD/c.log" 2>/dev/null || true
     cp /tmp/soak-app.log "$RD/app.log" 2>/dev/null || true
+    cp /tmp/soak-timeline.dat "$RD/timeline.dat" 2>/dev/null || true
   fi
   cleanup_run
   sleep 1
@@ -285,6 +308,43 @@ for run in $(seq 1 "$RUNS"); do
   s2c=$(grep -oE 's2c_total_bytes=[0-9]+' "$RD/c.log" 2>/dev/null | tail -1 | cut -d= -f2)
   built=$(grep -c 'built wl_buffer' "$RD/s.log" 2>/dev/null || echo 0)
 
+  # ---- Contamination: empty 100 ms buckets, and the longest run of them ------------------------
+  # A clean run has ZERO. Anything else means something outside the relay stole time during the
+  # measurement — a human at the machine being the known case — and the fps figure understates.
+  # Reported, never corrected for: a contaminated number is not a number to be adjusted, it is a
+  # number to be re-taken.
+  # Derive the frame timeline from the timestamps already in the proxy log — no sampler, no runtime
+  # cost, exact inter-frame gaps. A "stall" is an inter-frame gap far longer than the run's own median,
+  # which is the definition that does not need a hard-coded frame rate.
+  awk '/forward obj 3 opcode 1 / { if (match($0, /t_ns=[0-9]+/)) print substr($0, RSTART+5, RLENGTH-5) }' \
+    "$RD/c.log" > "$RD/timeline.dat" 2>/dev/null || true
+  if [ -s "$RD/timeline.dat" ]; then
+    # Count buckets in which the frame counter did not advance, and the longest run of them —
+    # **only up to the last sample that advanced**. The sampler deliberately outlives the
+    # application (it cannot know when the app will be stopped), so the timeline always ends in a
+    # tail of non-advancing samples that is the run ending, not a stall. Scoring that tail is not a
+    # subtle error: on a completely idle machine it reported a 3,400 ms stall in a run that the
+    # hand-rolled timeline had measured as perfectly clean. Two passes, because the cut-off is only
+    # known once the whole file has been read.
+    # Two passes: the median gap, then how many gaps exceed 10x it. 10x is deliberately loose — the
+    # stalls this exists to catch were 500-3400 ms against a ~45 ms median, i.e. 10-75x, while ordinary
+    # scheduling jitter is well under 2x. A tighter threshold would report jitter as contamination.
+    read -r empty longest samples medgap < <(awk '
+      NR == FNR { if (FNR > 1) g[++k] = $1 - prev; prev = $1; next }
+      FNR == 1 {
+        asort(g); med = (k ? g[int(k/2)+1] : 0)
+      }
+      { }
+      END {
+        for (i = 1; i <= k; i++) {
+          if (med > 0 && g[i] > 10 * med) { e++; if (g[i] > worst) worst = g[i] }
+        }
+        printf "%d %d %d %d\n", e + 0, worst / 1000000, k + 0, med / 1000000
+      }' "$RD/timeline.dat" "$RD/timeline.dat")
+  else
+    empty=-1; longest=-1; samples=0; medgap=0
+  fi
+
   [ "${inv:-0}" -gt 0 ] && m="$m invalid_object"
   [ "${drops:-0}" -gt 0 ] && m="$m event_drop"
   [ "${proto:-0}" -gt 0 ] && m="$m protocol"
@@ -296,9 +356,15 @@ for run in $(seq 1 "$RUNS"); do
     fail=$((fail+1)); verdict=FAIL
     for mode in $m; do modes[$mode]=$(( ${modes[$mode]:-0} + 1 )); done
   fi
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$run" "$verdict" "${m:--}" "${attaches:-0}" \
-    "${c2s:-0}" "${s2c:-0}" "${built:-0}" >> "$OUT/runs.tsv"
-  echo "run $run/$RUNS: $verdict${m:+ ($m)} attaches=$attaches c2s=${c2s:-?} s2c=${s2c:-?}"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$run" "$verdict" "${m:--}" "${attaches:-0}" \
+    "${c2s:-0}" "${s2c:-0}" "${built:-0}" "${empty:-0}" "${longest:-0}" "${samples:-0}" "${medgap:-0}" >> "$OUT/runs.tsv"
+  # The median gap is reported alongside, because "no stalls" and "fast" are different claims: a
+  # uniformly loaded machine produces a low frame rate with no abnormal gap at all, and this check
+  # would call that clean. It is clean *of stalls*; the median says whether it was also fast.
+  clean_note="clean, median gap ${medgap}ms"
+  [ "${empty:-0}" -gt 0 ] && clean_note="CONTAMINATED ${empty}/${samples} gaps, longest ${longest}ms, median ${medgap}ms"
+  [ "${empty:-0}" -lt 0 ] && clean_note="no timeline"
+  echo "run $run/$RUNS: $verdict${m:+ ($m)} attaches=$attaches c2s=${c2s:-?} s2c=${s2c:-?} [$clean_note]"
 done
 
 echo
@@ -311,4 +377,12 @@ if [ "$fail" -eq 0 ]; then
 else
   echo "failure modes:"; for k in "${!modes[@]}"; do echo "  $k: ${modes[$k]}"; done
 fi
+# ---- The contamination verdict for the sweep as a whole -----------------------------------------
+# Printed last and unconditionally, because an fps or traffic figure quoted without it is exactly the
+# kind of number this project has had to retract before.
+awk -F'\t' 'NR>1 { e+=$8; if ($8>0) bad++; if ($9>worst) worst=$9; n++ }
+  END { if (n==0) exit;
+        if (e==0) printf "CONTAMINATION: none — %d/%d runs had no abnormal inter-frame gaps. Figures are clean.\n", n, n;
+        else printf "CONTAMINATION: %d of %d runs disturbed (%d empty buckets total, longest stall %d ms).\n  Frame-rate figures from this sweep UNDERSTATE. Re-take on an idle machine.\n", bad, n, e, worst }' \
+  "$OUT/runs.tsv"
 echo "per-run table: $OUT/runs.tsv"

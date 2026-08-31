@@ -1300,7 +1300,16 @@ fn accept_client(
 fn wp_log(msg: &str) {
     // Only speak when explicitly asked, so the proxy is quiet in production and loud during bring-up.
     if std::env::var_os("RAYLAND_WP_LOG").is_some() {
-        eprintln!("[wp-proxy] {msg}");
+        // **Timestamped, and that is what makes a frame timeline free.** Establishing whether a
+        // frame-rate figure was disturbed needs to know *when* each frame was presented, and the
+        // obvious way — sampling the presented-frame count on a timer — was tried twice and cost more
+        // than it measured: a `grep -c` of the whole log ten times a second took the frame rate from
+        // 213 attaches to 98, and an offset-carrying version that spawned four processes per sample was
+        // no better. This line already exists for every forwarded request; stamping it turns the
+        // timeline into something derived **offline** from the log, at the cost of one clock read on a
+        // path that is already opt-in diagnostic. Exact inter-frame gaps, no sampler, and identical on
+        // both topologies because nothing is polled.
+        eprintln!("[wp-proxy] t_ns={} {msg}", rayland_relay::trace::monotonic_ns());
     }
 }
 
