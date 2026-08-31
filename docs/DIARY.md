@@ -5635,3 +5635,56 @@ asks, and four independent large wins moving nothing is exactly the signature of
 hypothesis. The test is to timestamp the application's successive ring writes and compare the
 distribution against `vn_relax`'s schedule — which needs no new code, only the trace already built
 this morning pointed at the arrival times rather than the segments.
+
+### 2026-08-31 (night, correction) — I reported a machine as incapable after looking at one filesystem
+
+Earlier tonight I wrote that the decisive weak-C measurement "is blocked, and not by Rayland", that
+milkv "has neither `vkcube` nor Mesa's virtio (Venus) ICD", and that its 92%-full root filesystem put
+building there out of reach. I put that in the diary, in `OVERVIEW.md`, in the project map, and in an
+evidence README, and I said it to the owner.
+
+**It was wrong.** The solsim session — which built the rig — pointed it out, and I verified it myself
+rather than take the correction on report:
+
+```
+/dev/mmcblk0p4   15G   14G  1.1G  93%  /            <- what I looked at
+/dev/mmcblk1p1  117G  5.7G  106G   6%  /mnt/build   <- where the rig is
+```
+
+`/mnt/build/sid` is a Debian sid riscv64 chroot with Mesa **26.1.6** — newer than the 26.0.3 our own
+docs record as the working C side — holding `virtio_icd.json`, `lvp_icd.json`, `vkcube`, a patched
+`vkgears`, and a prebuilt release `rayland-c`. It exists precisely *because* the host cannot hold it:
+the host is a ports snapshot frozen at 2022-12-25 whose apt reaches nothing newer. Everything I
+observed about the host was true. None of it was true of the machine.
+
+**The method error is worth more than the fact, and it is one this diary has caught before in other
+forms.** I ran `ls` on one filesystem, found nothing, and reported a property of *the board*. `df` was
+one command away — and `df` is what you run **before** concluding a machine is out of space, not
+after. I had even seen `df -h ~` output showing only the root filesystem and read it as the whole
+picture.
+
+Worse, I collapsed two different claims into one. "I should not install a Vulkan stack onto a
+93%-full host root uninvited" was correct, and I still think so. "The board cannot be tested" is a
+different sentence, and I only ever had evidence for the first. The first is a decision about what I
+am willing to do; the second is a claim about the world. Presenting a decision as a discovery is the
+subtler half of this mistake and the part I want to remember: **a negative result about someone
+else's environment deserves at least the effort I would spend on a positive one**, because a negative
+result is what stops anyone looking again.
+
+There is a straight line from here to today's other correction. This morning I refuted a
+`PROGRESS_POLL` belief that the project had carried for weeks — a sentence that was never true and
+that nobody re-checked because it sounded like a settled result. I then spent the evening
+manufacturing exactly such a sentence about milkv. The whole reason this project runs pre-registered
+experiments and keeps mutation-tested guards is that confident-sounding claims calcify. That applies
+to claims about the tooling as much as to claims about the code.
+
+The corrections are made where current truth lives (`OVERVIEW.md`, the map, the evidence README, with
+the wrong paragraph struck through rather than deleted), and this entry is the overturning, per the
+diary's own rule.
+
+**Standing fact, now correct:** the weak-C measurement is *available and unrun*. The forward-coalescing
+change predicts a real gain there and got only a regime-shift under a CPU quota; the board is where
+that prediction actually gets tested. Also worth carrying forward from the solsim session, because it
+would silently corrupt a figure: the chroot's `/usr/local/bin/vkgears` is **patched** with a NULL-seat
+guard and shadows stock `/usr/bin/vkgears.riscv64-linux-gnu` on `PATH`, so any `vkgears` number from
+that board must name the full path.

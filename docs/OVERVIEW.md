@@ -374,10 +374,20 @@ An earlier read of the same experiment at n = 7 showed a clean-looking 1.28× an
 second time in one day that a small sample flattered a hoped-for result (the fence-scan fix did the
 same at n = 3). Decide sample size before looking.
 
-**The decisive test is still not run**, and is blocked outside Rayland: milkv has rebooted and now has
-neither `vkcube` nor Mesa's virtio (Venus) ICD, and its root filesystem is 92% full (1.3 GB free)
-against a 9 GB debug target directory. `rayland-c` cross-compiles cleanly for
-`riscv64gc-unknown-linux-gnu` from the laptop, so only the board's Vulkan stack is missing.
+**The decisive test is still not run, but it is NOT blocked** — an earlier version of this paragraph
+said it was, and that was wrong. milkv's *host* root is a Debian ports snapshot frozen at 2022-12-25
+with 1.1 GB free and no Venus ICD, and nothing should be installed onto it. The working rig is a
+**Debian sid riscv64 chroot on a second card**: `/mnt/build` (`/dev/mmcblk1p1`, 117 GB, 106 GB free,
+in `fstab` by UUID), holding Mesa **26.1.6**, `virtio_icd.json`, `vkcube`, a patched `vkgears`, and a
+prebuilt release `rayland-c`. `sudo /mnt/build/chroot-mounts.sh up` after a reboot;
+`/mnt/build/README` documents it; `run-c1-milkv.sh` and `run-wp0-milkv.sh` drive the offscreen and
+windowed paths with exact-PID cleanup. `rayland-c` also cross-compiles cleanly for
+`riscv64gc-unknown-linux-gnu` from the laptop, which is how an A/B pair gets onto the board without a
+43-minute native build.
+
+**Note for anyone quoting a `vkgears` number from that board:** `/usr/local/bin/vkgears` in the chroot
+is *patched* (it carries a NULL-seat guard stock lacks) and shadows
+`/usr/bin/vkgears.riscv64-linux-gnu` on `PATH`. Name the full path with any figure.
 
 ### 5.4 Two findings that overturned earlier beliefs — do not re-propose the retired versions
 
