@@ -10,7 +10,17 @@ visible from the code — several of the project's central facts were discovered
 and at least three plausible-sounding designs were built and then disproved. A plan made without
 those facts will re-propose a dead end. They are all recorded here, with pointers to the evidence.
 
-**Last brought current:** 2026-08-31, against branch `main`.
+**Last brought current:** 2026-08-31, against branch `wp0-wayland-proxy`.
+
+> **Where the work is.** All WP0, (c)1 and (c)2 work described below lives on **`wp0-wayland-proxy`**,
+> which is **37 commits ahead of `main`** and behind it by none. `main` last moved on 2026-08-29.
+> Nothing is lost and nothing conflicts — but anyone looking for the WP0 proxy, the forward-path
+> coalescing, the poll-interval results or the `wl_shm` spec **will not find them on `main`**. Merging
+> is the repository owner's call, not a session's.
+>
+> (An earlier version of this line said "against branch `main`", which was false. The session that
+> wrote it trusted a stale branch name from its own start-of-session context instead of running
+> `git rev-parse --abbrev-ref HEAD`.)
 
 ---
 
