@@ -621,6 +621,9 @@ fn progress_thread(
             p
         };
         if !progress.is_empty() {
+            // `head` moved: virglrenderer's ring thread consumed commands. The gap back to
+            // `DeltaApplied` is virglrenderer noticing and executing.
+            rayland_s::stages::note(rayland_s::stages::Stage::RingProgress);
             // The reply arena for the commands that just retired, plus a check of whether the arena now
             // shows a `vkGetFenceStatus` reply reading `VK_SUCCESS` — read from the **live** arena, in the
             // same lock, because `take_venus_blob_writes` fragments the reply into per-changed-byte runs
@@ -652,7 +655,13 @@ fn progress_thread(
                 );
                 (v, s)
             };
+            if !venus.is_empty() {
+                // Changed reply-arena bytes are in hand — the answers exist on S.
+                rayland_s::stages::note(rayland_s::stages::Stage::VenusReply);
+            }
             if signaled {
+                // The app's submit and its readback copy are complete on S's GPU.
+                rayland_s::stages::note(rayland_s::stages::Stage::FenceSignaled);
                 // A fence just signalled: the application's submit and its readback copy are complete on
                 // S's GPU, so `res6` is a *whole* frame (the empty-submit context fence never guaranteed
                 // this — it retired before the DMA). Ship the readback pixels BEFORE the reply arena (which
@@ -671,6 +680,9 @@ fn progress_thread(
                 // matters: doing this read on the relay's path was measured stalling the ring for
                 // 30 s. See `LiveFrame`'s docs for the two approaches that failed before this one.
                 if !app.is_empty() {
+                    // This round trip carried a finished frame, which is what makes some far more
+                    // expensive than others; averaging the two would hide both.
+                    rayland_s::stages::note(rayland_s::stages::Stage::ReadbackShipped);
                     match live.lock() {
                         Ok(mut frame) => frame.apply_runs(&app),
                         // Presentation is not worth killing a working relay for.
@@ -689,6 +701,9 @@ fn progress_thread(
             if ship(&tx, &venus).is_err() {
                 return;
             }
+            // The head-advance is what releases the application; once it is on the link, this round
+            // trip is over as far as S is concerned.
+            rayland_s::stages::note(rayland_s::stages::Stage::ReplyShipped);
             if ship(&tx, &progress).is_err() {
                 return;
             }
@@ -735,6 +750,11 @@ fn serve(
                 // were the only two points on that path — so a message lost in the link and a message
                 // read but not applied were indistinguishable. This is the read seam.
                 link_log("r<", &c2s_kind(&m));
+                // Only a ring delta: this instrument exists to decompose the ring round trip, and
+                // recording every message kind would bury it in blob syncs.
+                if matches!(m, C2S::RingDelta { .. }) {
+                    rayland_s::stages::note(rayland_s::stages::Stage::DeltaRead);
+                }
                 m
             }
             Err(e) => {
@@ -802,6 +822,8 @@ fn serve(
         // `apply` and the sends below — its BlobCreated-before-BlobData reason (this function's docs)
         // is unchanged. `apply`'s engine calls block only on the actor, which services them promptly
         // even while a readback fence is in flight, so this can no longer deadlock the doorbell.
+        // Noted before `apply` takes ownership of the message; used only to bound the stage record.
+        let was_ring_delta = matches!(msg, C2S::RingDelta { .. });
         let out = session.apply(engine, msg);
 
         // **Look for the frame here, before the lock is released and before the replies go out.**
@@ -836,6 +858,12 @@ fn serve(
         drop(session);
         // Recorded after the drop, so the span is the whole time the progress thread was locked out.
         rayland_s::lockstat::record(&rayland_s::lockstat::table().msg_lock_held, held.elapsed());
+        // The delta's bytes are now in the ring blob's memory with `tail` published, so
+        // virglrenderer's ring thread may see them. Everything between here and the next
+        // `RingProgress` belongs to virglrenderer, not to us — which is the span nothing has timed.
+        if was_ring_delta {
+            rayland_s::stages::note(rayland_s::stages::Stage::DeltaApplied);
+        }
     }
 }
 
@@ -851,6 +879,9 @@ fn main() -> Result<()> {
     // Started before anything else so a run killed by the harness — which is how every soak run ends
     // — still leaves its lock statistics behind. Inert unless `RAYLAND_S_LOCKSTAT` is set.
     rayland_s::lockstat::start_reporter();
+    // Records S's per-stage timeline when `RAYLAND_S_STAGES` is set; inert otherwise. On loopback
+    // this shares `CLOCK_MONOTONIC` with C's `RELAXSTAT`, so the two records join directly.
+    rayland_s::stages::start_reporter();
     let listen = env_or(ENV_LISTEN, DEFAULT_LISTEN);
     let render_node = PathBuf::from(env_or(ENV_RENDER_NODE, DEFAULT_RENDER_NODE));
 

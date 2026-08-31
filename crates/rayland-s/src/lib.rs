@@ -48,6 +48,9 @@ pub mod apply;
 // S's writable view of a blob resource's shared pages.
 pub mod blob;
 
+/// S's stage recorder: where the ~16 ms per ring round trip goes.
+pub mod stages;
+
 /// Duration histograms for the applier lock — where S's message thread waits, and why.
 pub mod lockstat;
 // Putting the frame on S's display — and the one question (c)1 must ask that spec §7.2 forbids.

@@ -209,7 +209,7 @@ for run in $(seq 1 "$RUNS"); do
   # common case, and an empty word in an assignment prefix ends the prefix and makes bash read the next
   # word as the command name. `env` swallows the empty expansion harmlessly.
   env WAYLAND_DISPLAY="$WESTON_SOCKET" RAYLAND_S_EVENT_LOG=1 RAYLAND_C1_NO_PRESENT=1 \
-    ${SHIP_PRESENTED:+RAYLAND_S_SHIP_PRESENTED=1} ${LINK_LOG:+RAYLAND_S_REPLY_LOG=1} ${LOCKSTAT:+RAYLAND_S_LOCKSTAT=1} \
+    ${SHIP_PRESENTED:+RAYLAND_S_SHIP_PRESENTED=1} ${LINK_LOG:+RAYLAND_S_REPLY_LOG=1} ${LOCKSTAT:+RAYLAND_S_LOCKSTAT=1} ${STAGES:+RAYLAND_S_STAGES=1} \
     ${POLL_US:+RAYLAND_S_PROGRESS_POLL_US=$POLL_US} \
     RAYLAND_C1_S_LISTEN="0.0.0.0:$PORT" "$BIN/rayland-s" > "$RD/s.log" 2>&1 &
   S_PID=$!

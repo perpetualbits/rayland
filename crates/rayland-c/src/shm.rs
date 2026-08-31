@@ -145,6 +145,32 @@ pub struct LocalBlob {
     presented: bool,
 }
 
+/// How many bytes the C→S diff compares at a time before descending to individual bytes.
+///
+/// # Why this is a module constant and not a local one
+/// The guard test [`tests::the_chunked_diff_agrees_with_a_byte_at_a_time_reference`] derives its
+/// buffer size and its boundary cases **from this value**. When it was a local `const` the test used
+/// a hard-coded 512-byte buffer and hand-written offsets around 64 — so raising the chunk to 4096
+/// would have made the whole test buffer a single chunk, and every "straddles a boundary" case would
+/// have silently stopped testing anything while still passing. That is the third time in a fortnight
+/// this project has met a test that could only confirm the belief it was written from, so the
+/// coupling is now structural rather than remembered.
+///
+/// # Why 4096, measured
+/// This is the single largest term in the application's frame time, and it was found by measurement
+/// on 2026-09-01, not by inspection. `messages_for_delta` diffs **every** blob on **every** ring
+/// delta — 13.2 MiB for `vkcube` (an 8 MiB staging pool, a 1 MiB reply arena, four 1 MB swapchain
+/// images and the rest) — roughly three times per frame. At 64 bytes that is ~216,000 slice
+/// comparisons per delta, and a joined C/S stage trace put it at **9.99 ms, 51.1% of the whole
+/// round trip**. S's equivalent was raised from 64 to 4096 in August (`rayland_s::blob`) and C's was
+/// simply never changed with it, on the machine where it costs the most and which may be the weak
+/// one.
+///
+/// The chunk size **cannot change what the diff produces, only how fast it produces it** — a chunk
+/// that differs is still walked byte by byte, and a run straddling a boundary is still emitted whole.
+/// That equivalence is what the guard test asserts, against a deliberately naive reference.
+pub(crate) const DIFF_CHUNK: usize = 4096;
+
 impl LocalBlob {
     /// Allocate `size` bytes of local shared memory for a blob Mesa asked for, and produce both our
     /// lasting view of it and the descriptor Mesa must receive.
@@ -412,7 +438,7 @@ impl LocalBlob {
         // This repository has now stalled the relay three separate times by reading blob pages
         // byte-at-a-time (see `docs/DIARY.md`); the shape below is the same one that fixed the
         // 637 ms critical section on S.
-        const CHUNK: usize = 64;
+        const CHUNK: usize = DIFF_CHUNK;
         while i < len {
             let chunk_end = (i + CHUNK).min(len);
             // Whole chunk agrees with what S has: nothing to ship, and any run ends here.
@@ -538,20 +564,46 @@ mod tests {
             out
         }
 
-        const SIZE: u64 = 512;
-        // Each case is a set of byte indices to change, chosen relative to the 64-byte chunking.
+        // Derived from the real chunk size, never hard-coded: the cases below are *about* the chunk
+        // boundaries, so a buffer smaller than a few chunks would make them vacuous. Five chunks
+        // gives at least four interior boundaries to straddle.
+        //
+        // **Deliberately NOT a whole multiple of the chunk.** The `+ 37` makes the final chunk a
+        // partial one, so the loop's trailing-remainder path is exercised by every case. Mutation
+        // testing caught this: with an exact multiple, an implementation that simply *dropped* a
+        // trailing partial chunk passed the whole suite, because no buffer in it ever had one.
+        const CHUNK: usize = DIFF_CHUNK;
+        const SIZE: u64 = (CHUNK * 5 + 37) as u64;
+        // Each case is a set of byte indices to change, expressed **relative to `CHUNK`** so the
+        // boundary cases keep straddling a real boundary whatever the chunk size becomes.
         let cases: Vec<(&str, Vec<usize>)> = vec![
             ("nothing changed", vec![]),
             ("one byte mid-chunk", vec![10]),
-            ("a run straddling the first boundary", (60..70).collect()),
-            ("a run ending exactly on a boundary", (56..64).collect()),
-            ("a run starting exactly on a boundary", (64..72).collect()),
-            ("adjacent chunks, separated by one equal byte", {
+            (
+                "a run straddling the first boundary",
+                (CHUNK - 4..CHUNK + 6).collect(),
+            ),
+            (
+                "a run ending exactly on a boundary",
+                (CHUNK - 8..CHUNK).collect(),
+            ),
+            (
+                "a run starting exactly on a boundary",
+                (CHUNK..CHUNK + 8).collect(),
+            ),
+            ("two runs in one chunk, one equal byte between", {
                 let mut v: Vec<usize> = (100..128).collect();
                 v.extend(129..160);
                 v
             }),
-            ("a run spanning several whole chunks", (32..300).collect()),
+            (
+                "a run spanning several whole chunks",
+                (CHUNK / 2..CHUNK * 3 + 7).collect(),
+            ),
+            (
+                "a change in the last chunk only",
+                (CHUNK * 4 + 3..CHUNK * 4 + 9).collect(),
+            ),
             ("the very last byte", vec![SIZE as usize - 1]),
             ("every byte", (0..SIZE as usize).collect()),
         ];

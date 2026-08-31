@@ -120,10 +120,7 @@ pub fn wayland_event_channel() -> std::io::Result<(WaylandEventPoster, WaylandEv
     // SAFETY: `write_raw` is a valid, freshly-owned fd.
     let write_fd = unsafe { OwnedFd::from_raw_fd(write_raw) };
     Ok((
-        WaylandEventPoster {
-            tx,
-            wake: write_fd,
-        },
+        WaylandEventPoster { tx, wake: write_fd },
         WaylandEventInbox { rx, wake: read_fd },
     ))
 }
@@ -401,8 +398,10 @@ const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241;
 /// LINEAR: these are what a Venus WSI swapchain negotiates and what the HOST3D dma-buf on S exports, so the
 /// app never picks a format S cannot present. Mesa's `pick_surface_format` needs only that this set is
 /// non-empty (`count >= 1`); one pair would do, and both opaque and alpha are offered for completeness.
-const ADVERTISED_FORMATS: [(u32, u64); 2] =
-    [(DRM_FORMAT_XRGB8888, MOD_LINEAR), (DRM_FORMAT_ARGB8888, MOD_LINEAR)];
+const ADVERTISED_FORMATS: [(u32, u64); 2] = [
+    (DRM_FORMAT_XRGB8888, MOD_LINEAR),
+    (DRM_FORMAT_ARGB8888, MOD_LINEAR),
+];
 
 /// Read a passed fd's memfd identity (`st_dev`, `st_ino`) via `fstat`, for resource correlation.
 ///
@@ -540,7 +539,8 @@ fn try_intercept_buffer(data: &mut ProxyState, msg: &Message<ObjectId, OwnedFd>)
     match (iface, msg.opcode) {
         // Step 1: a new params object. Start tracking it; do not forward.
         (IFACE_DMABUF, OP_CREATE_PARAMS) => {
-            if let (Some(params_id), Some(params_obj)) = (first_new_id(msg), first_new_object(msg)) {
+            if let (Some(params_id), Some(params_obj)) = (first_new_id(msg), first_new_object(msg))
+            {
                 // Store the object's identity alongside its state, so a later destroy of a *different*
                 // object that happened to wear this same number cannot discard it.
                 data.pending.insert(
@@ -603,7 +603,11 @@ fn try_intercept_buffer(data: &mut ProxyState, msg: &Message<ObjectId, OwnedFd>)
             // A poisoned params object (multi-plane; see the `add` arm) is treated exactly like an
             // unresolved fd: no token crosses. Folding it into the same `None` keeps one refusal path
             // rather than two, which is what the caller and the app already cope with correctly.
-            let resolved = if pending.unsupported { None } else { pending.resource_id };
+            let resolved = if pending.unsupported {
+                None
+            } else {
+                pending.resource_id
+            };
             match (buffer_id, resolved) {
                 (Some(buffer_id), Some(resource_id)) => {
                     let token = BufferToken {
@@ -811,10 +815,7 @@ impl ObjectData<ProxyState> for ProxyObjectData {
     ) -> Option<Arc<dyn ObjectData<ProxyState>>> {
         // Does this request create a new object? The backend needs data for it if so — decided *before*
         // `msg` is consumed by translation below.
-        let makes_new_object = msg
-            .args
-            .iter()
-            .any(|arg| matches!(arg, Argument::NewId(_)));
+        let makes_new_object = msg.args.iter().any(|arg| matches!(arg, Argument::NewId(_)));
         // Record every object this request creates in the app-id → ObjectId map, so a later compositor event
         // targeting it (an `xdg_surface.configure`, a `wl_buffer.release`) can be delivered back — see
         // [`deliver_event`]. The new object's `ObjectId` is carried in the request itself as an
@@ -1284,10 +1285,7 @@ fn deliver_event(handle: &Handle, state: &ProxyState, msg: WaylandMessage) {
 /// The stream is registered with a fresh [`ProxyClientData`]; from then on the backend delivers that
 /// client's requests to the objects' [`ObjectData::request`]. After registering, flush so the client
 /// immediately sees the initial protocol state (e.g. the display's globals).
-fn accept_client(
-    backend: &mut Backend<ProxyState>,
-    listener: &UnixListener,
-) -> anyhow::Result<()> {
+fn accept_client(backend: &mut Backend<ProxyState>, listener: &UnixListener) -> anyhow::Result<()> {
     // `poll` reported the listener readable, so this accept does not block.
     let (stream, _addr): (UnixStream, _) = listener.accept()?;
     let mut handle = backend.handle();
@@ -1315,7 +1313,10 @@ fn wp_log(msg: &str) {
         // timeline into something derived **offline** from the log, at the cost of one clock read on a
         // path that is already opt-in diagnostic. Exact inter-frame gaps, no sampler, and identical on
         // both topologies because nothing is polled.
-        eprintln!("[wp-proxy] t_ns={} {msg}", rayland_relay::trace::monotonic_ns());
+        eprintln!(
+            "[wp-proxy] t_ns={} {msg}",
+            rayland_relay::trace::monotonic_ns()
+        );
     }
 }
 
@@ -1351,7 +1352,9 @@ mod tests {
     fn array_arg_is_copied_verbatim() {
         let bytes = vec![0u8, 1, 2, 250, 255];
         assert_eq!(
-            translate_arg(&Argument::<ObjectId, OwnedFd>::Array(Box::new(bytes.clone()))),
+            translate_arg(&Argument::<ObjectId, OwnedFd>::Array(Box::new(
+                bytes.clone()
+            ))),
             Ok(WaylandArg::Array(bytes))
         );
     }

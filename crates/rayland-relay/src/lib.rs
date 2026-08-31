@@ -67,4 +67,7 @@ pub use frame::{MAX_FRAME_BYTES, RelayError, read_msg, write_msg};
 /// Merging nearly-adjacent changed byte ranges, and the safety rule both directions share.
 pub mod ranges;
 
+/// An ordered, timestamped event recorder cheap enough to leave on a latency-critical path.
+pub mod stagelog;
+
 pub mod trace;

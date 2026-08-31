@@ -5755,3 +5755,76 @@ it is what I did after the poll experiment: I wrote the back-off idea into `OVER
 leading hypothesis" on the strength of four nulls, with no positive evidence for it whatsoever. Four
 things not being the cause is not evidence for any particular fifth thing. That framing is now
 corrected there.
+
+### 2026-09-01 — The 16 ms was never on S, and the fix was a constant we had already changed once
+
+The brief was to instrument the S-side span and find the ~16 ms. I built the instrument, and the
+answer is that the span I was told to instrument holds a quarter of it. The rest is on **C**.
+
+**What S's stages say.** Seven points across S's handling of one relayed ring delta. All of S is
+**4.96 ms** of a ~19 ms round trip, and the piece I most expected to be guilty —
+`DeltaApplied → head moved`, which is *virglrenderer's ring thread noticing and executing*, the one
+span in this whole system that is not ours and has never been timed — is **0.20 ms**. Third back-off
+hypothesis in two days, third refutation. I have now suspected Mesa's client-side relax,
+virglrenderer's host-side relax, and virglrenderer's execution, and all three are rounding errors.
+
+**Joining the two logs is what produced the answer**, and it was cheap because both daemons stamp the
+same `CLOCK_MONOTONIC` on loopback. Seven stages, 630 round trips:
+
+| stage | median | share |
+|---|---|---|
+| **C: diff every blob + serialize** | **9.99 ms** | **51.1%** |
+| C: write + flush | 0.16 ms | 1.6% |
+| transit + S works through the batch | 1.34 ms | 7.2% |
+| S: read → delta applied | 1.90 ms | 9.1% |
+| S: applied → head moved (virglrenderer) | 0.20 ms | 1.1% |
+| S: head moved → reply on the link | 2.76 ms | 17.4% |
+| transit back + C applies | 1.13 ms | 12.6% |
+
+Over half the round trip is C diffing blobs. On **C** — the machine that in the real deployment is the
+weak one, possibly a RISC-V board.
+
+**And the cause is embarrassing in the most useful way.** `messages_for_delta` diffs *every* blob on
+*every* ring delta — 13.2 MiB for vkcube, about three times a frame — and `take_changed_runs` compared
+it **64 bytes at a time**. S's identical routine was raised from 64 to 4096 in August, with a comment
+explaining exactly why a byte-at-a-time compare of an 8 MiB pool is ruinous. **C's was never changed
+with it.** The same fix, on the side where it costs more, sitting there for a month.
+
+Nothing subtle happened here. Nobody reasoned wrongly about C's chunk size; it was simply never
+looked at, because the August work was S-side and the constant lives in a different file. What found
+it was not insight but a joined timeline that attributed every nanosecond to somebody.
+
+**Measured. 9.13 ms → 2.17 ms on the stage itself (4.2×), and end to end 80 → 45 ms median across 11
+interleaved pairs — 1.78×, p = 0.0025.** That is the first change in a week of performance work that
+moved the frame rate at all. The four before it each collapsed a mechanism by 5–8× and moved nothing,
+and now I know why: none of them was on the critical path, and this one is 51% of it.
+
+I want to record what that week actually bought, because "four nulls then a win" undersells it. The
+nulls are what made this findable. Each one removed a candidate and, more importantly, each one pushed
+the instrument one level finer — a lock histogram, then an ownership split, then a seven-stage joined
+timeline. The last instrument found the answer in one run. I would not have built it on day one, and
+if I had guessed my way here I would have "fixed" the chunk size with no evidence that it mattered and
+no way to show that it had.
+
+**Two blind spots in the guard test, both found by mutation, both of the same family.** The test that
+licenses "speed only, not meaning" was written for a 64-byte chunk with a 512-byte buffer and offsets
+hand-written around 64. At 4096 the entire buffer becomes one chunk, so every straddles-a-boundary case
+would have tested nothing *and still passed*. And `SIZE` was an exact multiple of the chunk, so no case
+ever had a trailing partial chunk — an implementation that simply dropped one passed the whole suite.
+Both are fixed by making the test derive its buffer size and its offsets from the real constant, and by
+making the size deliberately not a multiple (`CHUNK * 5 + 37`). This is the fourth time in a fortnight
+this project has met a test that could only confirm the belief it was written from, and the first time
+one was caught *before* it mattered rather than after.
+
+One mutation was **not** caught and should not have been: forcing every run closed at a chunk boundary.
+`coalesce_ranges(_, 0)` merges *adjacent* ranges, so the split is repaired before it reaches the wire —
+behaviour-preserving by construction. Worth knowing precisely because the shared docs say gap 0 "merges
+nothing": that is true of the correct diff's output, and not true of a split one.
+
+**What is left, and it is a design question rather than a constant.** Stage 1a is still 2.17 ms, three
+times a frame, and now near the memory-bandwidth floor for a 13.2 MiB `memcmp`. Going further means not
+walking 13.2 MiB per delta at all. The clearest waste is visible in the blob list: **four 1 MB swapchain
+images the application never CPU-writes**, diffed on every delta to discover every time that nothing
+changed. Real dirty-page tracking (soft-dirty via `/proc/PID/clear_refs`, or `userfaultfd`) would end
+the scan entirely, and it is the same mechanism (c)2 has always needed for the mapped-memory problem —
+so this is not a detour from the roadmap, it is the roadmap arriving from an unexpected direction.

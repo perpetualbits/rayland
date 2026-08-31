@@ -869,6 +869,9 @@ fn ring_watcher_thread(
             // must be on S before the commands that read them, because S's ring thread dispatches
             // the instant `tail` lands. See `crate::blob_sync`.
             let msgs = messages_for_delta(&blobs, identity.res_id, delta);
+            // Blobs diffed and the batch serialized. The interval back to `RingShipped` is the
+            // forward path's own work, the 8 MiB staging-pool `memcmp` included.
+            rayland_c::relaxstat::note(rayland_c::relaxstat::Event::SyncPrepared);
 
             // One lock for the whole batch. This loop is the only ring watcher there is, so it
             // cannot overtake itself — the reason to hold one lock is the *other* thread sharing
@@ -896,6 +899,9 @@ fn ring_watcher_thread(
                     .expect("the progress lock is never poisoned")
                     .note_shipped(tail);
             }
+            // Everything is on the link. From here to S's `DeltaRead` is transit plus S working
+            // through the batch to reach the delta at the end of it.
+            rayland_c::relaxstat::note(rayland_c::relaxstat::Event::SyncSent);
             // New work was just produced, so do not even consider parking: go straight back and
             // look again. An application mid-frame produces continuously. IDLE was retracted in
             // step 1, so this shortcut leaves no stale claim behind.

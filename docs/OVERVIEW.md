@@ -10,7 +10,7 @@ visible from the code — several of the project's central facts were discovered
 and at least three plausible-sounding designs were built and then disproved. A plan made without
 those facts will re-propose a dead end. They are all recorded here, with pointers to the evidence.
 
-**Last brought current:** 2026-08-31, against branch `wp0-wayland-proxy`.
+**Last brought current:** 2026-09-01, against branch `wp0-wayland-proxy`.
 
 > **Where the work is.** All WP0, (c)1 and (c)2 work described below lives on **`wp0-wayland-proxy`**,
 > which is **37 commits ahead of `main`** and behind it by none. `main` last moved on 2026-08-29.
@@ -775,8 +775,27 @@ it either way. This is the best ratio of information to effort currently on the 
   tenth. A second hypothesis, virglrenderer's *host-side* `vkr_ring_relax` back-off, was formed and
   killed in the same data: a longer idle before a delta barely predicts a longer wait for its reply
   (Spearman ρ = +0.117, n = 1351), and even with **no** preceding idle the wait is 11.5 ms.
-- **The actual target, with a number for the first time: ~3.1 ring-delta round trips per frame at
-  ~16 ms each.** 91% of Rayland's share sits in intervals over 5 ms, and 90.5% of *that* is in
+- **FOUND AND FIXED, 2026-09-01: over half that round trip was C diffing blobs at a 64-byte grain.**
+  A seven-stage timeline joining C's and S's records on the shared loopback clock (630 round trips)
+  put **51.1% of the round trip in "C diffs every blob + serializes"** — 9.99 ms — against 4.96 ms for
+  *all* of S, and **0.20 ms** for virglrenderer's ring thread noticing and executing. The cause:
+  `messages_for_delta` diffs **every** blob on **every** ring delta (13.2 MiB for `vkcube` — an 8 MiB
+  staging pool, a 1 MiB reply arena, four 1 MB swapchain images — about three times a frame), and
+  `LocalBlob::take_changed_runs` compared it 64 bytes at a time. **S's identical routine was raised to
+  4096 in August and C's was never changed with it**, on the side where it costs more and which in the
+  real deployment is the weak machine. Raising `shm::DIFF_CHUNK` to 4096 is a speed change only
+  (guarded against a naive reference). **Measured: stage 9.13 → 2.17 ms (4.2×); end to end 80 → 45 ms
+  median across 11 interleaved pairs, 1.78×, p = 0.0025.** The first change in a week of perf work to
+  move the frame rate — the four before it were each 5–8× on a mechanism that was not on the critical
+  path. See `docs/data/2026-09-01-s-side-span/`.
+- **Still open, and now a design question rather than a constant.** Stage 1a is still 2.17 ms three
+  times a frame, near the memory-bandwidth floor for a 13.2 MiB `memcmp`. Going further means not
+  walking 13.2 MiB per delta at all — the four 1 MB swapchain images are re-diffed every time to
+  discover the application never CPU-wrote them. Real dirty-page tracking (soft-dirty via
+  `/proc/PID/clear_refs`, or `userfaultfd`) would end the scan, and it is the same mechanism (c)2 has
+  always needed for the mapped-memory problem.
+- **The superseded framing, kept because it was the route here: ~3.1 ring-delta round trips per frame
+  at ~16 ms each.** 91% of Rayland's share sits in intervals over 5 ms, and 90.5% of *that* is in
   intervals beginning with a ring delta going out. Three round trips at sixteen milliseconds is
   essentially the whole 57 ms frame — on **loopback**, where the network costs microseconds.
   Everything previously suspected is excluded by measurement: the network, S's lock contention, C's
