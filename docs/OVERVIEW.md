@@ -336,11 +336,29 @@ gap-coalesced: **6.1× fewer messages, 5.4× less time in `send()`**). Each coll
 5–8×. **Neither moved the median frame gap measurably.** The chain is *serialized latency*, so what is
 left in it is the **number** of round trips per frame and the fixed cost each pays.
 
-The `PROGRESS_POLL` (200 µs, `rayland-s`) is the standing suspect for that fixed cost. Note carefully
-that the experiment which appears to refute it — 200 µs → 20 µs measured *worse*, 11.2 fps against
-12.5–14.9 — **was run when every poll dragged a ~2 ms arena scan behind it**. That scan is now 131 µs.
-The refutation was of a different system and the experiment needs re-running; do not treat it as
-settled either way.
+**Both poll intervals have now been swept, pre-registered and factorial, and NEITHER is the term**
+(`docs/data/2026-08-31-poll-interval/`, n = 10 per arm, interleaved, with a manipulation check):
+
+| arm | `PARK_SLEEP` (C) | `PROGRESS_POLL` (S) | median gap | vs control |
+|---|---|---|---|---|
+| A control | 500 µs | 200 µs | 59.0 ms | — |
+| B | 500 µs | **20 µs** | **59.0 ms** | 1.000×, **p = 0.94** |
+| C | **50 µs** | 200 µs | 77.0 ms | 0.77×, **p = 0.004** |
+| D | **50 µs** | **20 µs** | 74.5 ms | 0.79×, p = 0.017 |
+
+- **`PROGRESS_POLL` does nothing.** Identical medians with the poll verified running ~3× more often.
+  Its doc comment's claim that on loopback "this becomes the dominant term" was flagged
+  `[INFERENCE] — never measured`; it is now measured and **refuted**, and the comment is corrected in
+  place. Do not tune it hoping for frame time.
+- **The earlier experiment was right about its outcome and wrong about its cause.** "200→20 µs was
+  worse" changed *both* intervals; all the damage is `PARK_SLEEP`'s (arm C reproduces it without
+  touching `PROGRESS_POLL`). The project carried that sentence for weeks as a reason not to look
+  again, and it was never true.
+- **`PARK_SLEEP` sits on a flat optimum at or above 500 µs.** Shortening it costs ~1.3× by
+  *fragmenting* the ring delta (ring messages 323 → 456, +41%, bytes unchanged), because a short park
+  wakes the watcher between Mesa's doorbell kicks. Lengthening it to 1000 or 2000 µs changes nothing
+  (p = 0.91, 0.88) **and batches nothing** (~300–318 ring messages throughout) — at 500 µs the watcher
+  is already doorbell-driven, not timer-driven. Leave it alone.
 
 **The weak-C prediction, tested by simulation and NOT confirmed as a speedup.** All of the above is
 loopback on a fast laptop, where saving C CPU buys nothing because C has CPU to spare. Running
@@ -724,9 +742,19 @@ it either way. This is the best ratio of information to effort currently on the 
 
 - **The synchronous round trip itself.** Now the *measured* explanation for frame time, and since
   2026-08-31 it is specifically the round-trip **count** and each trip's fixed cost, not CPU work on
-  either side — see §5.3. Candidate directions: the 200 µs `PROGRESS_POLL` (re-test it; its earlier
-  refutation predates the arena-scan fix), adaptive polling, reply batching. Matters most when
-  latency is high.
+  either side — see §5.3. Candidate directions: adaptive polling, reply batching. Matters most when
+  latency is high. **Both poll intervals are now excluded** by the sweep in §5.3 — do not re-propose
+  tuning them.
+- **The leading untested hypothesis for frame time: Mesa's own back-off, not Rayland.** Four large
+  interventions on our own code — S's lock contention (8.3×), C's message rate (6.1×),
+  `PROGRESS_POLL` (3× more polling), `PARK_SLEEP` (both directions) — moved the frame rate by nothing.
+  With feedback off the application implements `vkWaitForFences` by polling `vkGetFenceStatus`, and
+  the gap between polls is chosen by Mesa's `vn_relax`: yield for 16 iterations, then an exponentially
+  growing sleep from 10 µs (`vkr_ring.c:190-210`). If the app sleeps in `vn_relax` between polls, every
+  microsecond Rayland saves is absorbed by the app waiting longer before it next asks — which is
+  exactly the signature observed. **This is a hypothesis, not a finding.** The test needs no new code:
+  point the existing link trace at the *arrival times* of the application's successive ring writes and
+  compare the distribution against `vn_relax`'s schedule.
 - **A latent coalescing hazard on S's return path**, found by the safety check the C→S coalescing
   change required and deliberately *not* fixed there. `Applier::take_app_blob_writes` coalesces at
   gap 256 on the argument that `res6` is "S-written and C-read-only" — but its filter selects every

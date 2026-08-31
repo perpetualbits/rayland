@@ -119,14 +119,26 @@ const DEFAULT_RENDER_NODE: &str = "/dev/dri/renderD128";
 /// **latency, not bandwidth, is what will hurt Rayland**, and that the replies are round trips the
 /// application blocks on — but a round trip over any real network is measured in milliseconds, so a
 /// 200 µs poll adds a small fraction to it while costing S (the *strong* machine) a negligible slice
-/// of one core. On a loopback link, where the RTT is microseconds, this becomes the dominant term —
-/// a real caveat for Task 6's loopback e2e, stated here rather than discovered there.
+/// of one core.
 ///
-/// **[INFERENCE]** — never measured. virglrenderer's own ring thread faces the identical trade and
-/// answers it with an adaptive scheme (`thrd_yield()` for 16 iterations, then an exponentially
-/// growing sleep from 10 µs — `vkr_ring_relax`, `vkr_ring.c:190-210`). Copying that shape here is
-/// the obvious improvement and has not been done, because a fixed interval is the honest starting
-/// point for something with no measurements behind it.
+/// # MEASURED 2026-08-31, and the earlier inference here was WRONG
+/// This comment used to end by claiming that "on a loopback link, where the RTT is microseconds, this
+/// becomes the dominant term", flagged `[INFERENCE] — never measured`. It has now been measured, in a
+/// pre-registered factorial experiment (`docs/data/2026-08-31-poll-interval/`), and **it is not the
+/// dominant term on loopback — it is not a measurable term at all**. Taking this interval from 200 µs
+/// to 20 µs, with the poll verified to run ~3× more often, left the median inter-frame gap
+/// **identical to one decimal place (59.0 ms both arms, n = 10 each, p = 0.94)**.
+///
+/// An earlier, confounded experiment appeared to refute a shorter poll — 200→20 µs measured *worse* —
+/// but it changed C's `PARK_SLEEP` at the same time, and the factorial shows **all** of that damage
+/// was `PARK_SLEEP`'s. This interval contributed nothing in either direction.
+///
+/// So: do not tune this hoping for frame time, and do not "fix" it by copying virglrenderer's
+/// adaptive `vkr_ring_relax` shape (`thrd_yield()` ×16, then an exponentially growing sleep from
+/// 10 µs — `vkr_ring.c:190-210`). That remains a reasonable thing to do for CPU reasons; it is not a
+/// latency improvement, because there is no latency here to improve.
+///
+/// Override with `RAYLAND_S_PROGRESS_POLL_US` — see [`progress_poll`].
 const PROGRESS_POLL: Duration = Duration::from_micros(200);
 
 /// The progress poll interval actually used, allowing `RAYLAND_S_PROGRESS_POLL_US` to override it.

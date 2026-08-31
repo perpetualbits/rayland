@@ -5562,3 +5562,76 @@ Three things I want on the record from this, because they are about method rathe
    frame-rate movement anywhere*. Frame time is a serialized latency chain. The next thing to try is
    the one the morning's work newly unblocked: re-run the `PROGRESS_POLL` experiment, whose earlier
    refutation was measured when every poll dragged a 2 ms arena scan behind it.
+
+### 2026-08-31 (night) — The poll experiment, pre-registered: one knob does nothing and the other was blamed for it
+
+The morning's fence-scan fix made a cheap `PROGRESS_POLL` newly affordable, and the standing reason
+not to shorten it — an earlier run where 200→20 µs measured *worse* — was taken when every poll
+dragged a 2 ms arena scan behind it. So the refutation was of a different system, and the owner asked
+for the experiment again.
+
+**I pre-registered it**, and committed the pre-registration before the first run. Twice today a small
+sample had flattered the answer I wanted (the fence fix looked like a win at n=3 and was nothing at
+n=11; the starved-C test looked like 1.28× at n=7 and was 1.03× at n=13), and both times the bias ran
+the same way. Writing the design down first is the only defence I know. Fixed in advance: four arms,
+n=10 each, interleaved, primary metric the median inter-frame gap, a **manipulation check** on the
+progress thread's iteration count, and a stated prediction — *I expect a null* — recorded so that a
+null could not be retold afterwards as expected-all-along while a positive one got claimed.
+
+**The design's real contribution was being factorial.** The old experiment changed *both* poll
+intervals at once — S's `PROGRESS_POLL` and C's `PARK_SLEEP` — so whatever it saw, it could not say
+which knob did it. Making both readable from the environment meant one binary served every arm, which
+also removed the two-different-builds problem.
+
+**Result, and it is unusually clean in both directions:**
+
+| arm | `PARK` | `POLL` | median gap | vs control |
+|---|---|---|---|---|
+| A control | 500 | 200 | **59.0 ms** | — |
+| B | 500 | **20** | **59.0 ms** | 1.000×, p = 0.94 |
+| C | **50** | 200 | **77.0 ms** | 0.77×, **p = 0.004** |
+| D | **50** | **20** | 74.5 ms | 0.79×, p = 0.017 |
+
+**`PROGRESS_POLL` does nothing.** Medians identical to one decimal place, with the manipulation check
+proving the poll genuinely ran three times more often (36,958 → 115,804 iterations). Its own doc
+comment asserted that "on a loopback link, where the RTT is microseconds, this becomes the dominant
+term", flagged `[INFERENCE] — never measured`. It is now measured and it is **not a measurable term at
+all**. I corrected the comment in place and said what replaced it, because a confident inference that
+survives in a doc comment is how the next person inherits a wrong belief.
+
+**And the earlier experiment was right about its outcome and wrong about its cause.** All the damage
+was `PARK_SLEEP`'s — arm C reproduces it without touching `PROGRESS_POLL` at all. For weeks the
+project has carried "a shorter progress poll was tried and was worse" as a reason not to look again,
+and that sentence was never true.
+
+**Why a shorter park hurts, from C's own metrics: fragmentation, again.** Ring messages per run rise
+323 → 456 (+41%) at 50 µs with the total bytes unchanged. A short park wakes the watcher *between*
+Mesa's doorbell kicks, so the same bytes leave as more, smaller deltas, and each delta costs C a full
+blob-table sweep (an 8 MiB `memcmp` among others) and S an applier-lock acquisition. That is the third
+time in one day that fragmenting a stream into more messages has been the thing that cost, after the
+reply arena and the forward blob writes.
+
+**The follow-up, labelled exploratory because its hypothesis came after the data.** If fragmenting
+hurts, batching should help — so I registered a second sweep (500 / 1000 / 2000 µs, n=10, fresh
+control) and ran it. Null: p = 0.91 and 0.88. **And the mechanism check was null too, which is the
+part that explains everything** — ring messages stay at ~300–318 no matter how long the park gets.
+Lengthening batches nothing because at 500 µs the watcher is *already not timer-driven*; it is woken
+by the doorbell, throttled to at most one per millisecond. The timer only binds below that, which is
+precisely where arm C found the damage. So `PARK_SLEEP` sits on a flat optimum at or above 500 µs, the
+shipping default is right, and the one direction that changes anything makes it worse.
+
+**Where this leaves the day.** Four candidate explanations for frame time, eliminated by measurement:
+S's lock contention (8.3× less, no change), C's message rate (6.1× fewer, no change), `PROGRESS_POLL`
+(3× more polling, no change), `PARK_SLEEP` (shorter is worse, longer is nothing). That is four large
+interventions on our own code moving nothing, which is starting to look less like a series of misses
+and more like evidence about where the time actually is.
+
+**The hypothesis I now believe, and have not tested:** frame time is set by **Mesa's back-off, not by
+Rayland**. With fence feedback off the application implements `vkWaitForFences` by polling
+`vkGetFenceStatus`, and the gap between polls is chosen by Mesa's `vn_relax` — yield for 16
+iterations, then an exponentially growing sleep from 10 µs. If the app is sleeping in `vn_relax`
+between polls, then every microsecond we save is absorbed by the app waiting longer before it next
+asks, and four independent large wins moving nothing is exactly the signature of that. It is a
+hypothesis. The test is to timestamp the application's successive ring writes and compare the
+distribution against `vn_relax`'s schedule — which needs no new code, only the trace already built
+this morning pointed at the arrival times rather than the segments.

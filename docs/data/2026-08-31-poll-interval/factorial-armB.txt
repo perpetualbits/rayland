@@ -1,0 +1,60 @@
+== poll-B-1
+run	verdict	modes	attaches	c2s_bytes	s2c_bytes	frames	stall_gaps	longest_ms	frame_gaps	median_gap_ms
+1	PASS	-	91	481586	34465	4	0	0	90	52
+C1METRICS elapsed_us=9072101 app_connected_us=3036359 first_frame_us=3057223 first_frame_after_connect_us=20864 round_trips=11 round_trip_wait_us=66329 send_us=266015 send_hist=4us:12,8us:28,16us:38,32us:116,65us:405,131us:306,262us:354,524us:31,1048us:2,8388us:1, c2s_ring_msgs=345 c2s_ring_bytes=139064 s2c_ring_msgs=0 s2c_ring_bytes=0 c2s_inline_msgs=351 c2s_inline_bytes=10998 s2c_inline_msgs=0 s2c_inline_bytes=0 c2s_blob_sync_msgs=192 c2s_blob_sync_bytes=324579 s2c_blob_sync_msgs=2079 s2c_blob_sync_bytes=27869 c2s_replies_msgs=0 c2s_replies_bytes=0 s2c_replies_msgs=503 s2c_replies_bytes=4578 c2s_control_msgs=405 c2s_control_bytes=6945 s2c_control_msgs=183 s2c_control_bytes=2018 c2s_total_bytes=481586 s2c_total_bytes=34465 final=1
+  progress thread lock WAIT    n=118041  total_ms=941.3     hist=0us:11,0us:8413,0us:30216,0us:51683,0us:20003,1us:6076,2us:879,4us:244,8us:39,16us:58,32us:43,65us:25,131us:21,262us:9,524us:57,1048us:73,2097us:143,4194us:44,8388us:4,
+
+== poll-B-10
+run	verdict	modes	attaches	c2s_bytes	s2c_bytes	frames	stall_gaps	longest_ms	frame_gaps	median_gap_ms
+1	PASS	-	67	430259	31821	4	0	0	66	43
+C1METRICS elapsed_us=7050264 app_connected_us=3024623 first_frame_us=3041098 first_frame_after_connect_us=16475 round_trips=11 round_trip_wait_us=58408 send_us=173857 send_hist=4us:11,8us:12,16us:64,32us:121,65us:354,131us:245,262us:200,524us:7,8388us:1, c2s_ring_msgs=278 c2s_ring_bytes=107486 s2c_ring_msgs=0 s2c_ring_bytes=0 c2s_inline_msgs=286 c2s_inline_bytes=8983 s2c_inline_msgs=0 s2c_inline_bytes=0 c2s_blob_sync_msgs=142 c2s_blob_sync_bytes=308501 s2c_blob_sync_msgs=1971 s2c_blob_sync_bytes=26681 c2s_replies_msgs=0 c2s_replies_bytes=0 s2c_replies_msgs=401 s2c_replies_bytes=3664 c2s_control_msgs=309 c2s_control_bytes=5289 s2c_control_msgs=134 s2c_control_bytes=1476 c2s_total_bytes=430259 s2c_total_bytes=31821 final=1
+  progress thread lock WAIT    n=69737   total_ms=483.0     hist=0us:2,0us:9817,0us:22181,0us:26487,0us:8966,1us:1480,2us:347,4us:66,8us:22,16us:41,32us:24,65us:21,131us:25,262us:16,524us:62,1048us:79,2097us:100,8388us:1,
+
+== poll-B-2
+run	verdict	modes	attaches	c2s_bytes	s2c_bytes	frames	stall_gaps	longest_ms	frame_gaps	median_gap_ms
+1	PASS	-	84	467389	33869	4	0	0	83	61
+C1METRICS elapsed_us=13168649 app_connected_us=3061944 first_frame_us=3108554 first_frame_after_connect_us=46609 round_trips=11 round_trip_wait_us=186317 send_us=451007 send_hist=4us:4,8us:13,16us:35,32us:70,65us:289,131us:302,262us:294,524us:157,1048us:60,2097us:5,33554us:1, c2s_ring_msgs=338 c2s_ring_bytes=130283 s2c_ring_msgs=0 s2c_ring_bytes=0 c2s_inline_msgs=337 c2s_inline_bytes=10564 s2c_inline_msgs=0 s2c_inline_bytes=0 c2s_blob_sync_msgs=178 c2s_blob_sync_bytes=320080 s2c_blob_sync_msgs=2048 s2c_blob_sync_bytes=27528 c2s_replies_msgs=0 c2s_replies_bytes=0 s2c_replies_msgs=492 s2c_replies_bytes=4477 c2s_control_msgs=377 c2s_control_bytes=6462 s2c_control_msgs=169 s2c_control_bytes=1864 c2s_total_bytes=467389 s2c_total_bytes=33869 final=1
+  progress thread lock WAIT    n=147689  total_ms=1196.5    hist=0us:12132,0us:30391,0us:62575,0us:20915,1us:18096,2us:1855,4us:1073,8us:114,16us:64,32us:47,65us:35,131us:31,262us:23,524us:22,1048us:19,2097us:251,4194us:44,8388us:1,16777us:1,
+
+== poll-B-3
+run	verdict	modes	attaches	c2s_bytes	s2c_bytes	frames	stall_gaps	longest_ms	frame_gaps	median_gap_ms
+1	PASS	-	97	492807	35253	4	0	0	96	49
+C1METRICS elapsed_us=11143920 app_connected_us=3088828 first_frame_us=3141753 first_frame_after_connect_us=52924 round_trips=11 round_trip_wait_us=160064 send_us=352075 send_hist=4us:42,8us:70,16us:36,32us:110,65us:385,131us:294,262us:314,524us:89,1048us:23,2097us:4,4194us:1,16777us:1, c2s_ring_msgs=365 c2s_ring_bytes=145974 s2c_ring_msgs=0 s2c_ring_bytes=0 c2s_inline_msgs=373 c2s_inline_bytes=11680 s2c_inline_msgs=0 s2c_inline_bytes=0 c2s_blob_sync_msgs=202 c2s_blob_sync_bytes=327794 s2c_blob_sync_msgs=2113 s2c_blob_sync_bytes=28243 c2s_replies_msgs=0 c2s_replies_bytes=0 s2c_replies_msgs=534 s2c_replies_bytes=4860 c2s_control_msgs=429 c2s_control_bytes=7359 s2c_control_msgs=195 s2c_control_bytes=2150 c2s_total_bytes=492807 s2c_total_bytes=35253 final=1
+  progress thread lock WAIT    n=92197   total_ms=1058.0    hist=0us:6,0us:8282,0us:12011,0us:32510,0us:15715,1us:19340,2us:2109,4us:1510,8us:153,16us:75,32us:60,65us:29,131us:15,262us:13,524us:39,1048us:75,2097us:233,4194us:21,16777us:1,
+
+== poll-B-4
+run	verdict	modes	attaches	c2s_bytes	s2c_bytes	frames	stall_gaps	longest_ms	frame_gaps	median_gap_ms
+1	PASS	-	60	414960	30891	4	0	0	59	69
+C1METRICS elapsed_us=9112411 app_connected_us=3075752 first_frame_us=3119939 first_frame_after_connect_us=44187 round_trips=11 round_trip_wait_us=90635 send_us=251232 send_hist=8us:13,16us:8,32us:44,65us:186,131us:314,262us:292,524us:59,1048us:5,8388us:1, c2s_ring_msgs=253 c2s_ring_bytes=97980 s2c_ring_msgs=0 s2c_ring_bytes=0 c2s_inline_msgs=260 c2s_inline_bytes=8177 s2c_inline_msgs=0 s2c_inline_bytes=0 c2s_blob_sync_msgs=128 c2s_blob_sync_bytes=303997 s2c_blob_sync_msgs=1922 s2c_blob_sync_bytes=26142 c2s_replies_msgs=0 c2s_replies_bytes=0 s2c_replies_msgs=373 s2c_replies_bytes=3413 c2s_control_msgs=281 c2s_control_bytes=4806 s2c_control_msgs=121 s2c_control_bytes=1336 c2s_total_bytes=414960 s2c_total_bytes=30891 final=1
+  progress thread lock WAIT    n=113566  total_ms=701.5     hist=0us:202,0us:36294,0us:37186,0us:29453,1us:7519,2us:2036,4us:446,8us:66,16us:38,32us:43,65us:14,131us:20,262us:18,524us:43,1048us:59,2097us:96,4194us:30,8388us:2,16777us:1,
+
+== poll-B-5
+run	verdict	modes	attaches	c2s_bytes	s2c_bytes	frames	stall_gaps	longest_ms	frame_gaps	median_gap_ms
+1	PASS	-	79	456583	1033089	4	0	0	78	65
+C1METRICS elapsed_us=13253832 app_connected_us=3117524 first_frame_us=3258661 first_frame_after_connect_us=141136 round_trips=11 round_trip_wait_us=243668 send_us=449158 send_hist=8us:33,16us:21,32us:47,65us:255,131us:254,262us:337,524us:158,1048us:42,2097us:4,4194us:4,33554us:1, c2s_ring_msgs=312 c2s_ring_bytes=123595 s2c_ring_msgs=0 s2c_ring_bytes=0 c2s_inline_msgs=319 c2s_inline_bytes=10006 s2c_inline_msgs=0 s2c_inline_bytes=0 c2s_blob_sync_msgs=168 c2s_blob_sync_bytes=316865 s2c_blob_sync_msgs=2020 s2c_blob_sync_bytes=1027219 c2s_replies_msgs=0 c2s_replies_bytes=0 s2c_replies_msgs=451 s2c_replies_bytes=4116 c2s_control_msgs=357 c2s_control_bytes=6117 s2c_control_msgs=159 s2c_control_bytes=1754 c2s_total_bytes=456583 s2c_total_bytes=1033089 final=1
+  progress thread lock WAIT    n=140859  total_ms=1152.6    hist=0us:3364,0us:34832,0us:51743,0us:23822,1us:21630,2us:3122,4us:1686,8us:180,16us:64,32us:49,65us:30,131us:12,262us:10,524us:19,1048us:47,2097us:203,4194us:45,16777us:1,33554us:1,
+
+== poll-B-6
+run	verdict	modes	attaches	c2s_bytes	s2c_bytes	frames	stall_gaps	longest_ms	frame_gaps	median_gap_ms
+1	PASS	-	73	442286	32535	4	0	0	72	56
+C1METRICS elapsed_us=9060415 app_connected_us=3021279 first_frame_us=3047314 first_frame_after_connect_us=26034 round_trips=11 round_trip_wait_us=72807 send_us=245957 send_hist=4us:3,8us:25,16us:25,32us:68,65us:327,131us:284,262us:292,524us:50,1048us:2,2097us:1,8388us:1, c2s_ring_msgs=292 c2s_ring_bytes=114835 s2c_ring_msgs=0 s2c_ring_bytes=0 c2s_inline_msgs=299 c2s_inline_bytes=9386 s2c_inline_msgs=0 s2c_inline_bytes=0 c2s_blob_sync_msgs=154 c2s_blob_sync_bytes=312362 s2c_blob_sync_msgs=1991 s2c_blob_sync_bytes=26901 c2s_replies_msgs=0 c2s_replies_bytes=0 s2c_replies_msgs=440 s2c_replies_bytes=4012 c2s_control_msgs=333 c2s_control_bytes=5703 s2c_control_msgs=147 s2c_control_bytes=1622 c2s_total_bytes=442286 s2c_total_bytes=32535 final=1
+  progress thread lock WAIT    n=109529  total_ms=843.6     hist=0us:1804,0us:35942,0us:33350,0us:23536,1us:11877,2us:1834,4us:674,8us:74,16us:53,32us:59,65us:24,131us:19,262us:16,524us:51,1048us:71,2097us:91,4194us:43,8388us:11,
+
+== poll-B-7
+run	verdict	modes	attaches	c2s_bytes	s2c_bytes	frames	stall_gaps	longest_ms	frame_gaps	median_gap_ms
+1	PASS	-	72	440530	32315	4	0	0	71	70
+C1METRICS elapsed_us=13237751 app_connected_us=3094232 first_frame_us=3159490 first_frame_after_connect_us=65258 round_trips=11 round_trip_wait_us=212619 send_us=439115 send_hist=8us:18,16us:20,32us:32,65us:216,131us:267,262us:319,524us:128,1048us:65,2097us:6,33554us:1, c2s_ring_msgs=293 c2s_ring_bytes=113822 s2c_ring_msgs=0 s2c_ring_bytes=0 c2s_inline_msgs=298 c2s_inline_bytes=9355 s2c_inline_msgs=0 s2c_inline_bytes=0 c2s_blob_sync_msgs=152 c2s_blob_sync_bytes=311719 s2c_blob_sync_msgs=1986 s2c_blob_sync_bytes=26846 c2s_replies_msgs=0 c2s_replies_bytes=0 s2c_replies_msgs=424 s2c_replies_bytes=3869 c2s_control_msgs=329 c2s_control_bytes=5634 s2c_control_msgs=145 s2c_control_bytes=1600 c2s_total_bytes=440530 s2c_total_bytes=32315 final=1
+  progress thread lock WAIT    n=140201  total_ms=1074.9    hist=0us:272,0us:29495,0us:46931,0us:36098,1us:22044,2us:3015,4us:1674,8us:161,16us:83,32us:57,65us:40,131us:15,262us:14,524us:24,1048us:22,2097us:211,4194us:42,8388us:2,16777us:1,
+
+== poll-B-8
+run	verdict	modes	attaches	c2s_bytes	s2c_bytes	frames	stall_gaps	longest_ms	frame_gaps	median_gap_ms
+1	PASS	-	72	442127	32406	4	0	0	71	81
+C1METRICS elapsed_us=13190508 app_connected_us=3088929 first_frame_us=3162014 first_frame_after_connect_us=73084 round_trips=11 round_trip_wait_us=226117 send_us=439010 send_hist=8us:39,16us:30,32us:44,65us:192,131us:266,262us:267,524us:182,1048us:53,2097us:9,4194us:1,16777us:1, c2s_ring_msgs=301 c2s_ring_bytes=114714 s2c_ring_msgs=0 s2c_ring_bytes=0 c2s_inline_msgs=300 c2s_inline_bytes=9417 s2c_inline_msgs=0 s2c_inline_bytes=0 c2s_blob_sync_msgs=154 c2s_blob_sync_bytes=312362 s2c_blob_sync_msgs=1986 s2c_blob_sync_bytes=26846 c2s_replies_msgs=0 c2s_replies_bytes=0 s2c_replies_msgs=434 s2c_replies_bytes=3960 c2s_control_msgs=329 c2s_control_bytes=5634 s2c_control_msgs=145 s2c_control_bytes=1600 c2s_total_bytes=442127 s2c_total_bytes=32406 final=1
+  progress thread lock WAIT    n=138385  total_ms=1216.1    hist=0us:2440,0us:31730,0us:45288,0us:20584,1us:31785,2us:3630,4us:2150,8us:227,16us:96,32us:70,65us:32,131us:22,262us:19,524us:28,1048us:49,2097us:166,4194us:65,8388us:3,33554us:1,
+
+== poll-B-9
+run	verdict	modes	attaches	c2s_bytes	s2c_bytes	frames	stall_gaps	longest_ms	frame_gaps	median_gap_ms
+1	PASS	-	70	438538	32356	4	0	0	69	57
+C1METRICS elapsed_us=9093472 app_connected_us=3063308 first_frame_us=3104622 first_frame_after_connect_us=41314 round_trips=11 round_trip_wait_us=87409 send_us=246821 send_hist=4us:9,8us:47,16us:23,32us:72,65us:277,131us:282,262us:290,524us:64,1048us:3,8388us:1, c2s_ring_msgs=295 c2s_ring_bytes=112487 s2c_ring_msgs=0 s2c_ring_bytes=0 c2s_inline_msgs=302 c2s_inline_bytes=9479 s2c_inline_msgs=0 s2c_inline_bytes=0 c2s_blob_sync_msgs=150 c2s_blob_sync_bytes=311076 s2c_blob_sync_msgs=1988 s2c_blob_sync_bytes=26868 c2s_replies_msgs=0 c2s_replies_bytes=0 s2c_replies_msgs=431 s2c_replies_bytes=3932 c2s_control_msgs=321 c2s_control_bytes=5496 s2c_control_msgs=141 s2c_control_bytes=1556 c2s_total_bytes=438538 s2c_total_bytes=32356 final=1
+  progress thread lock WAIT    n=112963  total_ms=779.1     hist=0us:3664,0us:33849,0us:38582,0us:25358,1us:9138,2us:1438,4us:443,8us:67,16us:37,32us:51,65us:22,131us:16,262us:31,524us:52,1048us:67,2097us:110,4194us:37,8388us:1,16777us:1,
+

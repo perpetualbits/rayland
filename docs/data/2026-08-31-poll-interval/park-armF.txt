@@ -1,0 +1,50 @@
+== park-F-1
+run	verdict	modes	attaches	c2s_bytes	s2c_bytes	frames	stall_gaps	longest_ms	frame_gaps	median_gap_ms
+1	PASS	-	85	468034	33604	4	0	0	84	57
+C1METRICS elapsed_us=11109979 app_connected_us=3071957 first_frame_us=3155039 first_frame_after_connect_us=83081 round_trips=11 round_trip_wait_us=180046 send_us=322298 send_hist=4us:13,8us:28,16us:70,32us:110,65us:387,131us:233,262us:306,524us:66,1048us:19,2097us:3,4194us:1,33554us:1, c2s_ring_msgs=334 c2s_ring_bytes=130642 s2c_ring_msgs=0 s2c_ring_bytes=0 c2s_inline_msgs=344 c2s_inline_bytes=10781 s2c_inline_msgs=0 s2c_inline_bytes=0 c2s_blob_sync_msgs=178 c2s_blob_sync_bytes=320080 s2c_blob_sync_msgs=2057 s2c_blob_sync_bytes=27627 c2s_replies_msgs=0 c2s_replies_bytes=0 s2c_replies_msgs=448 s2c_replies_bytes=4091 c2s_control_msgs=381 c2s_control_bytes=6531 s2c_control_msgs=171 s2c_control_bytes=1886 c2s_total_bytes=468034 s2c_total_bytes=33604 final=1
+
+== park-F-10
+run	verdict	modes	attaches	c2s_bytes	s2c_bytes	frames	stall_gaps	longest_ms	frame_gaps	median_gap_ms
+1	PASS	-	74	444510	32417	4	0	0	73	64
+C1METRICS elapsed_us=11158438 app_connected_us=3087899 first_frame_us=3146335 first_frame_after_connect_us=58435 round_trips=11 round_trip_wait_us=204817 send_us=324951 send_hist=4us:9,8us:29,16us:23,32us:47,65us:281,131us:280,262us:328,524us:66,1048us:25,2097us:3,16777us:1, c2s_ring_msgs=295 c2s_ring_bytes=116191 s2c_ring_msgs=0 s2c_ring_bytes=0 c2s_inline_msgs=304 c2s_inline_bytes=9541 s2c_inline_msgs=0 s2c_inline_bytes=0 c2s_blob_sync_msgs=156 c2s_blob_sync_bytes=313005 s2c_blob_sync_msgs=1996 s2c_blob_sync_bytes=26956 c2s_replies_msgs=0 c2s_replies_bytes=0 s2c_replies_msgs=418 s2c_replies_bytes=3816 c2s_control_msgs=337 c2s_control_bytes=5773 s2c_control_msgs=149 s2c_control_bytes=1645 c2s_total_bytes=444510 s2c_total_bytes=32417 final=1
+
+== park-F-2
+run	verdict	modes	attaches	c2s_bytes	s2c_bytes	frames	stall_gaps	longest_ms	frame_gaps	median_gap_ms
+1	PASS	-	71	440545	32172	4	0	0	70	62
+C1METRICS elapsed_us=9073645 app_connected_us=3024307 first_frame_us=3043270 first_frame_after_connect_us=18963 round_trips=11 round_trip_wait_us=63080 send_us=248456 send_hist=4us:11,8us:40,16us:51,32us:109,65us:352,131us:206,262us:245,524us:48,1048us:12,2097us:5,4194us:1,8388us:1, c2s_ring_msgs=298 c2s_ring_bytes=113658 s2c_ring_msgs=0 s2c_ring_bytes=0 c2s_inline_msgs=306 c2s_inline_bytes=9603 s2c_inline_msgs=0 s2c_inline_bytes=0 c2s_blob_sync_msgs=152 c2s_blob_sync_bytes=311719 s2c_blob_sync_msgs=1989 s2c_blob_sync_bytes=26879 c2s_replies_msgs=0 c2s_replies_bytes=0 s2c_replies_msgs=406 s2c_replies_bytes=3715 c2s_control_msgs=325 c2s_control_bytes=5565 s2c_control_msgs=143 s2c_control_bytes=1578 c2s_total_bytes=440545 s2c_total_bytes=32172 final=1
+
+== park-F-3
+run	verdict	modes	attaches	c2s_bytes	s2c_bytes	frames	stall_gaps	longest_ms	frame_gaps	median_gap_ms
+1	PASS	-	92	484458	34639	4	0	0	91	64
+C1METRICS elapsed_us=15256700 app_connected_us=3094584 first_frame_us=3146393 first_frame_after_connect_us=51809 round_trips=11 round_trip_wait_us=201679 send_us=524330 send_hist=4us:12,8us:24,16us:53,32us:67,65us:300,131us:248,262us:338,524us:175,1048us:91,2097us:11,4194us:3,16777us:1, c2s_ring_msgs=355 c2s_ring_bytes=140790 s2c_ring_msgs=0 s2c_ring_bytes=0 c2s_inline_msgs=365 c2s_inline_bytes=11432 s2c_inline_msgs=0 s2c_inline_bytes=0 c2s_blob_sync_msgs=194 c2s_blob_sync_bytes=325222 s2c_blob_sync_msgs=2096 s2c_blob_sync_bytes=28056 c2s_replies_msgs=0 c2s_replies_bytes=0 s2c_replies_msgs=498 s2c_replies_bytes=4543 c2s_control_msgs=409 c2s_control_bytes=7014 s2c_control_msgs=185 s2c_control_bytes=2040 c2s_total_bytes=484458 s2c_total_bytes=34639 final=1
+
+== park-F-4
+run	verdict	modes	attaches	c2s_bytes	s2c_bytes	frames	stall_gaps	longest_ms	frame_gaps	median_gap_ms
+1	PASS	-	75	448605	32593	4	0	0	74	57
+C1METRICS elapsed_us=9101632 app_connected_us=3038323 first_frame_us=3067360 first_frame_after_connect_us=29037 round_trips=11 round_trip_wait_us=50983 send_us=235834 send_hist=4us:21,8us:28,16us:40,32us:107,65us:348,131us:236,262us:281,524us:44,1048us:3,8388us:1, c2s_ring_msgs=299 c2s_ring_bytes=118776 s2c_ring_msgs=0 s2c_ring_bytes=0 c2s_inline_msgs=309 c2s_inline_bytes=9696 s2c_inline_msgs=0 s2c_inline_bytes=0 c2s_blob_sync_msgs=160 c2s_blob_sync_bytes=314292 s2c_blob_sync_msgs=2011 s2c_blob_sync_bytes=27121 c2s_replies_msgs=0 c2s_replies_bytes=0 s2c_replies_msgs=416 s2c_replies_bytes=3806 c2s_control_msgs=341 c2s_control_bytes=5841 s2c_control_msgs=151 s2c_control_bytes=1666 c2s_total_bytes=448605 s2c_total_bytes=32593 final=1
+
+== park-F-5
+run	verdict	modes	attaches	c2s_bytes	s2c_bytes	frames	stall_gaps	longest_ms	frame_gaps	median_gap_ms
+1	PASS	-	82	463399	33356	4	0	0	81	57
+C1METRICS elapsed_us=13243213 app_connected_us=3088703 first_frame_us=3149516 first_frame_after_connect_us=60813 round_trips=11 round_trip_wait_us=215481 send_us=457800 send_hist=4us:27,8us:22,16us:35,32us:77,65us:258,131us:262,262us:292,524us:135,1048us:84,2097us:4,16777us:2, c2s_ring_msgs=322 c2s_ring_bytes=127841 s2c_ring_msgs=0 s2c_ring_bytes=0 c2s_inline_msgs=333 c2s_inline_bytes=10440 s2c_inline_msgs=0 s2c_inline_bytes=0 c2s_blob_sync_msgs=174 c2s_blob_sync_bytes=318794 s2c_blob_sync_msgs=2046 s2c_blob_sync_bytes=27506 c2s_replies_msgs=0 c2s_replies_bytes=0 s2c_replies_msgs=441 s2c_replies_bytes=4030 c2s_control_msgs=369 c2s_control_bytes=6324 s2c_control_msgs=165 s2c_control_bytes=1820 c2s_total_bytes=463399 s2c_total_bytes=33356 final=1
+
+== park-F-6
+run	verdict	modes	attaches	c2s_bytes	s2c_bytes	frames	stall_gaps	longest_ms	frame_gaps	median_gap_ms
+1	PASS	-	84	465938	33709	4	0	0	83	82
+C1METRICS elapsed_us=15256262 app_connected_us=3085880 first_frame_us=3141663 first_frame_after_connect_us=55783 round_trips=11 round_trip_wait_us=181387 send_us=511284 send_hist=4us:14,8us:36,16us:40,32us:79,65us:198,131us:287,262us:293,524us:171,1048us:98,2097us:8,33554us:1, c2s_ring_msgs=331 c2s_ring_bytes=129350 s2c_ring_msgs=0 s2c_ring_bytes=0 c2s_inline_msgs=341 c2s_inline_bytes=10688 s2c_inline_msgs=0 s2c_inline_bytes=0 c2s_blob_sync_msgs=176 c2s_blob_sync_bytes=319437 s2c_blob_sync_msgs=2052 s2c_blob_sync_bytes=27572 c2s_replies_msgs=0 c2s_replies_bytes=0 s2c_replies_msgs=468 s2c_replies_bytes=4272 c2s_control_msgs=377 c2s_control_bytes=6463 s2c_control_msgs=169 s2c_control_bytes=1865 c2s_total_bytes=465938 s2c_total_bytes=33709 final=1
+
+== park-F-7
+run	verdict	modes	attaches	c2s_bytes	s2c_bytes	frames	stall_gaps	longest_ms	frame_gaps	median_gap_ms
+1	PASS	-	75	448535	32427	4	0	0	74	140
+C1METRICS elapsed_us=15210612 app_connected_us=3036024 first_frame_us=3086809 first_frame_after_connect_us=50785 round_trips=11 round_trip_wait_us=58074 send_us=640175 send_hist=8us:119,16us:94,32us:170,65us:253,131us:182,262us:145,524us:83,1048us:101,2097us:49,4194us:23,8388us:2,16777us:1, c2s_ring_msgs=374 c2s_ring_bytes=118109 s2c_ring_msgs=0 s2c_ring_bytes=0 c2s_inline_msgs=349 c2s_inline_bytes=10936 s2c_inline_msgs=0 s2c_inline_bytes=0 c2s_blob_sync_msgs=158 c2s_blob_sync_bytes=313648 s2c_blob_sync_msgs=1997 s2c_blob_sync_bytes=26967 c2s_replies_msgs=0 c2s_replies_bytes=0 s2c_replies_msgs=415 s2c_replies_bytes=3793 c2s_control_msgs=341 c2s_control_bytes=5842 s2c_control_msgs=151 s2c_control_bytes=1667 c2s_total_bytes=448535 s2c_total_bytes=32427 final=1
+
+== park-F-8
+run	verdict	modes	attaches	c2s_bytes	s2c_bytes	frames	stall_gaps	longest_ms	frame_gaps	median_gap_ms
+1	PASS	-	70	437962	31966	4	0	0	69	61
+C1METRICS elapsed_us=9101938 app_connected_us=3071281 first_frame_us=3107798 first_frame_after_connect_us=36516 round_trips=11 round_trip_wait_us=82774 send_us=250205 send_hist=4us:9,8us:35,16us:22,32us:57,65us:278,131us:299,262us:309,524us:37,1048us:4,16777us:1, c2s_ring_msgs=286 c2s_ring_bytes=112158 s2c_ring_msgs=0 s2c_ring_bytes=0 c2s_inline_msgs=294 c2s_inline_bytes=9231 s2c_inline_msgs=0 s2c_inline_bytes=0 c2s_blob_sync_msgs=150 c2s_blob_sync_bytes=311076 s2c_blob_sync_msgs=1980 s2c_blob_sync_bytes=26780 c2s_replies_msgs=0 c2s_replies_bytes=0 s2c_replies_msgs=396 s2c_replies_bytes=3629 c2s_control_msgs=321 c2s_control_bytes=5497 s2c_control_msgs=141 s2c_control_bytes=1557 c2s_total_bytes=437962 s2c_total_bytes=31966 final=1
+
+== park-F-9
+run	verdict	modes	attaches	c2s_bytes	s2c_bytes	frames	stall_gaps	longest_ms	frame_gaps	median_gap_ms
+1	PASS	-	64	425314	31235	4	0	0	63	65
+C1METRICS elapsed_us=9101666 app_connected_us=3025577 first_frame_us=3044915 first_frame_after_connect_us=19337 round_trips=11 round_trip_wait_us=51163 send_us=240743 send_hist=4us:3,8us:10,16us:26,32us:67,65us:274,131us:232,262us:298,524us:59,1048us:5,8388us:1, c2s_ring_msgs=265 c2s_ring_bytes=104376 s2c_ring_msgs=0 s2c_ring_bytes=0 c2s_inline_msgs=275 c2s_inline_bytes=8642 s2c_inline_msgs=0 s2c_inline_bytes=0 c2s_blob_sync_msgs=138 c2s_blob_sync_bytes=307213 s2c_blob_sync_msgs=1950 s2c_blob_sync_bytes=26450 c2s_replies_msgs=0 c2s_replies_bytes=0 s2c_replies_msgs=367 s2c_replies_bytes=3360 c2s_control_msgs=297 c2s_control_bytes=5083 s2c_control_msgs=129 s2c_control_bytes=1425 c2s_total_bytes=425314 s2c_total_bytes=31235 final=1
+

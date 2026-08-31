@@ -170,6 +170,27 @@ const DEFAULT_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// kick is throttled to at most one per millisecond and is not guaranteed for every write
 /// (`vn_ring.c:475-483`). If the park logic were ever wrong, a bounded sleep degrades to latency;
 /// an unbounded one degrades to a hang. The cost of being wrong should not be unbounded.
+///
+/// # MEASURED 2026-08-31: 500 µs sits on a flat optimum, and SHORTENING IT IS HARMFUL
+/// This value was never chosen by measurement. It has now been swept
+/// (`docs/data/2026-08-31-poll-interval/`), and it turns out to matter in the direction nobody
+/// expected:
+///
+/// - **50 µs is ~1.3× SLOWER** (median inter-frame gap 59 → 77 ms, n = 10 per arm, p = 0.004).
+/// - **1000 µs and 2000 µs change nothing** (p = 0.91 and 0.88).
+///
+/// The mechanism is fragmentation, and C's own metrics show it: at 50 µs the ring messages per run
+/// rise **323 → 456 (+41%)** with the total bytes unchanged. A short park wakes this watcher
+/// *between* Mesa's doorbell kicks, so the same ring bytes leave as more, smaller deltas — and every
+/// delta costs a full sweep of the blob table (an 8 MiB staging-pool `memcmp` among others) here and
+/// an applier-lock acquisition on S's message thread.
+///
+/// Lengthening it batches nothing because at 500 µs this watcher is **already not timer-driven** — it
+/// is woken by the doorbell, which is throttled to at most one per millisecond. The timer only starts
+/// to bind below that, which is exactly where the damage appears.
+///
+/// **Leave this alone.** It is correct, and the one direction that changes anything makes it worse.
+/// Override with `RAYLAND_C1_PARK_SLEEP_US` — see [`park_sleep`].
 const PARK_SLEEP: Duration = Duration::from_micros(500);
 
 /// The park sleep actually used, allowing `RAYLAND_C1_PARK_SLEEP_US` to override it.
