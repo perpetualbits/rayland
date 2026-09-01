@@ -396,8 +396,11 @@ impl ObjectData for RegistryData {
     ) -> Option<Arc<dyn ObjectData>> {
         // A `global` event names one advertised global; record it for binding.
         if msg.opcode == EV_REGISTRY_GLOBAL {
-            if let [Argument::Uint(name), Argument::Str(Some(iface)), Argument::Uint(version)] =
-                &msg.args[..]
+            if let [
+                Argument::Uint(name),
+                Argument::Str(Some(iface)),
+                Argument::Uint(version),
+            ] = &msg.args[..]
             {
                 self.globals.lock().unwrap().push(GlobalEntry {
                     name: *name,
@@ -449,10 +452,7 @@ impl ObjectData for ReplayObjectData {
         msg: Message<ObjectId, OwnedFd>,
     ) -> Option<Arc<dyn ObjectData>> {
         // If the event creates an object, the backend needs data for it regardless of whether we relay it.
-        let makes_object = msg
-            .args
-            .iter()
-            .any(|arg| matches!(arg, Argument::NewId(_)));
+        let makes_object = msg.args.iter().any(|arg| matches!(arg, Argument::NewId(_)));
         // Translate and emit (dropping the event if it cannot be represented in the app's id space).
         translate_and_emit(&self.maps, &self.sink, &msg);
         makes_object.then(|| self.child())
@@ -515,7 +515,7 @@ fn event_log_enabled() -> bool {
 ///   the event, which is the honest outcome: an application that waits for a keymap is better served
 ///   than one handed a truncated mapping it will fault on.
 fn read_fd_contents(fd: std::os::fd::RawFd) -> Option<Vec<u8>> {
-    use std::os::fd::{BorrowedFd, AsRawFd};
+    use std::os::fd::{AsRawFd, BorrowedFd};
     use std::os::unix::fs::FileExt;
     // The true length, from the descriptor itself: the caller's `size` argument is the compositor's
     // claim, and this is the thing C will actually be asked to reproduce.
@@ -850,7 +850,9 @@ fn compositor_reader(conn: Connection, dead: Arc<AtomicBool>) {
                     if err.kind() == std::io::ErrorKind::Interrupted {
                         continue;
                     }
-                    eprintln!("rayland-s: WP0 compositor poll failed, event reader stopping: {err}");
+                    eprintln!(
+                        "rayland-s: WP0 compositor poll failed, event reader stopping: {err}"
+                    );
                     return;
                 }
                 // Read and dispatch the events into `ReplayObjectData::event`.
@@ -868,7 +870,9 @@ fn compositor_reader(conn: Connection, dead: Arc<AtomicBool>) {
             // queue to dispatch them, exactly as `roundtrip` does in this case.
             None => {
                 if let Err(e) = conn.backend().dispatch_inner_queue() {
-                    eprintln!("rayland-s: WP0 compositor dispatch failed, event reader stopping: {e}");
+                    eprintln!(
+                        "rayland-s: WP0 compositor dispatch failed, event reader stopping: {e}"
+                    );
                     return;
                 }
             }
@@ -894,6 +898,12 @@ pub struct WaylandReplay {
     maps: Arc<Mutex<IdMaps>>,
     /// Where compositor events go once translated into the app's id space.
     sink: Arc<dyn EventSink>,
+    /// S's mirrors of the application's `wl_shm` pools — S's own memfds, kept in step by copying.
+    ///
+    /// Lives here rather than in the id maps because it is not an identity table: it owns memory and
+    /// descriptors whose lifetime is the pool's. See [`crate::shm_mirror`], and in particular its
+    /// warning that S's file is a *different file* from the application's.
+    shm: crate::shm_mirror::ShmMirror,
     /// Whether the compositor-reader thread has been spawned (spawned once, after the connect roundtrip).
     reader_started: bool,
     /// Resolves a token's resource id to a duplicate of S's exported dma-buf descriptor (Task 4.3).
@@ -955,6 +965,8 @@ impl WaylandReplay {
     /// S exported for it — the `Applier` in the daemon, a fake in tests.
     pub fn new(sink: Arc<dyn EventSink>, fd_source: Arc<dyn ExportedFdSource>) -> Self {
         WaylandReplay {
+            // No pools until the application creates one; most applications never do.
+            shm: crate::shm_mirror::ShmMirror::default(),
             conn: None,
             backend: None,
             registry: None,
@@ -1048,8 +1060,7 @@ impl WaylandReplay {
             .spawn({
                 let dead = Arc::clone(&self.dead_flag);
                 move || compositor_reader(conn, dead)
-            })
-        {
+            }) {
             Ok(_) => self.reader_started = true,
             Err(e) => eprintln!("rayland-s: WP0 could not start the compositor event reader: {e}"),
         }
@@ -1085,7 +1096,9 @@ impl WaylandReplay {
         };
         // Map the interface name to the linked descriptor `send_request`'s child_spec needs.
         let Some(iface) = interface_by_name(&interface) else {
-            eprintln!("rayland-s: WP0 replay: no linked descriptor for `{interface}`; bind skipped");
+            eprintln!(
+                "rayland-s: WP0 replay: no linked descriptor for `{interface}`; bind skipped"
+            );
             return;
         };
         let backend = self.backend.as_ref().expect("connected");
@@ -1130,6 +1143,42 @@ impl WaylandReplay {
         self.flush();
     }
 
+    /// Write relayed `wl_shm` pool contents into S's mirror of that pool.
+    ///
+    /// # Why this is a method on the replay and not on the mirror alone
+    /// The mirror is keyed by the **application's** pool id, which is the identifier that travels;
+    /// resolving that is the replay's business, and keeping the call here means the mirror never needs
+    /// to know an id map exists.
+    ///
+    /// # Ordering, which is the load-bearing part
+    /// C sends this **before** the `wl_surface.commit` that presents the buffer, and both travel the
+    /// same ordered stream — so by the time the commit is replayed, these bytes are already in S's
+    /// pool. Reversing the two would present whatever the pool held from the previous frame, and would
+    /// do it *intermittently*, which is why C pins the order with a test rather than trusting it.
+    ///
+    /// # Failure modes
+    /// A write to an unknown pool, or one that would land outside the mirror, is logged and dropped.
+    /// Both mean the two sides disagree about a pool, which is worth saying out loud — but neither is
+    /// worth killing a session for, because the application's GPU frames travel a different path
+    /// entirely and are unaffected.
+    /// `(bytes written, updates applied, pools mirrored)` — S's half of the shm summary.
+    ///
+    /// Should agree with C's `shm_bytes`/`shm_commits`. A divergence means the two sides disagree
+    /// about a pool, which is exactly the drift [`crate::shm_mirror`] warns about and is worth saying
+    /// out loud rather than discovering as a wrong picture.
+    pub fn shm_summary(&self) -> (u64, u64, usize) {
+        self.shm.summary()
+    }
+
+    pub fn handle_shm_pool_data(&mut self, app_pool_id: u32, offset: u32, bytes: &[u8]) {
+        if let Err(e) = self.shm.write(app_pool_id, offset, bytes) {
+            eprintln!(
+                "rayland-s: WP0 shm: dropping {} bytes at offset {offset} for app pool {app_pool_id}: {e:?}",
+                bytes.len()
+            );
+        }
+    }
+
     /// Replay one Wayland **request** against S's compositor.
     ///
     /// Reconstructs a `wayland-backend` `Message`: the sender and every `Object`/`NewId` argument are
@@ -1157,7 +1206,10 @@ impl WaylandReplay {
         }
         // The sender must be an object the replay already created (bound global or prior new-id).
         let (sender, sender_version) = {
-            let maps = self.maps.lock().expect("the WP0 id maps lock is never poisoned");
+            let maps = self
+                .maps
+                .lock()
+                .expect("the WP0 id maps lock is never poisoned");
             match (maps.to_s(msg.object_id), maps.version_of(msg.object_id)) {
                 (Some(s), Some(v)) => (s, v),
                 _ => {
@@ -1186,6 +1238,37 @@ impl WaylandReplay {
                         .map(Box::new),
                 )),
                 WaylandArg::Array(b) => args.push(Argument::Array(Box::new(b.clone()))),
+                // **The shm-pool substitution, landing.** C kept the application's descriptor and sent
+                // only the size; S makes its *own* memfd of that size and passes *that* to the
+                // compositor, so the `wl_shm.create_pool` the compositor sees is ordinary and
+                // complete. The two files are kept in step by `C2S::ShmPoolData` copies, never by
+                // sharing — see `crate::shm_mirror`.
+                WaylandArg::ShmPool { size } => {
+                    // The pool's app-side id is the `new_id` argument, which precedes the fd in
+                    // `wl_shm.create_pool(new_id, fd, size)`. Reaching here without it would mean the
+                    // request was malformed, and creating a mirror under the wrong key would leave
+                    // every later `ShmPoolData` writing into nothing.
+                    let Some(app_pool_id) = new_app_id else {
+                        eprintln!(
+                            "rayland-s: refusing wl_shm.create_pool: the ShmPool argument arrived \
+                             with no new_id before it, so there is no pool to key the mirror by"
+                        );
+                        return;
+                    };
+                    match self.shm.create_pool(app_pool_id, *size) {
+                        Ok(fd) => args.push(Argument::Fd(fd)),
+                        Err(e) => {
+                            // **What this means for the app:** its pool never appears, so whatever it
+                            // meant to draw with shm — usually a cursor or a decoration — is absent.
+                            // Reported rather than fatal: the application's own GPU frames go through
+                            // the dma-buf path and are unaffected.
+                            eprintln!(
+                                "rayland-s: refusing wl_shm.create_pool for app pool {app_pool_id}: {e:?}"
+                            );
+                            return;
+                        }
+                    }
+                }
                 // **Refused, in the direction it can never legitimately travel.** `KeymapContent`
                 // exists for the *event* path, S→C: it replaces the fd `wl_keyboard.keymap` carries.
                 // A request arriving C→S with one would mean the application is trying to hand S a
@@ -1358,14 +1441,20 @@ impl WaylandReplay {
         let iface = ZwpLinuxDmabufV1::interface();
         // Find the global by interface name; S's registry numbering is its own, so the name is the key.
         let found = {
-            let globals = self.globals.lock().expect("the WP0 globals lock is never poisoned");
+            let globals = self
+                .globals
+                .lock()
+                .expect("the WP0 globals lock is never poisoned");
             globals
                 .iter()
                 .find(|g| g.interface == iface.name)
                 .map(|g| (g.name, g.version.min(DMABUF_BIND_VERSION)))
         };
         let Some((name, version)) = found else {
-            eprintln!("rayland-s: WP0 4.3: S's compositor advertises no `{}`", iface.name);
+            eprintln!(
+                "rayland-s: WP0 4.3: S's compositor advertises no `{}`",
+                iface.name
+            );
             return None;
         };
         let backend = self.backend.as_ref().expect("connected").clone();
@@ -1399,7 +1488,10 @@ impl WaylandReplay {
                 Some((id, version))
             }
             Err(e) => {
-                eprintln!("rayland-s: WP0 4.3: binding S's own `{}` failed: {e}", iface.name);
+                eprintln!(
+                    "rayland-s: WP0 4.3: binding S's own `{}` failed: {e}",
+                    iface.name
+                );
                 None
             }
         }
@@ -1438,7 +1530,10 @@ impl WaylandReplay {
             WaylandArg::Buffer(t) => Some(t.clone()),
             _ => None,
         }) else {
-            eprintln!("rayland-s: WP0 4.3: buffer request with no token (obj {}); refused", msg.object_id);
+            eprintln!(
+                "rayland-s: WP0 4.3: buffer request with no token (obj {}); refused",
+                msg.object_id
+            );
             return;
         };
         let Some(app_buffer_id) = msg.args.iter().find_map(|a| match a {
@@ -1481,27 +1576,35 @@ impl WaylandReplay {
         // it in `catch_unwind` for exactly that reason and this path must too: the first two-machine run of
         // this code took the whole daemon's main thread down with "expected version 3 but got 1", losing
         // the ring session along with the buffer. A refused buffer must cost the frame, not the session.
-        let send = |sender: ObjectId, req: SynthesizedRequest, data: Option<Arc<dyn ObjectData>>| {
-            catch_unwind(AssertUnwindSafe(|| {
-                backend.send_request(
-                    Message {
-                        sender_id: sender,
-                        opcode: req.opcode,
-                        args: req.args.into_iter().collect(),
-                    },
-                    data,
-                    req.child,
-                )
-            }))
-        };
+        let send =
+            |sender: ObjectId, req: SynthesizedRequest, data: Option<Arc<dyn ObjectData>>| {
+                catch_unwind(AssertUnwindSafe(|| {
+                    backend.send_request(
+                        Message {
+                            sender_id: sender,
+                            opcode: req.opcode,
+                            args: req.args.into_iter().collect(),
+                        },
+                        data,
+                        req.child,
+                    )
+                }))
+            };
 
         // Step 1: create the params object on the dmabuf global, and map the app's params id to it — that
         // mapping is what makes the app's *later* requests against this object (if any) resolvable.
         let [create_params, add, create_immed] = plan;
-        let s_params = match send(dmabuf_id, create_params, Some(self.object_data() as Arc<dyn ObjectData>)) {
+        let s_params = match send(
+            dmabuf_id,
+            create_params,
+            Some(self.object_data() as Arc<dyn ObjectData>),
+        ) {
             Ok(Ok(id)) => id,
             Ok(Err(e)) => {
-                eprintln!("rayland-s: WP0 4.3: step 1/3 create_params failed for resource {}: {e}", token.resource_id);
+                eprintln!(
+                    "rayland-s: WP0 4.3: step 1/3 create_params failed for resource {}: {e}",
+                    token.resource_id
+                );
                 return;
             }
             Err(_) => {
@@ -1523,7 +1626,10 @@ impl WaylandReplay {
         match send(s_params.clone(), add, None) {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => {
-                eprintln!("rayland-s: WP0 4.3: step 2/3 add failed for resource {}: {e}", token.resource_id);
+                eprintln!(
+                    "rayland-s: WP0 4.3: step 2/3 add failed for resource {}: {e}",
+                    token.resource_id
+                );
                 return;
             }
             Err(_) => {
@@ -1534,10 +1640,17 @@ impl WaylandReplay {
 
         // Step 3: the buffer itself. Once mapped, the app's own attach/commit replay through the ordinary
         // path and put this buffer on S's surface.
-        let s_buffer = match send(s_params, create_immed, Some(self.object_data() as Arc<dyn ObjectData>)) {
+        let s_buffer = match send(
+            s_params,
+            create_immed,
+            Some(self.object_data() as Arc<dyn ObjectData>),
+        ) {
             Ok(Ok(id)) => id,
             Ok(Err(e)) => {
-                eprintln!("rayland-s: WP0 4.3: step 3/3 create_immed failed for resource {}: {e}", token.resource_id);
+                eprintln!(
+                    "rayland-s: WP0 4.3: step 3/3 create_immed failed for resource {}: {e}",
+                    token.resource_id
+                );
                 return;
             }
             Err(_) => {
@@ -1557,7 +1670,12 @@ impl WaylandReplay {
         eprintln!(
             "rayland-s: WP0 4.3: built wl_buffer (app obj {app_buffer_id}) from resource {} \
              ({}x{} fmt {:#x} offset {} stride {} modifier {:#x})",
-            token.resource_id, token.width, token.height, token.drm_format, token.offset, token.stride,
+            token.resource_id,
+            token.width,
+            token.height,
+            token.drm_format,
+            token.offset,
+            token.stride,
             token.modifier
         );
         self.flush();
@@ -1708,8 +1826,12 @@ mod tests {
             "zwp_linux_dmabuf_v1",
             "zwp_linux_buffer_params_v1",
         ] {
-            let iface = interface_by_name(name).unwrap_or_else(|| panic!("no descriptor for {name}"));
-            assert_eq!(iface.name, name, "descriptor name must match the lookup key");
+            let iface =
+                interface_by_name(name).unwrap_or_else(|| panic!("no descriptor for {name}"));
+            assert_eq!(
+                iface.name, name,
+                "descriptor name must match the lookup key"
+            );
         }
         // An interface WP0 does not handle resolves to None, so its request is skipped, not mis-created.
         assert!(interface_by_name("wl_data_device_manager").is_none());
@@ -1758,6 +1880,9 @@ mod tests {
         // We cannot fabricate an ObjectId here, so the round-trip is covered by the integration test; this
         // asserts the empty-map default behaviour that guards registry chatter.
         let maps = IdMaps::default();
-        assert!(maps.to_s(3).is_none(), "an unmapped app id resolves to nothing");
+        assert!(
+            maps.to_s(3).is_none(),
+            "an unmapped app id resolves to nothing"
+        );
     }
 }

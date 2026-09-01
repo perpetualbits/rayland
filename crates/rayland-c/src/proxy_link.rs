@@ -60,6 +60,25 @@ impl WaylandSink for LinkSink {
     /// naming the bound object; the proxy's single dispatch thread calls this synchronously from
     /// `GlobalHandler::bind`, before the object's first request, and the link preserves order — so the
     /// causal ordering (bind, then requests) is maintained.
+    /// Send pool contents as a [`C2S::ShmPoolData`], on the same link and with the same
+    /// fire-and-forget discipline as the other two. The proxy's single dispatch thread calls this
+    /// immediately before forwarding the commit that depends on it, and the link preserves order — so
+    /// the bytes are on S before its compositor is told to look at the surface.
+    fn forward_shm_pool_data(&self, app_pool_id: u32, offset: u32, bytes: Vec<u8>) {
+        let mut link = self
+            .tx
+            .lock()
+            .expect("the send-link mutex is never poisoned");
+        let msg = C2S::ShmPoolData {
+            app_pool_id,
+            offset,
+            bytes,
+        };
+        if let Err(e) = link.send(&msg) {
+            eprintln!("rayland-c: forwarding shm pool contents to S failed: {e}");
+        }
+    }
+
     fn forward_bind(&self, interface: &str, version: u32, app_object_id: u32) {
         let mut link = self
             .tx

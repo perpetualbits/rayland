@@ -63,6 +63,9 @@ pub mod link;
 // here, and a metric that the binary alone could see would miss exactly the layer being measured.
 pub mod metrics;
 /// WP0 Wayland proxy: `rayland-c` as a Wayland server to the app, forwarding to S (buffer-by-token).
-pub mod wayland_proxy;
+/// `wl_shm` pool bookkeeping for the C-side proxy: which bytes a commit must carry to S.
+pub mod wayland_shm;
+
 /// WP0 Task 4.1: real `WaylandSink`/`ResourceResolver` impls wiring the proxy to the daemon's link and blobs.
 pub mod proxy_link;
+pub mod wayland_proxy;

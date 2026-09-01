@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use rayland_c::wayland_proxy::{ResourceResolver, WaylandSink};
 use rayland_relay::{WaylandArg, WaylandMessage};
-use wayland_client::globals::{registry_queue_init, GlobalListContents};
+use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::wl_buffer::WlBuffer;
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::{Connection, Dispatch, QueueHandle};
@@ -61,6 +61,9 @@ impl WaylandSink for Collector {
     }
     // This test asserts on the forwarded token, not on binds; record nothing for a bind.
     fn forward_bind(&self, _interface: &str, _version: u32, _app_object_id: u32) {}
+
+    /// Ignored: this test forwards no `wl_shm` traffic. Present so the sink satisfies the trait.
+    fn forward_shm_pool_data(&self, _app_pool_id: u32, _offset: u32, _bytes: Vec<u8>) {}
 }
 
 /// A resolver that maps exactly one memfd identity (the test's) to [`RESOURCE_ID`], mirroring the real
@@ -157,7 +160,12 @@ fn start_proxy(tag: &str) -> Option<Harness> {
         .bind(&queue.handle(), 3..=3, ())
         .expect("proxy lets the client bind zwp_linux_dmabuf_v1");
 
-    Some(Harness { collector, queue, dmabuf, memfd })
+    Some(Harness {
+        collector,
+        queue,
+        dmabuf,
+        memfd,
+    })
 }
 
 /// The `BufferToken` the proxy forwarded, or `None` if it forwarded no token at all.
@@ -176,7 +184,13 @@ fn forwarded_token(collector: &Collector) -> Option<rayland_relay::BufferToken> 
 /// Run the swapchain buffer-creation sequence through the proxy and assert the emitted `BufferToken`.
 #[test]
 fn create_immed_emits_a_correct_buffer_token_and_never_asserts() {
-    let Some(Harness { collector, mut queue, dmabuf, memfd }) = start_proxy("token") else {
+    let Some(Harness {
+        collector,
+        mut queue,
+        dmabuf,
+        memfd,
+    }) = start_proxy("token")
+    else {
         return; // no libwayland — skip, as the sibling tests do
     };
     let qh = queue.handle();
@@ -202,23 +216,33 @@ fn create_immed_emits_a_correct_buffer_token_and_never_asserts() {
 
     // Exactly one message should have been forwarded (the token); create_params/add do not cross.
     let token = forwarded_token(&collector).unwrap_or_else(|| {
-        panic!("no BufferToken was forwarded; messages: {:?}", collector.messages.lock().unwrap())
+        panic!(
+            "no BufferToken was forwarded; messages: {:?}",
+            collector.messages.lock().unwrap()
+        )
     });
 
     // The token must name the resolved resource and carry create_immed's geometry and add's modifier.
     assert_eq!(token.resource_id, RESOURCE_ID, "wrong resource id in token");
     assert_eq!(token.width, WIDTH as u32, "wrong width in token");
     assert_eq!(token.height, HEIGHT as u32, "wrong height in token");
-    assert_eq!(token.drm_format, DRM_FORMAT_ARGB8888, "wrong format in token");
+    assert_eq!(
+        token.drm_format, DRM_FORMAT_ARGB8888,
+        "wrong format in token"
+    );
     assert_eq!(token.modifier, MODIFIER, "wrong modifier in token");
     // The two fields with teeth. STRIDE is not WIDTH*4 and OFFSET is not 0, so neither of these can be
     // satisfied by a derivation from the geometry — only by carrying what `add` actually supplied.
     assert_eq!(
-        token.stride, STRIDE,
+        token.stride,
+        STRIDE,
         "wrong stride in token — a derived width x bpp would be {}",
         (WIDTH as u32) * 4
     );
-    assert_eq!(token.offset, OFFSET, "wrong offset in token — an assumed offset would be 0");
+    assert_eq!(
+        token.offset, OFFSET,
+        "wrong offset in token — an assumed offset would be 0"
+    );
 
     // And the message must also name the new wl_buffer (its app-side id, interface `wl_buffer`) so S can
     // create the buffer object for the token.
@@ -228,14 +252,23 @@ fn create_immed_emits_a_correct_buffer_token_and_never_asserts() {
             .iter()
             .any(|a| matches!(a, WaylandArg::NewId { interface, .. } if interface == "wl_buffer"))
     });
-    assert!(named_buffer, "the token message did not name the wl_buffer id");
+    assert!(
+        named_buffer,
+        "the token message did not name the wl_buffer id"
+    );
 }
 
 /// The asynchronous `params.create` path (opcode 2) is unsupported in WP0 and must be refused cleanly:
 /// no token is forwarded, and no protocol error is raised (the request is consumed, not mis-forwarded).
 #[test]
 fn async_create_is_refused_without_forwarding_a_token() {
-    let Some(Harness { collector, mut queue, dmabuf, memfd }) = start_proxy("async") else {
+    let Some(Harness {
+        collector,
+        mut queue,
+        dmabuf,
+        memfd,
+    }) = start_proxy("async")
+    else {
         return; // no libwayland — skip
     };
     let qh = queue.handle();
@@ -271,7 +304,13 @@ fn async_create_is_refused_without_forwarding_a_token() {
 /// happens, and leaves the app with a locally valid `wl_buffer` that S is simply never told to present.
 #[test]
 fn a_non_zero_plane_index_refuses_the_buffer() {
-    let Some(Harness { collector, mut queue, dmabuf, memfd }) = start_proxy("plane") else {
+    let Some(Harness {
+        collector,
+        mut queue,
+        dmabuf,
+        memfd,
+    }) = start_proxy("plane")
+    else {
         return; // no libwayland — skip
     };
     let qh = queue.handle();
@@ -284,9 +323,9 @@ fn a_non_zero_plane_index_refuses_the_buffer() {
         params.create_immed(WIDTH, HEIGHT, DRM_FORMAT_ARGB8888, Flags::empty(), &qh, ());
 
     // The refusal must be clean: consumed by the proxy, so the app sees no protocol error at all.
-    queue
-        .roundtrip(&mut AppData)
-        .expect("round-trip after a refused create_immed — the refusal must not be a protocol error");
+    queue.roundtrip(&mut AppData).expect(
+        "round-trip after a refused create_immed — the refusal must not be a protocol error",
+    );
 
     assert!(
         forwarded_token(&collector).is_none(),
@@ -303,7 +342,13 @@ fn a_non_zero_plane_index_refuses_the_buffer() {
 /// the last `add` would silently win and its stride would describe the whole buffer.
 #[test]
 fn a_second_add_refuses_the_buffer() {
-    let Some(Harness { collector, mut queue, dmabuf, memfd }) = start_proxy("twoadd") else {
+    let Some(Harness {
+        collector,
+        mut queue,
+        dmabuf,
+        memfd,
+    }) = start_proxy("twoadd")
+    else {
         return; // no libwayland — skip
     };
     let qh = queue.handle();
@@ -315,9 +360,9 @@ fn a_second_add_refuses_the_buffer() {
     let _buffer: WlBuffer =
         params.create_immed(WIDTH, HEIGHT, DRM_FORMAT_ARGB8888, Flags::empty(), &qh, ());
 
-    queue
-        .roundtrip(&mut AppData)
-        .expect("round-trip after a refused create_immed — the refusal must not be a protocol error");
+    queue.roundtrip(&mut AppData).expect(
+        "round-trip after a refused create_immed — the refusal must not be a protocol error",
+    );
 
     assert!(
         forwarded_token(&collector).is_none(),
@@ -332,7 +377,11 @@ fn make_memfd() -> OwnedFd {
     let name = CString::new("rayland-blob-test").unwrap();
     // SAFETY: `memfd_create` returns a fresh fd or -1; we check and take ownership via OwnedFd.
     let raw = unsafe { libc::memfd_create(name.as_ptr(), 0) };
-    assert!(raw >= 0, "memfd_create failed: {}", std::io::Error::last_os_error());
+    assert!(
+        raw >= 0,
+        "memfd_create failed: {}",
+        std::io::Error::last_os_error()
+    );
     // SAFETY: `raw` is a valid, freshly-owned fd we have not otherwise registered.
     unsafe { std::os::fd::FromRawFd::from_raw_fd(raw) }
 }

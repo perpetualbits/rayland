@@ -211,6 +211,39 @@ pub enum C2S {
         /// request naming this object arrives as a [`WaylandRequest`] whose `object_id` is this value.
         app_object_id: u32,
     },
+    /// **Contents of a region of an application `wl_shm` pool, copied from C's mapping into S's.**
+    ///
+    /// # Why this message exists at all
+    /// `wl_shm` is the pre-GPU way to put a picture on screen: the client maps a shared region, draws
+    /// into it with the CPU, and carves buffers out of it. Rayland exists because a shared page has no
+    /// network representation — but that reasoning does **not** apply to the pool's descriptor, because
+    /// `rayland-c` runs on the *same machine as the application* and can simply map it. So C keeps the
+    /// fd, S allocates a separate memfd of the same size, and this message is what keeps the two in
+    /// step. Nothing is shared; bytes are copied.
+    ///
+    /// # Why it must be sent BEFORE the commit that depends on it
+    /// Both this and the `wl_surface.commit` that presents the buffer travel the same ordered relay
+    /// stream, so sending the bytes first is sufficient to guarantee S's pool is current before its
+    /// compositor is told to look at the surface. **Reversing the order presents a stale frame, and
+    /// does so intermittently** — whether it looks wrong depends on what the pool happened to hold
+    /// from the previous frame, which is the worst kind of bug to inherit. `rayland-c`'s
+    /// `shm_ordering_puts_the_bytes_before_the_commit` test pins the order for that reason.
+    ///
+    /// # Why the whole buffer, and not just what changed
+    /// v1 is deliberately correct-first: no content hashing, no damage-rectangle intersection, no
+    /// compression. All three are sound and none is yet known to be *needed* — the traffic here is
+    /// predicted to be cursors and window decorations, not frames. The session summary exists to
+    /// settle that with numbers before anyone builds a cache whose invalidation is where the subtle
+    /// staleness bugs live.
+    ShmPoolData {
+        /// The application's `wl_shm_pool` object id, as C sees it. S maps this through the same
+        /// `app_id ↔ s_id` table every other WP0 object uses, to find its own mirror pool.
+        app_pool_id: u32,
+        /// Byte offset into the pool at which `bytes` begins.
+        offset: u32,
+        /// The pixel bytes themselves, read from C's mapping of the application's own pool.
+        bytes: Vec<u8>,
+    },
 }
 
 /// Buffer-by-token: names the S-side resource that a Wayland `wl_buffer` denotes, plus the
@@ -519,6 +552,27 @@ pub enum WaylandArg {
     /// A file-descriptor argument, replaced by buffer-by-token (see [`BufferToken`] for
     /// why a token, and not the fd itself, is what actually crosses).
     Buffer(BufferToken),
+    /// **The shm-pool substitution: how large a pool to make, in place of the fd naming it.**
+    ///
+    /// # Why this is a size and not a token or a payload
+    /// `wl_shm.create_pool(new_id pool, fd, int size)` is the only shm request carrying a descriptor.
+    /// The other two substitutions in this enum each send what the far side needs: [`Self::Buffer`]
+    /// sends a *name* for a resource S already holds, and [`Self::KeymapContent`] sends *contents*
+    /// because the bytes are the whole payload. A pool is neither — it is a mutable region the
+    /// application will write into repeatedly, long after creation, so nothing about its contents is
+    /// meaningful at `create_pool` time. What S needs is only its **size**, so it can allocate a
+    /// separate memfd of its own and keep it in step by copying (see [`crate::C2S::ShmPoolData`]).
+    ///
+    /// # The pitfall this makes structural
+    /// S's memfd is a **different file** from the application's. They are the same size only because
+    /// this argument says so and `resize` says so again. Nothing shares a page; nothing keeps them in
+    /// step automatically. Anything that changes one size must change the other.
+    ShmPool {
+        /// The pool's size in bytes, as the application declared it — after C has checked it against
+        /// the descriptor's real length, because a pool larger than its backing file is a `SIGBUS`
+        /// waiting to happen on whichever side reads past the end.
+        size: u32,
+    },
     /// **The keymap substitution: the *contents* of a file descriptor an event carried.**
     ///
     /// # Why this exists, and why it is the mirror of [`WaylandArg::Buffer`]

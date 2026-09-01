@@ -405,6 +405,11 @@ fn c2s_kind(m: &C2S) -> String {
         C2S::UnrefResource { res_id } => format!("UnrefResource res={res_id}"),
         C2S::WaylandRequest { .. } => "WaylandRequest".to_string(),
         C2S::WaylandBind { .. } => "WaylandBind".to_string(),
+        C2S::ShmPoolData {
+            app_pool_id, bytes, ..
+        } => {
+            format!("ShmPoolData pool={app_pool_id} n={}", bytes.len())
+        }
     }
 }
 
@@ -781,6 +786,17 @@ fn serve(
                 wl_replay.handle_bind(interface, version, app_object_id);
                 continue;
             }
+            // WP0 `wl_shm`: pool contents, written into S's own mirror memfd. Routed here with the
+            // other compositor-facing messages and never handed to the applier — it names a
+            // `wl_shm_pool`, which is a compositor object and means nothing to the vtest engine.
+            C2S::ShmPoolData {
+                app_pool_id,
+                offset,
+                bytes,
+            } => {
+                wl_replay.handle_shm_pool_data(app_pool_id, offset, &bytes);
+                continue;
+            }
             other => other,
         };
 
@@ -1070,6 +1086,15 @@ fn main() -> Result<()> {
 
     let applier_for_refresh = Arc::clone(&applier);
     serve(rx, tx, applier, &mut engine, &mut capture, &mut wl_replay)?;
+    // The mirror's side of the shm summary. S's numbers should match C's; a divergence means the two
+    // disagree about a pool, which is precisely the drift `shm_mirror`'s docs warn about.
+    let (shm_bytes, shm_writes, shm_pools) = wl_replay.shm_summary();
+    if shm_writes > 0 {
+        eprintln!(
+            "rayland-s: WP0 shm: {shm_bytes} bytes written across {shm_writes} updates into \
+             {shm_pools} mirrored pool(s)"
+        );
+    }
     eprintln!("rayland-s: session ended");
 
     // **Refresh the frame candidates exactly once, here, and never on the relay's hot path.**

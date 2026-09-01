@@ -22,9 +22,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rayland_c::wayland_proxy::{wayland_event_channel, ResourceResolver, WaylandSink};
+use rayland_c::wayland_proxy::{ResourceResolver, WaylandSink, wayland_event_channel};
 use rayland_relay::{WaylandArg, WaylandMessage};
-use wayland_client::globals::{registry_queue_init, GlobalListContents};
+use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::wl_callback::{Event as WlCallbackEvent, WlCallback};
 use wayland_client::protocol::wl_compositor::WlCompositor;
 use wayland_client::protocol::wl_registry::WlRegistry;
@@ -50,6 +50,9 @@ struct NullSink;
 impl WaylandSink for NullSink {
     fn forward_request(&self, _msg: WaylandMessage) {}
     fn forward_bind(&self, _interface: &str, _version: u32, _app_object_id: u32) {}
+
+    /// Ignored: this test forwards no `wl_shm` traffic. Present so the sink satisfies the trait.
+    fn forward_shm_pool_data(&self, _app_pool_id: u32, _offset: u32, _bytes: Vec<u8>) {}
 }
 struct NullResolver;
 impl ResourceResolver for NullResolver {
@@ -171,13 +174,17 @@ fn a_recycled_callback_id_still_receives_its_own_done() {
         surface: Some(surface.clone()),
         ..Default::default()
     };
-    queue.roundtrip(&mut app).expect("surface reaches the proxy");
+    queue
+        .roundtrip(&mut app)
+        .expect("surface reaches the proxy");
 
     // --- Drive FRAMES callbacks through the same recycled slot, as an animating app does. -------------
     let first: WlCallback = surface.frame(&qh, ());
     let mut next_id = first.id().protocol_id();
     let first_id = next_id;
-    queue.roundtrip(&mut app).expect("the first callback reaches the proxy");
+    queue
+        .roundtrip(&mut app)
+        .expect("the first callback reaches the proxy");
 
     let mut recycled_at_least_once = false;
     for frame in 0..FRAMES {
@@ -204,7 +211,9 @@ fn a_recycled_callback_id_still_receives_its_own_done() {
             None => break,
         }
         // Let the proxy see the new `frame` request before the next event is posted.
-        queue.roundtrip(&mut app).expect("the next callback reaches the proxy");
+        queue
+            .roundtrip(&mut app)
+            .expect("the next callback reaches the proxy");
     }
 
     assert_eq!(
@@ -239,7 +248,9 @@ fn wait_for(
 ) {
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline && !done(app) {
-        queue.roundtrip(app).expect("round-trip while awaiting an event");
+        queue
+            .roundtrip(app)
+            .expect("round-trip while awaiting an event");
         std::thread::sleep(Duration::from_millis(5));
     }
 }

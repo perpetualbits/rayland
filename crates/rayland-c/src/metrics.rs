@@ -121,6 +121,14 @@ impl Channel {
             C2S::SubmitCmd { .. } => Channel::Inline,
             // The mapped-memory cost, made visible.
             C2S::BlobData { .. } => Channel::BlobSync,
+            // **`wl_shm` pool content, counted with the blob sync and deliberately so.** Both are
+            // "bytes C copies out of a mapping because the far side cannot see it", which is the
+            // quantity this channel exists to expose. Giving shm its own channel would let a
+            // full-window software surface hide as a small number in a category nobody watches;
+            // folded in here it shows up against the traffic the presented-buffer exclusion was
+            // built to remove, which is exactly the comparison that matters if this path ever
+            // stops carrying cursors and starts carrying windows.
+            C2S::ShmPoolData { .. } => Channel::BlobSync,
             // Doorbells are real bytes: counted here, but never reported as an event count — see
             // the module docs and `C2S::NotifyRing`'s own "do not build a metric on this".
             C2S::NotifyRing { .. } => Channel::Control,
@@ -244,6 +252,24 @@ pub struct Metrics {
     /// past any plausible send, and anything longer saturates into the last one rather than
     /// panicking or wrapping.
     send_hist: [AtomicU64; 32],
+    /// Total `wl_shm` pool bytes C has copied to S this session.
+    ///
+    /// # Why this rides the metrics line rather than a teardown print
+    /// The design asks for a per-session shm summary, and a summary printed only at teardown is a
+    /// summary usually never printed: the proxy's serve loop exits on error, and every soak and demo
+    /// run ends by killing the daemon. `C1METRICS` already prints on a timer *and* at exit, so putting
+    /// the numbers there means they survive the way every run actually ends.
+    shm_bytes: AtomicU64,
+    /// Commits that carried shm bytes.
+    shm_commits: AtomicU64,
+    /// The largest single shm buffer observed.
+    ///
+    /// **This is the number the whole v1 scope rests on.** v1 ships no content hashing, no damage
+    /// intersection and no compression, on the prediction that this path carries cursors and window
+    /// decorations rather than frames. A largest-buffer figure in the tens of kilobytes confirms that
+    /// and closes the question; one in the megabytes says a real application is pushing whole windows
+    /// through a path that must never become the main road.
+    shm_largest: AtomicU64,
     /// The instant every duration here is relative to.
     start: Instant,
 }
@@ -277,6 +303,9 @@ pub fn metrics() -> &'static Metrics {
         app_connected_nanos: AtomicU64::new(0),
         send_nanos: AtomicU64::new(0),
         send_hist: Default::default(),
+        shm_bytes: AtomicU64::new(0),
+        shm_commits: AtomicU64::new(0),
+        shm_largest: AtomicU64::new(0),
         start: Instant::now(),
     })
 }
@@ -327,6 +356,20 @@ impl Metrics {
         };
         // Clamp rather than assert: an instrument must never be the thing that kills the daemon.
         self.send_hist[bucket.min(self.send_hist.len() - 1)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Fold one `wl_shm` commit's byte count into the session summary.
+    ///
+    /// # Inputs / outputs
+    /// - `bytes`: the size of the buffer range just sent. Counted unconditionally, not behind the
+    ///   metrics gate: this is three relaxed atomics on a path that runs at most once per frame and at
+    ///   most for an application that actually uses `wl_shm`, and the number is the evidence the whole
+    ///   v1 scope decision rests on. Losing it because a run forgot an env var would be the expensive
+    ///   outcome, not the cheap one.
+    pub fn record_shm_commit(&self, bytes: u64) {
+        self.shm_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.shm_commits.fetch_add(1, Ordering::Relaxed);
+        self.shm_largest.fetch_max(bytes, Ordering::Relaxed);
     }
 
     /// Record one framed message received S→C, and note the first frame if this is it.
@@ -467,6 +510,15 @@ impl Metrics {
         s.push_str(&format!(
             " send_us={}",
             self.send_nanos.load(Ordering::Relaxed) / 1_000
+        ));
+        // The shm summary. Always emitted, even as zeros: "this application used no shm at all" is
+        // itself the answer to the question the design asks, and an absent field reads as a missing
+        // measurement rather than a null result.
+        s.push_str(&format!(
+            " shm_bytes={} shm_commits={} shm_largest={}",
+            self.shm_bytes.load(Ordering::Relaxed),
+            self.shm_commits.load(Ordering::Relaxed),
+            self.shm_largest.load(Ordering::Relaxed),
         ));
         s.push_str(" send_hist=");
         for (i, b) in self.send_hist.iter().enumerate() {

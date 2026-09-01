@@ -217,7 +217,7 @@ fn message_is_solicited(msg: &C2S) -> bool {
         | C2S::UnrefResource { .. } => false,
         // WP0 Wayland-proxy messages never travel this vtest reply path — the session router splits
         // them off to the S-side Wayland client before `apply` — so they are not solicited replies.
-        C2S::WaylandRequest { .. } | C2S::WaylandBind { .. } => false,
+        C2S::WaylandRequest { .. } | C2S::WaylandBind { .. } | C2S::ShmPoolData { .. } => false,
     }
 }
 
@@ -931,7 +931,11 @@ impl Applier {
             }
             // WP0 Wayland-proxy messages must never reach the vtest apply path — the session router
             // splits them off to the S-side Wayland client. One here is an internal routing bug.
-            C2S::WaylandRequest { .. } | C2S::WaylandBind { .. } => {
+            // WP0's messages are replayed against S's real compositor by `WaylandReplay`, not
+            // applied to the vtest engine. `ShmPoolData` joins the other two here for the same
+            // reason: it names a `wl_shm_pool` object, which is a compositor object and means
+            // nothing to the engine. Reaching this arm means `main`'s router missed a case.
+            C2S::WaylandRequest { .. } | C2S::WaylandBind { .. } | C2S::ShmPoolData { .. } => {
                 Err(ApplyError::WaylandMessageOnVtestPath)
             }
         }

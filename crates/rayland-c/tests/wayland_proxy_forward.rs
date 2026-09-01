@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use rayland_c::wayland_proxy::{ResourceResolver, WaylandSink};
 use rayland_relay::{WaylandArg, WaylandMessage};
-use wayland_client::globals::{registry_queue_init, GlobalListContents};
+use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::wl_compositor::WlCompositor;
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::protocol::wl_surface::WlSurface;
@@ -49,6 +49,9 @@ impl WaylandSink for Collector {
             .unwrap()
             .push((interface.to_string(), version, app_object_id));
     }
+
+    /// Ignored: this test forwards no `wl_shm` traffic. Present so the sink satisfies the trait.
+    fn forward_shm_pool_data(&self, _app_pool_id: u32, _offset: u32, _bytes: Vec<u8>) {}
 }
 
 /// A resolver that recognises no inode — this test forwards only `create_surface`, never a buffer, so the
@@ -106,8 +109,8 @@ impl Dispatch<WlSurface, ()> for AppData {
 /// carrying the new surface's id as a translated `NewId`.
 #[test]
 fn create_surface_is_forwarded_with_a_translated_new_id() {
-    let socket_path: PathBuf = std::env::temp_dir()
-        .join(format!("rayland-wp-proxy-fwd-{}.sock", std::process::id()));
+    let socket_path: PathBuf =
+        std::env::temp_dir().join(format!("rayland-wp-proxy-fwd-{}.sock", std::process::id()));
 
     // Stand the proxy up with a recording sink on its own thread; keep our handle to the collector.
     let collector = Arc::new(Collector::default());
@@ -153,7 +156,9 @@ fn create_surface_is_forwarded_with_a_translated_new_id() {
     // the create_surface below targets (the app's wl_registry.bind itself never reaches the proxy).
     let binds = collector.binds.lock().unwrap();
     assert!(
-        binds.iter().any(|(iface, _v, _id)| iface == "wl_compositor"),
+        binds
+            .iter()
+            .any(|(iface, _v, _id)| iface == "wl_compositor"),
         "the proxy did not forward the wl_compositor bind; binds were: {binds:?}"
     );
 
@@ -167,9 +172,9 @@ fn create_surface_is_forwarded_with_a_translated_new_id() {
         "the proxy forwarded nothing; expected at least the create_surface request"
     );
     let saw_typed_new_id = messages.iter().any(|m| {
-        m.args.iter().any(|a| {
-            matches!(a, WaylandArg::NewId { interface, .. } if interface == "wl_surface")
-        })
+        m.args
+            .iter()
+            .any(|a| matches!(a, WaylandArg::NewId { interface, .. } if interface == "wl_surface"))
     });
     assert!(
         saw_typed_new_id,

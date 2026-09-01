@@ -10,7 +10,7 @@ visible from the code — several of the project's central facts were discovered
 and at least three plausible-sounding designs were built and then disproved. A plan made without
 those facts will re-propose a dead end. They are all recorded here, with pointers to the evidence.
 
-**Last brought current:** 2026-09-01 (evening), against branch `wp0-wayland-proxy`.
+**Last brought current:** 2026-09-01 (night), against branch `wp0-wayland-proxy`.
 
 > **Where the work is.** All WP0, (c)1 and (c)2 work described below lives on **`wp0-wayland-proxy`**,
 > which is **37 commits ahead of `main`** and behind it by none. `main` last moved on 2026-08-29.
@@ -759,6 +759,24 @@ unexplained failure (1/92) against a shipping arm clean through 480 runs. One ni
 it either way. This is the best ratio of information to effort currently on the board.
 
 ### 6.3 Longer-term open questions
+
+- **`wl_shm` IS IMPLEMENTED (2026-09-01), and it is what lets an ordinary toolkit application start
+  at all.** `winit`, GTK and Qt treat `wl_shm` as **fatal at event-loop creation**, so `solarsim` and
+  every toolkit app aborted with `WaylandError(Bind(NotPresent))` before creating a window or reaching
+  Vulkan. The proxy now advertises it. Mechanism: **C keeps the application's pool fd and maps it
+  locally — it is on the same machine, so the fd never needs to cross** — S allocates its own memfd of
+  the same size, and `C2S::ShmPoolData` keeps them in step by copying. This is the **third** member of
+  the same substitution family: `BufferToken` sends a *name*, `KeymapContent` sends *contents*, and
+  `ShmPool` sends only a **size**, because a pool is a mutable region whose contents mean nothing at
+  creation. **S's memfd is a different file**; they are the same size only because two messages say so.
+  Ordering is load-bearing and pinned by a mutation-checked test: the bytes must precede the commit, or
+  a stale frame is presented *intermittently*. v1 deliberately ships no content hashing, damage
+  intersection or compression — the `C1METRICS` line now carries `shm_bytes/shm_commits/shm_largest`,
+  and that largest-buffer figure is the evidence deciding whether any of them is ever needed. A
+  full-window buffer is **carried with a loud `shm:large-buffer` warning, not refused**: a blank window
+  is worse to debug than a slow one. `vkcube` re-measured after the new global: unaffected.
+- **`wl_shm` is not yet exercised end to end.** The acceptance test is `solarsim` on milkv rendering on
+  dop561; it has not been run.
 
 - **FIXED 2026-09-01: the `wl_keyboard.keymap` drop.** S dropped the event because it carries an fd;
   the cost was not "no keyboard" but a **hung application** — anything that creates a `wl_keyboard`

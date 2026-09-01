@@ -18,9 +18,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rayland_c::wayland_proxy::{wayland_event_channel, ResourceResolver, WaylandSink};
+use rayland_c::wayland_proxy::{ResourceResolver, WaylandSink, wayland_event_channel};
 use rayland_relay::{WaylandArg, WaylandMessage};
-use wayland_client::globals::{registry_queue_init, GlobalListContents};
+use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
 use wayland_protocols::xdg::shell::client::xdg_wm_base::{Event as XdgWmBaseEvent, XdgWmBase};
@@ -34,6 +34,9 @@ struct NullSink;
 impl WaylandSink for NullSink {
     fn forward_request(&self, _msg: WaylandMessage) {}
     fn forward_bind(&self, _interface: &str, _version: u32, _app_object_id: u32) {}
+
+    /// Ignored: this test forwards no `wl_shm` traffic. Present so the sink satisfies the trait.
+    fn forward_shm_pool_data(&self, _app_pool_id: u32, _offset: u32, _bytes: Vec<u8>) {}
 }
 struct NullResolver;
 impl ResourceResolver for NullResolver {
@@ -131,7 +134,9 @@ fn a_posted_compositor_event_reaches_the_app() {
     let mut app = AppData::default();
     let deadline = Instant::now() + Duration::from_secs(3);
     while app.pings.is_empty() && Instant::now() < deadline {
-        queue.roundtrip(&mut app).expect("round-trip while awaiting the ping");
+        queue
+            .roundtrip(&mut app)
+            .expect("round-trip while awaiting the ping");
         if app.pings.is_empty() {
             std::thread::sleep(Duration::from_millis(20));
         }

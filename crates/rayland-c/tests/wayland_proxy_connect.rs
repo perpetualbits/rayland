@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use rayland_c::wayland_proxy::{ResourceResolver, WaylandSink};
 use rayland_relay::WaylandMessage;
-use wayland_client::globals::{registry_queue_init, GlobalListContents};
+use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::{Connection, Dispatch};
 
@@ -32,6 +32,9 @@ struct NullSink;
 impl WaylandSink for NullSink {
     fn forward_request(&self, _msg: WaylandMessage) {}
     fn forward_bind(&self, _interface: &str, _version: u32, _app_object_id: u32) {}
+
+    /// Ignored: this test forwards no `wl_shm` traffic. Present so the sink satisfies the trait.
+    fn forward_shm_pool_data(&self, _app_pool_id: u32, _offset: u32, _bytes: Vec<u8>) {}
 }
 
 /// A resolver that recognises no inode. This test creates no buffers, so it is never consulted; it only

@@ -56,6 +56,9 @@ pub mod lockstat;
 // Putting the frame on S's display — and the one question (c)1 must ask that spec §7.2 forbids.
 pub mod present;
 // S's side of the command ring: where C's relayed bytes are laid down for virglrenderer to find.
+/// S's mirror of the application's `wl_shm` pools: its own memfds, kept in step by copying.
+pub mod shm_mirror;
+
 pub mod ring_mirror;
 
 /// WP0 Task 4.2: the S-side replay of the app's Wayland session against S's real compositor.

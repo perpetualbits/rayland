@@ -26,7 +26,7 @@
 
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -241,6 +241,7 @@ use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_v1::ZwpLi
 use wayland_protocols::xdg::shell::server::xdg_wm_base::XdgWmBase;
 use wayland_server::protocol::wl_compositor::WlCompositor;
 use wayland_server::protocol::wl_seat::WlSeat;
+use wayland_server::protocol::wl_shm::WlShm;
 
 /// Where the proxy sends the application's translated Wayland requests.
 ///
@@ -266,6 +267,21 @@ pub trait WaylandSink: Send + Sync {
     /// The real sink sends this as a [`rayland_relay::C2S::WaylandBind`]; a test collector records it. See
     /// the design doc §3, "Object-id mapping".
     fn forward_bind(&self, interface: &str, version: u32, app_object_id: u32);
+
+    /// Forward the contents of a region of an application `wl_shm` pool.
+    ///
+    /// # Why this is its own method and not a `forward_request`
+    /// It is not a request. No Wayland message carries pool contents — the client writes into shared
+    /// memory that the compositor simply reads, and the whole reason this exists is that S's copy is a
+    /// *different file* on a different machine. It rides
+    /// [`rayland_relay::C2S::ShmPoolData`] on the same ordered link.
+    ///
+    /// # Ordering, which the caller owes and this cannot enforce
+    /// The proxy must call this **before** forwarding the `wl_surface.commit` that presents the buffer.
+    /// Both travel the same ordered stream, so bytes-then-commit is sufficient; commit-then-bytes
+    /// presents whatever the pool held from the previous frame, and does so *intermittently*, which is
+    /// the hardest kind of bug to inherit.
+    fn forward_shm_pool_data(&self, app_pool_id: u32, offset: u32, bytes: Vec<u8>);
 }
 
 /// Resolves a passed file descriptor's memfd identity to the S-side resource it names.
@@ -338,6 +354,8 @@ struct PendingParams {
 struct ProxyState {
     /// Where translated requests go (a collector in tests, the real link to S in Task 4).
     sink: Arc<dyn WaylandSink>,
+    /// `wl_shm` pool bookkeeping: which bytes a commit must carry to S. See [`crate::wayland_shm`].
+    shm: crate::wayland_shm::ShmTracker,
     /// Turns a `params.add` fd into the S-side resource id it names (a stub in tests, `shm.rs` in Task 4).
     resolver: Arc<dyn ResourceResolver>,
     /// In-flight buffer state, keyed by the `zwp_linux_buffer_params_v1` object's id (the app's id space).
@@ -354,6 +372,25 @@ struct ProxyState {
 // index in its interface (document order in `linux-dmabuf-v1.xml`), which is how the Wayland wire numbers
 // them. Named here so the match on `(interface, opcode)` reads in domain terms, not magic numbers.
 /// The `zwp_linux_dmabuf_v1` global's interface name.
+/// `wl_shm`, the pre-GPU way to put a picture on screen. Advertised because `winit`, GTK and Qt all
+/// treat it as mandatory at startup — see [`crate::wayland_shm`].
+const IFACE_SHM: &str = "wl_shm";
+/// A pool carved out of the client's shared memory.
+const IFACE_SHM_POOL: &str = "wl_shm_pool";
+/// `wl_surface`, whose `attach` and `commit` decide *when* pool bytes must reach S.
+const IFACE_SURFACE: &str = "wl_surface";
+/// `wl_shm.create_pool(new_id pool, fd, int size)` — the only shm request carrying a descriptor.
+const OP_SHM_CREATE_POOL: u16 = 0;
+/// `wl_shm_pool.create_buffer(new_id, offset, width, height, stride, format)`.
+const OP_POOL_CREATE_BUFFER: u16 = 0;
+/// `wl_shm_pool.resize(size)`.
+const OP_POOL_RESIZE: u16 = 2;
+/// `wl_surface.attach(buffer, x, y)`.
+const OP_SURFACE_ATTACH: u16 = 1;
+/// `wl_surface.commit()` — the moment the protocol guarantees the client has finished drawing, and so
+/// the only correct point to copy its pixels.
+const OP_SURFACE_COMMIT: u16 = 6;
+
 const IFACE_DMABUF: &str = "zwp_linux_dmabuf_v1";
 /// The `zwp_linux_buffer_params_v1` object's interface name.
 const IFACE_PARAMS: &str = "zwp_linux_buffer_params_v1";
@@ -379,6 +416,13 @@ const OP_PARAMS_CREATE_IMMED: u16 = 3;
 /// (`:830-852`), which is three integers and no fd — a complete path in this Mesa. So the proxy advertises
 /// exactly v3, forcing the fd-free path, and answers the format query itself (see [`advertise_dmabuf_formats`]).
 const DMABUF_MAX_VERSION: u32 = 3;
+
+/// The `wl_shm` version advertised to the application.
+///
+/// Version 2 adds only `wl_shm.release`, which nothing in this proxy needs. A client binds the
+/// **minimum** of what it wants and what is offered, so advertising 1 is the conservative choice and
+/// costs nothing: no client requires 2 to function.
+const SHM_MAX_VERSION: u32 = 1;
 
 /// `zwp_linux_dmabuf_v1.modifier` **event** opcode (event index 1). Wire signature
 /// `[format: uint, modifier_hi: uint, modifier_lo: uint]`, valid since interface v3. This is the event the
@@ -533,6 +577,191 @@ fn immed_geometry(msg: &Message<ObjectId, OwnedFd>) -> (u32, u32, u32) {
 /// missing `add`), or because the params object was poisoned — still leaves the app with a locally valid
 /// `wl_buffer` (the backend created it from the `NewId`); S is simply never told to present it. The log
 /// names which of the two refusals occurred, since they call for different investigations.
+/// Handle the `wl_shm` requests, returning `true` when this function has already forwarded the request
+/// and the generic path must not forward it again.
+///
+/// # The five points, and why only one of them is consumed
+/// Four of the five merely *record* state so that `commit` knows what to copy, and then let the
+/// ordinary path forward them unchanged — they carry no descriptor and need no substitution:
+///
+/// | request | what happens |
+/// |---|---|
+/// | `wl_shm.create_pool` | map the app's fd, record the pool, forward with `ShmPool { size }` in place of the fd — **consumed** |
+/// | `wl_shm_pool.create_buffer` | record geometry, pass through |
+/// | `wl_shm_pool.resize` | remap locally, pass through |
+/// | `wl_surface.attach` | record what is attached, pass through |
+/// | `wl_surface.commit` | copy the attached buffer's bytes and send them **first**, pass through |
+///
+/// # The ordering at `commit` is the load-bearing detail
+/// The bytes are sent *before* returning, so the generic path's forward of the commit follows them on
+/// the same ordered link. Reversing that presents whatever S's pool held from the previous frame —
+/// and does so **intermittently**, since whether it looks wrong depends on the previous contents.
+/// `shm_ordering_puts_the_bytes_before_the_commit` pins it.
+///
+/// `commit` is the right moment because it is where the protocol guarantees the client has finished
+/// drawing. Copying at `attach` would be too early — a client may draw after attaching — and copying
+/// on S's demand is impossible, because S cannot ask.
+///
+/// # Inputs / outputs
+/// - Returns `true` only for `create_pool`. Everything else returns `false` and is forwarded normally,
+///   including every request on a surface that has a **dma-buf** buffer attached — the GPU path must
+///   pass through here without a word.
+fn try_intercept_shm(data: &mut ProxyState, msg: &Message<ObjectId, OwnedFd>) -> bool {
+    let iface = msg.sender_id.interface().name;
+    let obj = msg.sender_id.protocol_id();
+    match (iface, msg.opcode) {
+        // The only shm request carrying a descriptor. C maps it and keeps it; S is told only a size.
+        (IFACE_SHM, OP_SHM_CREATE_POOL) => {
+            let Some(pool_id) = first_new_id(msg) else {
+                wp_drop("drop:shm-create-pool-no-new-id: the request named no pool object");
+                return true;
+            };
+            // The fd and the size, positionally: `create_pool(new_id, fd, int size)`.
+            let fd = msg.args.iter().find_map(|a| match a {
+                Argument::Fd(fd) => Some(fd),
+                _ => None,
+            });
+            let size = msg.args.iter().find_map(|a| match a {
+                Argument::Int(v) => u32::try_from(*v).ok(),
+                _ => None,
+            });
+            let (Some(fd), Some(size)) = (fd, size) else {
+                wp_drop(&format!(
+                    "drop:shm-create-pool-malformed pool={pool_id}: expected an fd and a size"
+                ));
+                return true;
+            };
+            match data.shm.create_pool(pool_id, fd.as_fd(), size) {
+                Ok(size) => {
+                    // Forward with the descriptor replaced by the size. The `NewId` is kept so S
+                    // creates the pool object in the same id space as every other WP0 object.
+                    let wire = WaylandMessage {
+                        object_id: obj,
+                        opcode: msg.opcode,
+                        args: vec![
+                            WaylandArg::NewId {
+                                id: pool_id,
+                                interface: IFACE_SHM_POOL.to_string(),
+                                version: SHM_MAX_VERSION,
+                            },
+                            WaylandArg::ShmPool { size },
+                        ],
+                    };
+                    wp_log(&format!(
+                        "intercept wl_shm.create_pool -> pool {pool_id} ({size} bytes; fd kept on C)"
+                    ));
+                    data.sink.forward_request(wire);
+                }
+                Err(e) => {
+                    // **What this means for the app:** no pool, so whatever it meant to draw with shm
+                    // — usually a cursor or a decoration — is absent. Its GPU frames are unaffected.
+                    wp_drop(&format!("drop:shm-pool-refused pool={pool_id}: {e:?}"));
+                }
+            }
+            true
+        }
+        // Geometry only; no descriptor, so the generic path forwards it.
+        (IFACE_SHM_POOL, OP_POOL_CREATE_BUFFER) => {
+            if let Some(buffer_id) = first_new_id(msg) {
+                // **Read by position, not by type.** `create_buffer(new_id, offset, width, height,
+                // stride, format)` is four `int`s and one `uint`, and an earlier version of this code
+                // collected "the integers" — which silently skipped `format`, left four values where
+                // five were expected, matched nothing, and recorded no buffer at all. Nothing failed;
+                // the commit simply found no buffer and copied nothing. Matching the exact argument
+                // shape makes that impossible rather than unlikely.
+                let shape = msg.args.as_slice();
+                if let [
+                    Argument::NewId(_),
+                    Argument::Int(offset),
+                    Argument::Int(width),
+                    Argument::Int(height),
+                    Argument::Int(stride),
+                    Argument::Uint(format),
+                ] = shape
+                {
+                    let (offset, width, height, stride, format) =
+                        (*offset, *width, *height, *stride, *format);
+                    if let Err(e) = data.shm.create_buffer(
+                        buffer_id,
+                        obj,
+                        offset.max(0) as u32,
+                        width.max(0) as u32,
+                        height.max(0) as u32,
+                        stride.max(0) as u32,
+                        format,
+                    ) {
+                        // Refused, and the request still forwards: S's compositor will create its own
+                        // `wl_buffer` object, but no bytes will ever be sent for it, so nothing is
+                        // presented from it. That is the intended shape — a refusal here means the
+                        // geometry was unusable, and presenting garbage is worse than presenting
+                        // nothing.
+                        wp_drop(&format!(
+                            "drop:shm-buffer-refused buffer={buffer_id}: {e:?}"
+                        ));
+                    }
+                }
+            }
+            false
+        }
+        // Remap locally first: S resizes its own file when the forwarded request reaches it.
+        (IFACE_SHM_POOL, OP_POOL_RESIZE) => {
+            let new_size = msg.args.iter().find_map(|a| match a {
+                Argument::Int(v) => u32::try_from(*v).ok(),
+                _ => None,
+            });
+            if let Some(new_size) = new_size {
+                // The resize request carries no descriptor, so C re-maps the fd it already holds.
+                if let Err(e) = data.shm.resize_pool_in_place(obj, new_size) {
+                    wp_drop(&format!("drop:shm-resize-refused pool={obj}: {e:?}"));
+                }
+            }
+            false
+        }
+        // Record what is attached. A null buffer detaches, and that distinction decides whether the
+        // next commit copies anything at all.
+        (IFACE_SURFACE, OP_SURFACE_ATTACH) => {
+            let buffer = msg.args.iter().find_map(|a| match a {
+                Argument::Object(id) => Some(id.protocol_id()),
+                _ => None,
+            });
+            data.shm.attach(obj, buffer.filter(|id| *id != 0));
+            false
+        }
+        // The sync point. Send the bytes, then let the generic path forward the commit after them.
+        (IFACE_SURFACE, OP_SURFACE_COMMIT) => {
+            match data.shm.commit(obj) {
+                // Nothing attached, a null buffer, or a dma-buf buffer: the overwhelmingly common
+                // case for a GPU application, and it must cost nothing and say nothing.
+                Ok(None) => {}
+                Ok(Some((pool_id, offset, bytes))) => {
+                    // **The large-buffer warning, and why this carries rather than refuses.** A
+                    // full-window software surface is the traffic the presented-buffer exclusion was
+                    // built to eliminate, and it must not creep back in through this door. But
+                    // refusing it would make a software-rendered application show a *blank window*,
+                    // which is a worse failure to debug than a slow one. So it is carried, loudly, and
+                    // policy is decided later on the evidence this line produces.
+                    const LARGE: usize = 512 * 1024;
+                    if bytes.len() >= LARGE {
+                        wp_log(&format!(
+                            "shm:large-buffer surface={obj} pool={pool_id} bytes={} — carried, not \
+                             refused; if this is routine rather than exceptional the design needs \
+                             revisiting, not this path optimising",
+                            bytes.len()
+                        ));
+                    }
+                    crate::metrics::metrics().record_shm_commit(bytes.len() as u64);
+                    data.sink.forward_shm_pool_data(pool_id, offset, bytes);
+                }
+                Err(e) => {
+                    wp_drop(&format!("drop:shm-commit-refused surface={obj}: {e:?}"));
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
 fn try_intercept_buffer(data: &mut ProxyState, msg: &Message<ObjectId, OwnedFd>) -> bool {
     let iface = msg.sender_id.interface().name;
     // The params/buffer objects live in the app's id space, keyed by the sending object's protocol id.
@@ -733,6 +962,40 @@ fn advertise_dmabuf_formats(handle: &Handle, dmabuf: &ObjectId) {
 struct ProxyClientData;
 impl ClientData for ProxyClientData {}
 
+/// Send the `wl_shm.format` events a freshly-bound `wl_shm` owes its client.
+///
+/// # Why these two and only these two
+/// `ARGB8888` (0) and `XRGB8888` (1) are mandatory for every Wayland compositor, so a proxy that
+/// advertises exactly them is always telling the truth without asking S. Mirroring S's real list would
+/// mean a network round trip during the application's `wl_registry` sweep — on the startup path, where
+/// this project has been careful to avoid adding any — and would buy nothing: a client that wants a
+/// format outside these two is refused at `create_buffer` either way, with a message naming the format.
+///
+/// # Inputs / outputs
+/// - `handle`, `shm`: the backend and the just-bound `wl_shm` object.
+/// - Sends one `format` event per entry of [`crate::wayland_shm::SUPPORTED_FORMATS`]. A send failure is
+///   logged and skipped, matching [`deliver_event`]: the client vanishing mid-bind is not this
+///   function's problem to solve.
+fn advertise_shm_formats(handle: &Handle, shm: &ObjectId) {
+    /// `wl_shm.format` is event 0 on the interface.
+    const EVT_SHM_FORMAT: u16 = 0;
+    for format in crate::wayland_shm::SUPPORTED_FORMATS {
+        let event = Message {
+            sender_id: shm.clone(),
+            opcode: EVT_SHM_FORMAT,
+            args: [Argument::Uint(format)].into_iter().collect(),
+        };
+        if let Err(e) = handle.send_event(event) {
+            wp_log(&format!("wl_shm.format {format} could not be sent: {e:?}"));
+        }
+    }
+    wp_log(&format!(
+        "advertised {} wl_shm format(s) to the app on object {}",
+        crate::wayland_shm::SUPPORTED_FORMATS.len(),
+        shm.protocol_id()
+    ));
+}
+
 /// The handler the backend invokes when a client binds one of our advertised globals.
 ///
 /// A `wayland-backend` global is bound via `wl_registry.bind`; the backend then calls [`Self::bind`] to
@@ -780,6 +1043,16 @@ impl GlobalHandler<ProxyState> for ProxyGlobal {
         // (the proxy caps the advertisement at exactly v3, so a real client always binds v3 here).
         if self.iface_name == IFACE_DMABUF && version >= 3 {
             advertise_dmabuf_formats(handle, &object_id);
+        }
+        // The same locally-answered-capability pattern for `wl_shm`. A compositor is required to send
+        // a `format` event for each format it supports immediately on bind, and a client is entitled
+        // to make its choice from that list without a further roundtrip. Answering here rather than
+        // relaying S's list is not a shortcut: `ARGB8888` and `XRGB8888` are **mandatory for every
+        // Wayland compositor**, so advertising exactly those two is always truthful, and it keeps a
+        // network round trip off the application's startup path — the one place a stall is most
+        // visible. Any other format a client asks for is refused at `create_buffer`.
+        if self.iface_name == IFACE_SHM {
+            advertise_shm_formats(handle, &object_id);
         }
         // Record the bound global in the app-id → ObjectId map so a compositor event targeting it (e.g. a
         // `wl_seat.capabilities`, or an `xdg_wm_base.ping` on a descendant) can be delivered back — see
@@ -838,7 +1111,10 @@ impl ObjectData<ProxyState> for ProxyObjectData {
         // The one special case first: buffer-by-token interception on the dmabuf path. If it consumed the
         // request (a `create_params`/`add`/`create_immed`), the generic path must not also run — a raw fd
         // must never be forwarded.
-        if !try_intercept_buffer(data, &msg) {
+        // `wl_shm` first: its `create_pool` is the only other request carrying a descriptor, and its
+        // `commit` must put pool bytes on the wire *before* the generic path forwards the commit.
+        // Everything it does not consume falls through to the dmabuf interception below unchanged.
+        if !try_intercept_shm(data, &msg) && !try_intercept_buffer(data, &msg) {
             // Generic path: translate the request to its wire form and forward it to S. A stray unresolved
             // fd outside the intercepted dmabuf path is not expected in WP0; log and drop rather than
             // forward a raw fd or panic.
@@ -998,10 +1274,17 @@ pub fn run_with_events(
     create_global::<XdgWmBase>(&handle, u32::MAX);
     create_global::<ZwpLinuxDmabufV1>(&handle, DMABUF_MAX_VERSION);
     create_global::<WlSeat>(&handle, u32::MAX);
+    // **Advertised at version 1, deliberately.** Version 2 adds only `wl_shm.release`, which nothing
+    // here needs, and clients bind the minimum of what they want and what is offered — so the lower
+    // version is the conservative choice rather than a limitation. Without this global at all, `winit`
+    // aborts with `Bind(NotPresent)` before it creates a window or reaches Vulkan.
+    create_global::<WlShm>(&handle, SHM_MAX_VERSION);
     // Where the application dials in. WP0 serves exactly one such socket.
     let listener = UnixListener::bind(&socket_path)?;
     // The dispatch loop owns this state; it is threaded to every callback by the backend.
     let mut state = ProxyState {
+        // No pools until the application creates one; a purely GPU application never will.
+        shm: crate::wayland_shm::ShmTracker::default(),
         sink,
         resolver,
         pending: HashMap::new(),
@@ -1338,6 +1621,17 @@ fn deliver_event(handle: &Handle, state: &ProxyState, msg: WaylandMessage) {
                     return;
                 }
             },
+            WaylandArg::ShmPool { .. } => {
+                // An shm pool size travels app→S at `create_pool`, never back. **What this means for
+                // the app:** the event is lost, and it also means something upstream is confused,
+                // since nothing on S constructs such an event.
+                wp_drop(&format!(
+                    "drop:unexpected-shm-pool app_obj={} {}",
+                    msg.object_id,
+                    event_label(&sender, msg.opcode)
+                ));
+                return;
+            }
             WaylandArg::Buffer(_) => {
                 // A buffer token travels app→S, never back. **What this means for the app:** lost, and it
                 // also means something upstream is confused, since nothing constructs such an event.
@@ -1478,7 +1772,8 @@ mod tests {
         assert!(dup >= 0, "dup of the keymap fd failed");
         let mut file = unsafe { std::fs::File::from_raw_fd(dup) };
         let mut got = Vec::new();
-        file.read_to_end(&mut got).expect("the keymap fd must be readable");
+        file.read_to_end(&mut got)
+            .expect("the keymap fd must be readable");
 
         assert_eq!(
             got, keymap,
@@ -1493,7 +1788,8 @@ mod tests {
     /// application waiting for a keymap that had, in fact, arrived.
     #[test]
     fn an_empty_keymap_still_produces_a_valid_descriptor() {
-        let fd = synthesize_keymap_fd(&[]).expect("an empty keymap must still produce a descriptor");
+        let fd =
+            synthesize_keymap_fd(&[]).expect("an empty keymap must still produce a descriptor");
         assert!(fd.as_raw_fd() >= 0);
     }
 

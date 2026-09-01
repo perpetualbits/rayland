@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use rayland_c::wayland_proxy::{ResourceResolver, WaylandSink};
 use rayland_relay::WaylandMessage;
-use wayland_client::globals::{registry_queue_init, GlobalListContents};
+use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::{Connection, Dispatch, QueueHandle};
 use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::{
@@ -46,6 +46,9 @@ struct NullSink;
 impl WaylandSink for NullSink {
     fn forward_request(&self, _msg: WaylandMessage) {}
     fn forward_bind(&self, _interface: &str, _version: u32, _app_object_id: u32) {}
+
+    /// Ignored: this test forwards no `wl_shm` traffic. Present so the sink satisfies the trait.
+    fn forward_shm_pool_data(&self, _app_pool_id: u32, _offset: u32, _bytes: Vec<u8>) {}
 }
 struct NullResolver;
 impl ResourceResolver for NullResolver {

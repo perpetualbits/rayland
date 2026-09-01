@@ -6211,3 +6211,66 @@ per-commit `eprintln`, because that mistake now has five instances in this repos
 I have still not written a line of shm code, and I am not going to start it inside a turn that has
 already fixed a keymap, patched an upstream demo and chased a hang. Saying where it stands is the
 honest end of this turn.
+
+### 2026-09-01 (very late) — `wl_shm`, and the bug that hid inside a type
+
+The owner asked for `wl_shm`, and the reason it matters is bigger than one protocol: **`winit`, GTK and
+Qt all treat `wl_shm` as fatal at event-loop creation.** Not "degrade without it" — abort. So
+`solarsim`, and every ordinary toolkit application, dies with `WaylandError(Bind(NotPresent))` before it
+creates a window, touches wgpu or reaches Vulkan. None of the GPU path is even exercised. Advertising
+one global is the difference between "no toolkit application can start" and "they can".
+
+**The fd is not the problem it looks like, and that is the insight the design rests on.**
+`wl_shm.create_pool` passes a descriptor, and this whole project exists because a shared page has no
+network representation. But `rayland-c` runs on the *same machine as the application*: the app hands
+its pool fd to a process sitting next to it, exactly as it would to a local compositor. C maps it. The
+fd never needs to reach S. So S allocates its own memfd of the same size and the two are kept in step
+by copying — which makes this the **third** substitution in the same family, after
+`BufferToken` (send a *name* for something S already has) and `KeymapContent` (send the *contents*,
+because the bytes are the payload). A pool is neither: it is a mutable region, so what crosses at
+creation is only its **size**.
+
+**The one thing I want the next reader to hold onto** is the same sentence the S-side module opens
+with: S's memfd is a *different file*. Nothing is shared, nothing keeps them in step automatically, and
+they are the same size only because two messages say so.
+
+**Ordering is the load-bearing detail and it gets its own test**, because getting it wrong fails
+*intermittently*: the bytes must be sent before the `wl_surface.commit` that presents them, or S's
+compositor is told to look at a surface whose pool still holds the previous frame — and whether that
+looks wrong depends on what happened to be there. I mutation-tested it three ways: send the bytes 50 ms
+late, never send them, forward the fd instead of substituting a size. All three caught.
+
+**And then the bug that is the real story of this turn.** The integration test failed with "the proxy
+sent no ShmPoolData", and the dump said why:
+
+```
+create_buffer args: [NewId, Int(0), Int(8), Int(4), Int(32), Uint(1)]
+```
+
+The **format is a `uint`**, and the other four are `int`. My interception collected "the integers",
+got four values where it expected five, matched nothing, recorded no buffer — and **nothing failed**.
+No error, no refusal, no log line. The commit simply found no buffer and copied nothing.
+
+That is the third time today I have read a Wayland message by the wrong key. First an opcode read
+without its interface (`opcode 3` as `wl_surface.frame`, actually `set_title`). Then the same again on
+`opcode 1` (`wl_surface.attach`, actually `get_keyboard`) — which sent me hunting a buffer-release bug
+that did not exist. Now arguments read by *type* instead of by *position*. The shape is identical every
+time: **I used a property that is only meaningful in a context I had not pinned down.** The fix here is
+structural rather than careful — the arm now matches the exact argument shape, so a mismatched message
+cannot silently produce a partial read.
+
+Written down because the first two cost me an hour of misdirected diagnosis and this one would have
+shipped a feature that quietly never copies anything on some client's buffer layout.
+
+**Scope, honoured deliberately.** No content hashing, no damage intersection, no compression. All three
+are sound and none is yet known to be *needed*: the prediction is that this path carries cursors and
+window decorations, not frames, and §10's instrumentation is what turns that into a measurement. It now
+rides the `C1METRICS` line rather than a teardown print, because the serve loop exits on error and
+every soak and demo run ends by killing the daemon — a summary printed only at teardown is a summary
+usually never printed. A full-window buffer is **carried with a loud warning, not refused**, because a
+blank window is worse to debug than a slow one.
+
+`vkcube` re-measured after advertising the new global: 34 and 25 ms, clean, unaffected.
+
+**Not done, and not forgotten:** no end-to-end run yet. `solarsim` on milkv is the acceptance test, and
+`vkgears`'s Venus-WSI hang is still open and still separate from all of this.
