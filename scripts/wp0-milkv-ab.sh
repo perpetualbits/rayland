@@ -44,6 +44,10 @@ C_HOST="${C_HOST:-milkv.localdomain}"
 # The two arms. Cross-built on the laptop; see the header.
 A_BIN="${A_BIN:-/tmp/rv-c-BEFORE}"
 B_BIN="${B_BIN:-/tmp/rv-c-AFTER}"
+# The S-side arms. Default to the built binary for both, so an A/B that varies only C leaves S fixed;
+# set these to compare two S binaries against one C, which is how an S-side change is isolated.
+A_SBIN="${A_SBIN:-}"
+B_SBIN="${B_SBIN:-}"
 APP="${APP:-/usr/bin/vkcube}"
 APP_ARGS="${APP_ARGS:---gpu_number 0}"
 OUT="${OUT:-/tmp/milkv-ab-$(date +%Y%m%d-%H%M%S)}"
@@ -101,14 +105,17 @@ fi
 
 printf 'pair\tarm\tattaches\tframe_gaps\tmedian_gap_ms\tstall_gaps\tlongest_ms\n' > "$OUT/runs.tsv"
 
-run_one() {   # $1 = arm label, $2 = binary, $3 = pair number
-  local arm="$1" bin="$2" pair="$3"
+run_one() {   # $1 = arm label, $2 = C binary, $3 = pair number, $4 = optional S binary
+  local arm="$1" bin="$2" pair="$3" sbin="${4:-}"
+  # An S arm, when the comparison is about S rather than C.
+  [ -n "$sbin" ] && cp "$sbin" "$BIN/rayland-s"
   local rd="$OUT/pair$pair-$arm"; mkdir -p "$rd"
   local S_PID="" CPID=""
 
   # S: the GPU machine. RAYLAND_C1_NO_PRESENT keeps S off its own screen; the app's window is the
   # thing under test and it goes to weston.
   env WAYLAND_DISPLAY="$WESTON_SOCKET" RAYLAND_C1_NO_PRESENT=1 \
+    ${STAGES:+RAYLAND_S_STAGES=1} ${LOCKSTAT:+RAYLAND_S_LOCKSTAT=1} \
     RAYLAND_C1_S_LISTEN="0.0.0.0:$PORT" "$BIN/rayland-s" > "$rd/s.log" 2>&1 &
   S_PID=$!
   sleep 3
@@ -169,8 +176,8 @@ run_one() {   # $1 = arm label, $2 = binary, $3 = pair number
 }
 
 for p in $(seq 1 "$PAIRS"); do
-  run_one BEFORE "$A_BIN" "$p"
-  run_one AFTER  "$B_BIN" "$p"
+  run_one BEFORE "$A_BIN" "$p" "$A_SBIN"
+  run_one AFTER  "$B_BIN" "$p" "$B_SBIN"
 done
 
 echo

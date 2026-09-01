@@ -387,6 +387,13 @@ impl HostBlob {
         // while the saving is megabytes. A workload that dirtied most of a large blob would prefer a
         // smaller chunk, and if one ever appears this is the number to revisit.
         const CHUNK: usize = 4096;
+        // The inner level, for the same reason C has one (`rayland_c::shm::DIFF_SUBCHUNK`): a large
+        // chunk skips unchanged memory at `memcmp` speed but makes a *change* expensive, because one
+        // changed byte drags a whole chunk of byte-loop behind it. S's reply arena is exactly that
+        // shape — the return path's diff is deliberately byte-granular there, so its changes arrive as
+        // many isolated single-byte runs. Measured on the riscv64 board's S: `take_venus_blob_writes`
+        // cost 1.37 ms per call, 1.48 s of an 18.4 s run, all of it with the applier lock held.
+        const SUBCHUNK: usize = 256;
         let mut i = 0usize;
         while i < live.len() {
             // The tail chunk is short; `min` keeps both slices the same length, which slice equality
@@ -401,19 +408,33 @@ impl HostBlob {
                 i = chunk_end;
                 continue;
             }
-            // This chunk differs somewhere, so it — and only it — is examined byte by byte. A run
-            // open from the previous chunk stays open, so runs still merge across chunk boundaries
-            // exactly as the byte-at-a-time version merged them.
-            for j in i..chunk_end {
-                if live[j] != self.shadow[j] {
-                    // A byte S wrote. Extend the open run, or start one here — `get_or_insert` keeps
-                    // an already-open run's start rather than resetting it to `j`.
-                    open.get_or_insert(j);
-                } else if let Some(start) = open.take() {
-                    // A byte S did not write, so the run stops *before* it. Shipping it would be
-                    // shipping a byte S has no claim to — precisely the clobber this grain avoids.
-                    ranges.push((start, j));
+            // This chunk differs somewhere. **Subdivide before examining any byte individually**: the
+            // arena's changes are typically isolated bytes, and byte-walking the whole chunk to find
+            // them is what this level exists to avoid. A run open from an earlier block stays open, so
+            // runs still merge across every boundary exactly as the byte-at-a-time version merged them.
+            let mut s = i;
+            while s < chunk_end {
+                let sub_end = (s + SUBCHUNK).min(chunk_end);
+                if live[s..sub_end] == self.shadow[s..sub_end] {
+                    // Nothing S wrote in this whole block; any open run ended at its start.
+                    if let Some(start) = open.take() {
+                        ranges.push((start, s));
+                    }
+                    s = sub_end;
+                    continue;
                 }
+                for j in s..sub_end {
+                    if live[j] != self.shadow[j] {
+                        // A byte S wrote. Extend the open run, or start one here — `get_or_insert`
+                        // keeps an already-open run's start rather than resetting it to `j`.
+                        open.get_or_insert(j);
+                    } else if let Some(start) = open.take() {
+                        // A byte S did not write, so the run stops *before* it. Shipping it would be
+                        // shipping a byte S has no claim to — precisely the clobber this grain avoids.
+                        ranges.push((start, j));
+                    }
+                }
+                s = sub_end;
             }
             i = chunk_end;
         }

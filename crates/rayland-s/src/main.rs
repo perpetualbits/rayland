@@ -825,6 +825,11 @@ fn serve(
         // Noted before `apply` takes ownership of the message; used only to bound the stage record.
         let was_ring_delta = matches!(msg, C2S::RingDelta { .. });
         let out = session.apply(engine, msg);
+        // Still holding the lock: everything after this point is the capture and the sends, which the
+        // stage record must be able to tell apart from `apply` itself. See `stages::Stage`.
+        if was_ring_delta {
+            rayland_s::stages::note(rayland_s::stages::Stage::ApplyReturned);
+        }
 
         // **Look for the frame here, before the lock is released and before the replies go out.**
         // Spec §7.3: Mesa creates a blob resource lazily, at `vkMapMemory`, so the readback buffer's

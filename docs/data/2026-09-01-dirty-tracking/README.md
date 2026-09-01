@@ -105,3 +105,80 @@ python3 probe-softdirty-shared-memfd.py      # the cross-process, shared-memfd c
 PAIRS=8 SECS=25 A_BIN=... B_BIN=... scripts/wp0-milkv-ab.sh
 PAIRS=1 RELAXSTAT=1 ... scripts/wp0-milkv-ab.sh   # then the stage analysis
 ```
+
+---
+
+# Part 2 — are the deltas synchronous, and can 60 fps be reached?
+
+## Finding 3 — the deltas are genuinely synchronous. Batching is closed.
+
+If the 3.6 deltas per frame were one burst that C's watcher happened to split, merging them would be
+free. They are not. From the C-side event stream on the board (1,556 deltas, 435 frames):
+
+| | count | median gap to the next delta |
+|---|---|---|
+| a reply arrived in between | **1,446 (93.0%)** | 11.39 ms |
+| no reply in between | 109 (7.0%) | 7.54 ms |
+
+**No delta follows the previous by under 1 ms** (p10 = 9.38 ms). The application really does block on a
+reply before writing again, 3.6 times per frame. Merging them would mean *waiting*, and the deltas are
+~11 ms apart while the earlier `PARK_SLEEP` sweep showed only ~2 ms of added latency is free.
+
+## Finding 4 — S was not the problem, and fixing it changed nothing end to end
+
+S's own blob scan (`take_bytes_s_wrote`) had the same one-level shape C's did, and its cost was landing
+on the applier lock: `take_venus_blob_writes` cost 1.37 ms per call, 1.48 s of an 18.4 s run, all with
+the lock held — which is why S's *message thread* showed 5.18 ms per delta for what its own docs call
+"a `memcpy` and one atomic store". Giving S the same two-level subdivision:
+
+| S stage | before | after |
+|---|---|---|
+| read → `apply()` returned (lock wait + apply) | — | 0.206 ms |
+| `apply()` → lock released (capture + sends) | — | 0.004 ms |
+| applied → head moved (virglrenderer) | 0.082 ms | 0.268 ms |
+| head moved → reply on the link | 1.812 ms | 1.387 ms |
+| **read → reply shipped (all of S)** | **7.160 ms** | **1.843 ms** |
+
+**A 3.9× reduction — and an 8-pair interleaved A/B varying only S measured no end-to-end difference**
+(40.5 ms vs 41.0 ms). That is the fifth large mechanism win this week to move nothing, and this time
+the reason is visible in the ownership split rather than mysterious: C's diff dominates and everything
+else is serialised behind it.
+
+## Finding 5 — what owns milkv's frame now
+
+| owner | share | median |
+|---|---|---|
+| **C: diffing blobs** | **56.8%** | 6.38 ms × 3.62/frame ≈ **23 ms** |
+| Rayland round trip (wire + S) | 23.1% | — |
+| Compositor | 9.6% | — |
+| Application | 8.0% | — |
+| C: writing to the link | 2.5% | — |
+
+23.0 fps, 3.62 deltas/frame.
+
+## Finding 6 — the diff is at 2.2× the memory floor, not at it
+
+A pure `memcmp` of 9 MiB on this board takes **2.92 ms** (6.47 GB/s). Our diff of ~9.2 MiB takes
+**6.38 ms**. So the scan is *not* bandwidth-bound and there was room — but widening the outer chunk
+from 4096 to 65536, which cuts `memcmp` call count 16×, moved it only 6.50 → 6.26 ms. The gap is
+therefore not call overhead. The most likely remaining cause is **TLB**: the baseline is an ordinary
+heap `Vec` and gets transparent huge pages, while the live side is a shared memfd mapping that does
+not. That was not pursued — making the memfd huge-page backed changes what Mesa maps.
+
+## The answer on 60 fps, with the arithmetic
+
+**60 fps needs 16.7 ms/frame. It is not reachable on this board with this architecture.**
+
+- 3.62 **synchronous** round trips per frame (Finding 3), each of which must have the mapped blobs on S
+  *before* the commands that read them, so each must be preceded by a full scan.
+- Even at the measured pure-`memcmp` floor, that scan is 2.92 ms × 3.62 = **10.6 ms/frame**, before any
+  round trip, compositor or application time.
+- Adding the measured remainder (round trip 23.1%, compositor 9.6%, app 8.0% of a 43 ms frame ≈ 17.5 ms)
+  gives **~28 ms/frame ≈ 36 fps as the ceiling with a perfect scan**.
+- Reaching 60 fps requires the scan to go away entirely, which requires **dirty-page tracking** —
+  unavailable on this board (Finding 1) and needing kernel 5.19+/6.7+ or an architecture that
+  implements soft-dirty.
+
+**So the (c)2 mapped-memory problem is not only a correctness problem; on hardware without dirty-page
+tracking it is the performance wall, and there is no software workaround.** That is the substantive
+result of this work, and it is worth more than the 22 → 23 fps.

@@ -664,7 +664,10 @@ mod tests {
                 "a run starting exactly on a sub-block boundary",
                 (SUB * 3..SUB * 3 + 6).collect(),
             ),
-            ("two isolated bytes in different sub-blocks", vec![SUB + 1, SUB * 5 + 9]),
+            (
+                "two isolated bytes in different sub-blocks",
+                vec![SUB + 1, SUB * 5 + 9],
+            ),
             (
                 "one isolated byte per sub-block across a whole chunk",
                 (0..CHUNK / SUB).map(|b| b * SUB + 11).collect(),

@@ -49,6 +49,16 @@ static LOG: StageLog = StageLog::new("SSTAGE", "RAYLAND_S_STAGES");
 pub enum Stage {
     /// S's message thread has read a `C2S::RingDelta` off the link.
     DeltaRead,
+    /// `Applier::apply` returned, **with the applier lock still held**.
+    ///
+    /// # Why this sits between the other two
+    /// `DeltaRead -> DeltaApplied` was measured at **5.18 ms** on the riscv64 board — 71% of S's whole
+    /// span — for what the message loop's own docs describe as "a `memcpy` and one atomic store". That
+    /// span actually contains four things: waiting for the applier lock, `apply` itself, the frame
+    /// capture, and the replies being sent *while the lock is held*. This marker separates the first
+    /// two from the last two, which is the difference between "the delta is expensive to apply" and
+    /// "something after it is expensive and is holding the lock".
+    ApplyReturned,
     /// `Applier::apply` returned and the applier lock was released: the delta's bytes are in the ring
     /// blob's memory and `tail` is published, so virglrenderer's ring thread may now see them.
     DeltaApplied,
@@ -71,6 +81,7 @@ impl Stage {
     fn label(self) -> &'static str {
         match self {
             Stage::DeltaRead => "DeltaRead",
+            Stage::ApplyReturned => "ApplyReturned",
             Stage::DeltaApplied => "DeltaApplied",
             Stage::RingProgress => "RingProgress",
             Stage::VenusReply => "VenusReply",
