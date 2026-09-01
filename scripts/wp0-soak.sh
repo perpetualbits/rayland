@@ -253,7 +253,15 @@ for run in $(seq 1 "$RUNS"); do
   # free-running sustains ~20 fps — measured, `--c 60` gave 1 attach and never exited. That is a real
   # observation about `--c` and is reported rather than chased; here it only means the frame count has
   # to be imposed by this harness instead, by stopping the app once C's log shows enough attaches.
-  APP_ARGS="--gpu_number 0"
+  # **`--gpu_number` is an index into the device list Venus exposes, NOT a stable name.** The
+  # project rule "vkcube must run with --gpu_number 0" was written when index 0 was S's Intel node;
+  # its *intent* is "do not land on the NVIDIA RTX A500", which loses the device on 7 of 14 runs
+  # (CLAUDE.md, 2026-07-26). On 2026-09-01 a dionysus→dop561 run with `--gpu_number 0` selected
+  # "Virtio-GPU Venus (NVIDIA RTX A500 Laptop GPU)" and produced **zero attaches in 195 s** — four
+  # swapchain buffers created, one commit, nothing ever presented, which is what device loss looks
+  # like from outside. So the index is a knob, and the run log must always be checked for which
+  # device was actually chosen rather than trusting the number.
+  APP_ARGS="${APP_ARGS:---gpu_number 0}"
   A_PID=$(on_c "export XDG_RUNTIME_DIR=/run/user/\$(id -u)
     WAYLAND_DISPLAY=$WL_SOCK VN_DEBUG=vtest \
     VN_PERF=no_multi_ring,no_fence_feedback,no_semaphore_feedback,no_event_feedback,no_query_feedback \

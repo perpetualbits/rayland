@@ -5955,3 +5955,58 @@ does not establish it. And a caution I nearly walked into myself: this sweep's B
 while an earlier sweep of the *same binary* ran at 71 ms. Chaining sweeps into one triumphant ratio
 would have produced a much better-looking number and a false one. Every comparison here is interleaved
 and within a single sweep for exactly that reason.
+
+### 2026-09-01 (night) — dionysus as C, and the moment Rayland stopped being the bottleneck
+
+Three things were asked: show the cube on the real screen, park the milkv 60 fps goal without losing
+it, and bring dionysus up as machine C. The third one produced the best result this project has had,
+and it arrived attached to a measurement I nearly failed to make.
+
+**dionysus works as C with almost no ceremony** — Ubuntu 26.04, x86_64, 8 cores, the virtio ICD
+already present, and the same glibc as dop561 so `vkcube` copies over as a binary. No chroot, no
+cross-compilation, no board with 1 GB free. `wp0-soak.sh` drives it directly. And **soft-dirty works
+there**, cross-process on a shared memfd, which is the exact production case — so dionysus is where
+the dirty-page tracking that milkv cannot run could actually be built.
+
+**The result: 25 ms median inter-frame gap, in eight runs out of eight, all exactly 25.** That is
+40 fps from a real machine C over a real network, against milkv's 45 ms.
+
+Eight identical medians is not a measurement, it is a *clue*. A number that will not move is usually
+someone else's number. So I measured the control I should always have had: native `vkcube` on the
+same headless weston, no Rayland in the path at all.
+
+**25.39 ms. p10 25.23, p90 25.56. 39.4 fps.**
+
+So the relayed application is running at the compositor's pacing, which is to say **at native frame
+rate**. On a capable C, over a real network, Rayland is no longer the bottleneck for this workload. I
+have spent days measuring Rayland's cost on a machine where Rayland's cost dominates, and the same
+code on a normal machine disappears into the noise of the compositor's repaint timer.
+
+**And that control changes the 60 fps question rather than answering it.** This headless weston peaks
+at 39.4 fps. **Sixty frames per second cannot be demonstrated against it on any machine** — not on
+dionysus, not on milkv, not with perfect dirty-page tracking. The parked milkv item inherits this:
+its computed ceiling with a *perfect* scan was ~36 fps, which is below this compositor's own floor, so
+that goal needs both a kernel that can track dirty pages and a 60 Hz compositor to measure against.
+I had been treating the harness as transparent. It is a participant, and this is the third time in
+this project that a compositor has turned out to be one.
+
+**The contrast between the two C machines is now the clearest statement of the project's premise.**
+The identical diff, over identical bytes, is **0.98 ms and 17.4% of the wall clock on dionysus** and
+**6.38 ms and 56.8% on milkv**. Nothing about the code differs. That is what "C may be weak" costs,
+and it is why the work of the last two days was worth doing even though it moved dionysus not at all.
+
+**One trap cost me a 195-second run and deserves recording, because the rule that caused it is in
+CLAUDE.md.** "vkcube must run with `--gpu_number 0`" — but `--gpu_number` is an *index into the list
+Venus exposes*, not a name. The rule's intent is "do not land on the NVIDIA RTX A500", which loses the
+device on 7 of 14 runs. On this path index 0 **is** the NVIDIA card. The run selected it and produced
+**zero attaches in 195 seconds** with four swapchain buffers created, one commit, and **no error in
+any log** — device loss is silent from the outside. Index 1 is the Intel device and everything works.
+The harness now takes `APP_ARGS`, and the lesson is written at the constant: check the run log for
+which device was *chosen*, never trust the number.
+
+**And a second ssh lesson, identical to milkv's, which I should have generalised the first time.**
+dionysus refused every key I had; I told the owner it needed authorising, and the key was already
+installed. The owner's config sets `IdentitiesOnly yes` globally with no `Host dionysus` entry, so
+connections work while a `ControlPersist` master is alive and look like "permission denied" once it
+expires. I diagnosed exactly this on milkv four hours earlier and did not think to apply it. A lesson
+learned about one host is worth very little if it is filed under that host's name.

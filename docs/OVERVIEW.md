@@ -760,7 +760,20 @@ it either way. This is the best ratio of information to effort currently on the 
 
 ### 6.3 Longer-term open questions
 
-- **PARKED — 60 fps on milkv, pending an OS upgrade on that board.** Measured 2026-09-01: the board is
+- **HEADLINE, 2026-09-01: on a capable C, Rayland runs at NATIVE frame rate over a real network.**
+  With **dionysus** as C (x86_64, 8 cores, Ubuntu 26.04) → dop561: **25 ms median inter-frame gap in
+  8 runs out of 8**. Native `vkcube` on the same headless weston, no Rayland in the path:
+  **25.39 ms (p10 25.23, p90 25.56) = 39.4 fps.** The relayed application is sitting on the
+  compositor's repaint timer, not on Rayland's cost. The contrast with milkv is the project's premise
+  in one line: the identical blob diff over identical bytes is **0.98 ms / 17.4% of the wall clock on
+  dionysus** and **6.38 ms / 56.8% on milkv**. See `docs/data/2026-09-01-dionysus-as-c/`.
+- **THE HARNESS CAPS AT ~40 fps, and any future frame-rate target must account for it.** Headless
+  weston paces at ~25.4 ms, so **60 fps cannot be demonstrated against it on any machine** — measure a
+  60 fps claim against a 60 Hz compositor (the live COSMIC session) or not at all.
+- **PARKED — 60 fps on milkv, pending an OS upgrade on that board *and* a faster compositor to measure
+  against** (its computed ceiling with a perfect scan, ~36 fps, is below this compositor's own floor).
+  **`soft-dirty works on dionysus`, cross-process on a shared memfd — so the dirty-page tracking milkv
+  cannot run is buildable and testable there.** Measured 2026-09-01: the board is
   at ~23 fps against headless weston (~17 fps against the live COSMIC session). 60 fps needs
   16.7 ms/frame and **is not reachable on its current software**, and the arithmetic is settled rather
   than estimated: the application makes **3.62 genuinely synchronous round trips per frame** (93% of

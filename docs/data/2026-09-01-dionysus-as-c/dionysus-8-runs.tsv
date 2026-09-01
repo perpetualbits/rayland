@@ -1,0 +1,9 @@
+run	verdict	modes	attaches	c2s_bytes	s2c_bytes	frames	stall_gaps	longest_ms	frame_gaps	median_gap_ms
+1	PASS	-	67	444812	75120	4	0	0	66	25
+2	PASS	-	69	448935	75301	4	0	0	68	25
+3	PASS	-	70	450752	75775	4	0	0	69	25
+4	PASS	-	64	437998	74565	4	0	0	63	25
+5	PASS	-	65	439910	75164	4	0	0	64	25
+6	PASS	-	67	445789	75893	4	0	0	66	25
+7	PASS	-	146	620421	87002	4	0	0	145	25
+8	PASS	-	146	629323	89953	4	0	0	145	25
