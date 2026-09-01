@@ -789,7 +789,19 @@ it either way. This is the best ratio of information to effort currently on the 
   hardware/kernel gate, not a design dead end. One thing to solve first: `clear_refs` races the pagemap
   read, and a write landing in that window is *lost* rather than deferred — silent corruption of the
   mapped memory the relay exists to carry faithfully. See `docs/data/2026-09-01-dirty-tracking/`.
-- **The ~1 s stall on mouse entry/exit is NOT a Rayland defect** and should not be chased as one.
+- **The ~1 s stall on mouse entry/exit is FIXED — in `vkcube`, and demonstrated** (2026-09-01).
+  `docs/patches/vkcube-only-resize-on-actual-size-change.patch` guards the swapchain rebuild on an
+  actual size change. Over Rayland, milkv → dop561, 60 s each, pointer crossing only: **stock 178
+  configures → 92 rebuilds → 9 stalls, worst 1,117 ms; patched 392 configures (391 same-size) → 1
+  rebuild → 0 stalls, worst 104 ms**, and **4.3× more frames in the same wall clock**. Validated
+  natively on COSMIC first. See `docs/data/2026-09-01-vkcube-stall-fixed/`.
+- **AND ORDINARY APPLICATIONS WILL NOT HAVE THIS PROBLEM — `vkcube` is the outlier**, settled from
+  source rather than opinion. `vkcube` calls `demo_resize()` on every `xdg_surface.configure` with no
+  size check and marks `states UNUSED`. **`vkgears` (mesa-demos), a different app on the same path,
+  already records the size, compares, and rebuilds only on a real difference or on
+  `VK_SUBOPTIMAL_KHR`** — which is the ordinary Vulkan WSI pattern that toolkits follow. Do not
+  generalise vkcube's stall into a Rayland limitation.
+- **The original diagnosis stands and the proxy mitigation is still the wrong fix.**
   `vkcube` recreates its whole swapchain on every `xdg_toplevel.configure`; COSMIC sends one on every
   focus change; focus follows the pointer. Measured both ways: relayed, 96 pointer crossings → 96
   configures (95 carrying an unchanged `[500,500]`) → 97 recreations; **native on the same compositor,

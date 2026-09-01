@@ -6010,3 +6010,85 @@ installed. The owner's config sets `IdentitiesOnly yes` globally with no `Host d
 connections work while a `ControlPersist` master is alive and look like "permission denied" once it
 expires. I diagnosed exactly this on milkv four hours earlier and did not think to apply it. A lesson
 learned about one host is worth very little if it is filed under that host's name.
+
+### 2026-09-01 (late evening) — The stall is fixed, and it was three lines in vkcube
+
+The owner asked the right question, and it was one I had not asked myself: *why does glxgears
+apollo→dop561 cross the window edge without a hiccup?* Behind it was the concern that actually
+matters — **"I cannot have this kind of stalls when ordinary applications start working with
+Rayland."**
+
+The glxgears comparison is a weak control (it is OpenGL, and Rayland's GL path is (c)4 and unbuilt, so
+that run went over something else with no Vulkan swapchain to rebuild). But the worry it expressed
+was exactly right, and answering it properly turned out to be cheap: **read two applications' source.**
+
+**`vkcube`, `cube.c:3064` — rebuilds unconditionally:**
+
+```c
+xdg_surface_ack_configure(xdg_surface, serial);
+...
+demo_resize(demo);          // every configure, no size check
+```
+
+It does not even look at what changed; `handle_toplevel_configure` marks `states UNUSED`.
+
+**`vkgears`, mesa-demos — records, compares, then rebuilds:**
+
+```c
+static void wsi_resize(int w, int h) { new_width = w; new_height = h; }   // record only
+...
+if (result == VK_SUBOPTIMAL_KHR || width != new_width || height != new_height)
+   recreate_swapchain();                                                  // compare first
+```
+
+**vkgears already does the right thing.** So the answer to the owner's real question is: no, ordinary
+applications will not stall, because comparing before rebuilding is the ordinary pattern and vkcube is
+a demo with a naive handler. That is worth far more than the fix itself, and I could have established
+it yesterday by reading one more file instead of writing three paragraphs explaining why I had chosen
+not to act.
+
+**Which is the part I got wrong.** Yesterday I diagnosed this correctly, judged the in-proxy
+mitigation to be wrong — and it *is* wrong, that judgement still stands — and then stopped, filing it
+as "not a Rayland defect". But "not our bug" and "not our problem" are different sentences, and I
+wrote the first while behaving as though I had established the second. The owner had to come back and
+tell me they wanted it fixed. A user-visible one-second freeze does not stop being the project's
+problem because the defect is in someone else's file.
+
+**The fix is a size comparison**, with `!swapchain_ready` preserving first-time creation and the
+driver's `OUT_OF_DATE`/`SUBOPTIMAL` paths left as the safety net. Validated natively on dop561 first —
+seconds per iteration rather than minutes on the board — where stock rebuilt once per *configure*
+(3 configures, 2 distinct sizes, 3 rebuilds) and patched rebuilt once per *size change* (4 configures,
+2 distinct sizes, 1 rebuild).
+
+**Then over Rayland, milkv → dop561, 60 s each, pointer crossing only:**
+
+| arm | frames | configures | same-size | rebuilds | stalls | worst gap |
+|---|---|---|---|---|---|---|
+| stock | 252 | 178 | 177 | 92 | **9** | **1,117 ms** |
+| patched | **1,079** | 392 | 391 | **1** | **0** | **104 ms** |
+
+391 pure focus-change configures, one rebuild, zero stalls. Worst gap 1,117 ms → 104 ms, and **4.3×
+more frames in the same wall clock** because the application was drawing instead of rebuilding.
+
+One number in that table is a trap I nearly reported as a regression: stock's *median* inter-frame gap
+(40 ms) looks better than patched's (53 ms). It is an artefact — stock only produced 252 frames
+because it was stalled for much of the run, so its median is taken over the frames that survived.
+Frames-per-run is the honest measure and it is 4.3× the other way.
+
+**A methodological miss worth recording**, because it cost a whole A/B: the first native comparison
+gave stock 23 rebuilds for 23 configures and patched 33 for 44, which looked like the patch barely
+working. The two arms had not received the same input — during the patched run the owner was
+*dragging* the window, so 34 distinct sizes went past and 33 rebuilds is exactly correct behaviour. I
+had asked for "move the mouse in and out" and not for "and please do not resize", then read the
+difference as a property of the code. **When a human is the input device, the instruction is part of
+the experimental protocol.**
+
+Building it needed no cmake, which is worth knowing since the board has none: the shader `.inc` files
+are pre-generated in the Vulkan-Tools repo, so `cube.c` compiles with `gcc` given four
+`wayland-scanner` outputs — and `-lwayland-client` is required even though the loader `dlopen`s it,
+because the `wl_*_interface` symbols are data.
+
+Nothing in Rayland changed. Nothing in Rayland was broken. What the relay does is turn a ~1 ms local
+cost into a ~1 s one, which is precisely why this deserved an upstream patch rather than the proxy
+workaround — and why that workaround is still the wrong answer: the `states` array genuinely changes,
+and an application that renders focus needs to be told.

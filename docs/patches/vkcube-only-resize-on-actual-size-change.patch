@@ -1,0 +1,37 @@
+diff --git a/cube/cube.c b/cube/cube.c
+index a396fd4..dac718c 100644
+--- a/cube/cube.c
++++ b/cube/cube.c
+@@ -3065,13 +3065,31 @@ static void handle_surface_configure(void *data, struct xdg_surface *xdg_surface
+     struct demo *demo = (struct demo *)data;
+     xdg_surface_ack_configure(xdg_surface, serial);
+     demo->xdg_surface_has_been_configured = 1;
++    const uint32_t previous_width = demo->width;
++    const uint32_t previous_height = demo->height;
+     if (demo->pending_width > 0) {
+         demo->width = demo->pending_width;
+     }
+     if (demo->pending_height > 0) {
+         demo->height = demo->pending_height;
+     }
+-    demo_resize(demo);
++    /* Only rebuild the swapchain when the size actually changed.
++     *
++     * A compositor sends xdg_surface.configure for state changes too -- activation, maximisation,
++     * tiling -- and most of those carry the size the surface already has. Rebuilding the swapchain
++     * for one of those destroys and recreates every image, view, framebuffer and command buffer for
++     * no reason. On a local compositor that is invisible; across any remoting layer, where each
++     * Vulkan call is a network round trip, it is a visible freeze of about a second, once per
++     * pointer crossing when focus follows the mouse.
++     *
++     * !swapchain_ready keeps the first configure creating the swapchain, and the
++     * VK_ERROR_OUT_OF_DATE_KHR / VK_SUBOPTIMAL_KHR paths in the draw loop remain the safety net for
++     * anything that invalidates the swapchain without changing the size. This matches what
++     * mesa-demos' vkgears already does: record the size, compare, and recreate only on a real
++     * difference. */
++    if (demo->width != previous_width || demo->height != previous_height || !demo->swapchain_ready) {
++        demo_resize(demo);
++    }
+ }
+ 
+ static const struct xdg_surface_listener xdg_surface_listener = {handle_surface_configure};
