@@ -160,7 +160,11 @@ SOCK=/tmp/rl-soak.sock
 WL_SOCK=/tmp/rl-soak-wayland.sock
 WESTON_SOCKET="${WESTON_SOCKET:-wl-soak1}"
 VKCUBE="${VKCUBE:-/usr/bin/vkcube}"
-[ -n "${C_HOST-apollo}" ] && VKCUBE=/tmp/vkcube
+# Only rewrite the path when the caller did NOT name a binary: the two-machine path copies vkcube to
+# /tmp on C, but an explicitly-set `VKCUBE` means the caller wants a *different* application there and
+# silently replacing it makes the sweep measure something else entirely. That happened on 2026-09-01 —
+# a vkgears run on apollo quietly ran vkcube and produced a confidently wrong "vkgears hangs here too".
+if [ -n "${C_HOST-apollo}" ] && [ -z "${VKCUBE+set}" ]; then VKCUBE=/tmp/vkcube; fi
 OUT="${OUT:-/tmp/wp0-soak-$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "$OUT"
 
@@ -223,7 +227,12 @@ for run in $(seq 1 "$RUNS"); do
   # `env` rather than a bare assignment prefix: the optional SHIP_PRESENTED expands to nothing in the
   # common case, and an empty word in an assignment prefix ends the prefix and makes bash read the next
   # word as the command name. `env` swallows the empty expansion harmlessly.
+  # Pin what S's Venus enumerates, so no application can choose the NVIDIA card that loses the device
+  # on 7 of 14 runs. `--gpu_number` only helps applications that offer such a flag; this works for all
+  # of them. `S_ICD=` restores full enumeration.
+  S_ICD="${S_ICD-/usr/share/vulkan/icd.d/intel_icd.json}"
   env WAYLAND_DISPLAY="$WESTON_SOCKET" RAYLAND_S_EVENT_LOG=1 RAYLAND_C1_NO_PRESENT=1 \
+    ${S_ICD:+VK_ICD_FILENAMES=$S_ICD} \
     ${SHIP_PRESENTED:+RAYLAND_S_SHIP_PRESENTED=1} ${LINK_LOG:+RAYLAND_S_REPLY_LOG=1} ${LOCKSTAT:+RAYLAND_S_LOCKSTAT=1} ${STAGES:+RAYLAND_S_STAGES=1} \
     ${POLL_US:+RAYLAND_S_PROGRESS_POLL_US=$POLL_US} \
     RAYLAND_C1_S_LISTEN="0.0.0.0:$PORT" "$BIN/rayland-s" > "$RD/s.log" 2>&1 &

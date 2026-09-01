@@ -804,7 +804,16 @@ it either way. This is the best ratio of information to effort currently on the 
   `wl_seat`, so every sweep this project has ever run was structurally blind to this whole class of
   event.** A harness chosen to remove one variable removed a category with it. See
   `docs/data/2026-09-01-keymap-fix/`.
-- **`vkgears` still does not render over WP0 on milkv, and it NEVER ATTACHES A BUFFER** — so the
+- **`vkgears`'s hang is bounded to a CONJUNCTION: vkgears + Venus + Rayland + riscv64** (2026-09-01).
+  Five runs settle it: loopback x86_64 **works** (5,882 frames); apollo → dop561 x86_64 over the real
+  LAN **works** (7,446 frames); milkv → dop561 **hangs**; **milkv with lavapipe and no Rayland works at
+  a flat 60 FPS**; `vkcube` milkv → dop561 works. So it is not vkgears, not riscv64, not our Venus
+  path, and not the network — it is the combination. The tempting "Venus makes a second WSI ring and we
+  watch one" theory is **refuted**: during the hang C relays 2,332 ring messages and 5,389 blob syncs
+  in 40 s. **One confound remains and is the cheapest next step:** dop561/apollo run Mesa **26.0.8**,
+  the milkv chroot runs **26.1.6**, so architecture and Mesa version are not yet separated — put 26.1.6
+  on an x86_64 C, or an older Mesa in the chroot. See `docs/data/2026-09-01-vkgears-riscv64/`.
+- **Superseded detail, kept because it was the route in:** `vkgears` never attaches a buffer** — so the
   missing `wl_buffer.release` is a symptom, not the cause. A `gdb` stack shows Venus's WSI thread
   (`vn_wsi[0,0]`) sleeping in `vn_relax` **holding a mutex** while the application's main thread blocks
   acquiring it: it is waiting for something from the relay inside the Vulkan swapchain path, before it

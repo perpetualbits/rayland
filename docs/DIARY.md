@@ -6328,3 +6328,52 @@ vkcube.
 GPU physics, on a 4-core riscv64 board, over a network. It runs; it is not fast, and nothing here was
 measured against a baseline. And `vkgears`'s Venus-WSI hang is still open and still unrelated to any of
 this.
+
+### 2026-09-01 (last) — vkgears: bounded to a conjunction, and a harness bug that lied to me
+
+The owner asked why `vkgears` hangs, and said to comb its source if needed. The source turned out to be
+almost irrelevant; a matrix of five runs did the work.
+
+| C | arch | path | result |
+|---|---|---|---|
+| dop561 loopback | x86_64 | Venus over Rayland | **works**, 5,882 frames |
+| apollo → dop561 | x86_64 | Venus over Rayland, real LAN | **works**, 7,446 frames |
+| **milkv → dop561** | **riscv64** | Venus over Rayland | **HANGS** |
+| milkv local | riscv64 | **lavapipe, no Rayland** | **works, 60.0 FPS** |
+| milkv → dop561, `vkcube` | riscv64 | Venus over Rayland | **works** |
+
+That kills four explanations at once. It is not `vkgears` — 60 flat FPS on the same board, same Mesa,
+same compositor, with lavapipe. It is not riscv64 — same board runs `vkcube` over Rayland. It is not
+our Venus path — the same program runs over Rayland from two x86_64 machines. It is not the network —
+apollo crosses the same LAN. **It is the conjunction**, which is a much smaller thing to hunt than "it
+hangs".
+
+**The obvious theory was wrong, and the measurement is what killed it.** The blocked thread is named
+`vn_wsi[0,0]`, `rayland-c` says "watching command ring res_id=1", and `CLAUDE.md` records that "a
+second ring stays latent" — so: Venus makes a WSI ring, we watch one ring, hang. Clean, plausible, and
+false. During the hang C relays **2,332 ring messages and 5,389 blob syncs in 40 seconds**. Venus is
+spinning and we are answering. Whatever it waits for is not a message we failed to carry.
+
+**One confound survives and I want it named rather than buried**: dop561 and apollo run Mesa 26.0.8;
+the milkv chroot runs 26.1.6. So "riscv64" and "Mesa 26.1.6" are still one variable wearing two names,
+and separating them — a sid container on apollo, or an older Mesa in the chroot — is the cheapest next
+step. I did not do it because the owner's context was filling and stopping cleanly was worth more than
+one more result.
+
+**And a harness bug that produced a confidently wrong answer, which is the part worth remembering.**
+My first apollo run reported that `vkgears` hangs there too. It does not. `wp0-soak.sh` rewrites
+`VKCUBE=/tmp/vkcube` whenever `C_HOST` is set — the two-machine path copies vkcube over — so it
+silently ran **vkcube**, landed on the NVIDIA card, produced no frames, and I read that as "vkgears
+fails on apollo as well". Two wrong conclusions from one line of shell: that the failure was not
+riscv64-specific, and that apollo had a device-loss problem.
+
+I caught it only because the app log said `Selected GPU 0` — vkcube's phrasing, not vkgears'. The
+lesson is the same one this week keeps teaching in different costumes: **I read an output without
+checking which thing produced it.** An opcode without its interface, an argument by type instead of
+position, a filesystem standing in for a machine, a debug build standing in for the software, and now a
+harness silently substituting the program under test. The fix here is the same shape as the others —
+the override now only applies when the caller did not name a binary — but the pattern is mine, not the
+code's.
+
+Also fixed while here: neither harness pinned S's ICD, so applications kept choosing the NVIDIA card
+that loses the device on 7 of 14 runs. Both now default S's `VK_ICD_FILENAMES` to Intel.
