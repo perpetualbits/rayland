@@ -443,10 +443,25 @@ effort goes next:
   implements `vkWaitForFences` by polling `vkGetFenceStatus`, and every poll is a full C→S→execute→reply→C
   cycle. **The readback is not fragmented** — `res=5` averages 377-byte runs; the one-byte flood is the reply
   arena, whose gap-0 grain is a deliberate correctness property (a gap byte is one S did not write).
-- **Where the fixtures put the cost.** `icosa-cpu` pushes ~1 MiB/frame of CPU-computed fractal through
-  uninterceptable mapped memory; `icosa-gpu` does the same picture in ~80 bytes by evaluating it in a
-  fragment shader. Measured over the real network: **283 ms/frame against ~41 ms**, i.e. the mapped-write
-  volume *was* the dominant cost. In a command-streaming design resolution is separately cheap — it is the
+- **Where the fixtures put the cost — decomposed on 2026-09-01, and the decomposition matters more than
+  the totals.** `icosa-cpu` pushes ~1 MiB/frame of CPU-computed fractal through uninterceptable mapped
+  memory; `icosa-gpu` does the same picture in ~80 bytes by evaluating it in a fragment shader, so the
+  pair isolates cost against mapped-write volume. The earlier real-network reading was **283 ms/frame
+  against ~41 ms**, read as "the mapped-write volume *was* the dominant cost". **That reading was too
+  coarse**, and the fixtures' own per-frame timers say where the difference actually sits:
+  - **The synchronous round trip does not care about volume.** `draw+readback` is 51.9 ms (`-gpu`)
+    against 50.9 ms (`-cpu`) on the riscv64 board, and 10.1 against 15.8 on apollo — the same, whether
+    the frame pushed eighty bytes or a megabyte.
+  - **The megabyte is charged at `upload`**, the one Vulkan call that ships it: 6.4 ms native, 20.8 from
+    apollo, 101.1 from the board — **~20 ms/MiB from a strong C, ~100 ms/MiB from a weak one.** That is
+    (c)2's mapped-memory cost, with an address.
+  - **Most of `icosa-cpu`'s frame on the weak C is the application, not Rayland**: 683 of 850 ms is its
+    own CPU computing the fractal, with no Vulkan call in it. **Do not quote 850 ms as a relay cost**;
+    the relay's share is ~152 ms with a megabyte a frame and ~52 ms without.
+  - **Rayland scales with the board's general slowness, not superlinearly**: apollo → milkv is 4.9× on
+    `upload` and 5.1× on `draw+readback`.
+  Evidence: [`docs/data/2026-09-01-icosa-on-riscv64/`](docs/data/2026-09-01-icosa-on-riscv64/).
+  In a command-streaming design resolution is separately cheap — it is the
   GPU's problem and the GPU is next to the display — but costs bandwidth *today* only because S presents the
   application's readback buffer, which is what WP0's token → `wl_buffer` path exists to end.
 

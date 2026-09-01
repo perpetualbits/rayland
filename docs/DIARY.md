@@ -6483,3 +6483,80 @@ The uncomfortable summary is that this session produced no new capability. It re
 the instruments to lie, and one recorded finding. On the evidence of the last two days that is the
 better trade, but I would rather have noticed on 2026-09-01 that `attaches=0` appeared in a run whose
 application had printed its own frame rate to a log sitting in the same directory.
+
+### 2026-09-01 (later still) — Our own fixtures finally meet the weak machine, and the megabyte's cost has an address
+
+With the `vkgears` retraction done, the second item on the handover list was the one the owner had
+asked for and nobody had done: run **our** fixtures against the board. The argument for it is simple
+and I think correct — `vkcube` and `vkgears` are other people's programs, and every conclusion drawn
+from them this week has had to be defended against the possibility that the program, not Rayland, was
+the odd thing. `rayland-icosa-cpu` and `-gpu` are ours, differ in exactly one property, and carry
+per-frame timers.
+
+**First, a confound that would have quietly wrecked the whole thing.** The comparison is: run the
+fixture natively on S, run it from C through the relay, demand the frames be bit-identical. That
+spans two architectures — S computes the per-frame fractal on x86_64, the board computes it on
+riscv64 — and it is only meaningful because `rayland-icosa-core` builds its `log2`/`sin`/`cos` out of
+IEEE-754 basic operations precisely so they evaluate identically everywhere. That contract is written
+down at length in `exact_math.rs`. **It had only ever been executed on x86_64.**
+
+So I cross-compiled the crate's tests and ran them in the chroot on the board: 23 unit tests, plus
+`log2_table.rs` and `sin_cos_table.rs`, all pass. Those two are not self-consistency checks against
+the host's libm — `CASES` pairs each input with a committed raw `f64` bit pattern, generated once on
+one machine — so passing them on riscv64 is the cross-host claim being *met* on a second
+architecture rather than merely asserted. That is a small result and I am glad it came before the
+big one rather than after a day of chasing a diff.
+
+(It also cost me one wrong turn: the test binaries died with `GLIBC_2.39 not found` on the board's
+host root, which is the 2022 ports snapshot. Everything Vulkan already had to run in the sid chroot;
+now everything cross-built does too, and the new script says so.)
+
+**Correctness: 0 differing frames in 1,200, over 10 runs with the board as C** — six `icosa-gpu`
+runs and four `icosa-cpu`. I want to be careful about what that licenses. At the *frame* level it
+bounds the rate under 0.25%; at the *run* level ten runs bound nothing tighter than 30%, which is far
+too loose to call the (c)2 return path proven on a new architecture. It is consistent with the
+post-`G'` state. It is not, on its own, strong evidence about the residual `G'` retired.
+
+**Then the measurement, and it decomposes more cleanly than I expected.** Median per frame:
+
+| | fractal | upload | draw+readback |
+|---|---|---|---|
+| `icosa-gpu` apollo → S | 0.0 | 0.0 | 10.1 |
+| `icosa-gpu` milkv → S | 0.0 | 0.0 | 51.9 |
+| `icosa-cpu` apollo → S | 56.7 | 20.8 | 15.8 |
+| `icosa-cpu` milkv → S | 683.5 | 101.1 | 50.9 |
+
+**The round trip does not care about mapped-write volume.** On the board `draw+readback` is 51.9 ms
+for the fixture that wrote eighty bytes and 50.9 ms for the one that just pushed a megabyte through
+mapped memory. On apollo, 10.1 against 15.8. I had half-expected the megabyte to show up smeared
+across the round trip, and it does not.
+
+**It shows up at `upload`, which is the one Vulkan call that ships it** — 6.4 ms native, 20.8 from
+apollo, 101.1 from the board. So (c)2's mapped-memory cost now has a number and an address: roughly
+**20 ms per MiB from a strong C, 100 ms per MiB from the weak one**, charged at the copy call.
+
+**And the reassuring one.** apollo → milkv, `upload` goes 4.9× and `draw+readback` 5.1×. Two
+independent mechanisms moving by the same factor is just the board being about five times weaker on
+this path — the weak C does not make the relay disproportionately worse. That is what the design
+wanted and, as far as I can tell, the first time it has been measured rather than hoped.
+
+**The number I must not let anyone quote.** `icosa-cpu` costs 850 ms a frame on the board, and
+**683 ms of that is the application's own CPU** computing a megabyte of Mandelbrot — 80% of the
+frame, with no Vulkan call in it. Rayland's share is ~152 ms. The board's CPU is 12× slower than
+apollo's at that float work against ~5× on the relay path, so the fixture's headline number is mostly
+a statement about the board's FPU. The honest relay figures are ~152 ms/frame with a megabyte of
+mapped writes and ~52 ms without.
+
+**Harness work, and one defect of the same family as this morning's.**
+`scripts/c2-icosa-milkv.sh` is new (chroot-aware, exact-PID cleanup, both sides pinned to S's Intel
+GPU). `c2-icosa-two-machine.sh` gained an `APP=cpu|gpu` knob — it could only ever run the CPU
+fixture, so the *pair*, which is the entire reason the two exist, could not be run through it — and
+it was **also missing the S-side ICD pin**, exactly like `wp0-milkv-ab.sh` was. That is now three
+harnesses that needed the same pin and got it at three different times. It also threw the fixture's
+stdout away, which is the per-frame CSV: the harness that exists to measure these fixtures was
+discarding their instrumentation. All three fixed.
+
+I notice the shape of today: nothing I did was a feature. It was one retraction, one contract
+verified on a second architecture, one number located, and five harness defects. The fixtures earned
+their keep on first contact with the machine they were designed for, which is the argument for having
+built them.

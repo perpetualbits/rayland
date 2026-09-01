@@ -809,6 +809,41 @@ it either way. This is the best ratio of information to effort currently on the 
   `wl_seat`, so every sweep this project has ever run was structurally blind to this whole class of
   event.** A harness chosen to remove one variable removed a category with it. See
   `docs/data/2026-09-01-keymap-fix/`.
+- **The icosa fixtures, run against the weak C for the first time: the mapped-write cost has an
+  address, and it is NOT the round trip** (2026-09-01). Median per frame, fixtures' own timers:
+
+  | | fractal | upload | draw+readback |
+  |---|---|---|---|
+  | `icosa-gpu` apollo → S | 0.0 | 0.0 | 10.1 ms |
+  | `icosa-gpu` milkv → S | 0.0 | 0.0 | 51.9 ms |
+  | `icosa-cpu` apollo → S | 56.7 | 20.8 | 15.8 ms |
+  | `icosa-cpu` milkv → S | 683.5 | 101.1 | 50.9 ms |
+
+  - **`draw+readback` is the same for both fixtures on a given machine** (51.9 vs 50.9 on the board;
+    10.1 vs 15.8 on apollo) even though one wrote a megabyte through mapped memory and the other
+    eighty bytes. The synchronous round trip's cost is a property of the round trip, not of volume.
+  - **The megabyte is charged at `upload`** — the single Vulkan call that ships it — 6.4 ms native,
+    20.8 from apollo, 101.1 from the board: **~20 ms/MiB from a strong C, ~100 ms/MiB from a weak
+    one.** That is (c)2's mapped-memory problem as a number.
+  - **Rayland's costs scale with the board's general slowness, not superlinearly:** apollo → milkv is
+    4.9× on `upload` and 5.1× on `draw+readback`. Two mechanisms, one factor.
+  - **Do NOT quote `icosa-cpu`'s 850 ms/frame on the board as a Rayland cost.** 683 ms of it is the
+    application's own CPU computing the fractal, with no Vulkan call in it (the board's FPU is 12×
+    slower than apollo's, against ~5× on the relay path). Rayland's share is ~152 ms with a megabyte
+    a frame, ~52 ms without.
+  - **Correctness: 0 differing frames in 1,200, over 10 runs with the board as C.** Read at the
+    frame level (<0.25%); ten runs bound the *run*-level rate only under 30%, which does not prove
+    the (c)2 return path on this architecture.
+  - **The bit-exactness contract in `rayland-icosa-core` is now verified on a second architecture.**
+    The comparison spans x86_64 and riscv64 computing the same fractal, which is only meaningful
+    because `exact_math.rs` is built from IEEE-754 basic operations for that purpose — and that had
+    only ever been executed on x86_64. All 29 tests pass in the board's chroot, including the
+    committed golden-bit-pattern tables. Re-run them before believing any future diff from this
+    harness. **Cross-built binaries must run in the sid chroot, not the host root** (glibc 2.36 →
+    `GLIBC_2.39 not found` before `main`).
+  Harnesses: `scripts/c2-icosa-milkv.sh` (new), `scripts/c2-icosa-two-machine.sh` (now `APP=cpu|gpu`,
+  and it had been discarding the fixtures' per-frame CSV — the instrumentation it exists to collect).
+  See `docs/data/2026-09-01-icosa-on-riscv64/`.
 - **`vkgears` does NOT hang on riscv64 — the finding was instrumentation, and it is retracted**
   (2026-09-01, later the same day). The board renders `vkgears` at **41–47 ms/frame with zero stalls,
   4 runs of 4** against headless weston, and 910 frames in 60 s on the owner's real screen. The

@@ -4,7 +4,8 @@
 # ============================================================================================
 #
 # WHAT THIS PROVES
-#   `rayland-icosa-cpu` (120 frames, a spinning icosahedron textured with a per-frame CPU fractal
+#   `rayland-icosa-cpu` (the default; `APP=gpu` selects its shader-side twin) — 120 frames, a
+#   spinning icosahedron textured with a per-frame CPU fractal
 #   written into mapped HOST_COHERENT memory) runs on C (apollo) through `rayland-c`, is replayed
 #   on S (dop561) by `rayland-s`, and read back. Before the readback-completion gate, ~2/120 frames
 #   came back as the WHOLE PREVIOUS frame over a real link (0/120 on loopback) — a readback-delivery
@@ -12,7 +13,7 @@
 #   the gate, every frame must match native-on-S across many runs.
 #
 # CORRECTNESS ASSERTION
-#   Compare each relayed frame against `rayland-icosa-cpu` run NATIVELY ON S (same Intel GPU), so
+#   Compare each relayed frame against the same fixture run NATIVELY ON S (same Intel GPU), so
 #   only the transport differs and every frame must be bit-identical. Do NOT compare against the app
 #   run on C (AMD GPU, a different rasteriser).
 #
@@ -33,6 +34,13 @@ C_HOST="${C_HOST:-apollo}"
 S_IP="${S_IP:-192.168.1.192}"
 PORT="${PORT:-9402}"
 RUNS="${1:-10}"
+# Which fixture. The two exist as a PAIR — same geometry, same schedule, same render loop, differing
+# only in whether the per-frame fractal is computed on C's CPU into mapped memory (~1 MiB/frame with
+# no interceptable call) or in a fragment shader (~80 bytes of uniforms). Running only one of them
+# measures a number; running both measures how cost scales with mapped-write volume, which is the
+# question they were built to answer.
+APP="${APP:-cpu}"
+FIXTURE="rayland-icosa-$APP"
 # Which of Venus's feedback mechanisms Mesa may use. Each one it does NOT have replaces a shared
 # status page with a synchronous round trip, so turning them on is the obvious lever on frame time —
 # and it was tried, on 2026-07-26, and it does not hold. Both halves are worth knowing:
@@ -55,17 +63,24 @@ TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/rayland-c1-target}"
 BIN="$TARGET_DIR/release"
 SOCK="/tmp/rl-c2-icosa.sock"
 
-echo "### building rayland-c, rayland-s, rayland-icosa-cpu (release; the app must be fast) ###"
-CARGO_TARGET_DIR="$TARGET_DIR" cargo build --release -p rayland-c -p rayland-s -p rayland-icosa-cpu
+echo "### building rayland-c, rayland-s, $FIXTURE (release; the app must be fast) ###"
+CARGO_TARGET_DIR="$TARGET_DIR" cargo build --release -p rayland-c -p rayland-s -p $FIXTURE
 
+# *** PIN WHAT S's VULKAN ENUMERATES, ON BOTH SIDES OF THE COMPARISON ***
+# The fixtures ask `ash` for a physical device and take one; they have no `--gpu_number`. dop561 has
+# an Intel iGPU and an NVIDIA RTX A500 whose VK_ERROR_DEVICE_LOST is SILENT. Two ways that corrupts
+# this test: the remoted run losing the device and producing nothing, or the native baseline landing
+# on a DIFFERENT RASTERISER than the remoted run, which makes every frame differ for a reason that
+# has nothing to do with the relay. `S_ICD=` (empty) restores full enumeration.
+S_ICD="${S_ICD-/usr/share/vulkan/icd.d/intel_icd.json}"
 echo "### native baseline on S (Intel GPU, no Venus) ###"
 rm -rf /tmp/icosa-native && mkdir -p /tmp/icosa-native
-"$BIN/rayland-icosa-cpu" /tmp/icosa-native >/dev/null
+env ${S_ICD:+VK_ICD_FILENAMES=$S_ICD} "$BIN/$FIXTURE" /tmp/icosa-native >/tmp/icosa-native.csv
 echo "native frames: $(ls /tmp/icosa-native/frame_*.png | wc -l)"
 
 echo "### deploy C-side binaries to $C_HOST ###"
-scp -q "$BIN/rayland-c" "$BIN/rayland-icosa-cpu" "$C_HOST:/tmp/"
-ssh "$C_HOST" 'chmod +x /tmp/rayland-c /tmp/rayland-icosa-cpu'
+scp -q "$BIN/rayland-c" "$BIN/$FIXTURE" "$C_HOST:/tmp/"
+ssh "$C_HOST" "chmod +x /tmp/rayland-c /tmp/$FIXTURE"
 
 S_PID=""
 # Kill only by exact PID — the local rayland-s by the PID we captured, and the remote C-side by the
@@ -79,7 +94,7 @@ trap cleanup EXIT
 total_stale=0
 for run in $(seq 1 "$RUNS"); do
   ssh "$C_HOST" 'rm -rf /tmp/icosa-relay; mkdir -p /tmp/icosa-relay'
-  RAYLAND_C1_NO_PRESENT=1 RAYLAND_C1_S_LISTEN="0.0.0.0:$PORT" "$BIN/rayland-s" >"/tmp/rayland-s-c2-$run.log" 2>&1 &
+  env ${S_ICD:+VK_ICD_FILENAMES=$S_ICD} RAYLAND_C1_NO_PRESENT=1 RAYLAND_C1_S_LISTEN="0.0.0.0:$PORT" "$BIN/rayland-s" >"/tmp/rayland-s-c2-$run.log" 2>&1 &
   S_PID=$!; sleep 3
   kill -0 "$S_PID" 2>/dev/null || { echo "rayland-s died:"; cat "/tmp/rayland-s-c2-$run.log"; exit 1; }
   ssh "$C_HOST" "
@@ -88,7 +103,7 @@ for run in $(seq 1 "$RUNS"); do
     sleep 3
     VN_DEBUG=vtest VN_PERF="$VN_PERF_SETTING" \
     VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/virtio_icd.json VTEST_SOCKET_NAME=$SOCK \
-    env -u VK_LOADER_DRIVERS_SELECT /tmp/rayland-icosa-cpu /tmp/icosa-relay >/dev/null 2>&1 &
+    env -u VK_LOADER_DRIVERS_SELECT /tmp/$FIXTURE /tmp/icosa-relay >/tmp/icosa-relay.csv 2>&1 &
     app_pid=\$!; echo \$app_pid > /tmp/rayland-app.pid
     wait \$app_pid || echo APP_EXIT_NONZERO
   "

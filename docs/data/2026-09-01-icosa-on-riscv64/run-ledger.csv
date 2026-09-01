@@ -1,0 +1,5 @@
+config,runs,frames,differing,missing
+icosa-gpu milkv->S,6,720,0,0
+icosa-cpu milkv->S,4,480,0,0
+icosa-gpu apollo->S,1,120,0,0
+icosa-cpu apollo->S,1,120,0,0
