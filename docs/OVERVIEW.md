@@ -10,7 +10,7 @@ visible from the code — several of the project's central facts were discovered
 and at least three plausible-sounding designs were built and then disproved. A plan made without
 those facts will re-propose a dead end. They are all recorded here, with pointers to the evidence.
 
-**Last brought current:** 2026-09-01 (night), against branch `wp0-wayland-proxy`.
+**Last brought current:** 2026-09-01 (after the handover), against branch `wp0-wayland-proxy`.
 
 > **Where the work is.** All WP0, (c)1 and (c)2 work described below lives on **`wp0-wayland-proxy`**,
 > which is **37 commits ahead of `main`** and behind it by none. `main` last moved on 2026-08-29.
@@ -398,6 +398,11 @@ windowed paths with exact-PID cleanup. `rayland-c` also cross-compiles cleanly f
 **Note for anyone quoting a `vkgears` number from that board:** `/usr/local/bin/vkgears` in the chroot
 is *patched* (it carries a NULL-seat guard stock lacks) and shadows
 `/usr/bin/vkgears.riscv64-linux-gnu` on `PATH`. Name the full path with any figure.
+
+**And note which compositor a board figure came from.** `milkv-demo.sh` targets the owner's *live*
+session, where an unfocused window is throttled by the compositor: the same `vkgears` run measured
+910 frames in 60 s once and ~39 in 40 s twice, purely on whether the window was being composited.
+Only the headless-weston harnesses (`wp0-soak.sh`, `wp0-milkv-ab.sh`) produce a frame-rate figure.
 
 ### 5.4 Two findings that overturned earlier beliefs — do not re-propose the retired versions
 
@@ -804,26 +809,37 @@ it either way. This is the best ratio of information to effort currently on the 
   `wl_seat`, so every sweep this project has ever run was structurally blind to this whole class of
   event.** A harness chosen to remove one variable removed a category with it. See
   `docs/data/2026-09-01-keymap-fix/`.
-- **`vkgears`'s hang is bounded to a CONJUNCTION: vkgears + Venus + Rayland + riscv64** (2026-09-01).
-  Five runs settle it: loopback x86_64 **works** (5,882 frames); apollo → dop561 x86_64 over the real
-  LAN **works** (7,446 frames); milkv → dop561 **hangs**; **milkv with lavapipe and no Rayland works at
-  a flat 60 FPS**; `vkcube` milkv → dop561 works. So it is not vkgears, not riscv64, not our Venus
-  path, and not the network — it is the combination. The tempting "Venus makes a second WSI ring and we
-  watch one" theory is **refuted**: during the hang C relays 2,332 ring messages and 5,389 blob syncs
-  in 40 s. **One confound remains and is the cheapest next step:** dop561/apollo run Mesa **26.0.8**,
-  the milkv chroot runs **26.1.6**, so architecture and Mesa version are not yet separated — put 26.1.6
-  on an x86_64 C, or an older Mesa in the chroot. See `docs/data/2026-09-01-vkgears-riscv64/`.
-- **Superseded detail, kept because it was the route in:** `vkgears` never attaches a buffer** — so the
-  missing `wl_buffer.release` is a symptom, not the cause. A `gdb` stack shows Venus's WSI thread
-  (`vn_wsi[0,0]`) sleeping in `vn_relax` **holding a mutex** while the application's main thread blocks
-  acquiring it: it is waiting for something from the relay inside the Vulkan swapchain path, before it
-  ever presents. Four hypotheses killed by measurement — we are not dropping the releases (S's
-  compositor never sends any), it is not COSMIC-specific (headless weston fails identically), today's
-  keymap work did not cause it (pre-keymap binaries fail identically), and it is not the chroot's
-  patched build (stock `vkgears` fails identically). `vkcube` on the identical path receives ~1,300
-  releases. **Scope correction:** the recorded "vkgears runs end to end, 345 attaches" result was
-  **apollo → dop561 (x86_64)**; this is **milkv → dop561 (riscv64)**, and the claim does not hold
-  there. See `docs/data/2026-09-01-vkgears-blocked/`.
+- **`vkgears` does NOT hang on riscv64 — the finding was instrumentation, and it is retracted**
+  (2026-09-01, later the same day). The board renders `vkgears` at **41–47 ms/frame with zero stalls,
+  4 runs of 4** against headless weston, and 910 frames in 60 s on the owner's real screen. The
+  earlier "conjunction: vkgears + Venus + Rayland + riscv64" claim rested on frame counters that read
+  zero for `vkgears` under every condition, plus one genuinely silent hardware failure:
+  - **All three harnesses hardcoded `forward obj 3 opcode 1`.** Object 3 is *vkcube's* `wl_surface`;
+    `vkgears` allocates **6**. So every `vkgears` run ever scored reported zero frames — identically
+    for 33 FPS and for a stop. `milkv-demo.sh` printed that zero to a watching human every ten
+    seconds. Now one shared scorer, `scripts/attach-count.awk`, reads the id from the log.
+  - **`wp0-milkv-ab.sh` never got the Intel ICD pin** the other two received, so S enumerated the
+    NVIDIA RTX A500 whose `VK_ERROR_DEVICE_LOST` is *silent*. Unpinned: 0 attaches, 4/4. Pinned:
+    577–659, 4/4. Same board, same binaries, minutes apart. `vkgears` has no `--gpu_number`, so the
+    S-side pin is the only lever.
+  - **The retracted directory's own archived log disproves it**: `milkv-hang-protocol.log.gz`, the
+    log of the run whose metrics were quoted as "an application that draws nothing", holds **634
+    attaches, 634 frame callbacks and 632 `wl_buffer.release` events** over 35 s.
+  **The Mesa 26.0.8 vs 26.1.6 confound is moot and should not be re-proposed** — it was the last
+  uncontrolled variable of a defect that does not exist. (A sid `libvulkan_virtio.so` 26.1.6 sits at
+  `/tmp/mesa-sid/` on apollo, and `wp0-soak.sh` now takes `APP_ICD=`, if anyone ever wants it.)
+  See `docs/data/2026-09-01-vkgears-not-a-hang/`; the superseded directories are kept with retraction
+  notices at their heads.
+- **Two harness defects found in the same thread, both of which manufactured false PASSes**
+  (2026-09-01). `wp0-soak.sh` scored **zero-frame runs as PASS**: `grep -c` exits 1 on a zero count
+  while still printing `0`, so `|| echo 0` fired too, the variable became `"0\n0"`, and the liveness
+  test died with "integer expected" without recording a failure — firing only in the zero case, the
+  one case the check exists for. And its `VKCUBE` guard was dead code: `${VKCUBE+set}` is tested on
+  the line *after* the default has been assigned, so the two-machine rewrite to `/tmp/vkcube` never
+  fired and every such run asked apollo to run `/usr/bin/vkcube`, **a path apollo does not have** — no
+  application ran at all, and it scored PASS. Both fixed, plus a per-run **witness** recording
+  `/proc/<pid>/maps` and `/proc/<pid>/exe` so a wrong, stale or shadowed path is visible instead of
+  silently measuring another program, and a refusal to start when the app binary is not executable on C.
 - **Resizing still stalls, and that one IS ours.** A resize is a legitimate swapchain rebuild, and the
   relay makes a legitimate rebuild cost seconds (measured 5.1 s and 4.7 s on milkv for larger
   windows). Unlike the focus-change stall — which was `vkcube` rebuilding for nothing and is fixed —

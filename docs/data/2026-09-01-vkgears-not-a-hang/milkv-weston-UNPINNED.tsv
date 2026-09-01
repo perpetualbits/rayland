@@ -1,0 +1,5 @@
+pair	arm	attaches	frame_gaps	median_gap_ms	stall_gaps	longest_ms
+1	BEFORE	0	0	0	0	0
+1	AFTER	0	0	0	0	0
+2	BEFORE	0	0	0	0	0
+2	AFTER	0	0	0	0	0

@@ -1,3 +1,27 @@
+> # ⚠ RETRACTED — 2026-09-01 (same day, later)
+>
+> **The conclusion below is wrong, and this directory's own archived log is what disproves it.**
+> `vkgears` does not hang on the riscv64 board. Re-scored with `scripts/attach-count.awk`,
+> `milkv-hang-protocol.log.gz` — the protocol log of the very run whose metrics are quoted below,
+> matched by its 40.3 s span — contains **634 `wl_surface.attach` requests, 634 frame callbacks and
+> 632 `wl_buffer.release` events delivered to the application** over 35 s: an 18 FPS render. The
+> sentence "an application that draws nothing" describes a run that drew 634 frames.
+>
+> Three instrumentation defects produced the finding, and a fourth cause produced the real zeroes:
+> all three harnesses counted frames as `forward obj 3 opcode 1` with **vkcube's** surface object id
+> hardcoded (`vkgears` uses 6, so every `vkgears` run scored zero); `wp0-soak.sh`'s `grep -c || echo 0`
+> turned a zero into the string `"0\n0"` and scored such runs **PASS**; and `wp0-milkv-ab.sh` — the
+> harness behind this directory — was the one of the three never given the Intel ICD pin, so S
+> enumerated the NVIDIA RTX A500 whose device loss is *silent*. With that pin, the board renders
+> `vkgears` at 41–47 ms/frame, 4 runs of 4; without it, 0 attaches, 4 of 4.
+>
+> **The Mesa 26.0.8 vs 26.1.6 confound named at the end of this document was never the question**, and
+> the experiment it asks for is not worth running: it was the last uncontrolled variable of a defect
+> that does not exist.
+>
+> Full retraction, measurements and the fixes: [`../2026-09-01-vkgears-not-a-hang/`](../2026-09-01-vkgears-not-a-hang/).
+> Everything below is left exactly as written, because how the mistake was reached is the useful part.
+
 # Why `vkgears` hangs — bounded to Venus-over-Rayland on riscv64
 
 ## The matrix, which is the whole finding

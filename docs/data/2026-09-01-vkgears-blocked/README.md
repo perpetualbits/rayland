@@ -1,3 +1,22 @@
+> # ⚠ Cause reattributed — 2026-09-01 (same day, later)
+>
+> **The observation here is sound; its cause was not found.** These four logs really do show 0
+> `wl_surface.attach` over 4.4–5.9 s — re-scored with `scripts/attach-count.awk`, which resolves the
+> surface object id from the log, they still read 0. The opcode-vs-interface lesson below stands and
+> is worth keeping.
+>
+> But the *explanation* — a block inside Venus's WSI path specific to this path — is now the less
+> likely one. These runs predate the Intel ICD pin, so S enumerated the NVIDIA RTX A500 whose
+> `VK_ERROR_DEVICE_LOST` is **silent**: buffers are created, a commit or two happens, nothing is ever
+> presented, and no log says why. A controlled pair run later the same day gives 0 attaches in 4 of 4
+> runs unpinned against 577–659 attaches in 4 of 4 pinned, on the same board with the same binaries.
+> Every negative control listed below — stock vs patched `vkgears`, COSMIC vs headless weston,
+> pre- vs post-keymap binaries — leaves the GPU selection untouched, so none of them would have
+> distinguished the two explanations.
+>
+> This is **inference, not measurement**: these particular runs cannot now be re-taken under a known
+> ICD. See [`../2026-09-01-vkgears-not-a-hang/`](../2026-09-01-vkgears-not-a-hang/).
+
 # Why vkgears never gets `wl_buffer.release` — it never asks for one
 
 ## The short answer

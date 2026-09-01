@@ -6377,3 +6377,109 @@ code's.
 
 Also fixed while here: neither harness pinned S's ICD, so applications kept choosing the NVIDIA card
 that loses the device on 7 of 14 runs. Both now default S's `VK_ICD_FILENAMES` to Intel.
+
+### 2026-09-01 (after the handover) — There was no hang. I spent the session dismantling my own instruments
+
+The handover prompt was clear about what to do first: `vkgears` hangs from the riscv64 board, one
+confound is left — Mesa 26.0.8 on the working machines against 26.1.6 in the board's chroot — go
+separate them. Cheap, halves the search space. I did the setup for it: pulled Debian sid's amd64
+`libvulkan_virtio.so` (26.1.6) onto apollo, checked its dependencies resolve against apollo's glibc
+2.43 (they do), wrote an ICD manifest for it, and added an `APP_ICD` knob to `wp0-soak.sh` so the
+application's Mesa could be varied while everything else stayed fixed.
+
+Then, before running it, I did the thing the prompt's own method notes told me to do — *check what
+produced an output before reading it* — and the experiment evaporated, along with the defect it was
+designed to explain.
+
+**A control run of the working arm reported `attaches=0`.** apollo, x86_64, the machine that
+supposedly works. The application log said it had rendered 1,337 frames at 33 FPS. Both of those
+cannot be true, and the one that was wrong was mine.
+
+`vkgears` allocates its `wl_surface` as **object 6**. All three harnesses counted frames as
+`grep -c 'forward obj 3 opcode 1'`, with **vkcube's** object id baked in. An object id is not a
+constant — it is whatever the application's own client library happened to allocate — so every
+`vkgears` run any harness had ever scored reported zero frames, identically for a run at 33 FPS and a
+run that had stopped. `milkv-demo.sh` printed that zero to the terminal every ten seconds while a
+human watched it. **That is where the word "hang" came from.**
+
+This is the same lesson as `2026-09-01-vkgears-blocked/`, one level up. That session learned that an
+opcode is an index into *one interface's* request list and that `opcode 1` means `attach` only on a
+`wl_surface`. It resolved the interface correctly and then hardcoded the id. The generalisation it
+wrote down — *"a protocol id is a slot number, not an identity"* — applies to the id it then froze
+into three shell scripts.
+
+**The evidence directory disproved itself.** `2026-09-01-vkgears-riscv64/milkv-hang-protocol.log.gz`
+is the log of the very run whose metrics that README quotes — the spans match to 40.3 s. Scored with
+the id read out of the log: **634 attaches, 634 frame callbacks, 632 `wl_buffer.release` events
+delivered, over 35 s.** 18 FPS. The README describes it as "an application that draws nothing". The
+sentence had been carried forward from the earlier investigation and applied to a new run without
+re-scoring that run's log, which is a thing I will now assume I am doing whenever a finding travels
+between directories.
+
+Live confirmation on the board, same command the README gives as the repro for the hang: 910 frames
+in 60 s, on the owner's real screen.
+
+**Then two more runs gave ~1 FPS and I nearly published that as a new mystery.** They were against the
+live desktop, where an unfocused window gets throttled — which `wp0-soak.sh`'s own header explains at
+length and which is why that harness uses headless weston. A demo is not a measurement; I had been
+about to quote one as one.
+
+**So I went to weston, and got four zero-attach runs, and believed them for about a minute.** Same
+board, same binaries, and the application definitely connected — C's log shows the `wl_surface`
+created. It looked like the hang was real after all and merely compositor-dependent, which is a
+genuinely interesting shape and I wanted it to be true. What it actually was: **`wp0-milkv-ab.sh` is
+the one harness of the three that never got the Intel ICD pin.** S enumerated the NVIDIA RTX A500,
+whose `VK_ERROR_DEVICE_LOST` this project documented in July as *silent* — buffers created, a commit
+or two, nothing ever presented, no error anywhere. `vkgears` has no `--gpu_number`, so there is no
+application-side escape.
+
+Pinned, on the same board, minutes later:
+
+| S's ICD | attaches in 30 s | median gap |
+|---|---|---|
+| unpinned | 0, 0, 0, 0 | — |
+| pinned to Intel | 659, 621, 577, 583 | 41–47 ms, zero stalls |
+
+Complete separation, and 41–47 ms/frame is exactly the ~45 ms this project already records for that
+board. Not merely non-zero — *normal*.
+
+**Two more defects fell out of the same thread, and one of them is worse than the hang was.**
+
+`wp0-soak.sh` scored a zero-frame run as **PASS**. `grep -c` exits 1 when the count is zero and still
+prints `0`, so the `|| echo 0` fallback fired as well, the variable became the two-line string
+`"0\n0"`, the liveness comparison died with `[: 0\n0: integer expected`, and no failure mode was ever
+recorded. The bug fires only in the zero case, which is the only case the check exists for.
+
+And the `VKCUBE` guard added *yesterday* — the one written to stop the harness silently substituting
+the program under test — never worked. It tests `${VKCUBE+set}` on the line after
+`VKCUBE="${VKCUBE:-/usr/bin/vkcube}"` has already assigned a default, so the variable is
+unconditionally set and the rewrite to `/tmp/vkcube` can never fire. Every two-machine run since then
+asked apollo to execute `/usr/bin/vkcube`, **which does not exist on apollo**. No application started
+at all. Combined with the `PASS` bug: a passing sweep in which the program under test never executed.
+A guard against silent substitution that silently substituted nothing for something.
+
+**What I did about it, rather than only writing it down.** One scorer,
+`scripts/attach-count.awk`, shared by all three harnesses, reading `objects+ app_obj=N wl_surface`
+out of the proxy's own object table — two copies would drift and a wrong frame count does not look
+wrong, it looks like a result. The ordering bug fixed and backed by a check that refuses to start when
+the application binary is not executable on C. The ICD pin added to the third harness. And a per-run
+**witness**: `/proc/<pid>/maps` and `/proc/<pid>/exe`, recorded from the kernel rather than from the
+harness's own variables, so the next time a path is wrong, stale or shadowed the run says so instead
+of quietly measuring something else.
+
+**Two things I got wrong today that are not in the fixes.** I ran a probe of the launch string without
+`rayland-c` running, so the application fell back to xlib and I briefly read that as the failure —
+the same "check what produced the output" error, made while investigating that error. And I used
+`pkill -f '^/tmp/vkcube'` to clean up a test process, which this repository's rules forbid outright
+and for good reason; it matched only my own process this time, which is luck and not a defence.
+
+**Standing position.** `vkgears` + Venus + Rayland + riscv64 is not a conjunction that fails. The
+board renders it at its ordinary rate. The Mesa 26.1.6 experiment is set up on apollo and is **not
+worth running**: it was the last uncontrolled variable of a defect that does not exist. What remains
+genuinely open from the handover is unchanged — our own icosa fixtures have still never been run
+against the board, and frame time is still the synchronous round-trip count.
+
+The uncomfortable summary is that this session produced no new capability. It removed four ways for
+the instruments to lie, and one recorded finding. On the evidence of the last two days that is the
+better trade, but I would rather have noticed on 2026-09-01 that `attaches=0` appeared in a run whose
+application had printed its own frame rate to a log sitting in the same directory.

@@ -159,14 +159,48 @@ fi
 SOCK=/tmp/rl-soak.sock
 WL_SOCK=/tmp/rl-soak-wayland.sock
 WESTON_SOCKET="${WESTON_SOCKET:-wl-soak1}"
+# Whether the CALLER named an application has to be sampled BEFORE any default is applied, because
+# applying the default is what destroys that information.
+#
+# The guard below only rewrites the path when the caller did NOT name a binary: the two-machine path
+# copies vkcube to `/tmp` on C, but an explicitly-set `VKCUBE` means the caller wants a *different*
+# application there, and silently replacing it makes the sweep measure something else entirely. That
+# happened on 2026-09-01 — a `vkgears` run on apollo quietly ran `vkcube`.
+#
+# **The first version of that guard did not work, and its failure was silent in the worst way.** It
+# tested `${VKCUBE+set}` on the line *after* `VKCUBE="${VKCUBE:-/usr/bin/vkcube}"` had already
+# assigned a default, so the variable was unconditionally set and the rewrite could never fire. Every
+# two-machine run since then asked C to execute `/usr/bin/vkcube` — a path that exists on this laptop
+# and **not on apollo** — so `nohup` had nothing to run, no application ever started, and the run was
+# scored on an empty log. Combined with the `grep -c` bug fixed above, such a run was reported as
+# **PASS**: a passing sweep in which the program under test never executed. Hence both the ordering
+# fix here and the existence check further down; a missing binary must stop the sweep, not quietly
+# become a zero.
+VKCUBE_NAMED_BY_CALLER="${VKCUBE+set}"
 VKCUBE="${VKCUBE:-/usr/bin/vkcube}"
-# Only rewrite the path when the caller did NOT name a binary: the two-machine path copies vkcube to
-# /tmp on C, but an explicitly-set `VKCUBE` means the caller wants a *different* application there and
-# silently replacing it makes the sweep measure something else entirely. That happened on 2026-09-01 —
-# a vkgears run on apollo quietly ran vkcube and produced a confidently wrong "vkgears hangs here too".
-if [ -n "${C_HOST-apollo}" ] && [ -z "${VKCUBE+set}" ]; then VKCUBE=/tmp/vkcube; fi
+if [ -n "$C_HOST" ] && [ -z "$VKCUBE_NAMED_BY_CALLER" ]; then VKCUBE=/tmp/vkcube; fi
+# The Venus ICD the APPLICATION loads on C. This is a knob because the Mesa version on C is itself
+# under study: `vkgears` hangs with the riscv64 board as C (Debian sid, Mesa 26.1.6) and works with
+# x86_64 machines as C (Ubuntu, Mesa 26.0.8), and those two variables have never been separated.
+# Pointing this at a differently-versioned `libvulkan_virtio.so` puts a different Mesa on an
+# otherwise unchanged C machine, which is exactly what separates them.
+#
+# `rayland-c` is deliberately unaffected by this: it links no GPU stack at all, by construction
+# (`rayland-c/tests/no_gpu_linkage.rs`), so the only thing on C that reads an ICD is the application.
+APP_ICD="${APP_ICD:-/usr/share/vulkan/icd.d/virtio_icd.json}"
 OUT="${OUT:-/tmp/wp0-soak-$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "$OUT"
+
+# ---- The attach scorer, shared with milkv-demo.sh --------------------------------------------
+# `scripts/attach-count.awk` reads the application's wl_surface object id out of the proxy log
+# instead of hardcoding it. Its header documents why that matters and what the hardcoded version
+# cost this project — in short, every `vkgears` run either harness ever scored reported zero frames
+# whether the application was rendering or not, and one such zero became a recorded finding.
+#
+# It is COPIED into the run directory, so an archived sweep can later be re-scored with exactly the
+# program that scored it rather than with whatever the tree has drifted to, and it is shipped to C
+# because the traffic-mode poll loop below runs there.
+cp "$(dirname "$0")/attach-count.awk" "$OUT/attach.awk" || exit 1
 
 # ---- Pre-flight: refuse to measure through someone else's leftovers ------------------------
 # A previous sweep killed mid-run (a `timeout`, a Ctrl-C) leaves its daemon and app alive on C,
@@ -192,7 +226,20 @@ if [ -z "${NO_BUILD:-}" ]; then
 fi
 if [ -n "$C_HOST" ]; then
   scp -q "$BIN/rayland-c" /usr/bin/vkcube "$C_HOST:/tmp/" || exit 1
+  scp -q "$OUT/attach.awk" "$C_HOST:/tmp/soak-attach.awk" || exit 1
+fi
+if [ -n "$C_HOST" ]; then
   ssh "$C_HOST" 'chmod +x /tmp/rayland-c /tmp/vkcube'
+fi
+# ---- The application under test must actually EXIST on C -------------------------------------
+# A sweep whose application never runs is not a failing sweep, it is no sweep at all, and it looks
+# identical to a stalled one from the logs. Check the exact path that will be executed, on the exact
+# machine that will execute it, and refuse loudly rather than producing a table of zeroes.
+if ! on_c "test -x $VKCUBE"; then
+  echo "REFUSING TO RUN: the application under test is not executable on ${C_HOST:-this machine}:"
+  echo "  $VKCUBE"
+  echo "Name one with VKCUBE=/path/to/app, or copy it there first."
+  exit 1
 fi
 
 # ---- The headless compositor, started once and shared by every run --------------------------
@@ -274,10 +321,23 @@ for run in $(seq 1 "$RUNS"); do
   A_PID=$(on_c "export XDG_RUNTIME_DIR=/run/user/\$(id -u)
     WAYLAND_DISPLAY=$WL_SOCK VN_DEBUG=vtest \
     VN_PERF=no_multi_ring,no_fence_feedback,no_semaphore_feedback,no_event_feedback,no_query_feedback \
-    VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/virtio_icd.json VTEST_SOCKET_NAME=$SOCK \
+    VK_ICD_FILENAMES=$APP_ICD VTEST_SOCKET_NAME=$SOCK \
     env -u VK_LOADER_DRIVERS_SELECT nohup $VKCUBE $APP_ARGS >/tmp/soak-app.log 2>&1 & echo \$!")
 
 
+
+  # ---- WITNESS: what the application ACTUALLY loaded, recorded per run --------------------------
+  # Not decoration. Every knob above names a path, and a path that is wrong, stale, or shadowed fails
+  # SILENTLY: the loader falls back, the run completes, and the sweep reports a number for a different
+  # program than the one the caller thinks it measured. This harness has already produced two such
+  # confidently-wrong results (a `vkgears` arm that quietly ran `vkcube`; a chroot whose
+  # `/usr/local/bin/vkgears` shadows the stock one on PATH). So the run records, from the kernel
+  # rather than from its own variables, which `libvulkan_virtio.so` the process mapped and which
+  # executable it is — the two facts an ICD or binary A/B rests on entirely.
+  sleep 2
+  on_c "grep -oE '/[^ ]*libvulkan_virtio[^ ]*' /proc/$A_PID/maps 2>/dev/null | sort -u
+        readlink -f /proc/$A_PID/exe 2>/dev/null" > "$RD/app-witness.txt" 2>/dev/null || true
+  echo "  witness: $(tr '\n' ' ' < "$RD/app-witness.txt" 2>/dev/null)"
 
   if [ "$MODE" = traffic ]; then
     # Impose the frame count from here: poll C's own request trace until it has forwarded $FRAMES
@@ -285,7 +345,7 @@ for run in $(seq 1 "$RUNS"); do
     # — and a run that hits the bound without reaching $FRAMES is scored on its actual attach count,
     # which the per-run table records, rather than being silently averaged in as if it were complete.
     for _ in $(seq 1 90); do
-      n=$(on_c "grep -c 'forward obj 3 opcode 1 ' /tmp/soak-c.log 2>/dev/null || echo 0")
+      n=$(on_c "awk -f /tmp/soak-attach.awk /tmp/soak-c.log 2>/dev/null || echo 0")
       [ "${n:-0}" -ge "$FRAMES" ] && break
       sleep 2
     done
@@ -350,7 +410,7 @@ for run in $(seq 1 "$RUNS"); do
             | grep -vc 'carries-fd wl_keyboard.keymap' || true)
   drops=$(( ${c_drops:-0} + ${s_drops:-0} ))
   proto=$(grep -chE 'protocol error|panicked|PANICKED' "$RD/s.log" 2>/dev/null | awk '{s+=$1} END{print s+0}')
-  attaches=$(grep -c 'forward obj 3 opcode 1 ' "$RD/c.log" 2>/dev/null || echo 0)
+  attaches=$(awk -f "$OUT/attach.awk" "$RD/c.log" 2>/dev/null || echo 0)
   c2s=$(grep -oE 'c2s_total_bytes=[0-9]+' "$RD/c.log" 2>/dev/null | tail -1 | cut -d= -f2)
   s2c=$(grep -oE 's2c_total_bytes=[0-9]+' "$RD/c.log" 2>/dev/null | tail -1 | cut -d= -f2)
   built=$(grep -c 'built wl_buffer' "$RD/s.log" 2>/dev/null || echo 0)
@@ -363,8 +423,7 @@ for run in $(seq 1 "$RUNS"); do
   # Derive the frame timeline from the timestamps already in the proxy log — no sampler, no runtime
   # cost, exact inter-frame gaps. A "stall" is an inter-frame gap far longer than the run's own median,
   # which is the definition that does not need a hard-coded frame rate.
-  awk '/forward obj 3 opcode 1 / { if (match($0, /t_ns=[0-9]+/)) print substr($0, RSTART+5, RLENGTH-5) }' \
-    "$RD/c.log" > "$RD/timeline.dat" 2>/dev/null || true
+  awk -v mode=timeline -f "$OUT/attach.awk" "$RD/c.log" > "$RD/timeline.dat" 2>/dev/null || true
   if [ -s "$RD/timeline.dat" ]; then
     # Count buckets in which the frame counter did not advance, and the longest run of them —
     # **only up to the last sample that advanced**. The sampler deliberately outlives the

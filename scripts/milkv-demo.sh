@@ -90,7 +90,9 @@ sleep 3
 kill -0 "$S_PID" 2>/dev/null || { echo "rayland-s did not stay up:"; tail -20 "$LOG/s.log"; exit 1; }
 
 scp -q "${SSH_OPTS[@]}" "$C_BIN" "$C_HOST:/tmp/rayland-c-demo"
-on_c "sudo cp /tmp/rayland-c-demo $CHROOT/opt/rayland/ && sudo chmod +x $CHROOT/opt/rayland/rayland-c-demo
+scp -q "${SSH_OPTS[@]}" "$(dirname "$0")/attach-count.awk" "$C_HOST:/tmp/attach-count.awk"
+on_c "sudo cp /tmp/attach-count.awk $CHROOT/tmp/attach-count.awk
+      sudo cp /tmp/rayland-c-demo $CHROOT/opt/rayland/ && sudo chmod +x $CHROOT/opt/rayland/rayland-c-demo
       sudo rm -f $CHROOT$SOCK $CHROOT$WLPATH $CHROOT/tmp/rl-demo-c.log $CHROOT/tmp/rl-demo-app.log
       sudo chroot $CHROOT /bin/bash -c '
         export XDG_RUNTIME_DIR=/run/user/0
@@ -131,7 +133,12 @@ esac
 for i in $(seq 1 "$SECONDS_TO_RUN"); do
   sleep 1
   if [ $((i % 10)) -eq 0 ]; then
-    n=$(on_c "sudo grep -c 'forward obj 3 opcode 1 ' $CHROOT/tmp/rl-demo-c.log 2>/dev/null" | tr -d ' \r\n')
+    # Count frames with the SHARED scorer, which reads the surface object id out of the log.
+    # This line used to `grep -c 'forward obj 3 opcode 1'`, with the id hardcoded to vkcube's. For
+    # `vkgears`, whose surface is object 6, it therefore printed `0` every ten seconds while the
+    # application was in fact rendering at 18 FPS — and that zero, watched by a human, is where the
+    # "vkgears hangs on riscv64" finding of 2026-09-01 came from. See `attach-count.awk`.
+    n=$(on_c "sudo awk -f $CHROOT/tmp/attach-count.awk $CHROOT/tmp/rl-demo-c.log 2>/dev/null" | tr -d ' \r\n')
     echo "  t=${i}s  frames presented on dop561: ${n:-0}"
   fi
 done

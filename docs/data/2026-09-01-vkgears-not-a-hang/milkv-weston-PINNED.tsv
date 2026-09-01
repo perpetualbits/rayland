@@ -1,0 +1,5 @@
+pair	arm	attaches	frame_gaps	median_gap_ms	stall_gaps	longest_ms
+1	BEFORE	659	658	41	0	0
+1	AFTER	621	620	43	0	0
+2	BEFORE	577	576	46	0	0
+2	AFTER	583	582	47	0	0

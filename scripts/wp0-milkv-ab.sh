@@ -25,7 +25,7 @@
 #   goes is wrong. That is the question; everything below is scaffolding for it.
 #
 #   Primary metric is the **median inter-frame gap**, computed exactly as `wp0-soak.sh` computes it:
-#   from the `t_ns=` stamps on C's own `forward obj 3 opcode 1` proxy log lines (a `wl_surface.attach`
+#   from the `t_ns=` stamps on C's own forwarded `wl_surface.attach` proxy log lines (see
 #   forwarded), so no sampler runs and nothing is polled. `attaches` is reported but is NOT a rate.
 #
 # CLEANUP
@@ -114,7 +114,22 @@ run_one() {   # $1 = arm label, $2 = C binary, $3 = pair number, $4 = optional S
 
   # S: the GPU machine. RAYLAND_C1_NO_PRESENT keeps S off its own screen; the app's window is the
   # thing under test and it goes to weston.
+  #
+  # **Restrict what S's Vulkan enumerates, exactly as `wp0-soak.sh` and `milkv-demo.sh` do.** The
+  # application picks its adapter from the list Venus advertises, and that list is whatever S's
+  # loader can see. dop561 has an Intel iGPU and an NVIDIA RTX A500, and the NVIDIA card loses the
+  # device on 7 of 14 runs — **silently**: buffers are created, a commit or two happens, nothing is
+  # ever presented, and no log on either side says why. That is indistinguishable, from the outside,
+  # from the application blocking.
+  #
+  # This script was the one harness of the three that never got the pin, and on 2026-09-02 it
+  # produced four consecutive zero-attach `vkgears` runs that were read as a riscv64 block until the
+  # missing pin was noticed. `vkgears` has no `--gpu_number`, so there is no application-side way to
+  # steer it; the pin is the only lever. `S_ICD=` (empty) restores full enumeration for a session
+  # deliberately hunting the device loss.
+  S_ICD="${S_ICD-/usr/share/vulkan/icd.d/intel_icd.json}"
   env WAYLAND_DISPLAY="$WESTON_SOCKET" RAYLAND_C1_NO_PRESENT=1 \
+    ${S_ICD:+VK_ICD_FILENAMES=$S_ICD} \
     ${STAGES:+RAYLAND_S_STAGES=1} ${LOCKSTAT:+RAYLAND_S_LOCKSTAT=1} \
     RAYLAND_C1_S_LISTEN="0.0.0.0:$PORT" "$BIN/rayland-s" > "$rd/s.log" 2>&1 &
   S_PID=$!
@@ -159,9 +174,13 @@ run_one() {   # $1 = arm label, $2 = C binary, $3 = pair number, $4 = optional S
 
   # The timeline, and the same scoring `wp0-soak.sh` uses: median inter-attach gap, plus how many gaps
   # exceed 10x it (contamination, reported rather than averaged in).
-  awk '/forward obj 3 opcode 1 / { if (match($0, /t_ns=[0-9]+/)) print substr($0, RSTART+5, RLENGTH-5) }' \
-      "$rd/c.log" > "$rd/timeline.dat"
-  local attaches; attaches=$(grep -c 'forward obj 3 opcode 1 ' "$rd/c.log" 2>/dev/null || echo 0)
+  # Score with the SHARED scorer (`scripts/attach-count.awk`), which reads the application's
+  # wl_surface object id out of the proxy log. The id used to be hardcoded to 3 — vkcube's — here
+  # and in the other two harnesses, so any application with a different surface id was scored as
+  # having presented nothing at all. See that file's header for what that cost.
+  local scorer; scorer="$(dirname "$0")/attach-count.awk"
+  awk -v mode=timeline -f "$scorer" "$rd/c.log" > "$rd/timeline.dat"
+  local attaches; attaches=$(awk -f "$scorer" "$rd/c.log" 2>/dev/null || echo 0)
   local empty longest samples medgap
   read -r empty longest samples medgap < <(awk '
     NR == FNR { if (FNR > 1) g[++k] = $1 - prev; prev = $1; next }
