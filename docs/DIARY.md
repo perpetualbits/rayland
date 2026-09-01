@@ -5893,3 +5893,65 @@ The owner's config sets `IdentitiesOnly yes` globally with no `Host milkv` entry
 only worked by riding a ten-minute `ControlPersist` master and every "connection refused" after that
 looks like the board being down. The harness passes `-o IdentitiesOnly=no` and does not touch the
 owner's configuration.
+
+### 2026-09-01 (late) — Dirty-page tracking cannot run on the machine that needs it, and 60 fps is not on this road
+
+The ask was dirty-page tracking, with milkv comfortably above 60 fps. I got the board from ~20 fps to
+~22 fps and I am not going to dress that up: **neither half of the ask is reachable the way it was
+framed, and both failures are measured rather than argued.**
+
+**Soft-dirty does not exist on riscv64.** I probed rather than assumed, on both machines. On the laptop,
+writing page 3 of an eight-page mapping sets soft-dirty on page 3 and nothing else. On milkv — kernel
+5.15, riscv64 — writing page 3 sets **nothing**; the architecture does not select
+`CONFIG_HAVE_ARCH_SOFT_DIRTY`. The two modern alternatives are also out on 5.15: `UFFD_FEATURE_WP_ASYNC`
+wants 5.19+, `PAGEMAP_SCAN` wants 6.7+.
+
+I did write the probe for the *exact* production scenario before giving up on it, because "it works for
+anonymous memory" would not have been evidence: a child process writes a `MAP_SHARED` memfd, the parent
+reads the child's pagemap, which is precisely how C would watch the application. Pages 7 and 40 written,
+pages 7 and 40 reported, nothing else. **The mechanism is right and the hardware cannot run it.** That
+is worth having established, because the next C might be an x86_64 box.
+
+There is a second reason I did not build it speculatively, and it is the kind of thing that would have
+bitten later: `clear_refs` has an unavoidable race. Between reading the pagemap and clearing it, a write
+sets a bit the clear then destroys — the write is *lost*, not deferred, which is silent corruption of
+exactly the mapped memory this whole sub-project exists to relay faithfully. Closing that deserves care,
+and care is worth spending once there is a machine that can use the answer.
+
+**And then the arithmetic that settles the 60 fps question.** On the board the diff now costs 6.59 ms
+per delta at 3.58 deltas per frame — **23.6 ms of a 45 ms frame**. Remove the diff *entirely* and 21 ms
+remain: **47 fps**. Sixty needs 16.7 ms. So perfect dirty tracking, on a machine that supported it,
+still would not reach the target. I would rather say that with the numbers than deliver 47 fps and let
+the goal quietly slip.
+
+**The lever that would reach it is one I can now name precisely: the number of round trips per frame.**
+At one delta per frame instead of 3.58, the diff falls to 6.6 ms and S's own per-delta handling from
+~17.8 ms to ~5 ms — projecting ~12 ms per frame, comfortably past 60. That is the "synchronous round
+trip" seam this project has carried for weeks, arriving from a new direction and with a number on it. I
+checked whether the deltas can simply be merged: they cannot cheaply, because `take_delta` already
+drains to the current tail, so merging means *waiting*, and the deltas are ~12 ms apart while the PARK
+sweep showed only ~2 ms of added latency is free.
+
+**What I did deliver, and one genuinely instructive miss.** Two changes, neither needing a kernel
+feature. First: a presented blob is not diffed at all — correctness before speed, since S renders into
+it and never reports those writes, so C's baseline is stale by design and anything C shipped would
+overwrite S's pixels. That is 4 MiB of the 13.2 MiB walked per delta, 30% of the bytes.
+
+It bought **15%**, not 30%. The gap is the interesting part: **unchanged megabytes are cheap `memcmp`;
+the cost is byte-walking the chunks that differ.** The swapchain images are entirely unchanged, so they
+were the *cheapest* bytes in the walk. With a 4096-byte chunk one changed byte drags a 4096-byte
+byte-loop behind it, and the staging pool's changes are exactly that shape — 6,560 changed bytes
+arriving as 4,564 separate runs. So the second change adds a 256-byte level between the chunk and the
+bytes. Together: 8.785 → 6.586 ms per delta.
+
+I note that yesterday I raised the chunk 64 → 4096 and called it straightforwardly good. It was, but it
+also made every isolated change 64× more expensive to locate, and I did not notice because I was
+measuring the total and the total improved. The two-level version is what the one-level change should
+have been.
+
+**End to end it is 49.5 → 45.0 ms, 1.10×, p = 0.17 — not significant at n = 8.** The mechanism is solid
+and directly measured; the frame-rate effect is inside this board's run-to-run spread and this sweep
+does not establish it. And a caution I nearly walked into myself: this sweep's BEFORE arm ran at 49.5 ms
+while an earlier sweep of the *same binary* ran at 71 ms. Chaining sweeps into one triumphant ratio
+would have produced a much better-looking number and a false one. Every comparison here is interleaved
+and within a single sweep for exactly that reason.

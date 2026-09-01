@@ -124,7 +124,7 @@ run_one() {   # $1 = arm label, $2 = binary, $3 = pair number
         sudo chroot $CHROOT /bin/bash -c '
           export XDG_RUNTIME_DIR=/run/user/0
           mkdir -p \$XDG_RUNTIME_DIR && chmod 700 \$XDG_RUNTIME_DIR
-          RAYLAND_WP_LOG=1 RAYLAND_C1_METRICS=1 \
+          RAYLAND_WP_LOG=1 RAYLAND_C1_METRICS=1 ${RELAXSTAT:+RAYLAND_C1_RELAXSTAT=1} \
           RAYLAND_C1_S_ADDR=$S_IP:$PORT RAYLAND_C1_SOCKET=$SOCK RAYLAND_C1_WAYLAND_DISPLAY=$WLPATH \
           nohup /opt/rayland/rayland-c-arm > /tmp/rl-ab-c.log 2>&1 &
           echo \$! > /tmp/rl-ab-c.pid

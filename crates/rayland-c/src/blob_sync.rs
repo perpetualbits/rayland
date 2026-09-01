@@ -270,6 +270,33 @@ pub fn messages_for_delta(blobs: &BlobTable, ring_res_id: u32, delta: RingDelta)
             // changed", so it costs a vectorised scan and no traffic. Shipping *whole* blobs here,
             // which an earlier experiment did, tripled C's message count and slowed the relay enough
             // that the application never reached the submit under test.
+            //
+            // **MEASURED 2026-09-01, and the sentence above turned out to be optimistic.** "A
+            // vectorised scan" is 13.2 MiB for `vkcube`, walked on *every* ring delta, about three
+            // times a frame. On the riscv64 board that is **8.78 ms per delta — 30.8 ms of a 50 ms
+            // frame, 62% of it.** It is the single largest term in frame time on a weak C, and the
+            // skip immediately below is the largest safe reduction available without kernel support.
+
+            // **A presented blob is not diffed at all**, which is a correctness statement first and a
+            // saving second.
+            //
+            // Correctness: a presented blob is one C published to S as a `BufferToken`, so S's GPU
+            // renders into it and — since the 2026-08-29 presented-buffer exclusion — never reports
+            // those writes back. C's baseline for it is therefore stale **by design**, and anything C
+            // shipped for it would lay C's old news over S's freshly rendered pixels. C must never
+            // ship one, so there is nothing to learn by diffing one.
+            //
+            // Saving: for `vkcube` the four swapchain images are **4 MiB of the 13.2 MiB** walked per
+            // delta — about a third of the walk spent re-establishing, three times a frame, that the
+            // application has not CPU-written pixels only the other machine's GPU ever writes.
+            //
+            // This changes no output. A full-run census on 2026-08-31 recorded C→S `BlobData` for
+            // resources 3, 4, 5 and 6 only, never for 7–10, the four swapchain images. It removes
+            // work, not messages — and `a_presented_blob_is_never_shipped_even_when_its_bytes_changed`
+            // pins the correctness half against a blob whose bytes really did change.
+            if blob.is_presented() {
+                continue;
+            }
             blob.ensure_baseline();
             // **How near two changed runs must be for this direction to merge them.**
             //
@@ -292,14 +319,13 @@ pub fn messages_for_delta(blobs: &BlobTable, ring_res_id: u32, delta: RingDelta)
             // For those, S's GPU writes and never tells C, so C's baseline is stale by design and a
             // re-shipped gap byte would overwrite S's freshly rendered pixels with C's old news.
             //
-            // C knows which blobs those are because C is the side that publishes their `BufferToken`s
-            // — `BlobInodeResolver::resolve_inode` marks the blob when it resolves the swapchain
-            // memfd. See `LocalBlob::is_presented` and `rayland_relay::ranges::coalesce_ranges`.
-            let gap = if blob.is_presented() {
-                0
-            } else {
-                FORWARD_COALESCE_GAP
-            };
+            // **The presented exception that used to live here is now handled above, by not diffing
+            // such a blob at all.** Until 2026-09-01 this chose a zero gap for a presented blob, so
+            // that coalescing could not re-ship C's stale copy of bytes S had rendered. Skipping the
+            // blob outright is strictly stronger — nothing is shipped rather than nothing extra — so
+            // this branch became unreachable and is gone rather than left as reassuring dead code.
+            // The safety argument itself is unchanged and now lives at the skip.
+            let gap = FORWARD_COALESCE_GAP;
             // Each run reuses `BlobData`'s offset field; v1 only ever used offset 0 (the whole blob).
             for run in blob.take_changed_runs(gap) {
                 out.push(C2S::BlobData {
@@ -592,18 +618,61 @@ mod tests {
         assert!(matches!(msgs[0], C2S::RingDelta { .. }));
     }
 
-    /// **The forward path coalesces nearby changed runs — and a presented blob does not.**
+    /// **A presented blob is never diffed, even when its bytes have changed.**
+    ///
+    /// This is the stronger half of the presented rule. `nearby_runs_coalesce_except_on_a_presented_blob`
+    /// asserts that a presented blob keeps the byte grain; this asserts it is not shipped *at all*,
+    /// which is what makes skipping the diff for it correct rather than merely faster.
+    ///
+    /// The scenario is the one that would corrupt a frame: S has rendered into the blob (so C's
+    /// baseline is stale by design and C's copy is meaningless), and C's mapping then differs from
+    /// that baseline. A diff would see a change and ship it, overwriting S's pixels with C's copy.
+    #[test]
+    fn a_presented_blob_is_never_shipped_even_when_its_bytes_changed() {
+        let blobs = table_of(&[(7, VERTEX_BUFFER_BLOB_ID, 4096, 0x00)]);
+        {
+            let mut table = blobs.lock().expect("the blob table lock");
+            let blob = table.get_mut(&7).expect("res 7");
+            blob.ensure_baseline();
+            let _ = blob.take_changed_runs(0);
+            // Now mark it presented and change every byte. A blob that is diffed would ship 4096
+            // bytes; a blob that is skipped ships nothing.
+            blob.note_presented();
+            blob.bytes_mut().fill(0xEE);
+        }
+        let out = messages_for_delta(&blobs, 1, a_delta());
+        let shipped: Vec<&C2S> = out
+            .iter()
+            .filter(|m| matches!(m, C2S::BlobData { res_id: 7, .. }))
+            .collect();
+        assert!(
+            shipped.is_empty(),
+            "a presented blob must never be shipped: S renders into it and never reports those \
+             writes, so C's copy is stale by design and shipping it would overwrite S's pixels"
+        );
+        // The ring delta itself must still be relayed — skipping a blob must not skip the frame.
+        assert!(
+            out.iter().any(|m| matches!(m, C2S::RingDelta { .. })),
+            "the ring delta must still cross"
+        );
+    }
+
+    /// **The forward path coalesces nearby changed runs — and a presented blob ships nothing.**
     ///
     /// Both halves are asserted in one test on purpose: the interesting claim is not "coalescing
-    /// works" but "coalescing is *withheld* exactly where it would be unsafe", and that is only
-    /// visible as a difference between two blobs in the same relay.
+    /// works" but that it is *withheld* exactly where it would be unsafe, and that is only visible as
+    /// a difference between two blobs in the same relay.
     ///
-    /// The scenario is the one the safety argument is about. Each blob gets two changed bytes
-    /// separated by a short unchanged gap. For an ordinary blob the gap rides along and one
-    /// `BlobData` crosses, because S reports every byte it writes and C's baseline is therefore a
-    /// true model of S's copy — so re-shipping the gap byte writes what S already holds. For a
-    /// **presented** blob S renders into it and deliberately never reports those writes, C's baseline
-    /// is stale by design, and the gap must stay unshipped: two `BlobData`, byte-granular.
+    /// Each blob gets two changed bytes separated by a short unchanged gap. For an ordinary blob the
+    /// gap rides along and one `BlobData` crosses, because S reports every byte it writes and C's
+    /// baseline is a true model of S's copy — so re-shipping a gap byte writes what S already holds.
+    /// A **presented** blob is not diffed at all: S renders into it and never reports those writes,
+    /// so C's baseline is stale by design and *any* byte C shipped would overwrite S's pixels.
+    ///
+    /// Until 2026-09-01 the presented blob was diffed with a zero coalescing gap, and this test
+    /// asserted two byte-granular runs. Skipping it outright is strictly stronger, so the expectation
+    /// here moved with it — recorded because a test that is merely *edited* to match new behaviour is
+    /// how a weakened guard slips through, and this one was strengthened.
     #[test]
     fn nearby_runs_coalesce_except_on_a_presented_blob() {
         // Two application blobs, identical in every way but the mark.
@@ -613,8 +682,6 @@ mod tests {
         ]);
         {
             let mut table = blobs.lock().expect("the blob table lock");
-            // `res=6` is a swapchain image C has published as a BufferToken.
-            table.get_mut(&6).expect("res 6").note_presented();
             // The same two-changes-with-a-gap pattern in each: bytes 0 and 4 change, 1..4 do not.
             for id in [5u32, 6u32] {
                 let blob = table.get_mut(&id).expect("the blob");
@@ -624,6 +691,9 @@ mod tests {
                 blob.bytes_mut()[0] = 0x11;
                 blob.bytes_mut()[4] = 0x22;
             }
+            // `res=6` is a swapchain image C has published as a BufferToken. Marked *after* its bytes
+            // changed, so the change is genuinely present and genuinely withheld.
+            table.get_mut(&6).expect("res 6").note_presented();
         }
 
         let out = messages_for_delta(&blobs, 1, a_delta());
@@ -646,13 +716,13 @@ mod tests {
             vec![(0, 5)],
             "an ordinary blob's two nearby changes must coalesce into one BlobData"
         );
-        // The presented blob: the byte grain is preserved, so C cannot overwrite S's pixels with the
-        // stale gap bytes. THIS is the safety property; if it ever fails, presented frames corrupt.
+        // The presented blob: nothing at all. THIS is the safety property; if it ever fails,
+        // presented frames corrupt.
         assert_eq!(
             runs_for(6),
-            vec![(0, 1), (4, 1)],
-            "a presented blob must keep the byte grain — coalescing would re-ship C's stale copy of \
-             bytes S rendered and never reported back"
+            Vec::new(),
+            "a presented blob must not be shipped at all — S renders into it and never reports \
+             those writes, so C's copy is stale by design"
         );
     }
 

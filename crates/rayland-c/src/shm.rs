@@ -145,6 +145,32 @@ pub struct LocalBlob {
     presented: bool,
 }
 
+/// How many bytes the C→S diff compares in its **inner** pass before descending to individual bytes.
+///
+/// # Why there are two levels
+/// A single level forces a false choice. A *small* chunk makes the scan of unchanged memory slow —
+/// 13.2 MiB in 64-byte slices is 216,000 comparisons and was measured at 8.78 ms per delta on the
+/// riscv64 board. A *large* chunk makes a change expensive instead: with a 4096-byte chunk, **one
+/// changed byte costs a 4096-byte byte-loop**, and the Venus staging pool's changes are exactly that
+/// shape — a 2026-08-31 census found 6,560 changed bytes arriving as 4,564 separate runs, i.e. almost
+/// all of them isolated.
+///
+/// That is why skipping the four 1 MB swapchain images — 30% of the bytes walked — bought only 15% of
+/// the time (8.80 → 7.51 ms, measured): those megabytes are entirely unchanged, so they were the
+/// *cheapest* bytes in the walk. The expensive bytes are the few thousand that differ, each dragging a
+/// whole chunk of byte-loop behind it.
+///
+/// So the outer pass uses [`DIFF_CHUNK`] to skip unchanged memory at `memcmp` speed, and a chunk that
+/// differs is subdivided into `DIFF_SUBCHUNK` blocks before any byte is looked at individually. An
+/// isolated changed byte then costs one 4096-byte `memcmp`, sixteen 256-byte `memcmp`s and a 256-byte
+/// byte-loop, instead of a 4096-byte byte-loop.
+///
+/// **Neither constant can change what the diff produces, only how fast** — a differing block is still
+/// walked byte by byte and a run straddling any boundary is still emitted whole. That equivalence is
+/// what [`tests::the_chunked_diff_agrees_with_a_byte_at_a_time_reference`] asserts against a naive
+/// reference, with cases derived from *both* constants so neither can be changed into vacuity.
+pub(crate) const DIFF_SUBCHUNK: usize = 256;
+
 /// How many bytes the C→S diff compares at a time before descending to individual bytes.
 ///
 /// # Why this is a module constant and not a local one
@@ -449,18 +475,36 @@ impl LocalBlob {
                 i = chunk_end;
                 continue;
             }
-            // Something in this chunk differs; find exactly what, byte by byte.
-            for j in i..chunk_end {
-                if live[j] != self.baseline[j] {
-                    // Updating the baseline as we go is what makes the shipped bytes come from
-                    // `self.baseline` rather than a second read of `live` — see below.
-                    self.baseline[j] = live[j];
-                    if open.is_none() {
-                        open = Some(j);
+            // Something in this chunk differs. **Subdivide before looking at any byte individually**:
+            // the changes here are typically a handful of isolated bytes, and byte-walking the whole
+            // 4096-byte chunk to find them is what the second level exists to avoid. See
+            // [`DIFF_SUBCHUNK`].
+            let mut s = i;
+            while s < chunk_end {
+                let sub_end = (s + DIFF_SUBCHUNK).min(chunk_end);
+                // This block agrees with what S has: nothing to ship, and any open run ends here —
+                // exactly as the outer level does, so a run straddling a sub-block boundary is still
+                // emitted whole.
+                if live[s..sub_end] == self.baseline[s..sub_end] {
+                    if let Some(start) = open.take() {
+                        ranges.push((start, s));
                     }
-                } else if let Some(start) = open.take() {
-                    ranges.push((start, j));
+                    s = sub_end;
+                    continue;
                 }
+                for j in s..sub_end {
+                    if live[j] != self.baseline[j] {
+                        // Updating the baseline as we go is what makes the shipped bytes come from
+                        // `self.baseline` rather than a second read of `live` — see below.
+                        self.baseline[j] = live[j];
+                        if open.is_none() {
+                            open = Some(j);
+                        }
+                    } else if let Some(start) = open.take() {
+                        ranges.push((start, j));
+                    }
+                }
+                s = sub_end;
             }
             i = chunk_end;
         }
@@ -573,6 +617,7 @@ mod tests {
         // testing caught this: with an exact multiple, an implementation that simply *dropped* a
         // trailing partial chunk passed the whole suite, because no buffer in it ever had one.
         const CHUNK: usize = DIFF_CHUNK;
+        const SUB: usize = DIFF_SUBCHUNK;
         const SIZE: u64 = (CHUNK * 5 + 37) as u64;
         // Each case is a set of byte indices to change, expressed **relative to `CHUNK`** so the
         // boundary cases keep straddling a real boundary whatever the chunk size becomes.
@@ -603,6 +648,26 @@ mod tests {
             (
                 "a change in the last chunk only",
                 (CHUNK * 4 + 3..CHUNK * 4 + 9).collect(),
+            ),
+            // The inner level's boundaries, derived from `DIFF_SUBCHUNK` for the same reason the
+            // outer ones are derived from `DIFF_CHUNK`: a hand-written offset would stop straddling
+            // anything the moment either constant moved.
+            (
+                "a run straddling a sub-block boundary",
+                (SUB - 3..SUB + 5).collect(),
+            ),
+            (
+                "a run ending exactly on a sub-block boundary",
+                (SUB * 2 - 6..SUB * 2).collect(),
+            ),
+            (
+                "a run starting exactly on a sub-block boundary",
+                (SUB * 3..SUB * 3 + 6).collect(),
+            ),
+            ("two isolated bytes in different sub-blocks", vec![SUB + 1, SUB * 5 + 9]),
+            (
+                "one isolated byte per sub-block across a whole chunk",
+                (0..CHUNK / SUB).map(|b| b * SUB + 11).collect(),
             ),
             ("the very last byte", vec![SIZE as usize - 1]),
             ("every byte", (0..SIZE as usize).collect()),
