@@ -6681,3 +6681,36 @@ stayed 120/120 bit-identical with it armed.
 A good day's result is a direction closed. I would rather have spent two runs finding this than three
 weeks discovering it inside an implementation — which is, I notice, the same argument I made
 yesterday for measuring the prize before building the mechanism, and it paid twice.
+
+### 2026-09-02 (end) — Writing the handover found a document arguing with itself
+
+Nothing was built this turn. I wrote the continuation prompt for the next session and, in checking a
+claim before repeating it, found that **`OVERVIEW.md`, `CLAUDE.md` and the project map had all been
+asserting WP0 4.3 was unfinished for four days while their own task tables said it was done.**
+
+The prose was specific enough to be convincing: it named a file and a line number,
+`wayland_client.rs:592`, and quoted the log message there — *"buffer-token request … deferred to 4.3;
+skipped"*. That is exactly the kind of detail I would normally take as evidence rather than check.
+The line does not exist. `wayland_client.rs` resolves a token's resource id to a duplicated dma-buf
+descriptor, lays out the three requests that build the `wl_buffer`, and logs `"WP0 4.3: built
+wl_buffer"`. The map, separately, still had both 4.3 parts at status `planned`.
+
+So three documents disagreed with the code and two of them disagreed with themselves, in a repository
+whose conventions say in as many words that a stale comment is a bug. The mechanism is not mysterious:
+4.3 was completed in a burst that updated the *table* — the thing you look at — and left the paragraph
+below it, and the map, describing the state before. Nobody re-read the paragraph because the table
+above it already answered the question.
+
+I want to note what caught it, because it is the same thing that has caught everything else this week:
+I was about to write "4.3 part 2 is the next piece of work" into a handover, and asked what produced
+that claim. It came from a document, not from the code. That is now the seventh instance in three days
+of the same error shape — reading an output without checking what produced it — and the first where
+the misleading output was *our own prose* rather than an instrument.
+
+All three are corrected, with the contradiction recorded rather than quietly deleted. The handover
+tells the next session to believe the code and fix the document if it finds another.
+
+One thing I am deliberately not doing: auditing the rest of `OVERVIEW.md` against the tree. It is a
+1,200-line document and a full audit is its own task with its own budget, not a thing to tack onto a
+handover. The next session should know the class of defect exists rather than assume this was the only
+instance — which is a weaker statement than I would like, and the honest one.

@@ -481,16 +481,16 @@ effort goes next:
   first concluded the opposite and was **overturned by Task 4.0-bis**; both are left in the plan.
   **State (2026-08-29): 4.3 and 4.5 DONE — an unmodified vkcube on C spins in its own window on S's screen, confirmed by a human watching it, with pixels no longer crossing the wire.** 4.1 (C-side wiring) and 4.2 (S router, replay, object-id map) done; **4.4 (the event
   return path) genuinely works** — vkcube receives both `configure` events through the tunnel and
-  acks them; **4.3 is the open piece** — C's half is complete, S part 1 (retaining each blob's
-  exported dma-buf descriptor, which `mem->exported` permits exactly once, at creation) is landed,
-  and **S part 2 (token → `wl_buffer`) is specified but deliberately not written**, because it
-  cannot be verified without a compositor and a GPU and "code that compiles while exercising no test
-  would look done". Two decisions it needs first: **`stride` must go on `BufferToken`** (deriving
-  `width × bpp` garbles pixels rather than failing cleanly), and **S must *synthesize* the
-  `params.add`** rather than replay it, since C drops the fd by design — a request S originates, a
-  first for the replay module. Resolve and clone the fd **under the applier lock and release it
-  before any `send_request`**, or the relay's mutex ends up behind a compositor round trip. Then
-  4.5: vkcube's cube on S's screen. See
+  acks them; **4.3 is COMPLETE** — S builds real `wl_buffer`s from relayed tokens, verified over the
+  real network. (This bullet previously said part 2 was "specified but deliberately not written",
+  contradicting the same bullet's own "4.3 and 4.5 DONE" two sentences earlier; corrected 2026-09-02
+  against the code, where `wayland_client.rs` logs `"WP0 4.3: built wl_buffer"` and the old
+  `"deferred to 4.3; skipped"` line is gone.) The decisions it needed, all taken and still binding:
+  **`stride` goes on `BufferToken`** (deriving `width × bpp` garbles pixels rather than failing
+  cleanly); **S *synthesizes* the `params.add`** rather than replaying it, since C drops the fd by
+  design — a request S originates, a first for the replay module; and the fd is resolved and cloned
+  **under the applier lock and released before any `send_request`**, or the relay's mutex ends up
+  behind a compositor round trip. See
   [`docs/design/2026-07-22-wp0-wayland-proxy-first-light.md`](docs/design/2026-07-22-wp0-wayland-proxy-first-light.md)
   and its `-plan` companion.
 - **(c)3 — content-addressed assets.**

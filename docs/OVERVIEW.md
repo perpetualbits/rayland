@@ -455,17 +455,23 @@ cross the network.**
 | 4.4 — event return path (eventfd wakeup, `send_event`, `S2C::WaylandEvent`, `configure`) | **genuinely working** — measured: vkcube receives both `configure`s through the tunnel and **acks** them |
 | 4.5 — end-to-end: vkcube's spinning cube on S's screen | **REACHED 2026-08-29**, confirmed by a human watching the screen — and with **pixels no longer crossing the network** (S→C fell 571×). See §6.1.2 |
 
-**4.3 part 2 is the immediate next piece of work.** Its shape turned out smaller and different from
-the plan's decomposition: **C's half was already complete** (the `params.add` handler resolves the
-passed memfd's inode to an S-side resource id, `create_immed` assembles the full `BufferToken`, and
-an unresolved fd is deliberately *not* forwarded rather than guessed at — the doc comments calling
-this "the next sub-step" are stale). **4.3 is S-side only.** Part 1 is landed: S retains the dma-buf
-descriptor virglrenderer exports per blob, exposed as `Applier::exported_fd() -> BorrowedFd`, a
-borrow and never ownership, because `mem->exported` permits exactly one export per resource and it
-already happened at creation.
+**4.3 is COMPLETE, and the paragraph that used to stand here saying otherwise was stale.** It
+described part 2 as "unwritten" and cited `wayland_client.rs:592` still logging *"buffer-token
+request … deferred to 4.3; skipped"*. That line no longer exists: `wayland_client.rs` resolves a
+token's resource id to a duplicated dma-buf descriptor, lays out the three requests that turn a
+`BufferToken` into a `wl_buffer`, and logs `"WP0 4.3: built wl_buffer (app obj N) from resource M"`.
+The task table above — which recorded 4.3 as done and verified over the real network on 2026-08-29 —
+was right, and this prose contradicted it for four days. Corrected 2026-09-02, on discovering the
+contradiction while writing a handover; recorded rather than silently deleted because a document
+disagreeing with itself is the failure mode this file exists to prevent.
 
-Part 2 is unwritten. `crates/rayland-s/src/wayland_client.rs:592` still logs *"buffer-token request
-(obj N opcode M) deferred to 4.3; skipped"* and drops the whole request.
+For the record, the shape it turned out to have: **C's half was already complete** (the `params.add`
+handler resolves the passed memfd's inode to an S-side resource id, `create_immed` assembles the
+full `BufferToken`, and an unresolved fd is deliberately *not* forwarded rather than guessed at), so
+**4.3 was S-side only**. Part 1 retains the dma-buf descriptor virglrenderer exports per blob, as
+`Applier::exported_fd() -> BorrowedFd` — a borrow and never ownership, because `mem->exported`
+permits exactly one export per resource and it already happened at creation. Part 2 is the token →
+`wl_buffer` sequence described below.
 
 **The sequence as built, with two corrections to what this document previously said.** Both are
 recorded rather than silently rewritten, because the planning side reasoned from the old version.
