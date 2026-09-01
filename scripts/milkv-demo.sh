@@ -65,7 +65,23 @@ echo "### S = $S_IP:$PORT, presenting into the LIVE session ($DISPLAY_SOCKET)"
 # them, so `${S_EVENT_LOG:+RAYLAND_S_EVENT_LOG=1}` becomes the *command name* when the variable is set
 # and vanishes into a syntax error when it is not. `wp0-soak.sh` carries the same note for the same
 # reason; this script had to learn it separately.
+# **Restrict what S's Vulkan enumerates, and so what Venus exposes to the application.**
+#
+# The application chooses its adapter from the list Venus advertises, and that list is whatever S's
+# Vulkan loader can see. dop561 has both an Intel iGPU and an NVIDIA RTX A500, and the NVIDIA card
+# loses the device on 7 of 14 runs (CLAUDE.md, 2026-07-26) — silently, with no error in any log.
+#
+# `vkcube` can be steered with `--gpu_number`, but that is an *index* into a list whose order moves,
+# and it only works for applications that offer such a flag. `solarsim` does not: it asks wgpu for
+# `PowerPreference::HighPerformance`, which picks the discrete card every time, and no environment
+# variable overrides a hardcoded preference. So the honest fix is on this side — show S's Venus only
+# the device that works, rather than asking every application to avoid the one that does not.
+#
+# Override with `S_ICD=` (empty) to enumerate everything, which is what a session hunting the NVIDIA
+# device loss would want.
+S_ICD="${S_ICD-/usr/share/vulkan/icd.d/intel_icd.json}"
 env WAYLAND_DISPLAY="$DISPLAY_SOCKET" XDG_RUNTIME_DIR=/run/user/$(id -u) \
+  ${S_ICD:+VK_ICD_FILENAMES=$S_ICD} \
   RAYLAND_C1_NO_PRESENT=1 RAYLAND_C1_S_LISTEN="0.0.0.0:$PORT" \
   ${S_EVENT_LOG:+RAYLAND_S_EVENT_LOG=1} \
   "$S_BIN" > "$LOG/s.log" 2>&1 &
@@ -79,7 +95,7 @@ on_c "sudo cp /tmp/rayland-c-demo $CHROOT/opt/rayland/ && sudo chmod +x $CHROOT/
       sudo chroot $CHROOT /bin/bash -c '
         export XDG_RUNTIME_DIR=/run/user/0
         mkdir -p \$XDG_RUNTIME_DIR && chmod 700 \$XDG_RUNTIME_DIR
-        RAYLAND_WP_LOG=1 RAYLAND_C1_S_ADDR=$S_IP:$PORT RAYLAND_C1_SOCKET=$SOCK \
+        RAYLAND_WP_LOG=1 RAYLAND_C1_METRICS=1 RAYLAND_C1_S_ADDR=$S_IP:$PORT RAYLAND_C1_SOCKET=$SOCK \
         RAYLAND_C1_WAYLAND_DISPLAY=$WLPATH \
         nohup /opt/rayland/rayland-c-demo > /tmp/rl-demo-c.log 2>&1 &
         echo \$! > /tmp/rl-demo-c.pid
@@ -102,7 +118,9 @@ APP_JOB=$!
 # Device loss on the NVIDIA card is silent — the run looks alive and simply never presents — so a demo
 # that does not check this wastes the viewer's whole session staring at nothing.
 sleep 6
-gpu="$(on_c "sudo grep -m1 'Selected GPU' $CHROOT/tmp/rl-demo-app.log 2>/dev/null" || true)"
+# Match any line naming the adapter, not just vkcube's phrasing: `solarsim` prints "GPU: ..." from
+# wgpu, and a check that only understood one application's log would silently stop guarding.
+gpu="$(on_c "sudo grep -m1 -iE 'Selected GPU|^GPU:|adapter' $CHROOT/tmp/rl-demo-app.log 2>/dev/null" || true)"
 echo "### ${gpu:-<no GPU line yet>}"
 case "$gpu" in
   *NVIDIA*) echo "### ABORTING: landed on the NVIDIA card, which loses the device and will never present." >&2

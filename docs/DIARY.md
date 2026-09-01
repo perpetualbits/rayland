@@ -6274,3 +6274,57 @@ blank window is worse to debug than a slow one.
 
 **Not done, and not forgotten:** no end-to-end run yet. `solarsim` on milkv is the acceptance test, and
 `vkgears`'s Venus-WSI hang is still open and still separate from all of this.
+
+### 2026-09-01 (end) — solarsim runs, and the acceptance run earned its place
+
+An unmodified wgpu/winit application, on a riscv64 board, drawn by dop561's GPU, on dop561's real
+desktop. **169 frames in two minutes.** Yesterday it could not create a window.
+
+All four of the design's acceptance criteria are met, and the fourth is the interesting one.
+
+**§3's furniture assumption is not merely confirmed, it is confirmed harder than predicted.** The
+prediction was that `wl_shm` carries cursors and decorations, not frames, so v1 shipped without content
+hashing, damage intersection or compression and put its effort into the instrumentation that would
+settle the question. Measured:
+
+```
+create_pool -> pool 6  (2 bytes)
+create_pool -> pool 46 (1024 bytes)      <- exactly a 16x16 ARGB cursor
+shm_bytes=0  shm_commits=0  shm_largest=0
+```
+
+Two pools, 2 and 1024 bytes, and **not one byte synced in two minutes** — the application never
+committed a surface with an shm buffer attached. The three deferred optimisations are not just
+unnecessary; there is nothing for them to optimise. That is the outcome deferring them was betting on,
+and it is worth noting the bet could have gone the other way: if that number had come back in megabytes
+the design would have needed revisiting rather than the code optimising.
+
+**Two bugs, and neither was findable any other way.** This is the part I want on the record, because
+the temptation with an acceptance criterion is to treat it as ceremony after the real work.
+
+*First:* `wl_shm` was missing from S's interface registry. C intercepted and forwarded perfectly; S
+logged `no linked descriptor for wl_shm; bind skipped` and carried on, and the application did not
+care, because its **GPU** frames go through dma-buf. The only symptom was a cursor that never appeared.
+A table of "interfaces we support" cannot be tested for an omission by a test that lists the same
+interfaces — and mine did exactly that, listing eleven names and asserting all eleven resolve. Only
+running something that binds one you forgot will find it.
+
+*Second:* the substitution expanded back into one argument where the wire needs two.
+`create_pool(new_id, fd, int size)` has its fd replaced by `ShmPool { size }`, so S must expand that
+into *both* the descriptor and the size it stood in for. I pushed only the descriptor, and
+`wayland-client` refused it outright: `expected [NewId, Fd, Int], got [NewId(...), Fd(33)]`. A good
+failure — loud, immediate, naming the exact mismatch — and a reminder that a substitution is a *two-way*
+transformation and I had only written one direction.
+
+**A third thing, about choosing a GPU.** The first run landed on the NVIDIA card, which loses the
+device on 7 of 14 runs, silently. `solarsim` asks wgpu for `PowerPreference::HighPerformance`, and
+**no environment variable overrides a hardcoded preference** — `vkcube`'s `--gpu_number` has no
+equivalent here. So the fix went where it belongs: `rayland-s` now runs with `VK_ICD_FILENAMES` pinned
+to Intel, so S's Venus enumerates only the device that works and no application can pick the broken
+one. Steering the *application* was always the wrong layer; it just happened to be available for
+vkcube.
+
+**What is not claimed.** 169 frames in 120 s is about 1.4 fps, on a heavy solar-system simulator with
+GPU physics, on a 4-core riscv64 board, over a network. It runs; it is not fast, and nothing here was
+measured against a baseline. And `vkgears`'s Venus-WSI hang is still open and still unrelated to any of
+this.

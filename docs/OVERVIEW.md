@@ -775,8 +775,26 @@ it either way. This is the best ratio of information to effort currently on the 
   and that largest-buffer figure is the evidence deciding whether any of them is ever needed. A
   full-window buffer is **carried with a loud `shm:large-buffer` warning, not refused**: a blank window
   is worse to debug than a slow one. `vkcube` re-measured after the new global: unaffected.
-- **`wl_shm` is not yet exercised end to end.** The acceptance test is `solarsim` on milkv rendering on
-  dop561; it has not been run.
+- **ACCEPTANCE MET (2026-09-01): `solarsim` runs on milkv and renders on dop561** — an unmodified
+  wgpu/winit application on a riscv64 board, drawn by dop561's GPU, on the real desktop. **169 frames
+  in ~120 s** (~1.4 fps; a heavy simulator on a 4-core board over a network — it runs, it is not fast,
+  and no baseline was measured). `vkcube` and the suite unaffected.
+- **§3's furniture assumption is settled, and more strongly than predicted.** Two shm pools, of **2 and
+  1024 bytes** (1024 = a 16×16 ARGB cursor), and **`shm_bytes=0, shm_commits=0` across two minutes** —
+  the application never committed a surface with an shm buffer attached. The three deferred
+  optimisations (content hashing, damage intersection, compression) have **nothing to optimise**. That
+  question is closed with a number.
+- **The acceptance run found two bugs nothing else could**, both in S's replay of a protocol only a real
+  toolkit exercises: `wl_shm` was missing from S's interface registry (C forwarded perfectly, S skipped
+  the bind, and the only symptom was a cursor that never appeared — a table of supported interfaces
+  cannot be tested for an omission by a test listing the same interfaces), and the `ShmPool`
+  substitution expanded back into one wire argument where `create_pool(new_id, fd, int size)` needs
+  two. See `docs/data/2026-09-01-solarsim-acceptance/`.
+- **Adapter selection is an S-side concern now.** `solarsim` asks wgpu for
+  `PowerPreference::HighPerformance` and no env var overrides a hardcoded preference, so it landed on
+  the NVIDIA card that loses the device on 7 of 14 runs. `rayland-s` is now run with `VK_ICD_FILENAMES`
+  pinned to Intel so S's Venus enumerates only the working device. Steering the *application*
+  (`--gpu_number`) was always the wrong layer; it merely happened to be available for `vkcube`.
 
 - **FIXED 2026-09-01: the `wl_keyboard.keymap` drop.** S dropped the event because it carries an fd;
   the cost was not "no keyboard" but a **hung application** — anything that creates a `wl_keyboard`

@@ -80,6 +80,7 @@ use wayland_client::backend::{Backend, ObjectData, ObjectId, WaylandError};
 // interface string to the linked `&'static Interface` that `send_request`'s `child_spec` requires.
 use wayland_client::protocol::{
     wl_buffer::WlBuffer, wl_callback::WlCallback, wl_compositor::WlCompositor, wl_region::WlRegion,
+    wl_shm::WlShm, wl_shm_pool::WlShmPool,
     wl_registry::WlRegistry, wl_seat::WlSeat, wl_surface::WlSurface,
 };
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
@@ -1256,7 +1257,18 @@ impl WaylandReplay {
                         return;
                     };
                     match self.shm.create_pool(app_pool_id, *size) {
-                        Ok(fd) => args.push(Argument::Fd(fd)),
+                        Ok(fd) => {
+                            // **Two arguments come back out of one.** `WaylandArg::ShmPool` replaces
+                            // the `fd` of `create_pool(new_id, fd, int size)` on the wire, but the
+                            // compositor's signature still wants both — so the substitution expands
+                            // here into the descriptor *and* the size it stood in for. Pushing only
+                            // the fd leaves a short request, and `wayland-client` rejects it with
+                            // "Unexpected signature ... expected [NewId, Fd, Int]" — which is exactly
+                            // how the first acceptance run found this, and is a far better failure
+                            // than a compositor quietly reading a wrong length.
+                            args.push(Argument::Fd(fd));
+                            args.push(Argument::Int(i32::try_from(*size).unwrap_or(i32::MAX)));
+                        }
                         Err(e) => {
                             // **What this means for the app:** its pool never appears, so whatever it
                             // meant to draw with shm — usually a cursor or a decoration — is absent.
@@ -1796,6 +1808,15 @@ fn interface_by_name(name: &str) -> Option<&'static Interface> {
         "wl_region" => WlRegion::interface(),
         "wl_callback" => WlCallback::interface(),
         "wl_buffer" => WlBuffer::interface(),
+        // The `wl_shm` pair. Missing these was caught by the first `solarsim` acceptance run and by
+        // nothing else: C intercepted `create_pool` and forwarded it correctly, S logged
+        // "no linked descriptor for `wl_shm`; bind skipped", and the application carried on happily
+        // because its *GPU* frames go through dma-buf — so the only symptom was a cursor that never
+        // appeared on S. No unit test can notice a missing entry in a table of things to support;
+        // only running a real toolkit application can, which is exactly what the acceptance criterion
+        // is for.
+        "wl_shm" => WlShm::interface(),
+        "wl_shm_pool" => WlShmPool::interface(),
         "wl_seat" => WlSeat::interface(),
         "xdg_wm_base" => XdgWmBase::interface(),
         "xdg_surface" => XdgSurface::interface(),
@@ -1819,6 +1840,8 @@ mod tests {
             "wl_region",
             "wl_callback",
             "wl_buffer",
+            "wl_shm",
+            "wl_shm_pool",
             "wl_seat",
             "xdg_wm_base",
             "xdg_surface",
