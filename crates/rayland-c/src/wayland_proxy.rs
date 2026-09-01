@@ -33,6 +33,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use rayland_relay::{BufferToken, WaylandArg, WaylandMessage};
+use rayland_vtest::transport::create_memfd;
 use wayland_server::Resource; // brings `interface()` into scope for the generated object types
 use wayland_server::backend::protocol::{Argument, Message};
 use wayland_server::backend::{
@@ -1127,6 +1128,69 @@ fn drain_events(
     Ok(())
 }
 
+/// Create a fresh, read-only `memfd` holding `bytes`, to stand in for a keymap descriptor.
+///
+/// # Why C mints this rather than relaying one
+/// A file descriptor cannot cross a network. `wl_keyboard.keymap` names a read-only mapping whose
+/// *contents are the whole payload* — the XKB keymap as text — so S sends the bytes
+/// ([`rayland_relay::WaylandArg::KeymapContent`]) and C makes an equivalent descriptor locally. The
+/// application mmaps a read-only fd of `size` bytes holding the keymap, which is exactly what the
+/// protocol promises it; nothing about the substitution is observable to it.
+///
+/// # Why it is sealed
+/// The compositor's own keymap fd is read-only to the client, and some clients map it `MAP_PRIVATE`
+/// and trust it not to change underneath them. `F_SEAL_WRITE` plus `F_SEAL_SHRINK` makes that true
+/// here too — and, more practically, a keymap that could be resized under a client's mapping is a
+/// `SIGBUS` waiting to happen. Sealing is best-effort: a kernel or filesystem that refuses the seal
+/// still gives a correct (if unsealed) keymap, which is better than no keyboard at all.
+///
+/// # Inputs / outputs
+/// - `bytes`: the keymap text, exactly as S read it from the compositor's descriptor.
+/// - Returns an [`OwnedFd`] positioned at offset 0, or `None` if the descriptor could not be created,
+///   written or rewound. The caller drops the event on `None`.
+///
+/// # Failure modes
+/// `memfd_create` can fail on fd exhaustion; the write can fail on a full `tmpfs`. Both are reported
+/// by the caller as a dropped event rather than a panic — this runs on the proxy's event thread, and
+/// an application missing a keymap is a far better outcome than a daemon that dies.
+fn synthesize_keymap_fd(bytes: &[u8]) -> Option<OwnedFd> {
+    use std::io::{Seek, SeekFrom, Write};
+    // `create_memfd` is `rayland-vtest`'s, the same one the blob path uses, so there is one way this
+    // project makes anonymous shared memory rather than two that can drift.
+    let fd = match create_memfd(bytes.len() as u64) {
+        Ok(fd) => fd,
+        Err(e) => {
+            eprintln!("rayland-c: WP0 keymap: creating the keymap memfd failed: {e}");
+            return None;
+        }
+    };
+    // Write through a borrowed `File`: `File::from` would take ownership and close the descriptor when
+    // it dropped, and the descriptor is precisely what this function returns.
+    let mut file = std::fs::File::from(fd);
+    if let Err(e) = file.write_all(bytes) {
+        eprintln!("rayland-c: WP0 keymap: writing the keymap failed: {e}");
+        return None;
+    }
+    // Rewind: the client is entitled to a descriptor it can map from offset 0, and some clients also
+    // `read()` it. Leaving the offset at the end would give a correct mapping and an empty read.
+    if let Err(e) = file.seek(SeekFrom::Start(0)) {
+        eprintln!("rayland-c: WP0 keymap: rewinding the keymap memfd failed: {e}");
+        return None;
+    }
+    let fd: OwnedFd = file.into();
+    // Best-effort sealing; see this function's docs for why a refusal is not fatal.
+    // SAFETY: `fcntl` with `F_ADD_SEALS` takes an fd and an int and returns an int; the descriptor is
+    // live and owned here.
+    unsafe {
+        libc::fcntl(
+            fd.as_raw_fd(),
+            libc::F_ADD_SEALS,
+            libc::F_SEAL_WRITE | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW,
+        );
+    }
+    Some(fd)
+}
+
 /// Deliver one compositor event, arriving in the **app's** id space, to the application via `send_event`.
 ///
 /// # Id translation
@@ -1198,6 +1262,11 @@ fn deliver_event(handle: &Handle, state: &ProxyState, msg: WaylandMessage) {
     }
     // Rebuild the argument list in the backend's `send_event` form (`Argument<ObjectId, RawFd>`).
     let mut args: Vec<Argument<ObjectId, RawFd>> = Vec::with_capacity(msg.args.len());
+    // Holds the keymap descriptor this function may mint, so it stays open across `send_event` and is
+    // closed exactly once afterwards. `Argument::Fd` carries a raw number and takes no ownership: the
+    // backend duplicates what it needs while sending, so closing earlier would send a closed fd and
+    // never closing would leak one per keymap event.
+    let mut keymap_fd: Option<OwnedFd> = None;
     for arg in &msg.args {
         match arg {
             WaylandArg::Int(v) => args.push(Argument::Int(*v)),
@@ -1240,6 +1309,35 @@ fn deliver_event(handle: &Handle, state: &ProxyState, msg: WaylandMessage) {
                 return;
             }
             // A buffer token in a compositor→app event is never expected; drop rather than mis-deliver.
+            // **The keymap substitution, landing.** S sent the *contents* of the fd
+            // `wl_keyboard.keymap` carried, because an fd cannot cross a network; C mints a fresh
+            // `memfd` holding those bytes and hands the application that. The application mmaps a
+            // read-only fd of `size` bytes containing the keymap — exactly the protocol's promise —
+            // and cannot tell that the descriptor was made here rather than by the compositor.
+            //
+            // Until 2026-09-01 the whole event was dropped, and the cost was not merely "no
+            // keyboard": an application that creates a `wl_keyboard` **waits for its keymap**, so
+            // `vkgears` built its swapchain against a seat-advertising compositor and then never drew.
+            WaylandArg::KeymapContent(bytes) => match synthesize_keymap_fd(bytes) {
+                Some(fd) => {
+                    // Push the raw number, then park the owner: `Argument::Fd` takes no ownership, and
+                    // the descriptor must outlive `send_event`. Reading the number *before* the move
+                    // keeps that ordering explicit rather than relying on borrow-checker luck.
+                    args.push(Argument::Fd(fd.as_raw_fd()));
+                    keymap_fd = Some(fd);
+                }
+                None => {
+                    // **What this means for the app:** it waits for a keymap that never comes, which
+                    // is the same outcome as the old unconditional drop — but now it is a reported
+                    // failure of one syscall rather than a silent structural gap.
+                    wp_drop(&format!(
+                        "drop:keymap-memfd-failed app_obj={} {}: could not create the keymap memfd",
+                        msg.object_id,
+                        event_label(&sender, msg.opcode)
+                    ));
+                    return;
+                }
+            },
             WaylandArg::Buffer(_) => {
                 // A buffer token travels app→S, never back. **What this means for the app:** lost, and it
                 // also means something upstream is confused, since nothing constructs such an event.
@@ -1297,6 +1395,11 @@ fn deliver_event(handle: &Handle, state: &ProxyState, msg: WaylandMessage) {
             );
         }
     }
+    // Close the keymap descriptor now that `send_event` has consumed what it needed. Explicit rather
+    // than left to scope exit, because *when* it closes is the whole contract: `Argument::Fd` carries
+    // a bare number and the backend duplicates while sending, so closing before this point would send
+    // a closed descriptor and never closing would leak one per keymap event.
+    drop(keymap_fd);
 }
 
 /// Accept one pending connection on `listener` and hand its stream to the backend as a new client.
@@ -1341,12 +1444,59 @@ fn wp_log(msg: &str) {
 
 #[cfg(test)]
 mod tests {
+
     //! Pure translation tests for the scalar argument cases.
     //!
     //! `Object`/`NewId`/`Fd` need a real `ObjectId`/`OwnedFd`, which only the backend mints, so they are
     //! covered by the integration forward test (a real client sends real objects). The cases here are the
     //! ones with actual mapping logic worth pinning: the value scalars, and — the subtle one — `Str`'s
     //! NUL handling and its null-vs-present distinction.
+    use super::synthesize_keymap_fd;
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+
+    /// **The synthesized keymap descriptor must be readable and hold exactly the bytes S sent.**
+    ///
+    /// This is the whole of the substitution's correctness on C's side: the application is promised a
+    /// read-only descriptor of `size` bytes containing the XKB keymap, and it must not be able to tell
+    /// that the descriptor was minted here rather than by the compositor. A keymap that arrives
+    /// truncated, empty, or positioned at end-of-file is worse than the old dropped event, because the
+    /// application maps garbage instead of waiting.
+    ///
+    /// The offset check is the one that would actually have bitten: writing leaves the file position
+    /// at the end, so a client that `read()`s rather than `mmap()`s would see nothing at all while a
+    /// client that maps would see the right thing — a bug that reproduces on some toolkits only.
+    #[test]
+    fn a_synthesized_keymap_fd_reads_back_exactly_what_was_written() {
+        // A stand-in for a real XKB keymap: the content is opaque to this code, only its bytes matter.
+        let keymap = b"xkb_keymap { xkb_keycodes { <ESC> = 9; }; };".to_vec();
+        let fd = synthesize_keymap_fd(&keymap).expect("the keymap memfd must be creatable");
+
+        // Read it back through a *duplicate*, so this test cannot disturb the descriptor's own offset
+        // the way a careless caller would.
+        let dup = unsafe { libc::dup(fd.as_raw_fd()) };
+        assert!(dup >= 0, "dup of the keymap fd failed");
+        let mut file = unsafe { std::fs::File::from_raw_fd(dup) };
+        let mut got = Vec::new();
+        file.read_to_end(&mut got).expect("the keymap fd must be readable");
+
+        assert_eq!(
+            got, keymap,
+            "the application must see exactly the keymap S read from the compositor"
+        );
+    }
+
+    /// An empty keymap yields a valid, empty descriptor rather than a failure.
+    ///
+    /// A compositor is not obliged to send a non-empty keymap, and `memfd` sizing is the one place a
+    /// zero length could turn into an error. Returning `None` here would drop the event and leave the
+    /// application waiting for a keymap that had, in fact, arrived.
+    #[test]
+    fn an_empty_keymap_still_produces_a_valid_descriptor() {
+        let fd = synthesize_keymap_fd(&[]).expect("an empty keymap must still produce a descriptor");
+        assert!(fd.as_raw_fd() >= 0);
+    }
+
     use super::*;
     use std::ffi::CString;
 

@@ -760,6 +760,24 @@ it either way. This is the best ratio of information to effort currently on the 
 
 ### 6.3 Longer-term open questions
 
+- **FIXED 2026-09-01: the `wl_keyboard.keymap` drop.** S dropped the event because it carries an fd;
+  the cost was not "no keyboard" but a **hung application** — anything that creates a `wl_keyboard`
+  waits for its keymap. Fixed by the mirror of buffer-by-token: S sends the descriptor's *contents*
+  (`WaylandArg::KeymapContent`), C mints a sealed `memfd` and hands the app that. Verified 35,581 bytes
+  relayed against 35,581 advertised. **Note the trap it revealed: headless weston advertises no
+  `wl_seat`, so every sweep this project has ever run was structurally blind to this whole class of
+  event.** A harness chosen to remove one variable removed a category with it. See
+  `docs/data/2026-09-01-keymap-fix/`.
+- **`vkgears` still does not render over WP0, and the blocker is now a different one.** With the
+  keymap fixed it gets its configure, builds four `wl_buffer`s, attaches and commits twice, and then
+  receives **zero `wl_buffer.release` events** — so it blocks. `vkcube` on the same path receives
+  ~1,300 releases, so the return path works in general. This is the next thing to chase.
+- **Resizing still stalls, and that one IS ours.** A resize is a legitimate swapchain rebuild, and the
+  relay makes a legitimate rebuild cost seconds (measured 5.1 s and 4.7 s on milkv for larger
+  windows). Unlike the focus-change stall — which was `vkcube` rebuilding for nothing and is fixed —
+  there is no application bug here to patch. It is the synchronous round-trip cost, applied to the few
+  hundred calls a rebuild makes.
+
 - **HEADLINE, 2026-09-01: on a capable C, Rayland runs at NATIVE frame rate over a real network.**
   With **dionysus** as C (x86_64, 8 cores, Ubuntu 26.04) → dop561: **25 ms median inter-frame gap in
   8 runs out of 8**. Native `vkcube` on the same headless weston, no Rayland in the path:

@@ -6092,3 +6092,68 @@ Nothing in Rayland changed. Nothing in Rayland was broken. What the relay does i
 cost into a ~1 s one, which is precisely why this deserved an upstream patch rather than the proxy
 workaround — and why that workaround is still the wrong answer: the `states` array genuinely changes,
 and an application that renders focus needs to be told.
+
+### 2026-09-01 (night) — The keymap defect is fixed, and the harness had been hiding it
+
+The owner asked to see vkcube and then vkgears, milkv → dop561. vkcube went up and, with the patched
+build, crossed the mouse edge without a stall — 108 pointer crossings, 114 configures, 11 rebuilds,
+all of them real resizes. The owner's verdict on the remaining stalls was right and I want it on the
+record in their words: *"resizing is still causing stalls though."* It is, and that one is **ours** —
+a resize is a legitimate rebuild, and we make a legitimate rebuild cost seconds. Two of them in that
+run were 5.1 s and 4.7 s, bigger than the old focus-change stalls because a bigger window means a
+bigger swapchain.
+
+**Then vkgears did not draw, and the reason was a defect this project has carried since WP0 began.**
+
+```
+rayland-s: WP0 replay bound `wl_seat` v4 (app obj 5)
+[wp-event][S] drop:carries-fd s_obj=5 wl_keyboard.keymap
+```
+
+`wl_keyboard.keymap` carries a **file descriptor**, an fd cannot cross a network, so S dropped the
+whole event. The cost was never "no keyboard": an application that creates a `wl_keyboard` **waits for
+its keymap**, so vkgears built its swapchain and stopped. vkcube escaped only because it ignores the
+keymap.
+
+**And here is the part that stings: headless weston advertises no `wl_seat` at all.** Every sweep this
+project has run — every soak, every A/B, every failure-rate measurement — used headless weston,
+precisely because it composites on a timer and never blanks. So the harness that made all our numbers
+trustworthy was also the reason this defect was invisible. It appeared within seconds of pointing a
+demo at the owner's real desktop. **A test environment chosen to remove one variable removed a whole
+class of event with it**, and nothing in the harness could have told us: there is no drop, no error,
+no missing frame — the seat simply is not there.
+
+**The fix is the mirror of buffer-by-token.** There is nothing on S to *name* — the keymap is data, a
+few tens of KiB, immutable for the keyboard's life. So the bytes cross, and C mints a sealed `memfd`
+holding them. The application maps a read-only fd of `size` bytes containing the keymap, which is
+exactly what the protocol promises it. Deliberately **not** a general fd substitution: it carries
+bytes, so it is right only where the contents *are* the payload. A descriptor naming a GPU buffer or a
+sync file still cannot cross this way.
+
+**My first version of it killed the application, and the way it died was informative.** Exit 135 —
+SIGBUS. I had used `dup` + `read_to_end`, and written a confident comment saying the duplicate had its
+own file offset. **It does not.** `dup` shares the open file description, offset included, so the read
+started wherever the compositor's descriptor happened to point, could return a short buffer, and
+helpfully left the compositor's own offset at EOF. Since the event's `size` argument travels
+unchanged, a short read means the application maps `size` bytes over a shorter file and faults past
+the end.
+
+`read_at` (`pread`) fixes it: explicit offset, no shared state, no dup at all. Verified end to end —
+**35,581 bytes relayed against 35,581 advertised** — and I now log that length unconditionally, because
+a mismatch does not surface as an error anywhere: it surfaces as a SIGBUS in someone else's process.
+
+The wrong comment is the thing I want to remember. It was not a typo; it was a plausible belief about
+POSIX, written as fact, in the exact place a reader would go to check the invariant. It made the bug
+*harder* to find than no comment would have.
+
+**Where vkgears stands now, honestly: better, and still not rendering.** Keymap delivered, zero drops
+on either side, no crash, application alive. And **zero `wl_buffer.release` events** — it attaches and
+commits twice, then blocks waiting for a buffer to come back. vkcube on the same path gets ~1,300
+releases, so the return path works in general and this is something specific. That is the next thing,
+and it is not the keymap.
+
+One small self-inflicted detour along the way: I read vkgears' two `opcode 3` requests as
+`wl_surface.frame` and briefly believed it was starved of frame callbacks. They are
+`xdg_toplevel.set_title` and `xdg_surface.set_window_geometry`. **An opcode is an index into one
+interface's list** — this project wrote that sentence down months ago about *events*, and I just made
+the same mistake about *requests*.

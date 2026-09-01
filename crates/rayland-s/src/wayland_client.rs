@@ -487,6 +487,77 @@ fn event_log_enabled() -> bool {
     std::env::var_os("RAYLAND_S_EVENT_LOG").is_some()
 }
 
+/// Read a file descriptor's entire contents **from offset 0, without moving its file offset**.
+///
+/// # Why this exists
+/// `wl_keyboard.keymap` carries an fd to a read-only mapping holding the XKB keymap as text. An fd
+/// cannot cross a network, but these *bytes* can, and C mints an equivalent `memfd` on the far side —
+/// see [`rayland_relay::WaylandArg::KeymapContent`].
+///
+/// # The invariant this function exists to hold, and how it was broken
+/// The event's `size` argument travels unchanged, so **the bytes returned here must be the whole
+/// file**: C sizes its `memfd` to this length, the application maps `size` bytes over it, and a short
+/// file means the application faults reading past the end. That is not theoretical — the first
+/// version of this used `dup` plus `read_to_end` and `vkgears` died with **SIGBUS** (exit 135).
+///
+/// **`dup` does not give an independent file offset.** It duplicates the descriptor, and the copy
+/// shares the *open file description* — including the offset — with the original. So `read_to_end`
+/// started wherever the compositor's descriptor happened to be pointing, could return fewer bytes than
+/// the file holds, and left the compositor's own offset at EOF as a parting gift. An earlier comment
+/// here asserted the opposite; it was wrong, and the assertion is what made the bug hard to see.
+///
+/// `read_at` (`pread`) is the fix: it reads from an explicit offset and touches no shared state, so
+/// no dup is needed and nothing the compositor owns is disturbed.
+///
+/// # Inputs / outputs
+/// - `fd`: the descriptor named by the event. Borrowed, never consumed, never repositioned.
+/// - Returns the file's full contents, or `None` if `fstat` or a read fails — the caller then drops
+///   the event, which is the honest outcome: an application that waits for a keymap is better served
+///   than one handed a truncated mapping it will fault on.
+fn read_fd_contents(fd: std::os::fd::RawFd) -> Option<Vec<u8>> {
+    use std::os::fd::{BorrowedFd, AsRawFd};
+    use std::os::unix::fs::FileExt;
+    // The true length, from the descriptor itself: the caller's `size` argument is the compositor's
+    // claim, and this is the thing C will actually be asked to reproduce.
+    // SAFETY: `fstat` fills a `stat` it is given; the descriptor is live for this call.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        eprintln!(
+            "rayland-s: WP0 keymap: fstat of the keymap fd failed: {}",
+            std::io::Error::last_os_error()
+        );
+        return None;
+    }
+    let len = usize::try_from(st.st_size).unwrap_or(0);
+    // Borrow rather than own: this descriptor belongs to the `wayland-client` backend, which closes it
+    // when the handler returns. A `File` built from it would close it too — a double close, and on a
+    // busy process a use-after-free of whatever fd number is reused next.
+    // SAFETY: the descriptor is live for the duration of this call, and the `BorrowedFd` does not
+    // outlive it.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    let file = std::mem::ManuallyDrop::new(unsafe {
+        <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(borrowed.as_raw_fd())
+    });
+    let mut bytes = vec![0u8; len];
+    let mut done = 0usize;
+    while done < len {
+        match file.read_at(&mut bytes[done..], done as u64) {
+            // A zero-length read before the end means the file is shorter than `fstat` claimed. Report
+            // what was actually read rather than shipping a buffer with a zeroed tail.
+            Ok(0) => {
+                bytes.truncate(done);
+                break;
+            }
+            Ok(n) => done += n,
+            Err(e) => {
+                eprintln!("rayland-s: WP0 keymap: reading the keymap fd failed: {e}");
+                return None;
+            }
+        }
+    }
+    Some(bytes)
+}
+
 /// The name of the event at `opcode` on `interface`, or `None` if the opcode is outside the descriptor.
 ///
 /// # Why by name and not by opcode
@@ -609,6 +680,11 @@ fn translate_and_emit(
     // inside the lock, so a dropped event left no trace at all, and "no errors in S's log" was not evidence
     // about a path that was silent by construction. Carrying the reason out as a `Copy` value lets it be
     // *formatted* outside the critical section, so the witness cannot slow the section it is watching.
+    // Decided once, outside the argument loop: is this the one fd-carrying event whose *contents* are
+    // its whole meaning? Matched by interface and event **name**, not by a bare opcode — an opcode is
+    // an index into one interface's event list, so the same number means something different on every
+    // other interface.
+    let is_keymap = event_label(msg.sender_id.interface(), msg.opcode) == "wl_keyboard.keymap";
     let outcome: Result<WaylandMessage, EventDrop> = {
         let maps = maps.lock().expect("the WP0 id maps lock is never poisoned");
         // The sender must be an object the replay created; S's own registry/display objects are not, so
@@ -644,9 +720,41 @@ fn translate_and_emit(
                             drop_reason = Some(EventDrop::CarriesNewId);
                             break;
                         }
-                        Argument::Fd(_) => {
-                            drop_reason = Some(EventDrop::CarriesFd);
-                            break;
+                        // **An fd. One kind can cross as its contents; the rest still cannot.**
+                        //
+                        // `wl_keyboard.keymap` names a read-only mapping whose *bytes are the whole
+                        // payload* — the XKB keymap as text — so sending the bytes and letting C mint
+                        // its own `memfd` is faithful: the application mmaps a read-only fd of `size`
+                        // bytes holding the keymap, which is exactly the protocol's promise. Anything
+                        // else an fd might name (a GPU buffer, a sync file) has identity beyond its
+                        // bytes and is still dropped.
+                        Argument::Fd(fd) => {
+                            if is_keymap {
+                                match read_fd_contents(std::os::fd::AsRawFd::as_raw_fd(fd)) {
+                                    Some(bytes) => {
+                                        // Logged unconditionally, not behind the event trace: this
+                                        // length must equal the `size` the event carries unchanged,
+                                        // and a mismatch is a SIGBUS in the application rather than an
+                                        // error anyone would see. Cheap — once per keyboard.
+                                        eprintln!(
+                                            "rayland-s: WP0 keymap: relaying {} bytes of keymap \
+                                             content (must match the event's size argument)",
+                                            bytes.len()
+                                        );
+                                        args.push(WaylandArg::KeymapContent(bytes));
+                                    }
+                                    // Reading it failed. Dropping the event is the honest outcome —
+                                    // the application waits for a keymap rather than mapping garbage —
+                                    // and the reason is recorded rather than silently swallowed.
+                                    None => {
+                                        drop_reason = Some(EventDrop::CarriesFd);
+                                        break;
+                                    }
+                                }
+                            } else {
+                                drop_reason = Some(EventDrop::CarriesFd);
+                                break;
+                            }
                         }
                     }
                 }
@@ -1078,6 +1186,21 @@ impl WaylandReplay {
                         .map(Box::new),
                 )),
                 WaylandArg::Array(b) => args.push(Argument::Array(Box::new(b.clone()))),
+                // **Refused, in the direction it can never legitimately travel.** `KeymapContent`
+                // exists for the *event* path, S→C: it replaces the fd `wl_keyboard.keymap` carries.
+                // A request arriving C→S with one would mean the application is trying to hand S a
+                // keymap, which no interface in WP0's set does. Refusing loudly beats silently
+                // pushing an argument the compositor will misread as something else.
+                WaylandArg::KeymapContent(bytes) => {
+                    eprintln!(
+                        "rayland-s: refusing request {}.#{}: it carries KeymapContent ({} bytes), \
+                         which is an S->C event substitution and has no meaning in a request",
+                        msg.object_id,
+                        msg.opcode,
+                        bytes.len()
+                    );
+                    return;
+                }
                 // An object reference: translate through the map, or null if it is not (yet) known.
                 WaylandArg::Object(id) => {
                     let obj = self

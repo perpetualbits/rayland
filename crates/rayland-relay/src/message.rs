@@ -519,6 +519,29 @@ pub enum WaylandArg {
     /// A file-descriptor argument, replaced by buffer-by-token (see [`BufferToken`] for
     /// why a token, and not the fd itself, is what actually crosses).
     Buffer(BufferToken),
+    /// **The keymap substitution: the *contents* of a file descriptor an event carried.**
+    ///
+    /// # Why this exists, and why it is the mirror of [`WaylandArg::Buffer`]
+    /// `wl_keyboard.keymap` hands the client a **file descriptor** to a read-only mapping holding the
+    /// XKB keymap as text. An fd cannot cross a network — the founding constraint of this project —
+    /// so until 2026-09-01 S dropped the whole event, and the consequence was not merely "no
+    /// keyboard": an application that binds `wl_seat` and creates a `wl_keyboard` **waits for its
+    /// keymap**, and `vkgears` relayed to a compositor that advertises a seat built its swapchain and
+    /// then never drew a frame. `vkcube` escaped only because it ignores the keymap, and a compositor
+    /// with no seat — headless weston, which every sweep used — hid this for weeks.
+    ///
+    /// The buffer path solved the same shape of problem by sending a *name* for something S already
+    /// had. Here there is nothing on S to name: the keymap is **data**, small (tens of KiB of text)
+    /// and immutable for the life of the keyboard. So the data itself crosses, and C creates a fresh
+    /// `memfd` holding it and hands *that* to the application, which cannot tell the difference — it
+    /// mmaps a read-only fd of `size` bytes holding the keymap, exactly what the protocol promises.
+    ///
+    /// # What this is NOT
+    /// Not a general fd substitution. It carries bytes, so it is correct only for a descriptor whose
+    /// *contents* are the whole payload. A descriptor naming a GPU buffer, a sync file, or anything
+    /// with identity beyond its bytes still cannot cross this way, and the event carrying it is still
+    /// dropped — see `rayland_s::wayland_client`'s `EventDrop::CarriesFd`.
+    KeymapContent(Vec<u8>),
 }
 
 #[cfg(test)]
