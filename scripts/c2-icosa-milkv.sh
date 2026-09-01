@@ -72,6 +72,12 @@ FIXTURE="rayland-icosa-$APP"
 # LOAD-BEARING: (c)2's completion barrier works by spotting the application's `vkGetFenceStatus`
 # reply reading VK_SUCCESS, and fence feedback removes that poll entirely (measured: exit 134, zero
 # frames, every time). Do not "tidy" this list.
+# `RELAXSTAT=1` arms C's stage recorder (`RAYLAND_C1_RELAXSTAT`), which brackets each ring delta
+# into RingShipped -> SyncPrepared (the forward path's WORK: every blob diffed against its baseline
+# and the batch serialized) -> SyncSent (written and flushed). That first interval is where the blob
+# diff lives, and it is the interval any dirty-page-tracking work would be trying to remove — so it
+# is what says whether that work is worth doing on THIS machine. The recorder does one clock read
+# and one array store per event and is designed not to perturb; see `relaxstat.rs`.
 VN_PERF_SETTING="${VN_PERF_SETTING:-no_multi_ring,no_fence_feedback,no_semaphore_feedback,no_event_feedback,no_query_feedback}"
 # `IdentitiesOnly yes` is set globally in the owner's ssh config with no `Host` entry for the board,
 # so a fresh connection offers no key and is refused once a ControlPersist master expires.
@@ -148,7 +154,8 @@ for run in $(seq 1 "$RUNS"); do
     export XDG_RUNTIME_DIR=/run/user/0
     mkdir -p \$XDG_RUNTIME_DIR && chmod 700 \$XDG_RUNTIME_DIR
     rm -f $SOCK
-    RAYLAND_C1_METRICS=1 RAYLAND_C1_S_ADDR=$S_IP:$PORT RAYLAND_C1_SOCKET=$SOCK \
+    RAYLAND_C1_METRICS=1 ${RELAXSTAT:+RAYLAND_C1_RELAXSTAT=1} \
+    RAYLAND_C1_S_ADDR=$S_IP:$PORT RAYLAND_C1_SOCKET=$SOCK \
       nohup /opt/rayland/rayland-c > /tmp/rl-icosa-c.log 2>&1 &
     echo \$! > /tmp/rayland-c.pid
     sleep 3

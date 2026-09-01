@@ -6560,3 +6560,55 @@ I notice the shape of today: nothing I did was a feature. It was one retraction,
 verified on a second architecture, one number located, and five harness defects. The fixtures earned
 their keep on first contact with the machine they were designed for, which is the argument for having
 built them.
+
+### 2026-09-01 (last) — I measured the prize before building the mechanism, and the prize is in an odd place
+
+Third item on the handover: frame time, where "everything cheap is exhausted" and the named structural
+fix is dirty-page tracking — with a silent-corruption hazard to solve first (a write landing between
+the pagemap read and the `clear_refs`) and the flat statement that riscv64 cannot do it.
+
+I did not start building it. Two reasons, and I think both are right. The mechanism carries a
+*silent* corruption risk, which is the most expensive kind to get wrong; and this project has spent a
+week watching large mechanism wins move the frame rate by nothing. Sizing the prize first is cheap.
+
+C's stage recorder already brackets each ring delta into `RingShipped → SyncPrepared` — every blob
+diffed against its baseline, then serialized — so the answer needed one env var and two runs.
+
+| board as C | deltas/frame | diff median | send median | send p90 |
+|---|---|---|---|---|
+| `icosa-cpu` (~1 MiB/frame changes) | 4.4 | 10.86 ms | 0.32 ms | 62.5 ms |
+| `icosa-gpu` (~80 B/frame changes) | 1.7 | **8.92 ms** | 0.13 ms | 0.93 ms |
+
+**`icosa-gpu` changes about eighty bytes a frame and still pays 8.92 ms per delta.** That single
+comparison is the finding. The megabyte's own contribution to the diff is ~1.9 ms; the other 8.9 —
+**82%** — is `memcmp` over memory that did not change, re-scanned every delta to rediscover it is the
+same. Which is exactly what the "13.2 MiB per delta" note predicted, now measured on the machine that
+matters instead of inferred on a laptop.
+
+So the prize has a size: **15.2 ms/frame, 29% of `icosa-gpu`'s entire 51.9 ms frame on the board.**
+`icosa-gpu` is the shape of an ordinary application — one that is not deliberately pushing megabytes
+through mapped memory — so 29% is the honest figure, and it is the largest single lever anyone has
+put a number on.
+
+**And it cannot be claimed where it is worth most.** The board is 5.15 with no
+`CONFIG_HAVE_ARCH_SOFT_DIRTY`; `UFFD_WP_ASYNC` wants 5.19+, `PAGEMAP_SCAN` 6.7+. soft-dirty works on
+dionysus, where the same scan is proportionally cheaper. The machine that needs it least is the one
+that can have it. I want that stated plainly rather than discovered by someone three weeks into an
+implementation.
+
+**Which points somewhere else, and I am recording it as a direction and not a claim.** The waste is
+not "we cannot tell which *pages* changed". It is that **every blob is scanned on every delta**,
+including ones that cannot have changed. The relay already knows which blobs are rings, which are
+`presented`, and which the application has ever mapped writable. A filter at the protocol level needs
+no kernel support, is portable to riscv64, and is not the design the handover proposed. It is
+untested. I have not built it and I am not claiming it works.
+
+**One column that will trip up the next person, so it is in the evidence too.** `icosa-cpu`'s send
+interval has a 62.5 ms p90 and totals 7.10 s — *more* than its diff. That is backpressure from
+genuinely shipping a megabyte a frame, and for that fixture every one of those bytes really did
+change. Dirty-page tracking would not reduce it by a byte. If anyone later reports that dirty-page
+tracking sped up `icosa-cpu`, that column is where to check the claim.
+
+The runs stayed 120/120 bit-identical with the recorder armed, which is the check that says the
+instrument did not become the experiment. This project has caught four instruments doing that, one of
+them this morning.

@@ -139,3 +139,68 @@ cargo test --release --no-run -p rayland-icosa-core --target riscv64gc-unknown-l
 
 Raw per-frame CSVs are in [`csv/`](csv/); the correctness counts are in
 [`run-ledger.csv`](run-ledger.csv).
+
+---
+
+# 6. Sizing the prize for dirty-page tracking — and it is scanning, not shipping
+
+The handover names dirty-page tracking as the structural fix for frame time, notes it carries a
+silent-corruption hazard (`clear_refs` racing a write), and observes that **riscv64 cannot do it**.
+Before building a mechanism with that risk, the prize is worth measuring on the machine that matters.
+
+C's stage recorder (`RELAXSTAT=1` on [`../../scripts/c2-icosa-milkv.sh`](../../scripts/c2-icosa-milkv.sh))
+brackets each ring delta as `RingShipped → SyncPrepared → SyncSent`. The first interval is the
+forward path's *work*: **every blob diffed against its baseline**, then serialized. The second is
+writing and flushing. Both fixtures, board as C, one run each — the runs were still 120/120
+bit-identical, so the recorder did not disturb correctness.
+
+| | deltas | per frame | **diff**, median | diff total | send, median | send p90 | send total |
+|---|---|---|---|---|---|---|---|
+| `icosa-cpu` (~1 MiB/frame changes) | 526 | 4.4 | **10.86 ms** | 5.61 s | 0.32 ms | 62.5 ms | 7.10 s |
+| `icosa-gpu` (~80 B/frame changes) | 206 | 1.7 | **8.92 ms** | 1.79 s | 0.13 ms | 0.93 ms | 0.09 s |
+
+## 6.1 The finding: 82% of the diff is scanning memory that did not change
+
+**`icosa-gpu` changes about eighty bytes per frame and still pays 8.92 ms per delta.** The fixture
+that writes a full megabyte through mapped memory pays 10.86. So the megabyte's *own* contribution to
+the diff is about **1.9 ms**, and the other **8.9 ms — 82% of the cost — is `memcmp` over memory that
+did not change**: the 8 MiB Venus staging pool, the 1 MiB reply arena, and the swapchain images the
+application never CPU-writes, re-scanned on every delta to rediscover that they are the same.
+
+That is precisely the cost dirty-page tracking removes, and it is now a number rather than a
+prediction:
+
+- `icosa-gpu`: 8.92 ms × 1.7 deltas/frame = **15.2 ms/frame, 29% of that fixture's entire 51.9 ms
+  frame on the board.**
+- `icosa-cpu`: 10.86 × 4.4 = **47.8 ms/frame, 31% of Rayland's ~152 ms share.**
+
+`icosa-gpu` is the shape of an ordinary application — one that does not push megabytes through
+mapped memory — so **29% of frame time on the weak C** is the honest size of the prize.
+
+## 6.2 The cruel part
+
+The mechanism cannot run where it is worth the most. The board is kernel 5.15 with no
+`CONFIG_HAVE_ARCH_SOFT_DIRTY` (proven by probe); `UFFD_WP_ASYNC` needs 5.19+ and `PAGEMAP_SCAN` 6.7+.
+soft-dirty works on dionysus (x86_64), where the same scan costs proportionally less — the machine
+that needs it least is the one that can have it.
+
+## 6.3 What this suggests instead, and it needs no kernel support
+
+The waste is not "we cannot tell which *pages* changed". It is that **every blob is scanned on every
+delta**, including ones that cannot have changed. A cheaper filter than page tables may exist above
+the kernel — the relay already knows which blobs are rings, which are `presented`, and which the
+application has mapped writable at all. That is a protocol-level question, it is portable to riscv64,
+and it is *not* the design the handover proposed. It is untested and is recorded here as a direction,
+not a claim.
+
+## 6.4 Also visible: the send tail is the megabyte, and it is real
+
+`icosa-cpu`'s `SyncPrepared → SyncSent` has a median of 0.32 ms and a p90 of **62.5 ms**, totalling
+7.10 s — *more* than its diff. `icosa-gpu`'s totals 0.09 s. That is backpressure from actually
+shipping a megabyte a frame over the link, and unlike the scan it is **not** waste: for this fixture
+every one of those bytes genuinely changed. Dirty-page tracking would not reduce it by a byte. Any
+future claim that dirty-page tracking speeds up `icosa-cpu` should be checked against this column
+first.
+
+Raw traces: [`relaxstat-milkv-cpu.dat.gz`](relaxstat-milkv-cpu.dat.gz),
+[`relaxstat-milkv-gpu.dat.gz`](relaxstat-milkv-gpu.dat.gz) (`t_ns stage`, one event per line).

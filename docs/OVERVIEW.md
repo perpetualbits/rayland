@@ -809,6 +809,35 @@ it either way. This is the best ratio of information to effort currently on the 
   `wl_seat`, so every sweep this project has ever run was structurally blind to this whole class of
   event.** A harness chosen to remove one variable removed a category with it. See
   `docs/data/2026-09-01-keymap-fix/`.
+- **The prize for dirty-page tracking is sized, and 82% of the blob diff is scanning memory that did
+  not change** (2026-09-01). Measured on the board with C's stage recorder, which brackets each ring
+  delta as `RingShipped → SyncPrepared` (every blob diffed, then serialized):
+
+  | board as C | deltas/frame | diff median | send median | send p90 |
+  |---|---|---|---|---|
+  | `icosa-cpu` (~1 MiB/frame changes) | 4.4 | 10.86 ms | 0.32 ms | 62.5 ms |
+  | `icosa-gpu` (~80 B/frame changes) | 1.7 | **8.92 ms** | 0.13 ms | 0.93 ms |
+
+  - **`icosa-gpu` changes ~80 bytes a frame and still pays 8.92 ms per delta.** The megabyte's own
+    contribution is ~1.9 ms; the other **82%** is `memcmp` over the 8 MiB staging pool, the reply
+    arena and swapchain images the app never CPU-writes, re-scanned every delta.
+  - **The prize: 15.2 ms/frame = 29% of `icosa-gpu`'s entire 51.9 ms frame on the weak C.**
+    `icosa-gpu` is the shape of an ordinary application, so 29% is the honest figure — the largest
+    single lever anyone has put a number on.
+  - **It cannot be claimed where it is worth most.** The board is kernel 5.15 with no
+    `CONFIG_HAVE_ARCH_SOFT_DIRTY`; `UFFD_WP_ASYNC` needs 5.19+, `PAGEMAP_SCAN` 6.7+. soft-dirty works
+    on dionysus, where the scan is proportionally cheaper. **The machine that needs it least is the
+    one that can have it.**
+  - **A direction, NOT a claim, and not the handover's design:** the waste is not "we cannot tell
+    which *pages* changed" but that **every blob is scanned on every delta**, including ones that
+    cannot have changed. The relay already knows which blobs are rings, which are `presented`, and
+    which the app has mapped writable — a protocol-level filter needs no kernel support and is
+    portable to riscv64. Untested; nothing is built.
+  - **Trap for whoever measures this next:** `icosa-cpu`'s send interval has a 62.5 ms p90 and totals
+    *more* than its diff. That is real backpressure from shipping a megabyte a frame, every byte of
+    which genuinely changed — **dirty-page tracking would not reduce it at all.** Check any future
+    "dirty-page tracking sped up `icosa-cpu`" claim against that column.
+  See `docs/data/2026-09-01-icosa-on-riscv64/` §6.
 - **The icosa fixtures, run against the weak C for the first time: the mapped-write cost has an
   address, and it is NOT the round trip** (2026-09-01). Median per frame, fixtures' own timers:
 
