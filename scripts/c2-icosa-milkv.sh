@@ -154,7 +154,7 @@ for run in $(seq 1 "$RUNS"); do
     export XDG_RUNTIME_DIR=/run/user/0
     mkdir -p \$XDG_RUNTIME_DIR && chmod 700 \$XDG_RUNTIME_DIR
     rm -f $SOCK
-    RAYLAND_C1_METRICS=1 ${RELAXSTAT:+RAYLAND_C1_RELAXSTAT=1} \
+    RAYLAND_C1_METRICS=1 ${RELAXSTAT:+RAYLAND_C1_RELAXSTAT=1} ${BLOBSCAN:+RAYLAND_C1_BLOBSCAN=1} \
     RAYLAND_C1_S_ADDR=$S_IP:$PORT RAYLAND_C1_SOCKET=$SOCK \
       nohup /opt/rayland/rayland-c > /tmp/rl-icosa-c.log 2>&1 &
     echo \$! > /tmp/rayland-c.pid

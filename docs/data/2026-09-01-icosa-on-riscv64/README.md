@@ -204,3 +204,75 @@ first.
 
 Raw traces: [`relaxstat-milkv-cpu.dat.gz`](relaxstat-milkv-cpu.dat.gz),
 [`relaxstat-milkv-gpu.dat.gz`](relaxstat-milkv-gpu.dat.gz) (`t_ns stage`, one event per line).
+
+---
+
+# 7. The protocol-level filter: proposed here, and refuted here (2026-09-02)
+
+§6 ended by naming a direction — skip diffing blobs that *cannot* have changed, using a signal that
+is not a kernel page table and not a decode of the ring. It was recorded as a direction and not a
+claim. It was then spiked, and **it does not pay.** This section is the refutation, written up so
+nobody re-proposes it.
+
+The probe is `blobscan`, an env-gated instrument in
+[`crates/rayland-c/src/blob_sync.rs`](../../crates/rayland-c/src/blob_sync.rs) that attributes the
+per-delta scan to individual blobs. Both fixtures stayed **120/120 bit-identical** with it armed.
+
+```
+BLOBSCAN=1 APP=gpu scripts/c2-icosa-milkv.sh
+BLOBSCAN=1 APP=cpu scripts/c2-icosa-milkv.sh
+```
+
+## 7.1 Where the scan time is
+
+Per delta, board as C (raw: [`blobscan-milkv-gpu.txt.gz`](blobscan-milkv-gpu.txt.gz),
+[`blobscan-milkv-cpu.txt.gz`](blobscan-milkv-cpu.txt.gz)):
+
+| blob | size | `icosa-gpu` | `icosa-cpu` | changed on |
+|---|---|---|---|---|
+| Venus staging pool | 8 MiB | **8.06 ms — 85%** | **7.91 ms — 68%** | 41–47% of scans |
+| the app's own staging buffer | 1 MiB | — | 2.20 ms — 19% | 23% of scans |
+| a non-application blob | 1 MiB | 1.09 ms — 11% | 1.12 ms — 10% | **never** |
+| an application blob | 256 KiB | 0.34 ms — 3% | 0.34 ms — 3% | **never** |
+| the rest | ≤2 KiB | 0.01 ms | 0.01 ms | — |
+| **total** | | **9.50 ms** | **11.59 ms** | |
+
+Scan bandwidth is **0.93–1.02 GB/s** in both, so the cost is exactly `bytes ÷ 1 GB/s`. The scan is
+already running at the board's memory bandwidth: **no chunk-size or constant tuning can help it, and
+the only lever is scanning fewer bytes.**
+
+## 7.2 Why no filter gets those bytes
+
+1. **The dominant blob cannot be skipped.** The 8 MiB Venus staging pool genuinely changes on 41–47%
+   of deltas — and ships only **~500–600 bytes** when it does. We scan 8 MiB to find 600 bytes. That
+   is a *narrowing* problem, not a *skipping* one, and narrowing needs to know which region changed:
+   either the decoder — banned by (c)1 §7 and enforced by
+   [`decoder_is_not_load_bearing.rs`](../../crates/rayland-c/tests/decoder_is_not_load_bearing.rs) —
+   or dirty-page tracking, which riscv64 does not have. **There is no third signal.**
+2. **The filterable remainder is only 13–15%, and filtering it is unsound.** "Has not changed yet"
+   does not imply "will not change". Establishing that a blob has not changed *is* the scan, so the
+   check costs exactly what it would save, and getting it wrong ships nothing while the application
+   believes it shipped — silent staleness, on the relay path.
+3. **No static property discriminates.** `is_application_memory` is useless here: application memory
+   both never-changes (the 256 KiB blob) and changes every frame (`icosa-cpu`'s 1 MiB staging
+   buffer). Resource ids are not stable either — the pool is `res 6` in one fixture and `res 7` in
+   the other.
+
+Also checked: the pool's size is not a knob. Mesa grows it through
+`vn_renderer_shmem_pool_grow_locked` and exposes no environment variable for it, so shrinking the
+dominant term would mean patching Mesa.
+
+## 7.3 The recommendation
+
+**Do not build a protocol-level filter.** Dirty-page tracking is the right mechanism — it is the only
+thing that addresses the 68–85% — and the honest position is the uncomfortable one from §6.2: it
+works on x86_64, where the scan is worth ~19% of frame time, and cannot run on the riscv64 board,
+where it is worth ~29%. Anyone picking this up should start from that sentence, not from a filter.
+
+## 7.4 One unverified observation, flagged as unverified
+
+The pool *grows* (`vn_renderer_shmem_pool_grow_locked`), which raises the possibility that the 1 MiB
+non-application blob that **never changes in either fixture** is a *retired* pool chunk Venus has
+stopped writing — about 10% of the scan spent on abandoned memory. That is a guess from a function
+name and a zero. It has not been verified, and even if true there is no signal by which C could learn
+that Venus is finished with a shmem, so it would not by itself yield a filter.

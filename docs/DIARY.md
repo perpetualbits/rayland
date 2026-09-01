@@ -6612,3 +6612,72 @@ tracking sped up `icosa-cpu`, that column is where to check the claim.
 The runs stayed 120/120 bit-identical with the recorder armed, which is the check that says the
 instrument did not become the experiment. This project has caught four instruments doing that, one of
 them this morning.
+
+### 2026-09-02 — I proposed the filter, then killed it with my own probe
+
+Yesterday's last entry sized the prize for dirty-page tracking (82% of the blob scan is `memcmp` over
+memory that did not change, worth 29% of frame time on the weak C) and then pointed somewhere else:
+the waste is not that we cannot tell which *pages* changed, it is that **every blob is scanned on
+every delta**, and the relay already knows things about blobs that the kernel does not need to tell
+it. I wrote that down as a direction and explicitly not a claim. The owner asked me to spike it.
+
+It does not work, and the probe that killed it took one instrument and two runs.
+
+**Where the scan time actually is**, per delta on the board:
+
+| blob | size | `icosa-gpu` | `icosa-cpu` | changed on |
+|---|---|---|---|---|
+| Venus staging pool | 8 MiB | **8.06 ms — 85%** | **7.91 ms — 68%** | 41–47% of scans |
+| the app's own staging buffer | 1 MiB | — | 2.20 ms — 19% | 23% |
+| a non-application blob | 1 MiB | 1.09 ms — 11% | 1.12 ms — 10% | **never** |
+| an application blob | 256 KiB | 0.34 ms — 3% | 0.34 ms — 3% | **never** |
+
+Three things fall out, and the first is the one that ends it.
+
+**The dominant blob cannot be skipped, only narrowed — and narrowing is the forbidden move.** The
+8 MiB pool *does* change, on nearly half of all deltas. It just ships **500–600 bytes** when it does.
+We scan eight megabytes to find six hundred bytes. To do better you must know *which region* changed,
+and there are exactly two ways: decode the ring — which (c)1 §7 forbids outright and
+`decoder_is_not_load_bearing.rs` enforces mechanically — or ask the page tables, which is the thing
+riscv64 cannot do. My "third signal" does not exist. I had assumed one would turn up because the
+relay knows a lot about blobs; what it knows is all *identity*, and the question is *location*.
+
+**The part I could filter is 13–15%, and filtering it is unsound.** Two blobs never change in either
+fixture. But "has not changed yet" is not "will not change", and the way you establish a blob has not
+changed is to scan it — the check costs exactly what it would save. Get it wrong and nothing ships
+while the application believes it did: silent staleness, on the relay path, which is the failure mode
+this code is most careful about everywhere else.
+
+**And no static property discriminates.** I had half-expected `is_application_memory` to be the
+signal. It is worthless here: application memory both never-changes (the 256 KiB blob) and changes
+every single frame (`icosa-cpu`'s staging buffer). The resource ids are not stable across workloads
+either — the pool is `res 6` in one fixture and `res 7` in the other.
+
+**One number that closes off a whole class of tinkering.** Scan bandwidth measured 0.93–1.02 GB/s in
+both fixtures. The cost is exactly `bytes ÷ 1 GB/s` — the scan already runs at the board's memory
+bandwidth. So `DIFF_CHUNK` and its relatives are done; there is nothing left in constants. The only
+lever is fewer bytes. I also checked whether the 8 MiB is a knob: Mesa grows that pool through
+`vn_renderer_shmem_pool_grow_locked` and exposes no environment variable, so shrinking it means
+patching Mesa.
+
+So the recommendation is the uncomfortable one from yesterday, unchanged and now with the alternative
+eliminated rather than merely unexplored: **dirty-page tracking is the only mechanism that addresses
+the 68–85%, it works on x86_64 where the prize is ~19% of frame time, and it cannot run on the board
+where the prize is ~29%.** The machine that needs it least is the one that can have it.
+
+I am recording one guess as a guess, because it would otherwise get quietly upgraded by the next
+reader. The pool *grows*, and the 1 MiB blob that never changes in either fixture might be a
+*retired* pool chunk Venus has stopped writing — ~10% of the scan spent on abandoned memory. That is
+inference from a function name and a zero. Even if true, there is no signal by which C could learn
+Venus is finished with a shmem, so it yields no filter either.
+
+The instrument is kept rather than thrown away, at the owner's call, and its module doc now carries
+the table above so the answer lives next to the code that produced it. Its "what it may never become"
+paragraph is not decoration: it counts and it prints, it has no return value reaching a relay
+decision, and it must not acquire one — a measurement that starts deciding is on the wrong side of
+§7 for exactly the reason the decoder is. 93 tests pass, both guards included, and both fixtures
+stayed 120/120 bit-identical with it armed.
+
+A good day's result is a direction closed. I would rather have spent two runs finding this than three
+weeks discovering it inside an implementation — which is, I notice, the same argument I made
+yesterday for measuring the prize before building the mechanism, and it paid twice.

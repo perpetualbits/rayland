@@ -101,6 +101,147 @@ use crate::ring::RingDelta;
 // The messages this module decides to send.
 use rayland_relay::C2S;
 
+// =================================================================================================
+// `blobscan` — attributing the per-delta blob scan to individual blobs.
+// =================================================================================================
+//
+// # The question it was built for, and the answer it gave
+// The per-delta scan costs **8.92 ms on the riscv64 board even for a fixture that changes ~80 bytes
+// a frame**, so 82% of it is `memcmp` over memory that did not change. Dirty-page tracking would
+// remove that and riscv64 cannot do dirty-page tracking, so the open question was whether a
+// **protocol-level** filter could skip blobs C knows cannot have changed. This instrument was
+// written to size that idea before building it, and it **refuted it**. Measured on the board,
+// 2026-09-02, per delta:
+//
+// | | `icosa-gpu` | `icosa-cpu` |
+// |---|---|---|
+// | the 8 MiB Venus staging pool | 8.06 ms — **85%** | 7.91 ms — **68%** |
+// | the application's own 1 MiB buffer | — | 2.20 ms — 19% |
+// | a 1 MiB non-application blob that **never changes** | 1.09 ms — 11% | 1.12 ms — 10% |
+// | a 256 KiB application blob that **never changes** | 0.34 ms — 3% | 0.34 ms — 3% |
+//
+// Three facts kill the filter, and they are worth keeping so nobody re-proposes it:
+//
+//  1. **The dominant blob cannot be skipped.** The staging pool genuinely changes on 41–47% of
+//     deltas — but ships only ~500–600 bytes when it does. We scan 8 MiB to find 600 bytes.
+//     Narrowing that requires knowing *which region* changed, which is either the decoder (banned
+//     by (c)1 §7, enforced by `tests/decoder_is_not_load_bearing.rs`) or dirty-page tracking
+//     (absent on riscv64). There is no third signal.
+//  2. **The filterable remainder is 13–15%, and skipping it is unsound.** "Has not changed yet"
+//     does not imply "will not change", and establishing that it has not changed *is* the scan.
+//  3. **No static property discriminates.** `is_application_memory` is useless here: application
+//     memory both never-changes (the 256 KiB blob) and changes on every frame (`icosa-cpu`'s 1 MiB
+//     staging buffer). Resource ids move between workloads — the pool is `res 6` in one fixture and
+//     `res 7` in the other.
+//
+// Scan bandwidth measured **0.93–1.02 GB/s** in both fixtures, so the cost is simply
+// `bytes ÷ 1 GB/s`: the scan already runs at the board's memory bandwidth and no chunk-size or
+// constant tuning can help it. **The only lever is scanning fewer bytes.**
+//
+// # Why it is kept rather than deleted
+// It began as a throwaway probe. It is kept because the question recurs — every future attempt on
+// frame time will want to know where the scan time went on *that* workload, and re-deriving it cost
+// a cross-compile and two board runs. Keeping it also keeps the table above honest: it is
+// reproducible with `BLOBSCAN=1 scripts/c2-icosa-milkv.sh` rather than being a number in a comment.
+//
+// # Why it is shaped like this
+// Four instruments in this project have been caught changing their own measurement. This one does,
+// per blob per delta, two `Instant` reads and one map update — and the update happens while the
+// caller **already holds the blob table lock**, so the mutex below is uncontended by construction
+// and adds no new synchronisation to the relay path. It prints once every `REPORT_EVERY` deltas,
+// and does nothing whatsoever when the gate is off. Both fixtures stayed 120/120 bit-identical with
+// it armed, which is the check that says the instrument did not become the experiment.
+//
+// # What it may never become
+// **Nothing here may ever inform what is relayed.** It counts and it prints. It has no return value
+// that reaches a relay decision, and it must not acquire one: the moment a measurement of this kind
+// starts *deciding*, it is on the wrong side of (c)1 §7 for exactly the reason the decoder is.
+pub(crate) mod blobscan {
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Deltas between reports. Large enough that printing is not in the measurement, small enough
+    /// that a run that ends early still yields something.
+    const REPORT_EVERY: u64 = 200;
+
+    /// What is accumulated per resource id.
+    #[derive(Default, Clone, Copy)]
+    struct Acc {
+        /// How many times this blob was scanned.
+        scans: u64,
+        /// Total nanoseconds spent inside `take_changed_runs` for it.
+        nanos: u64,
+        /// The blob's length, last seen (constant in practice; recorded to size the scan).
+        len: u64,
+        /// How many scans found at least one changed run — the number this spike turns on.
+        scans_with_change: u64,
+        /// Total bytes actually shipped for it.
+        changed_bytes: u64,
+        /// Whether C classes this blob as application memory (ring-findings §6's `blob_id` signal).
+        /// A **non-decode** property, so unlike anything the decoder could tell us it is legitimate
+        /// input to a filter — which is precisely what this spike is trying to find.
+        app_mem: bool,
+    }
+
+    static STATE: OnceLock<Mutex<(BTreeMap<u32, Acc>, u64)>> = OnceLock::new();
+
+    fn state() -> &'static Mutex<(BTreeMap<u32, Acc>, u64)> {
+        STATE.get_or_init(|| Mutex::new((BTreeMap::new(), 0)))
+    }
+
+    /// Whether recording is on, from `RAYLAND_C1_BLOBSCAN`. Read once.
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("RAYLAND_C1_BLOBSCAN").is_some())
+    }
+
+    /// Record one blob's scan.
+    pub fn record(
+        res_id: u32,
+        len: usize,
+        nanos: u64,
+        runs: usize,
+        changed_bytes: usize,
+        app_mem: bool,
+    ) {
+        let mut g = state().lock().expect("throwaway instrument mutex");
+        let e = g.0.entry(res_id).or_default();
+        e.scans += 1;
+        e.nanos += nanos;
+        e.len = len as u64;
+        if runs > 0 {
+            e.scans_with_change += 1;
+        }
+        e.changed_bytes += changed_bytes as u64;
+        e.app_mem = app_mem;
+    }
+
+    /// Called once per delta; prints a cumulative report every `REPORT_EVERY` deltas.
+    pub fn end_of_delta() {
+        let mut g = state().lock().expect("throwaway instrument mutex");
+        g.1 += 1;
+        if g.1 % REPORT_EVERY != 0 {
+            return;
+        }
+        let deltas = g.1;
+        let mut out = String::new();
+        for (res_id, a) in &g.0 {
+            out.push_str(&format!(
+                "BLOBSCAN deltas={deltas} res={res_id} len={} scans={} ms_total={:.1} \
+us_per_scan={:.1} scans_with_change={} changed_bytes={} app_mem={}\n",
+                a.len,
+                a.scans,
+                a.nanos as f64 / 1e6,
+                if a.scans > 0 { a.nanos as f64 / 1e3 / a.scans as f64 } else { 0.0 },
+                a.scans_with_change,
+                a.changed_bytes,
+                a.app_mem,
+            ));
+        }
+        eprint!("{out}");
+    }
+}
+
 /// Decide everything C must send S for one drained ring delta, in the order it must be sent.
 ///
 /// **This function's return order is a correctness contract, not a convenience.** See the module
@@ -326,8 +467,22 @@ pub fn messages_for_delta(blobs: &BlobTable, ring_res_id: u32, delta: RingDelta)
             // this branch became unreachable and is gone rather than left as reassuring dead code.
             // The safety argument itself is unchanged and now lives at the skip.
             let gap = FORWARD_COALESCE_GAP;
+            // Attribute this one blob's scan (see `blobscan`). Two clock reads, gated.
+            let scan_start = blobscan::enabled().then(std::time::Instant::now);
+            let runs = blob.take_changed_runs(gap);
+            if let Some(t0) = scan_start {
+                let changed: usize = runs.iter().map(|r| r.bytes.len()).sum();
+                blobscan::record(
+                    res_id,
+                    blob.size() as usize,
+                    t0.elapsed().as_nanos() as u64,
+                    runs.len(),
+                    changed,
+                    blob.is_application_memory(),
+                );
+            }
             // Each run reuses `BlobData`'s offset field; v1 only ever used offset 0 (the whole blob).
-            for run in blob.take_changed_runs(gap) {
+            for run in runs {
                 out.push(C2S::BlobData {
                     res_id,
                     offset: run.offset,
@@ -335,6 +490,11 @@ pub fn messages_for_delta(blobs: &BlobTable, ring_res_id: u32, delta: RingDelta)
                 });
             }
         }
+    }
+
+    // One delta's worth of per-blob scans is now recorded (see `blobscan`).
+    if blobscan::enabled() {
+        blobscan::end_of_delta();
     }
 
     // **Last, always.** Everything above must be on S before the commands that may read it. See the

@@ -10,7 +10,7 @@ visible from the code — several of the project's central facts were discovered
 and at least three plausible-sounding designs were built and then disproved. A plan made without
 those facts will re-propose a dead end. They are all recorded here, with pointers to the evidence.
 
-**Last brought current:** 2026-09-01 (after the handover), against branch `wp0-wayland-proxy`.
+**Last brought current:** 2026-09-02, against branch `wp0-wayland-proxy`.
 
 > **Where the work is.** All WP0, (c)1 and (c)2 work described below lives on **`wp0-wayland-proxy`**,
 > which is **37 commits ahead of `main`** and behind it by none. `main` last moved on 2026-08-29.
@@ -828,11 +828,31 @@ it either way. This is the best ratio of information to effort currently on the 
     `CONFIG_HAVE_ARCH_SOFT_DIRTY`; `UFFD_WP_ASYNC` needs 5.19+, `PAGEMAP_SCAN` 6.7+. soft-dirty works
     on dionysus, where the scan is proportionally cheaper. **The machine that needs it least is the
     one that can have it.**
-  - **A direction, NOT a claim, and not the handover's design:** the waste is not "we cannot tell
-    which *pages* changed" but that **every blob is scanned on every delta**, including ones that
-    cannot have changed. The relay already knows which blobs are rings, which are `presented`, and
-    which the app has mapped writable — a protocol-level filter needs no kernel support and is
-    portable to riscv64. Untested; nothing is built.
+  - **That direction was spiked on 2026-09-02 and is REFUTED — do not re-propose it.** A
+    protocol-level filter ("skip blobs that cannot have changed") does not pay, and the per-blob
+    attribution says why. Per delta on the board: the **8 MiB Venus staging pool is 85%
+    (`icosa-gpu`) / 68% (`icosa-cpu`)** of the scan; a 1 MiB non-application blob that *never*
+    changes is 10–11%; a 256 KiB application blob that never changes is 3%.
+    1. **The dominant blob cannot be skipped, only narrowed.** The pool genuinely changes on 41–47%
+       of deltas — shipping just **500–600 bytes** each time. Scanning 8 MiB to find 600 bytes is a
+       *location* problem, and location comes only from the decoder (banned by (c)1 §7, enforced by
+       `decoder_is_not_load_bearing.rs`) or from page tables (absent on riscv64). **There is no
+       third signal.**
+    2. **The filterable remainder is 13–15% and filtering it is unsound.** "Has not changed yet" is
+       not "will not change", and establishing it has not changed *is* the scan — the check costs
+       what it would save, and getting it wrong is silent staleness on the relay path.
+    3. **No static property discriminates.** `is_application_memory` is worthless here: app memory
+       both never-changes and changes every frame. Resource ids move between workloads.
+  - **Scan bandwidth is 0.93–1.02 GB/s, so cost is exactly `bytes ÷ 1 GB/s`.** The scan already runs
+    at the board's memory bandwidth: **there is nothing left in `DIFF_CHUNK` or any other constant**,
+    and the only lever is scanning fewer bytes. The 8 MiB is not a knob either — Mesa grows it via
+    `vn_renderer_shmem_pool_grow_locked` with no environment variable.
+  - **So the recommendation stands with the alternative now eliminated rather than unexplored:**
+    dirty-page tracking is the only mechanism that addresses the 68–85%; it works on x86_64 (~19% of
+    frame time) and cannot run on the board (~29%).
+  - `blobscan` (env-gated, `BLOBSCAN=1`) is **kept** in `crates/rayland-c/src/blob_sync.rs`, with
+    that table in its module doc so the answer lives next to the code that produced it. It counts and
+    prints; it has no return value reaching a relay decision and must never acquire one.
   - **Trap for whoever measures this next:** `icosa-cpu`'s send interval has a 62.5 ms p90 and totals
     *more* than its diff. That is real backpressure from shipping a megabyte a frame, every byte of
     which genuinely changed — **dirty-page tracking would not reduce it at all.** Check any future
