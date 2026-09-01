@@ -61,8 +61,13 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "### S = $S_IP:$PORT, presenting into the LIVE session ($DISPLAY_SOCKET)"
-WAYLAND_DISPLAY="$DISPLAY_SOCKET" XDG_RUNTIME_DIR=/run/user/$(id -u) \
+# `env`, not a bare assignment prefix: bash decides which words are assignments **before** expanding
+# them, so `${S_EVENT_LOG:+RAYLAND_S_EVENT_LOG=1}` becomes the *command name* when the variable is set
+# and vanishes into a syntax error when it is not. `wp0-soak.sh` carries the same note for the same
+# reason; this script had to learn it separately.
+env WAYLAND_DISPLAY="$DISPLAY_SOCKET" XDG_RUNTIME_DIR=/run/user/$(id -u) \
   RAYLAND_C1_NO_PRESENT=1 RAYLAND_C1_S_LISTEN="0.0.0.0:$PORT" \
+  ${S_EVENT_LOG:+RAYLAND_S_EVENT_LOG=1} \
   "$S_BIN" > "$LOG/s.log" 2>&1 &
 S_PID=$!
 sleep 3

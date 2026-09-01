@@ -768,10 +768,17 @@ it either way. This is the best ratio of information to effort currently on the 
   `wl_seat`, so every sweep this project has ever run was structurally blind to this whole class of
   event.** A harness chosen to remove one variable removed a category with it. See
   `docs/data/2026-09-01-keymap-fix/`.
-- **`vkgears` still does not render over WP0, and the blocker is now a different one.** With the
-  keymap fixed it gets its configure, builds four `wl_buffer`s, attaches and commits twice, and then
-  receives **zero `wl_buffer.release` events** — so it blocks. `vkcube` on the same path receives
-  ~1,300 releases, so the return path works in general. This is the next thing to chase.
+- **`vkgears` still does not render over WP0 on milkv, and it NEVER ATTACHES A BUFFER** — so the
+  missing `wl_buffer.release` is a symptom, not the cause. A `gdb` stack shows Venus's WSI thread
+  (`vn_wsi[0,0]`) sleeping in `vn_relax` **holding a mutex** while the application's main thread blocks
+  acquiring it: it is waiting for something from the relay inside the Vulkan swapchain path, before it
+  ever presents. Four hypotheses killed by measurement — we are not dropping the releases (S's
+  compositor never sends any), it is not COSMIC-specific (headless weston fails identically), today's
+  keymap work did not cause it (pre-keymap binaries fail identically), and it is not the chroot's
+  patched build (stock `vkgears` fails identically). `vkcube` on the identical path receives ~1,300
+  releases. **Scope correction:** the recorded "vkgears runs end to end, 345 attaches" result was
+  **apollo → dop561 (x86_64)**; this is **milkv → dop561 (riscv64)**, and the claim does not hold
+  there. See `docs/data/2026-09-01-vkgears-blocked/`.
 - **Resizing still stalls, and that one IS ours.** A resize is a legitimate swapchain rebuild, and the
   relay makes a legitimate rebuild cost seconds (measured 5.1 s and 4.7 s on milkv for larger
   windows). Unlike the focus-change stall — which was `vkcube` rebuilding for nothing and is fixed —

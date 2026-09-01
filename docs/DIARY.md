@@ -6157,3 +6157,57 @@ One small self-inflicted detour along the way: I read vkgears' two `opcode 3` re
 `xdg_toplevel.set_title` and `xdg_surface.set_window_geometry`. **An opcode is an index into one
 interface's list** — this project wrote that sentence down months ago about *events*, and I just made
 the same mistake about *requests*.
+
+### 2026-09-01 (late night) — vkgears never asked for a buffer release, and I had the question backwards
+
+The owner asked why vkgears never gets `wl_buffer.release`. The answer is that **it never attaches a
+buffer**, so there is nothing to release. The premise was mine, not theirs, and it was wrong.
+
+**How I got there was a repeat of a mistake I made twenty minutes earlier.** I counted
+`forward obj N opcode 1` across every object and called it "attaches". An opcode is an index into
+*one interface's* request list: opcode 1 is `wl_surface.attach` only on a `wl_surface`. My two hits
+were `wl_seat.get_keyboard` and `xdg_surface.get_toplevel`. I had *just* made the same error reading
+`opcode 3` as `wl_surface.frame` when it was `set_title` and `set_window_geometry`, corrected myself,
+wrote a note about it — and then did it again in the very next analysis.
+
+This project has the lesson written down: *a protocol id is a slot number, not an identity*. That was
+learned about **ids**. It is equally true of **opcodes**, and I did not carry it across. Worth noting
+why it is easy: the proxy log *resolves object ids* (`objects+ app_obj=6 wl_surface`) and does **not**
+resolve opcodes. The asymmetry in the instrument produced the asymmetry in my reasoning.
+
+**What is actually happening, from a stack rather than a guess.** `gdb` on the blocked process:
+
+```
+Thread 2 "vn_wsi[0,0]":  clock_nanosleep  <- Venus's WSI thread, in its back-off
+Thread 1 "vkgears":      pthread_mutex_lock ... main () at vkgears.c:1528
+```
+
+Venus's WSI thread sleeps in `vn_relax` **holding a mutex**, and the application's main thread blocks
+acquiring that same mutex. It is waiting for something from the relay that never comes.
+
+**Four hypotheses, four killed, and the discipline of killing them is the useful part:**
+
+- *We drop the releases.* S's event witness says its compositor never **sends** one — only setup
+  events. Not our event path.
+- *COSMIC-specific.* Fails identically against headless weston.
+- *Today's keymap work broke it.* Re-ran with the pre-keymap binaries: identical. No regression.
+- *The chroot's patched vkgears.* Stock `/usr/bin/vkgears.riscv64-linux-gnu` behaves identically.
+
+And `vkcube` on the identical path — same C, S, compositor, board — runs fine with ~1,300 releases.
+
+**A recorded claim needs its scope narrowed.** `CLAUDE.md` says vkgears runs end to end, "345 attaches
+… 10–13 fps" (2026-08-30). That was **apollo → dop561**, x86_64. All of tonight is **milkv → dop561**,
+riscv64. The claim is not wrong; the sentence reads broader than the evidence, and this is the machine
+where it does not hold. I have said so rather than quietly re-testing until something agreed.
+
+**On the `wl_shm` spec, and a connection worth making.** Its §12 names the keymap defect as the main
+risk to the whole shm effort — `winit` binds `wl_seat`, creates a `wl_keyboard`, and would hit exactly
+the drop I fixed tonight. **That dependency is now cleared**, and I have folded that into the spec
+along with the two corrections the solsim session accepted from me: the coalescing safety condition
+stated rather than inferred (the identical-looking condition on the presented-blob path is *false*),
+and the instrumentation shape written concretely — a log2 histogram behind an env gate, never a
+per-commit `eprintln`, because that mistake now has five instances in this repository.
+
+I have still not written a line of shm code, and I am not going to start it inside a turn that has
+already fixed a keymap, patched an upstream demo and chased a hang. Saying where it stands is the
+honest end of this turn.

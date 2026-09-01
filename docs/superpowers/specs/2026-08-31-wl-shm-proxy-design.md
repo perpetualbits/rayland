@@ -277,6 +277,18 @@ decorations — which is the very traffic §10 is measuring.
 
 ## 12. Risks and dependencies
 
+> **UPDATE 2026-09-01 — this dependency is CLEARED.** The keymap defect described below is **fixed**:
+> S now sends the descriptor's *contents* as `WaylandArg::KeymapContent` and C mints a sealed `memfd`
+> holding them, the same substitution shape this spec uses for the pool fd. Verified end to end
+> (35,581 bytes relayed against 35,581 advertised, zero event drops on either side). So the risk this
+> section is built around no longer blocks the shm work, and the early acceptance run it recommends is
+> worth doing for other reasons but is no longer the gate. See `docs/data/2026-09-01-keymap-fix/`.
+>
+> One correction to the paragraph below while it is being read: the keymap drop does **not** always
+> segfault the application. `vkgears` was observed **hanging** on it — an application that creates a
+> `wl_keyboard` waits for its keymap — and a first, buggy version of the fix produced a genuine
+> **SIGBUS** by handing over a short `memfd`. "Segfaults" was one observed symptom, not the mechanism.
+
 **The keymap defect may make this necessary but not sufficient.** `winit` binds `wl_seat` and
 creates a `wl_keyboard`. S relays `wl_seat.capabilities`, the application asks for the keyboard,
 and S then drops `wl_keyboard.keymap` because it carries an fd — while continuing to deliver
@@ -289,6 +301,22 @@ but that is **untested**. Two consequences: the keymap mitigation may need to la
 this work, and the end-to-end acceptance test should be attempted **early** rather than at the
 end. Checking this is cheap and entirely independent of the shm work — run `solarsim` against
 the current proxy and observe whether it survives seat setup. Do that before writing shm code.
+
+**The coalescing safety condition must be stated, not inferred (folded in 2026-09-01).** When §8's
+optimisations are eventually built, `rayland_relay::ranges::coalesce_ranges` is the shared primitive —
+and it carries an obligation. Re-shipping an unchanged byte is safe **only where the sender's baseline
+is a faithful model of the receiver's copy**. That holds here because C is the only writer of the pool
+and S's memfd is written exclusively from C's copies. **State this explicitly when the optimisation is
+built: the identical-looking condition on the presented-blob path is FALSE — S renders into those and
+never reports it — and conflating the two is a pixel-corruption bug.**
+
+**Instrumentation must not perturb what it measures (folded in 2026-09-01).** §10 says what to record
+but not how, and "per commit: pool, dimensions, bytes" invites a per-commit `eprintln`, which is
+exactly the mistake this project has made **five** times — most recently a link trace whose two
+`eprintln`s per message halved the frame rate. The shape that works: a **log2-bucketed histogram
+behind an env gate**, one `CLOCK_MONOTONIC` read and one relaxed atomic per sample, reported on a
+timer. `crates/rayland-s/src/lockstat.rs` and `rayland_relay::stagelog` are working instances to copy.
+No per-message `eprintln` on any path that runs per frame.
 
 **The furniture assumption is an assumption.** §3 predicts cursor-and-decoration traffic. If
 `libdecor` turns out to repaint large decoration surfaces frequently, the numbers change and
