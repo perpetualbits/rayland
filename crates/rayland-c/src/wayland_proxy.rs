@@ -1272,9 +1272,28 @@ fn deliver_event(handle: &Handle, state: &ProxyState, msg: WaylandMessage) {
         // The witness's answer line: this event **reached the application**. Its counterpart is S's
         // `emit`; an S `emit` with no C `delivered` means the event was lost on the link between them.
         if std::env::var_os("RAYLAND_WP_LOG").is_some() {
+            // **The scalar arguments, not just how many there are.** An event count answers "did it
+            // arrive"; it cannot answer "what did it say", and on 2026-09-01 that was exactly the
+            // question: a live run showed 21 `xdg_toplevel.configure` events producing 21 swapchain
+            // recreations, each costing the application ~1 s over the relay, and deciding whether the
+            // application was right to recreate needs the *size* the compositor sent. Only `Int` and
+            // `Uint` are printed — a string or array argument could carry application content, and
+            // this is a diagnostic, not a place to leak a title or a clipboard.
+            let scalars: Vec<String> = msg
+                .args
+                .iter()
+                .filter_map(|a| match a {
+                    WaylandArg::Int(v) => Some(v.to_string()),
+                    WaylandArg::Uint(v) => Some(v.to_string()),
+                    _ => None,
+                })
+                .collect();
             eprintln!(
-                "[wp-event][C] delivered app_obj={} {} args={}",
-                msg.object_id, label, arg_count
+                "[wp-event][C] delivered app_obj={} {} args={} scalars=[{}]",
+                msg.object_id,
+                label,
+                arg_count,
+                scalars.join(",")
             );
         }
     }

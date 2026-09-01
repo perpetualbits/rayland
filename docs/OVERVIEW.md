@@ -10,7 +10,7 @@ visible from the code — several of the project's central facts were discovered
 and at least three plausible-sounding designs were built and then disproved. A plan made without
 those facts will re-propose a dead end. They are all recorded here, with pointers to the evidence.
 
-**Last brought current:** 2026-09-01, against branch `wp0-wayland-proxy`.
+**Last brought current:** 2026-09-01 (evening), against branch `wp0-wayland-proxy`.
 
 > **Where the work is.** All WP0, (c)1 and (c)2 work described below lives on **`wp0-wayland-proxy`**,
 > which is **37 commits ahead of `main`** and behind it by none. `main` last moved on 2026-08-29.
@@ -759,6 +759,33 @@ unexplained failure (1/92) against a shipping arm clean through 480 runs. One ni
 it either way. This is the best ratio of information to effort currently on the board.
 
 ### 6.3 Longer-term open questions
+
+- **PARKED — 60 fps on milkv, pending an OS upgrade on that board.** Measured 2026-09-01: the board is
+  at ~23 fps against headless weston (~17 fps against the live COSMIC session). 60 fps needs
+  16.7 ms/frame and **is not reachable on its current software**, and the arithmetic is settled rather
+  than estimated: the application makes **3.62 genuinely synchronous round trips per frame** (93% of
+  consecutive ring deltas have a reply between them; none is under 1 ms apart), each of which must be
+  preceded by a full scan of the application's mapped blobs. Even at the board's measured pure-`memcmp`
+  floor that scan is 2.92 ms × 3.62 = **10.6 ms/frame** before any round trip, compositor or
+  application time; with the measured remainder the ceiling is **~36 fps with a perfect scan**.
+  Removing the scan entirely needs **dirty-page tracking**, and the board cannot provide it: riscv64
+  does not implement `CONFIG_HAVE_ARCH_SOFT_DIRTY` (probed directly — a written page shows no bit),
+  `UFFD_FEATURE_WP_ASYNC` needs kernel 5.19+, and the `PAGEMAP_SCAN` ioctl needs 6.7+; milkv runs
+  5.15.0. **Revisit when that board's OS is upgraded** — the mechanism itself was verified working for
+  our exact case (a parent reading a child's pagemap for a `MAP_SHARED` memfd) on x86_64, so this is a
+  hardware/kernel gate, not a design dead end. One thing to solve first: `clear_refs` races the pagemap
+  read, and a write landing in that window is *lost* rather than deferred — silent corruption of the
+  mapped memory the relay exists to carry faithfully. See `docs/data/2026-09-01-dirty-tracking/`.
+- **The ~1 s stall on mouse entry/exit is NOT a Rayland defect** and should not be chased as one.
+  `vkcube` recreates its whole swapchain on every `xdg_toplevel.configure`; COSMIC sends one on every
+  focus change; focus follows the pointer. Measured both ways: relayed, 96 pointer crossings → 96
+  configures (95 carrying an unchanged `[500,500]`) → 97 recreations; **native on the same compositor,
+  188 configures → 188 recreations, with the arguments showing identical size and only the `states`
+  array toggling** — and native still ran at 40 fps because a local recreation costs ~1 ms. Over the
+  relay a recreation is hundreds of synchronous round trips ≈ 1 s. A mitigation (withhold a configure
+  whose size is unchanged) was considered and **deliberately not taken**: it would be the proxy
+  deciding an activation change is not worth telling the application, which is false for anything that
+  renders focus. See `docs/data/2026-09-01-mouse-stall/`.
 
 - **The synchronous round trip itself.** Now the *measured* explanation for frame time, and since
   2026-08-31 it is specifically the round-trip **count** and each trip's fixed cost, not CPU work on
