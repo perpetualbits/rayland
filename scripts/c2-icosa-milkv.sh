@@ -164,6 +164,16 @@ for run in $(seq 1 "$RUNS"); do
     env -u VK_LOADER_DRIVERS_SELECT /opt/rayland/$FIXTURE /tmp/icosa-relay > /tmp/rl-icosa-app.log 2>&1 &
     app_pid=\$!; echo \$app_pid > /tmp/rayland-app.pid
     wait \$app_pid || echo APP_EXIT_NONZERO
+    # Retire THIS run's daemon rather than leaving it for the exit trap, which only ever knew the
+    # last PID written. Otherwise every earlier run's rayland-c survives into the next run, bound to
+    # the same vtest socket the next application is about to dial. Exact PID only, and only after
+    # confirming it is still our binary -- never a name or pattern kill. Same fix as the x86_64
+    # sibling; see its comment for why this is a confound rather than mere untidiness.
+    cpid=\$(cat /tmp/rayland-c.pid 2>/dev/null)
+    case \"\$(readlink /proc/\$cpid/exe 2>/dev/null)\" in
+      /opt/rayland/rayland-c|'/opt/rayland/rayland-c (deleted)') kill \"\$cpid\" 2>/dev/null ;;
+    esac
+    rm -f /tmp/rayland-c.pid /tmp/rayland-app.pid
   '" 2>&1 | tail -3
   elapsed=$(( $(date +%s) - start ))
 

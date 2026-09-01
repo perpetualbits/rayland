@@ -311,7 +311,7 @@ reason against rather than re-deriving.
 | Shipping-config failure rate, real network | **0 failures in 480 runs** → <0.62% at 95% (rule of three) |
 | Stale frames after the G' barrier | **0 across 20 real-network runs** |
 | `icosa-gpu` frame time, real network | **~41 ms/frame** |
-| `icosa-cpu` frame time, real network | **283 ms/frame** — mapped-write volume *was* the dominant cost |
+| `icosa-cpu` frame time, real network | **283 ms/frame** — but see §6.3: the decomposition shows this is **not** the round trip being volume-sensitive. The megabyte is charged at `upload`, and most of the weak-C frame is the application's own CPU |
 | `icosa-gpu` loopback | ~50 ms/frame with a **78 KB** return path |
 | Readback message count after gap-threshold coalescing | ~5000 → **~180 messages/frame**, still bit-identical, still 0 stale |
 | Batching `ship()`'s per-message lock and flush | **1.03×** — i.e. not the bottleneck |
@@ -768,6 +768,34 @@ TRIES=400 VN_PERF_SETTING=no_multi_ring,no_fence_feedback scripts/soak-failure-r
 The semaphore/event/query feedback arm: **worth 1.23×**, currently held back by exactly one
 unexplained failure (1/92) against a shipping arm clean through 480 runs. One night of soak settles
 it either way. This is the best ratio of information to effort currently on the board.
+
+**IT COULD NOT HAVE SETTLED ANYTHING UNTIL 2026-09-02, AND THE HARNESS IS NOW FIXED.** The command
+above was checked before being run and did not work: every document and the script's own usage line
+say `VN_PERF_SETTING`, and the script read `VNPERF`. **The variable selecting the arm under test was
+connected to nothing**, so the night would have measured the shipping arm and labelled it the feedback
+arm. Seven more defects were found alongside it, of which three matter to any number this instrument
+has produced or will produce:
+
+- **It manufactured failures.** An S dying on `SIGSEGV` during teardown still held its port, the next
+  iteration's S exited with "Address already in use", and the attempt was scored as a **failure of
+  the arm under test**. Observed directly in a six-run smoke test. The loop now waits for the port
+  (a **UDP** socket — S speaks QUIC) and aborts rather than scoring a run it could not set up: a
+  harness may lose a run, it may never invent one.
+- **It measured binaries it had failed to deploy.** An unchecked `scp` died with ETXTBSY and the loop
+  reported "6 clean, 0 failed" for a build that never reached C. It also never rebuilt, pointing at a
+  target directory nothing else writes, five weeks stale.
+- **It leaked a `rayland-c` on C every iteration** — 400 over a night, sharing one vtest socket. The
+  same leak was present in `c2-icosa-two-machine.sh` and `c2-icosa-milkv.sh`; **fixed in all three.**
+
+**What this does and does not do to the recorded numbers.** The 0/480 is probably sound: the stale
+binaries were current on the day that soak ran. The **1/92 is not thereby explained** — it came from
+`c2-icosa-two-machine.sh`, which does abort rather than score when S fails to start, so it is
+protected against the port bug. But that script leaked daemons, and an intermittently-surviving
+`rayland-c` whose S connection is gone is a mechanism that produces exactly "one run lost to a silent
+Venus SIGABRT". **That is a mechanism of the right shape that was present the whole time, not a
+demonstrated cause.** Treat the feedback question as open on both sides, and let the re-run decide.
+Verified after the fixes: 10/10 and 4/4 clean, no leaks, provenance printed. See `docs/DIARY.md`,
+2026-09-02 (later).
 
 ### 6.3 Longer-term open questions
 

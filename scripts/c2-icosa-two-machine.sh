@@ -50,14 +50,26 @@ FIXTURE="rayland-icosa-$APP"
 #     reply reading VK_SUCCESS, and fence feedback removes that poll entirely. Measured: enabling it
 #     gives exit 134 and 0 frames, immediately and every time.
 #
-#   * Semaphore, event and query feedback look safe and ARE NOT. Enabling them measured 1.23x on
-#     icosa-gpu over loopback (median draw_readback 48.7 ms -> 39.5 ms) with all 120 frames still
-#     bit-identical — and then failed this very sweep: 9/10 runs clean, one run lost entirely to a
-#     silent Venus SIGABRT. These mechanisms are shared status pages S writes and C's Mesa reads
-#     directly, and (c)1 does not relay them (see `scripts/c1-two-machine.sh`'s own note). Mesa reads
-#     a page whose update has not arrived and eventually aborts. A loopback pass proves nothing here.
+#   * Semaphore, event and query feedback are worth 1.23x and their status is UNRESOLVED — this
+#     comment used to say they "look safe and ARE NOT", and that is stronger than the evidence.
+#     Measured 1.23x on icosa-gpu over loopback (median draw_readback 48.7 ms -> 39.5 ms), all 120
+#     frames bit-identical, and then one run of ten lost to a silent Venus SIGABRT in this sweep.
+#     That single event was hunted through 82 further clean runs (60 of them unattended with core
+#     capture genuinely armed; no core was ever produced). 1 failure in 92 against 0 in 20 is NOT a
+#     significant difference, so the failure cannot be pinned on feedback at all.
 #
-# Adopting any of these needs the feedback pages relayed, not the flag removed.
+#     The explanation this comment used to give is REFUTED, and must not be repeated: "(c)1 does not
+#     relay the feedback pages" is false. `emit_blob_writes` excludes only rings, and
+#     `take_bytes_s_wrote` detects change by diffing a shadow, so it catches writes virglrenderer's
+#     GPU makes directly rather than only relayed copies. Measured with all three feedbacks on: S
+#     ships back res=2 and res=5 and nothing else, traffic within 0.1% of the feedback-off run.
+#     There is no un-relayed feedback page in this workload.
+#
+#     A loopback pass still proves nothing here. The flags stay off because an unexplained
+#     total-session loss is unexplained either way — not because feedback is known to break anything.
+#
+# `no_fence_feedback` is load-bearing in every arm; the other three are what the queued soak
+# (`scripts/soak-failure-rate.sh`) exists to settle.
 VN_PERF_SETTING="${VN_PERF_SETTING:-no_multi_ring,no_fence_feedback,no_semaphore_feedback,no_event_feedback,no_query_feedback}"
 TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/rayland-c1-target}"
 BIN="$TARGET_DIR/release"
@@ -106,6 +118,18 @@ for run in $(seq 1 "$RUNS"); do
     env -u VK_LOADER_DRIVERS_SELECT /tmp/$FIXTURE /tmp/icosa-relay >/tmp/icosa-relay.csv 2>&1 &
     app_pid=\$!; echo \$app_pid > /tmp/rayland-app.pid
     wait \$app_pid || echo APP_EXIT_NONZERO
+    # Retire THIS run's daemon. Nothing used to: only the exit trap killed a rayland-c, and only the
+    # single PID left in the file, so every earlier run's daemon survived to the end of the sweep --
+    # all of them bound to the same vtest socket as the next run's application. That is a live
+    # confound for any per-run result this sweep produces, and this is the sweep whose 9-of-10 lost
+    # one session to an unexplained Venus SIGABRT. NOT established as that failure's cause; it is a
+    # mechanism that could produce exactly that shape and that was present the whole time.
+    # Kill by the exact PID this run recorded, and only after confirming it is still our binary.
+    cpid=\$(cat /tmp/rayland-c.pid 2>/dev/null)
+    case \"\$(readlink /proc/\$cpid/exe 2>/dev/null)\" in
+      /tmp/rayland-c|'/tmp/rayland-c (deleted)') kill \"\$cpid\" 2>/dev/null ;;
+    esac
+    rm -f /tmp/rayland-c.pid /tmp/rayland-app.pid
   "
   sleep 1
   rm -rf /tmp/icosa-relay && scp -q -r "$C_HOST:/tmp/icosa-relay" /tmp/icosa-relay

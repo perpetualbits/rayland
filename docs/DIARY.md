@@ -6714,3 +6714,74 @@ One thing I am deliberately not doing: auditing the rest of `OVERVIEW.md` agains
 1,200-line document and a full audit is its own task with its own budget, not a thing to tack onto a
 handover. The next session should know the class of defect exists rather than assume this was the only
 instance — which is a weaker statement than I would like, and the honest one.
+
+### 2026-09-02 (later) — The queued experiment could not have answered the question, and had not been able to for weeks
+
+I sat down to run the thing this project has called its cheapest queued experiment since July — one
+night of soak on the Venus feedback arm, to convert a superstition into a number. I did not run it.
+Before running it I asked what produced the command I was about to type, which is the habit this week
+has beaten into me, and the answer was that nothing did: the invocation printed in `OVERVIEW.md` §6.2,
+in the handover, in the diary and in the harness's *own usage line* sets `VN_PERF_SETTING`, and
+`soak-failure-rate.sh` reads `VNPERF`. **The variable selecting the arm under test was not connected
+to anything.** A night on that command would have measured the shipping configuration — the arm
+already clean through 480 runs — and labelled the result as the feedback arm.
+
+That is one defect. Looking for its siblings found seven more, and they get worse as they go:
+
+2. **The software was five weeks old.** `BIN` pointed at `~/.cache/rayland-c1-target`, a directory
+   nothing else in the tree writes and this script never rebuilt. Every other harness — all eight of
+   them — builds first, into `/tmp/rayland-c1-target`. The binaries sitting there were dated
+   2026-07-27, i.e. 26 commits behind on `rayland-c` and `rayland-s`, missing the forward-message
+   coalescing and the `reply_arena_fence_signaled` rewrite among others. In fairness to the past: on
+   the day the 480-run soak ran, that build *was* current, so I do not think the existing 0/480 is
+   contaminated by this. It is the *next* run that would have been.
+3. **No provenance in the output.** A 400-run result outlives the terminal it ran in.
+4. **S's GPU was not pinned.** This was the only two-machine harness not pinning `VK_ICD_FILENAMES`
+   to Intel. dop561 has an NVIDIA RTX A500 whose `VK_ERROR_DEVICE_LOST` is silent and which loses
+   the device on about half its runs; here that lands as `frames != 120`, scored as a failure *of
+   the arm*. A soak resolving a 1-in-92 effect cannot share a denominator with a 1-in-2 confound.
+5. **Evidence was overwritten**, and in the repo: every run's S log went to one `base-s.log` that the
+   next iteration truncated, so a failure's log survived only if the failure happened last. In a
+   harness whose entire purpose is catching rare failures.
+6. **A failed deploy was not checked.** I found this by watching it happen: `scp` died with ETXTBSY,
+   the loop ran anyway against whatever binary was already on C, and the harness printed **"6 clean,
+   0 failed"** for a build it had failed to deliver.
+7. **A `rayland-c` leaked on C every iteration** — the cause of 6. Each iteration started one and
+   none were retired; only the last PID reached the pid file, so the exit trap could kill exactly one
+   and the rest accumulated. Four hundred of them over a night, contending for one vtest socket.
+8. **The harness manufactured failures.** An S that had died on `SIGSEGV` during teardown was still
+   holding its port a second later, so the next iteration's S exited with *"Address already in use"*,
+   C had nothing to talk to, 0 frames came back, and the attempt was scored **as a failure of the arm
+   under test**. I watched this happen in a six-run smoke test. The loop retired S with
+   `kill; sleep 1` and started the next with `sleep 3`, and nothing anywhere checked that the port
+   was free or that S had come up.
+
+Defect 8 is the one I want to be careful about, because it is tempting to over-read. The feedback
+question rests entirely on *"1 unexplained failure in 92 runs"* — a session lost with no core and no
+explanation. That is exactly the shape defect 8 produces. **It is not established that this caused
+it**, and I want that stated plainly rather than buried: the 1-in-10 that started the suspicion came
+from `c2-icosa-two-machine.sh`, not from this harness, and that script *does* check S came up (it
+aborts the sweep instead of scoring a failure), so it is protected against this specific bug. What I
+can say is narrower and still worth something: the instrument used to compare arms could invent
+failures, and a ~1% effect cannot be settled by a denominator that includes invented events.
+
+But the sibling sweep has defect 7. It leaks a `rayland-c` per run, all bound to the same vtest
+socket the next run's application dials. An intermittently-surviving daemon whose S connection is
+gone is a mechanism that produces precisely "one run lost entirely to a silent Venus SIGABRT". Again:
+**a mechanism that could produce that shape and was present the whole time, not a demonstrated
+cause.** I fixed the leak in both siblings rather than leave the confound in place for the re-run.
+
+One thing I got wrong inside the fix, and it is the same error class, so it belongs here. My port
+check was `ss -ltn` — listening TCP. S's transport is QUIC, so its listener is a **UDP** socket and
+the predicate matched nothing, ever. It failed safely only because I had written the caller to abort
+rather than assume; a version that read "not listening" as "free" would have started every S into a
+port the previous one still held, which is defect 8 rebuilt by the person fixing defect 8. It cost
+one run to find because the harness stopped and said what it saw.
+
+Verified after all eight: 10 clean of 10 and 4 of 4, no leaked daemons on apollo, port handling
+correct, provenance printed. That is not the soak — it is the instrument being fit to run it.
+
+What I believe now, with confidence: the soak is worth a night and was not worth one this morning.
+What I do not believe, and want the next session not to inherit as settled: that the 1-in-92 was
+feedback. It may have been. It may have been a harness. The honest position is that the number was
+produced by instruments with known failure modes of the right shape, and the re-run is what decides.
