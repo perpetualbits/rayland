@@ -6915,3 +6915,54 @@ network that is genuinely broken was the right way to check a guard — the fail
 so I used it rather than reasoning about it.
 
 The control arm is still owed. It cannot run until the machines are on the same network again.
+
+### 2026-09-02 (evening) — Scoping (c)4, and the acceptance application turned out to be the wrong kind of program
+
+(c)4 has sat on the roadmap as one line — "real/complex applications; GL via Zink" — for weeks. Scoping
+it split it in two, and the split was decided by a measurement rather than by taste.
+
+The first question was which application defines "done", because the interface list is a guess until a
+real program demands it. The owner chose `rt`, their own terminal: a real daily-use application whose
+internals they know, which is exactly what made `solarsim` productive as an acceptance app. I agreed
+and described it as "wgpu/winit like solarsim".
+
+**That was an inference and it was wrong.** `rt` uses `winit` for windowing, and I reasoned from there
+to a renderer. `crates/rt/src/backend.rs::choose_backend` returns `BackendKind::Gl` for any non-X11
+display, and a protocol trace of a live run holds **zero** Vulkan lines against 2,143 on Mesa's EGL
+queues. `rt` is an OpenGL application. Rayland relays Vulkan; an OpenGL program emits no Venus stream
+to capture, so `rt` cannot run over Rayland at all today — not for want of protocol coverage. Choosing
+it as the acceptance application would have made Zink a prerequisite of its own acceptance test,
+inverting the phase order we had just agreed.
+
+Getting that trace at all took three tries and the failures are worth keeping, because two of them are
+the week's recurring shape. The first run produced an empty log; I had assumed the program writes to
+the stderr I gave it, and `rt` calls `crashlog::capture_stderr_if_not_a_tty()` and redirects its own —
+the output was not missing, it was somewhere else. Then the log I finally found *also* looked empty,
+because my regex expected libwayland's classic `wl_registry@2` and this build prints `wl_registry#2`.
+Both times the data was there and the instrument was wrong, and both times "empty result" was the
+symptom, which is precisely the failure mode that cost this project a whole session on 2026-09-01.
+
+With the tracing working the numbers came out clean, and they are better evidence than anything I
+would have reasoned to. `solarsim` — Vulkan, and already running over Rayland — binds **19** globals.
+WP0 offers **5**. `rt` binds 25. Both are `winit` applications with heavily overlapping lists, which is
+what makes this a specification of the toolkit's demand rather than one program's quirk.
+
+The framing I first reached for was also wrong and I corrected it in the spec: those fourteen are not
+"silently skipped". C never advertises them, so the application never sees them and adapts. That is
+*correct* Wayland behaviour — globals are optional. The defect is not the absence; it is that the
+absence is unrecorded, so nobody can distinguish a deliberate omission from an oversight. `solarsim`
+has been running for a day without its display's scale factor, decorations, cursor shape, fractional
+scaling or presentation timing, and no log anywhere says so.
+
+The root defect underneath is one I would not have found without reading both sides: **the supported
+set is written down twice**, in two crates and two type systems — C's `create_global` calls over
+`wayland-server` descriptors, S's `interface_by_name` over `wayland-client` ones. They drifted, and
+that drift *is* the `wl_shm` bug: added to C, forgotten in S, detected by a human noticing a missing
+cursor. The spec's spine is one shared declaration in `rayland-relay` with two-sided tests, because the
+existing test — which enumerates the names it expects and asserts they resolve — can only catch a name
+someone remembered to add in two places at once.
+
+Spec at `docs/superpowers/specs/2026-09-02-c4-protocol-breadth-design.md`. What I am least sure of is
+the `Refused` disposition for `wp_linux_drm_syncobj_manager_v1`: withholding it is safe today, but
+explicit GPU synchronisation across machines is exactly the sort of thing that turns out to be
+load-bearing later, and I have written it down as deferred rather than as solved.

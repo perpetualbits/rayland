@@ -90,7 +90,7 @@ window.PROJECT_MAP = {
     {
       id: "zink-gl", label: "Real apps · GL via Zink", layer: "app", status: "planned",
       tags: ["(c)4"],
-      desc: "The far end of the roadmap: real, complex applications, and OpenGL support by routing it through Zink (GL-on-Vulkan). Depends on everything below it being solid first.",
+      desc: "SPLIT IN TWO ON 2026-09-02, on evidence, and the split is the finding. Measured by tracing wl_registry.bind against the live compositor: solarsim (Vulkan, wgpu/winit) binds 19 globals and WP0 offers 5; rt binds 25. The missing ones are NOT skipped -- C never advertises them, so the app silently does without its display scale, decorations, cursor shape, fractional scaling and presentation timing, and nothing reports the degradation. (c)4a is that protocol breadth, specced at docs/superpowers/specs/2026-09-02-c4-protocol-breadth-design.md with solarsim as the acceptance app. THE ROOT DEFECT IS THAT THE SUPPORTED SET IS WRITTEN DOWN TWICE -- C's create_global calls (wayland-server descriptors) and S's interface_by_name (wayland-client descriptors), which drifted and produced the wl_shm bug. Fix: one shared const table in rayland-relay, with two-sided tests. (c)4b is GL via Zink. THE ORDER WAS NEARLY INVERTED BY A WRONG INFERENCE: rt was chosen as acceptance app because it uses winit, and rt is an OPENGL application -- choose_backend returns BackendKind::Gl for any non-X11 display, and its trace holds ZERO Vulkan lines against 2143 on Mesa EGL queues. rt therefore cannot run over Rayland at all until Zink exists, which would have made (c)4b a prerequisite of its own acceptance test. rt is the north star and (c)4b's acceptance app; solarsim is (c)4a's.",
       files: [],
       specs: [{ label: "Architecture", href: "docs/design/2026-07-13-native-remote-wayland-gpu.md" }],
       parts: [],
@@ -365,7 +365,7 @@ window.PROJECT_MAP = {
     { id: "c2",  kind: "phase",  label: "(c)2 · Mapped memory & readback", status: "done" },
     { id: "wp0", kind: "phase",  label: "WP0 · Wayland proxy first light", status: "active" },
     { id: "c3",  kind: "phase",  label: "(c)3 · Content-addressed assets", status: "planned" },
-    { id: "c4",  kind: "phase",  label: "(c)4 · Real apps · GL via Zink", status: "planned" },
+    { id: "c4",  kind: "phase",  label: "(c)4a · Protocol breadth (specced) · (c)4b · GL via Zink", status: "planned" },
     { id: "sp4", kind: "harden", label: "SP4 · Adaptive L3 · session & security", status: "planned" },
     { id: "sp5", kind: "harden", label: "SP5 · Proxy completeness (Sommelier/waypipe-grade)", status: "planned" },
     { id: "audio", kind: "harden", label: "Audio track", status: "planned" }
