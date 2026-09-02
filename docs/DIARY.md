@@ -6966,3 +6966,71 @@ Spec at `docs/superpowers/specs/2026-09-02-c4-protocol-breadth-design.md`. What 
 the `Refused` disposition for `wp_linux_drm_syncobj_manager_v1`: withholding it is safe today, but
 explicit GPU synchronisation across machines is exactly the sort of thing that turns out to be
 load-bearing later, and I have written it down as deferred rather than as solved.
+
+### 2026-09-02 (review) — A peer session reviewed five of my commits and found nine things, and one of its corrections corrected me twice
+
+`rayland-f9` — the session that did the `vkgears` retraction I built on — was asked to review my work
+rather than touch the tree. It sent nine findings and touched nothing, which is the right shape for
+two sessions in one working copy. I verified every one against the tree before acting; all nine hold.
+
+Five would have bitten the next soak, and two of those were **my own fixes from this morning**:
+
+1. **`rayland-c` could never dump a core.** The daemon is launched by `nohup &` and `ulimit -c
+   unlimited` sat on the *next* line. A process inherits its core limit at exec, and apollo's shell
+   limit is 0, so the daemon's cores were disabled by construction. The fixture is launched after the
+   ulimit and was always fine — which is why "no core was produced" during the feedback hunt is still
+   true of the *application*, and says nothing whatever about the daemon. `gdb` was also handed
+   `/tmp/rayland-icosa-cpu` as the executable for *any* core, so a `rayland-c` core would have been
+   back-traced against the wrong binary and printed confident nonsense. Both fixed.
+2. **My abort guards discarded the sweep's own results.** I made the loop stop rather than score, and
+   then `exit 1`-ed straight past the RESULT line — so an abort at attempt 37 of 400 threw away 36
+   good measurements. Losing a run and losing the whole run are different failures and only the first
+   is acceptable. Now a `PARTIAL RESULT` line with its denominator made explicit.
+3. **The relayed fixture's CSV was never fetched**, in the harness that exists to collect it: the
+   `scp` took only the PNG directory, the CSV had no per-run suffix so it self-overwrote anyway, and
+   `2>&1` merged `VN_DEBUG` spew into the file the analysis parses.
+4. **A trap that did the opposite of its comment.** `trap cleanup EXIT INT TERM` with no `exit` in the
+   handler: bash resumes after the handler, so Ctrl-C killed S and the sweep *carried on*, scoring
+   `missing=120` for every remaining run.
+
+**The fifth finding is the interesting one, because the peer then corrected its own version of it and
+in doing so corrected mine.** It flagged that `S_IP` was hardcoded to `192.168.1.192` with no override
+while six sibling harnesses derive it — a real fragility, and I "fixed" it by deriving. The peer then
+went and read `c1-sweep.sh`, which has documented both of dop561's addresses since July: `.192` is
+WiFi (avg 11.8 ms, max 91, mdev 26) and `.150` is a wired adapter (0.65 ms, mdev 0.18). The 0/480 was
+run on 2026-07-27 by the first committed form of this harness, carrying that same literal. So **both
+the 0/480 and my 400/400 were taken over `.192`, and my derivation would have silently moved future
+runs onto a link with 18× less latency and 140× less jitter.** A fix that improves a harness and
+quietly invalidates its own history is worse than the hardcode. Reverted to an explicit `.192` with
+the reasoning written next to it.
+
+Two things follow that I would not have got to alone. The first is the peer's, and it is right: those
+figures are **stronger** for having been taken over the jittery path. They are reliability numbers,
+not timing numbers, and zero failures in 480 across an 11.8 ms / 91 ms link says more than zero across
+a 0.65 ms wire.
+
+The second is mine, and it fell out of implementing the peer's other suggestion — record the link in
+the provenance block, since it is the one datum that has now bitten twice. I added a measured RTT, ran
+it, and **the measurement immediately contradicted the label I had just written**: `.192` now measures
+0.80 ms avg, mdev 0.095 — wired-class, on the address documented as WiFi. The topology has changed
+three times in one day. So an address is no longer evidence of a link, and the provenance block now
+characterises the link **from the measurement** and says so out loud when the label and the wire
+disagree. What this means for the two historical figures is honest and unsatisfying: nobody measured
+the RTT at the time, so their link is attested by an address whose meaning has since changed.
+
+I also introduced a bug while fixing (1) and caught it in the same minute. My explanatory comment used
+markdown backticks — inside a double-quoted `ssh` string, where bash runs backticked text as a command
+substitution. `` `nohup` `` executed `nohup` with no arguments. It printed errors and the run still
+reported "2 clean, 0 failed", which is the exact shape of everything I have been fixing today, in a
+comment I wrote to warn about it.
+
+The four lower findings were all real too: the `blobscan` probe stopped its clock *after* its own
+accounting (immaterial to the numbers, but it falsified the module's own cost note, three lines from a
+comment about instruments that change what they measure); a project-map node whose prose contradicted
+its own `status: "done"`, the fourth such contradiction in three days; and — the one I most want
+recorded — the icosa README paired `upload` 4.9× with `draw+readback` 5.1× and called them "two
+independent mechanisms moving by the same factor", when the first is `icosa-cpu`'s and the second is
+`icosa-gpu`'s. Two sweeps chained into one ratio, which is the hazard this project records against
+other people's work. The same-fixture figure is 3.2×, and it was in the table two sections above the
+whole time. The conclusion survives and reads better honestly: the range is 3.2–5.1×, all of it well
+under the ~12× FPU gap, so the relay scales sub-linearly against the raw arithmetic difference.

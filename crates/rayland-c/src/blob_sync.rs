@@ -471,11 +471,19 @@ pub fn messages_for_delta(blobs: &BlobTable, ring_res_id: u32, delta: RingDelta)
             let scan_start = blobscan::enabled().then(std::time::Instant::now);
             let runs = blob.take_changed_runs(gap);
             if let Some(t0) = scan_start {
+                // Stop the clock BEFORE the probe's own accounting. Until 2026-09-02 `elapsed()`
+                // was evaluated after the `sum()` below, so the attributed scan time included the
+                // instrument -- immaterial against a 10.85 ms scan, but this module's own doc
+                // claims it costs "two Instant reads and one map update", and it sits three lines
+                // from a comment recording four earlier instruments caught changing what they
+                // measured. An instrument that quietly contradicts its own cost note is the thing
+                // that comment exists to warn about.
+                let elapsed_ns = t0.elapsed().as_nanos() as u64;
                 let changed: usize = runs.iter().map(|r| r.bytes.len()).sum();
                 blobscan::record(
                     res_id,
                     blob.size() as usize,
-                    t0.elapsed().as_nanos() as u64,
+                    elapsed_ns,
                     runs.len(),
                     changed,
                     blob.is_application_memory(),

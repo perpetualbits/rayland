@@ -134,7 +134,12 @@ cleanup() {
 # EXIT alone is not enough: bash does not run an EXIT trap when killed by an untrapped SIGTERM, so a
 # run stopped from outside would leave `rayland-s` holding the port and the next run would die with
 # "Address already in use" — which looks like a relay failure and is not one.
-trap cleanup EXIT INT TERM
+# EXIT alone would miss a signal; but a bare `trap cleanup INT` is worse than it looks -- bash runs
+# the handler and then RESUMES the loop, so Ctrl-C killed rayland-s and the sweep carried on
+# talking to nothing, scoring missing=120 into total_stale for every remaining run. The handler
+# must exit. 130 is the conventional status for SIGINT.
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT TERM
 
 total_stale=0
 for run in $(seq 1 "$RUNS"); do

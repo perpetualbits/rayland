@@ -89,12 +89,21 @@ where (c)2's mapped-memory problem shows up as a number: **roughly 20 ms per MiB
 
 apollo → milkv, for the two parts that are Rayland's:
 
-- `upload` 20.8 → 101.1 ms = **4.9×**
-- `draw+readback` 10.1 → 51.9 ms = **5.1×**
+- `upload` 20.8 → 101.1 ms = **4.9×** — `icosa-cpu` (this stage is 0.0 ms on `icosa-gpu`)
+- `draw+readback` 10.1 → 51.9 ms = **5.1×** — `icosa-gpu`
+- `draw+readback` 15.8 → 50.9 ms = **3.2×** — `icosa-cpu`, i.e. the *same-fixture* comparison
 
-Two independent mechanisms moving by the same factor is the board simply being about five times
-weaker on this path. Nothing about the weak C makes the relay disproportionately worse, which is the
-outcome the design wanted and had not previously been able to claim from measurement.
+**Correction, 2026-09-02.** This section previously listed only the first two and concluded "two
+independent mechanisms moving by the same factor". They are not the same fixture: `4.9×` is
+`icosa-cpu`'s and `5.1×` is `icosa-gpu`'s, so pairing them chains two sweeps into one ratio — the
+hazard this project records against other people's numbers. The same-fixture figure was in the
+table two sections above the whole time and is **3.2×**.
+
+**The conclusion survives, and is stronger stated honestly.** The range is **3.2–5.1×**, and every
+ratio in it sits well below the ~12× gap between the two machines' FPUs. So the relay is not
+disproportionately worse on the weak C — it scales with the board's general slowness, sub-linearly
+against the raw arithmetic gap. That is the outcome the design wanted, and it does not need two
+fixtures welded into a single number to support it.
 
 ### 3.3 On the weak C, the application is the bottleneck — not the relay
 

@@ -76,10 +76,30 @@
 # Unlike the feedback hunt this does NOT stop at the first failure — a rate needs the whole
 # denominator. Cores are captured and post-mortemed as they appear, and the loop continues.
 set -u
-C_HOST=apollo; S_IP=192.168.1.192; PORT=9414
-# A TCP port on S that C can probe for reachability before the sweep starts. Bash's /dev/tcp cannot
-# test UDP, and the relay's own port is QUIC/UDP, so this borrows sshd -- if C cannot open TCP/22 back
-# to S, it certainly cannot reach S's UDP relay port either. Cheap, and it catches the one-way route.
+C_HOST=apollo; PORT=9414
+# *** S's address is PINNED TO THE WiFi LINK, DELIBERATELY, AND THAT IS NOT A BUG. ***
+#
+# dop561 has two addresses and `scripts/c1-sweep.sh` measured both in July:
+#   192.168.1.192 -> WiFi.  RTT from apollo: avg 11.8 ms, max 91 ms, mdev 26 ms.
+#   192.168.1.150 -> br0, a wired USB Ethernet adapter. RTT: avg 0.65 ms, mdev 0.18 ms.
+#
+# Six sibling harnesses derive this with `ip route get`, which lands on the WIRED address. This one
+# must not, and the reason is comparability rather than habit: the 0-in-480 shipping-arm figure
+# (2026-07-27, this harness's first commit, which carried this same literal) and the 0-in-400
+# feedback-arm figure (2026-09-02) were BOTH taken over .192. Deriving the address would silently
+# move future runs onto a link with 18x less latency and 140x less jitter, and the result could no
+# longer be pooled with either. A "fix" that improves the harness and quietly invalidates its own
+# history is a worse outcome than a hardcode.
+#
+# Note this makes both figures STRONGER than a wired run would have been. They are reliability
+# numbers, not timing numbers, and zero failures across a jittery 11.8 ms / 91 ms path says more
+# than zero across a 0.65 ms wire. What they cannot do is characterise the wired path, and they may
+# not be pooled with anything measured on .150.
+#
+# `S_IP=192.168.1.150` runs the wired link on purpose. The provenance block prints whichever was
+# used, with its measured RTT, so the link can never again be implicit -- it has bitten twice.
+S_IP="${S_IP:-192.168.1.192}"
+
 PROBE_PORT="${PROBE_PORT:-22}"
 SOCK=/tmp/rl-base.sock
 # Where per-run evidence lands. Defect 5: this used to be `$(dirname "$0")` — the repo's own
@@ -146,6 +166,27 @@ echo "  binaries:      $(date -r "$BIN/rayland-c" '+%F %T') rayland-c, \
 $(date -r "$BIN/rayland-s" '+%F %T') rayland-s"
 echo "  S ICD pin:     ${S_ICD:-<none: full enumeration>}"
 echo "  C host:        $C_HOST      S listen: 0.0.0.0:$PORT      tries: $TRIES"
+# THE LINK, measured at run time. Two experiments have now been misread for want of this line: the
+# 0/480 and 400/400 could not be attributed to a link without archaeology, and a topology change
+# under a running sweep voided a 400-run control arm. Print what was actually used.
+_rtt=$(ssh -o BatchMode=yes "$C_HOST" "ping -c 5 -q -W 2 $S_IP 2>/dev/null | tail -1" 2>/dev/null)
+echo "  S address:     $S_IP$([ "$S_IP" = 192.168.1.192 ] && echo '  (the address the 0/480 and 400/400 figures used)' || echo '  (NOT the .192 those figures used; not poolable with them)')"
+echo "  C sees S at:   $(ssh -o BatchMode=yes "$C_HOST" 'echo $SSH_CLIENT' 2>/dev/null | awk '{print $1}')"
+echo "  measured RTT:  ${_rtt:-<unavailable>}"
+# CHARACTERISE THE LINK FROM THE MEASUREMENT, NOT FROM THE ADDRESS. July's numbers (c1-sweep.sh)
+# were WiFi avg 11.8 ms / mdev 26 ms against wired avg 0.65 ms / mdev 0.18 ms, and on 2026-09-02
+# .192 measured 0.80 ms / mdev 0.095 -- wired-class, on the address labelled WiFi. The topology has
+# changed three times in one day; an address is no longer evidence of a link, so print what the
+# wire actually did and say plainly when it disagrees with the label.
+_avg=$(printf '%s' "${_rtt:-}" | sed -nE 's#.*= *[0-9.]+/([0-9.]+)/.*#\1#p')
+if [ -n "$_avg" ]; then
+  _kind=$(awk -v a="$_avg" 'BEGIN{ print (a < 3) ? "wired-class" : "WiFi-class" }')
+  echo "  link profile:  $_avg ms avg -> $_kind (July: WiFi 11.8 ms avg / mdev 26; wired 0.65 / 0.18)"
+  if [ "$S_IP" = 192.168.1.192 ] && [ "$_kind" = "wired-class" ]; then
+    echo "  NOTE: .192 was WiFi in July and is measuring wired-class now. The address label is stale;"
+    echo "        believe this RTT, not the label, when deciding what this run is poolable with."
+  fi
+fi
 ssh "$C_HOST" '
   cat /proc/sys/kernel/core_pattern > /tmp/core_pattern.orig
   sudo -n sh -c "echo /tmp/cores/core.%e.%p > /proc/sys/kernel/core_pattern"
@@ -257,30 +298,52 @@ preflight() {
 # Run the preconditions BEFORE any attempt is scored. Placed here rather than earlier because bash
 # needs the definition first -- an earlier draft called it above its own definition, which would have
 # aborted every run with "preflight: command not found".
+# Abort the sweep WITHOUT discarding what it already measured.
+#
+# The guards below stop rather than score, which is right -- a harness may lose a run, it may never
+# invent one. But until 2026-09-02 they also `exit 1` straight past the RESULT line, so an abort at
+# attempt 37 of 400 threw away 36 perfectly good results. Losing a run and losing the whole run are
+# different failures, and only the first is acceptable. The partial tally is printed with its
+# denominator made explicit, so it can never be mistaken for a completed sweep.
+abort_sweep() {
+  echo "$1" >&2
+  echo >&2
+  echo "PARTIAL RESULT [arm: $VN_PERF_SETTING]: $ok clean, $fails failed, out of $((ok + fails))" >&2
+  echo "  SWEEP ABORTED at attempt $i of $TRIES -- this is NOT a completed run and must not be" >&2
+  echo "  quoted as one. The attempts above it were measured; the rest were never attempted." >&2
+  exit 1
+}
+
 preflight || exit 1
 
 for i in $(seq 1 "$TRIES"); do
   keep_s_log=0                             # per-iteration; set if S's teardown dies unexpectedly
   ssh "$C_HOST" 'rm -rf /tmp/icosa-base && mkdir -p /tmp/icosa-base && rm -f /tmp/cores/core.*'
   if ! wait_for_port_free; then
-    echo "ABORTING at attempt $i: port $PORT still held after the previous S was retired." >&2
-    echo "Scoring this as an arm failure would be inventing data; stopping instead." >&2
-    exit 1
+    abort_sweep "ABORTING at attempt $i: port $PORT still held after the previous S was retired.
+Scoring this as an arm failure would be inventing data; stopping instead."
   fi
   env ${S_ICD:+VK_ICD_FILENAMES=$S_ICD} \
     RAYLAND_C1_NO_PRESENT=1 RAYLAND_C1_S_LISTEN="0.0.0.0:$PORT" "$BIN/rayland-s" >"$LOG/base-s-$i.log" 2>&1 &
   S_PID=$!
   if ! wait_for_port_listening || ! kill -0 "$S_PID" 2>/dev/null; then
-    echo "ABORTING at attempt $i: rayland-s never started listening. Its log:" >&2
     cat "$LOG/base-s-$i.log" >&2
-    exit 1
+    abort_sweep "ABORTING at attempt $i: rayland-s never started listening (its log is above)."
   fi
   sleep 2                                  # S is listening; give the engine a moment before C dials
   ssh "$C_HOST" "
+    # *** ulimit BEFORE the daemon is launched, not after. ***
+    # A process inherits its core limit at exec, and apollo's shell limit is 0. With this line
+    # below the nohup (where it sat until 2026-09-02) rayland-c could never dump a core, by
+    # construction, so 'no core was produced' said nothing about the daemon -- only about the
+    # application, which is launched after this line and was always fine.
+    # NOTE: no backticks anywhere in this remote block. It is a double-quoted ssh string, so bash
+    # runs backticked text as a command substitution ON S before sending it; a markdown-style
+    # markdown-style nohup in backticks executed nohup with no arguments. Found the same day.
+    ulimit -c unlimited
     RAYLAND_C1_S_ADDR=$S_IP:$PORT RAYLAND_C1_SOCKET=$SOCK nohup /tmp/rayland-c >/tmp/rayland-c-base.log 2>&1 &
     echo \$! > /tmp/rayland-c.pid
     sleep 3
-    ulimit -c unlimited
     VN_DEBUG=vtest VN_PERF=$VN_PERF_SETTING \
     VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/virtio_icd.json VTEST_SOCKET_NAME=$SOCK \
     env -u VK_LOADER_DRIVERS_SELECT timeout 200 /tmp/rayland-icosa-cpu /tmp/icosa-base >/dev/null 2>&1
@@ -316,24 +379,31 @@ for i in $(seq 1 "$TRIES"); do
   # No verdict line at all means the ssh or the remote shell failed, so the application never ran and
   # there is NOTHING to score. Defect 9: this used to fall through to `${fr:-0}` -> 0 -> "FAILURE".
   if [ -z "$line" ]; then
-    echo "ABORTING at attempt $i: no verdict from C -- the application never ran. C said:" >&2
     sed 's/^/    /' "$LOG/base-$i.txt" >&2
-    exit 1
+    abort_sweep "ABORTING at attempt $i: no verdict from C -- the application never ran (C's output is above)."
   fi
   # C reaching S is a precondition, not a result. If S never saw a connection, the run measured the
   # network, not the arm.
   if ! grep -q 'C connected' "$LOG/base-s-$i.log" 2>/dev/null; then
-    echo "ABORTING at attempt $i: C never connected to S ($S_IP:$PORT)." >&2
-    echo "  That is the network, not the configuration under test. S's log:" >&2
     sed 's/^/    /' "$LOG/base-s-$i.log" >&2
-    exit 1
+    abort_sweep "ABORTING at attempt $i: C never connected to S ($S_IP:$PORT).
+That is the network, not the configuration under test (S's log is above)."
   fi
   fr=$(echo "$line" | grep -oE 'frames=[0-9]+' | cut -d= -f2)
   co=$(echo "$line" | grep -oE 'cores=[0-9]+' | cut -d= -f2)
   if [ "${fr:-0}" -ne 120 ] || [ "${co:-0}" -gt 0 ]; then
     fails=$((fails+1))
     echo "FAILURE $fails at attempt $i: $line"
-    [ "${co:-0}" -gt 0 ] && ssh "$C_HOST" 'c=$(ls -t /tmp/cores/core.* | head -1); gdb --batch -ex "thread apply all bt 25" /tmp/rayland-icosa-cpu "$c" 2>&1' > "$LOG/base-bt-$i.txt" 2>&1
+    # Back-trace against the binary that ACTUALLY dumped. core_pattern is core.%e.%p, so the
+    # executable name is in the filename; hardcoding the fixture (as this did until 2026-09-02)
+    # back-traces a `rayland-c` core against `rayland-icosa-cpu` and prints confident nonsense.
+    [ "${co:-0}" -gt 0 ] && ssh "$C_HOST" 'c=$(ls -t /tmp/cores/core.* | head -1);
+      e=$(basename "$c" | cut -d. -f2);
+      exe=/tmp/$e; [ -x "$exe" ] || exe=$(command -v "$e" 2>/dev/null);
+      echo "core=$c executable=${exe:-UNKNOWN}";
+      [ -n "$exe" ] && gdb --batch -ex "thread apply all bt 25" "$exe" "$c" 2>&1 \
+        || echo "no executable found for %e=$e; not back-tracing against the wrong binary"' \
+      > "$LOG/base-bt-$i.txt" 2>&1
   else
     ok=$((ok+1))
     # A clean run's S log says nothing; keep only the interesting ones so the directory stays

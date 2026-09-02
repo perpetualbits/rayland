@@ -115,7 +115,9 @@ for run in $(seq 1 "$RUNS"); do
     sleep 3
     VN_DEBUG=vtest VN_PERF="$VN_PERF_SETTING" \
     VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/virtio_icd.json VTEST_SOCKET_NAME=$SOCK \
-    env -u VK_LOADER_DRIVERS_SELECT /tmp/$FIXTURE /tmp/icosa-relay >/tmp/icosa-relay.csv 2>&1 &
+    # stdout is the fixture's per-frame CSV and must stay CLEAN: merging stderr into it (as this
+    # did until 2026-09-02) folds VN_DEBUG=vtest spew through the same file the analysis parses.
+    env -u VK_LOADER_DRIVERS_SELECT /tmp/$FIXTURE /tmp/icosa-relay >/tmp/icosa-relay.csv 2>/tmp/icosa-relay.stderr &
     app_pid=\$!; echo \$app_pid > /tmp/rayland-app.pid
     wait \$app_pid || echo APP_EXIT_NONZERO
     # Retire THIS run's daemon. Nothing used to: only the exit trap killed a rayland-c, and only the
@@ -133,6 +135,13 @@ for run in $(seq 1 "$RUNS"); do
   "
   sleep 1
   rm -rf /tmp/icosa-relay && scp -q -r "$C_HOST:/tmp/icosa-relay" /tmp/icosa-relay
+  # *** FETCH THE CSV, PER RUN. ***
+  # This script exists to collect the fixture's own per-frame instrumentation, and until
+  # 2026-09-02 it collected only the PNG directory -- the CSV stayed on C, unfetched, with no
+  # $run suffix so each run overwrote the last anyway. A ten-run sweep produced no relayed
+  # timings at all, which is the one thing it was for.
+  scp -q "$C_HOST:/tmp/icosa-relay.csv" "/tmp/icosa-relay-$run.csv" 2>/dev/null \
+    || echo "  WARNING: no CSV fetched for run $run; relayed timings are missing"
   kill "$S_PID" 2>/dev/null || true; S_PID=""
   stale=0
   for f in /tmp/icosa-native/frame_*.png; do
