@@ -110,6 +110,14 @@ SOCK=/tmp/rl-base.sock
 LOG="${LOG:-/tmp/rayland-soak}"
 mkdir -p "$LOG"
 TRIES="${TRIES:-60}"
+# How many times one attempt may be RE-ATTEMPTED after a transient setup failure before the sweep
+# gives up. A re-attempt is neither inventing a run nor losing one: nothing was measured, so nothing
+# is scored, and the attempt simply happens again. This exists because the link between C and S
+# dropped mid-sweep on 2026-09-02 and again on 2026-09-03, and a 400-run sweep that aborts on the
+# first blip never finishes. Retries are COUNTED and printed with the result: a run that needed
+# forty of them is telling you something about the network, and burying that would be its own lie.
+MAX_SETUP_RETRIES="${MAX_SETUP_RETRIES:-5}"
+total_retries=0
 
 # Refuse the old, silently-ignored spelling rather than defaulting past it. Sampling `${VNPERF+set}`
 # BEFORE any assignment is the whole point: a guard placed after `VNPERF="${VNPERF:-...}"` can never
@@ -309,26 +317,57 @@ abort_sweep() {
   echo "$1" >&2
   echo >&2
   echo "PARTIAL RESULT [arm: $VN_PERF_SETTING]: $ok clean, $fails failed, out of $((ok + fails))" >&2
+  echo "  setup retries (transient, not scored): $total_retries" >&2
   echo "  SWEEP ABORTED at attempt $i of $TRIES -- this is NOT a completed run and must not be" >&2
   echo "  quoted as one. The attempts above it were measured; the rest were never attempted." >&2
   exit 1
 }
 
+# Retire S by the exact PID we started, and wait for it. Used both at the end of a scored attempt
+# and before a re-attempt, because leaving S running would hold the port the retry needs.
+retire_s() {
+  [ -n "${S_PID:-}" ] || return 0
+  kill "$S_PID" 2>/dev/null
+  wait "$S_PID" 2>/dev/null; s_status=$?
+  S_PID=""
+}
+
+# A transient setup failure: re-attempt if we have retries left, otherwise stop.
+#
+# The distinction this encodes is the one the whole harness turns on. A run that produced a verdict
+# is DATA, whatever the verdict. A run that never got as far as producing one measured the network
+# or the harness, and must not enter the denominator in either direction -- not as a failure (that
+# invents data) and not as a pass (that hides it). Re-attempting is the third option, and it is the
+# honest one as long as the count is reported.
+retry_or_abort() {
+  retire_s
+  if [ "$setup_retries" -lt "$MAX_SETUP_RETRIES" ]; then
+    setup_retries=$((setup_retries + 1))
+    total_retries=$((total_retries + 1))
+    echo "  re-attempting $i (setup retry $setup_retries/$MAX_SETUP_RETRIES): $1" >&2
+    sleep 5
+    return 0
+  fi
+  abort_sweep "$1
+Exhausted $MAX_SETUP_RETRIES setup retries at attempt $i; this is the network or the harness, not the arm."
+}
+
 preflight || exit 1
 
 for i in $(seq 1 "$TRIES"); do
+ setup_retries=0
+ while :; do
   keep_s_log=0                             # per-iteration; set if S's teardown dies unexpectedly
   ssh "$C_HOST" 'rm -rf /tmp/icosa-base && mkdir -p /tmp/icosa-base && rm -f /tmp/cores/core.*'
   if ! wait_for_port_free; then
-    abort_sweep "ABORTING at attempt $i: port $PORT still held after the previous S was retired.
-Scoring this as an arm failure would be inventing data; stopping instead."
+    retry_or_abort "port $PORT still held after the previous S was retired." && continue
   fi
   env ${S_ICD:+VK_ICD_FILENAMES=$S_ICD} \
     RAYLAND_C1_NO_PRESENT=1 RAYLAND_C1_S_LISTEN="0.0.0.0:$PORT" "$BIN/rayland-s" >"$LOG/base-s-$i.log" 2>&1 &
   S_PID=$!
   if ! wait_for_port_listening || ! kill -0 "$S_PID" 2>/dev/null; then
     cat "$LOG/base-s-$i.log" >&2
-    abort_sweep "ABORTING at attempt $i: rayland-s never started listening (its log is above)."
+    retry_or_abort "rayland-s never started listening (its log is above)." && continue
   fi
   sleep 2                                  # S is listening; give the engine a moment before C dials
   ssh "$C_HOST" "
@@ -380,14 +419,13 @@ Scoring this as an arm failure would be inventing data; stopping instead."
   # there is NOTHING to score. Defect 9: this used to fall through to `${fr:-0}` -> 0 -> "FAILURE".
   if [ -z "$line" ]; then
     sed 's/^/    /' "$LOG/base-$i.txt" >&2
-    abort_sweep "ABORTING at attempt $i: no verdict from C -- the application never ran (C's output is above)."
+    retry_or_abort "no verdict from C -- the application never ran (C's output is above)." && continue
   fi
   # C reaching S is a precondition, not a result. If S never saw a connection, the run measured the
   # network, not the arm.
   if ! grep -q 'C connected' "$LOG/base-s-$i.log" 2>/dev/null; then
     sed 's/^/    /' "$LOG/base-s-$i.log" >&2
-    abort_sweep "ABORTING at attempt $i: C never connected to S ($S_IP:$PORT).
-That is the network, not the configuration under test (S's log is above)."
+    retry_or_abort "C never connected to S ($S_IP:$PORT) -- the network, not the arm." && continue
   fi
   fr=$(echo "$line" | grep -oE 'frames=[0-9]+' | cut -d= -f2)
   co=$(echo "$line" | grep -oE 'cores=[0-9]+' | cut -d= -f2)
@@ -411,6 +449,9 @@ That is the network, not the configuration under test (S's log is above)."
     # run still produced its 120 frames, but the teardown crash is exactly what defect 8 was about.
     [ "${keep_s_log:-0}" -eq 1 ] || rm -f "$LOG/base-s-$i.log"
   fi
-  [ $((i % 10)) -eq 0 ] && echo "progress: $i done, ok=$ok fails=$fails"
+  [ $((i % 10)) -eq 0 ] && echo "progress: $i done, ok=$ok fails=$fails, setup retries=$total_retries"
+  break                                    # the attempt produced a verdict; move to the next one
+ done
 done
 echo "RESULT [arm: $VN_PERF_SETTING]: $ok clean, $fails failed, out of $TRIES"
+echo "  setup retries (transient link/harness failures, NOT scored): $total_retries"
