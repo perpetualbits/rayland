@@ -6830,3 +6830,46 @@ happened to hand me without checking which one the destination expected.
 it off both upstream commits — those become permanent history in someone else's repository, where an
 unexplained link to a private session is noise — and put it in the PR description instead, which is
 editable if the owner would rather it were not there.
+
+### 2026-09-02 (result) — 400 clean out of 400, and what that is and is not worth
+
+The soak finished: **`RESULT [arm: no_multi_ring,no_fence_feedback]: 400 clean, 0 failed, out of
+400`**. I checked it the way this project checks things now, which is to say I did not believe the
+summary line: 400 files, contiguous 1 to 400, every one reading exactly `rc=0 frames=120 cores=0`, no
+kept failure logs and no anomalous-teardown notes because there were none to keep. Both machines came
+back clean — no leaked daemon on apollo, `core_pattern` restored, the port free on dop561.
+
+So the question that has been queued for weeks has an answer, and it is the boring one: **the feedback
+arm is not detectably worse than the shipping arm.** Under 0.75% at 95% by the rule of three; pooled
+with the earlier hunt, 1 in 492.
+
+I want to be careful about what this is, because the temptation is to over-read it in the direction I
+was already leaning this evening.
+
+**It does not explain the 1/92.** That failure is still unexplained. What changed is the shape of the
+alternative: one unattributed loss now sits against 400 clean runs of the very arm it was charged to,
+rather than against ten. "Feedback causes session loss" was never a strong fit and is now a poor one;
+"a one-off — harness, GPU, or chance" was always the boring rival and is now the better one. That is
+a shift in likelihood, not a demonstration, and it should be written down as such.
+
+**It does not measure speed, and I nearly wrote a sentence that implied it did.** The 1.23× is an
+`icosa-gpu` figure measured over **loopback**. This soak ran `icosa-cpu` over the **real network**.
+They are different workloads on different topologies; the reliability result does not carry the speed
+result on its back. If the flags get turned on for the 1.23×, that number deserves re-measuring where
+it would actually be claimed.
+
+**And the control arm is still owed.** The shipping arm's 0/480 came from the harness *before*
+tonight's eight fixes, on binaries five weeks older. Both arms reading zero makes the comparison safe
+in practice — an instrument that invents failures cannot invent zero of them — but it is not clean,
+and I would rather say that than let a tidy "0 vs 0" imply more symmetry than the evidence has.
+
+There is a small irony worth recording. The instrument that produced tonight's clean 400 was, this
+morning, incapable of selecting the arm it was told to measure, ran five-week-old binaries, scored its
+own setup failures against the hypothesis, and once reported "6 clean, 0 failed" for a build it had
+failed to deliver. The result is trustworthy *because* the evening went to the instrument instead of
+the experiment. Had I run the command as documented at 01:00, I would have had a number by 04:00, it
+would have been the wrong arm's, and nothing in the output would have said so.
+
+**What I am not doing:** launching the control arm. The owner was offered "re-run both arms,
+interleaved" earlier tonight and chose the single feedback arm; starting the other one unasked would
+quietly overrule that choice for three hours of machine time. It is queued, not taken.

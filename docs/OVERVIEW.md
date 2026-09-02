@@ -316,7 +316,7 @@ reason against rather than re-deriving.
 | Readback message count after gap-threshold coalescing | ~5000 → **~180 messages/frame**, still bit-identical, still 0 stale |
 | Batching `ship()`'s per-message lock and flush | **1.03×** — i.e. not the bottleneck |
 | Venus semaphore/event/query feedback, loopback | **1.23×** (median `draw_readback` 48.7 ms → 39.5 ms, 120/120 bit-identical) |
-| Feedback-arm failures | **1 in 92** runs, vs 0 in 20 without — *not* a significant difference |
+| Feedback-arm failures | **0 in 400** (2026-09-02, fixed harness, real network) → <0.75% at 95%; pooled with the earlier hunt, **1 in 492**. Supersedes the 1-in-92 framing |
 | `VK_ERROR_DEVICE_LOST` on `vkQueueSubmit` | NVIDIA RTX A500 **7/14** runs lost; Intel Iris Xe **0/10** |
 | Teardown `SIGABRT` (libepoxy, from `virgl_renderer_cleanup`) | was ~21%, **fixed** |
 | **WP0 return traffic, presented-buffer exclusion off / on** | **307,776 B → 219 B per frame: 1,406×** (5 frame-matched runs a side, A/B inside one binary) |
@@ -765,15 +765,48 @@ reason no longer holds. `wl_shm.create_pool` passes a file descriptor — which 
 cross a network — and its contents are pixels, ~1 MB/frame, exactly what the presented-buffer
 exclusion removed. It is a `wl_shm` client; WP0 is a dmabuf mechanism.
 
-## 6.2 The cheapest queued experiment — needs both machines
+## 6.2 THE QUEUED EXPERIMENT IS DONE — the feedback arm is clean through 400 runs
 
 ```
 TRIES=400 VN_PERF_SETTING=no_multi_ring,no_fence_feedback scripts/soak-failure-rate.sh
 ```
 
-The semaphore/event/query feedback arm: **worth 1.23×**, currently held back by exactly one
-unexplained failure (1/92) against a shipping arm clean through 480 runs. One night of soak settles
-it either way. This is the best ratio of information to effort currently on the board.
+**RESULT, 2026-09-02: `400 clean, 0 failed, out of 400`.** The semaphore/event/query feedback arm,
+over the real network, on current binaries, with S's GPU pinned — verified per-attempt (400 files,
+contiguous, every one `rc=0 frames=120 cores=0`) rather than from the summary line, and with no
+failure logs or anomalous teardowns kept because there were none.
+
+**What this establishes.** The feedback arm's failure rate is **under 0.75% at 95% confidence** (rule
+of three). Pooled with the earlier hunt it is **1 in 492**. Against the shipping arm's `0/480` that is
+**no detectable difference whatsoever** — as it was before, except that the earlier comparison rested
+on a single unexplained event and this one rests on 400 clean runs of the arm under suspicion.
+
+**What this does NOT establish, stated plainly.**
+- **It does not explain the original 1/92.** That failure remains unexplained. What has changed is
+  that it now sits against 400 clean runs rather than 10, so "feedback causes session loss" is a much
+  worse fit than it was, and a one-off — harness artefact, GPU, or chance — is a much better one.
+- **It does not measure speed.** The 1.23× was measured on `icosa-gpu` over **loopback**; this soak
+  ran `icosa-cpu` over the **real network**. The reliability result and the speed result come from
+  different workloads on different topologies, and neither transfers to the other for free.
+- **The control arm is owed on the fixed instrument.** The shipping arm's `0/480` came from the
+  harness *before* its eight defects were fixed, and on binaries five weeks older. Both arms reading
+  zero makes the comparison safe in practice, but a matched control run is what would make it clean.
+
+**Recommendation, for the owner's decision rather than taken unilaterally:** the stated reason for
+keeping `no_semaphore_feedback,no_event_feedback,no_query_feedback` on was *"we do not know what that
+failure was"*. That reason is now much weaker, and there is a measured 1.23× on the table. Turning the
+three flags off is a live option; what would make it solid is re-measuring the 1.23× on the real
+network, since that number has only ever been a loopback figure.
+
+Provenance of this run: `git 2249b6f on wp0-wayland-proxy` (clean tree), `rayland-c` built
+2026-09-02, S pinned to `intel_icd.json`, C = apollo, 400 tries. Evidence:
+`/tmp/rayland-soak/2026-09-02-feedback-arm/`.
+
+*Historical framing, kept because the reasoning matters:* the semaphore/event/query feedback arm was
+**worth 1.23×**, held back by exactly one unexplained failure (1/92) against a shipping arm clean
+through 480 runs. One night of soak was expected to settle it either way, and it was the best ratio of
+information to effort on the board. It also could not have run as documented — see the eight harness
+defects above.
 
 **IT COULD NOT HAVE SETTLED ANYTHING UNTIL 2026-09-02, AND THE HARNESS IS NOW FIXED.** The command
 above was checked before being run and did not work: every document and the script's own usage line
