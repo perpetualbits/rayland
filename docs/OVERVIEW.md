@@ -802,6 +802,28 @@ Provenance of this run: `git 2249b6f on wp0-wayland-proxy` (clean tree), `raylan
 2026-09-02, S pinned to `intel_icd.json`, C = apollo, 400 tries. Evidence:
 `/tmp/rayland-soak/2026-09-02-feedback-arm/`.
 
+**THE CONTROL ARM WAS ATTEMPTED THE SAME DAY AND IS VOID. Do not quote its numbers.** It was launched
+with byte-identical binaries (sha256-verified, not merely same-timestamped) and produced
+`35 clean, 365 failed` — a preposterous figure for a configuration with 480 prior clean runs, and the
+absurdity is the only reason anyone looked. **The 365 are not failures.** From attempt 36 the LAN was
+being migrated onto a VLAN underneath the run: apollo moved to `172.16.20.10/24` while S stayed on
+`192.168.1.0/24`, so **C could not reach S at all** — 13 attempts died with "Could not resolve
+hostname apollo", and 345 more ran `rayland-c` against an S it could not dial. Verified after the
+fact: a UDP probe from apollo to both of S's addresses arrives nowhere.
+
+**The only valid data is the 35 attempts before the network broke, and all 35 were clean.** The
+feedback arm's 400/400 is unaffected — it ran 01:39–04:50, before the migration.
+
+**This was a NINTH harness defect, and specifically a gap in the fix for the eighth.** Defect 8 taught
+the loop to abort when *S* fails to start; nothing checked *C*. Now fixed: a `preflight()` verifies C
+is reachable over ssh **and that C can reach S** (a one-way route — ssh works, the reverse does not —
+is exactly what happened), and inside the loop an attempt with no parsable verdict, or whose S log
+never says `C connected`, **aborts the sweep instead of being scored**. Verified by running it against
+the currently-broken route: it refuses with a diagnosis instead of inventing 400 data points. The rule
+this keeps re-establishing: **a harness may lose a run; it may never invent one.**
+
+**The control arm therefore remains OWED**, and needs the network settled first.
+
 *Historical framing, kept because the reasoning matters:* the semaphore/event/query feedback arm was
 **worth 1.23×**, held back by exactly one unexplained failure (1/92) against a shipping arm clean
 through 480 runs. One night of soak was expected to settle it either way, and it was the best ratio of

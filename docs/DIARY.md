@@ -6873,3 +6873,45 @@ would have been the wrong arm's, and nothing in the output would have said so.
 **What I am not doing:** launching the control arm. The owner was offered "re-run both arms,
 interleaved" earlier tonight and chose the single feedback arm; starting the other one unasked would
 quietly overrule that choice for three hours of machine time. It is queued, not taken.
+
+### 2026-09-02 (control arm) — 365 failures that never happened, and the ninth defect was a hole in my eighth
+
+The control arm came back `35 clean, 365 failed, out of 400`, on the shipping configuration — the one
+with 480 prior clean runs behind it. That number is not a finding; it is an alarm. A configuration
+does not go from a measured <0.62% failure rate to 91% because three feedback flags were turned *off*.
+
+The harness had kept every failure's S log, which is defect 5's fix earning its keep, and attempt 36
+said it outright: `ssh: Could not resolve hostname apollo.localdomain`. The LAN was being migrated
+onto a VLAN underneath the run. apollo is now `172.16.20.10/24` on `enp1s0.20`; S is still on
+`192.168.1.0/24`; the forge had already moved to `172.16.20.16` earlier in the session, which is the
+same migration seen from a different angle. Thirteen attempts failed to resolve C at all, and 345 more
+successfully ssh'd to C — the route works in *that* direction — and then ran `rayland-c` against an S
+it could not dial. I checked rather than inferred: a UDP datagram from apollo to both of S's addresses
+arrives nowhere, while ssh from S to apollo works fine. A one-way route.
+
+So the run measured the network. The only valid data is the 35 attempts before it broke, all clean.
+
+**The part I want on the record is whose fault the scoring was.** Last night I found defect 8 — the
+harness scoring its own setup failures against the arm under test — and wrote into the file that "a
+harness may lose a run; it may never invent one." I then fixed exactly one side of the link. I taught
+the loop to abort when *S* fails to start and did not ask the symmetric question about *C*. Sixteen
+hours later the other side broke and the harness invented 358 failures, in a shape I had already named
+and believed I had closed.
+
+It is worth being precise about why the fix was partial rather than wrong. I was debugging a specific
+observed failure — an S that held its port — and I fixed the thing I had watched happen. The general
+form of that bug is "any precondition of a run, scored as its result", and the port was one instance
+of it. Fixing the instance and writing the general rule in a comment above it is not the same as
+enforcing the general rule, and I did the first while believing I had done the second.
+
+Now enforced on both sides: a `preflight()` that requires C reachable over ssh *and* C able to reach
+S, and inside the loop, an attempt with no parsable verdict from C, or whose S log never records
+`C connected`, aborts the sweep. Both refuse rather than score. Verified against the currently-broken
+route: the harness stops with a diagnosis naming the one-way route, instead of producing 400 numbers.
+
+I also caught one bug in the fix before it ran: I called `preflight` above its own definition, which
+bash would have failed with `preflight: command not found` on every invocation. Testing it against a
+network that is genuinely broken was the right way to check a guard — the failing case was available,
+so I used it rather than reasoning about it.
+
+The control arm is still owed. It cannot run until the machines are on the same network again.

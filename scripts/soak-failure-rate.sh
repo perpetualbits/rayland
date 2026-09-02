@@ -20,7 +20,7 @@
 # feedback arm measured 1.23x faster and has exactly one unexplained failure against it (1/92). One
 # night of this settles what argument could not.
 #
-# *** EIGHT DEFECTS THAT WOULD HAVE SILENTLY VOIDED THAT NIGHT, FOUND 2026-09-02, FIXED HERE. ***
+# *** NINE DEFECTS THAT WOULD HAVE SILENTLY VOIDED THAT NIGHT, FOUND 2026-09-02, FIXED HERE. ***
 # Each one produced a plausible-looking result for the wrong thing, which is the failure mode this
 # project has now paid for more than any other. Kept written down because the fix is invisible once
 # applied, and the next person to add a harness should recognise the shapes:
@@ -51,6 +51,9 @@
 #
 #   7. A `rayland-c` LEAKED ON C EVERY ITERATION — 400 over a night, and the cause of 6.
 #
+#   9. AN UNREACHABLE C WAS ALSO SCORED AS AN ARM FAILURE -- the same bug as 8 on the other side of
+#      the link, found when it voided a 400-run control arm. See the preflight above the loop.
+#
 #   8. THE HARNESS MANUFACTURED FAILURES. An S that had not released its port made the next
 #      iteration's S fail to bind, which was scored against the arm under test. See the block
 #      above the loop; this is the one that can have corrupted numbers already recorded.
@@ -74,6 +77,10 @@
 # denominator. Cores are captured and post-mortemed as they appear, and the loop continues.
 set -u
 C_HOST=apollo; S_IP=192.168.1.192; PORT=9414
+# A TCP port on S that C can probe for reachability before the sweep starts. Bash's /dev/tcp cannot
+# test UDP, and the relay's own port is QUIC/UDP, so this borrows sshd -- if C cannot open TCP/22 back
+# to S, it certainly cannot reach S's UDP relay port either. Cheap, and it catches the one-way route.
+PROBE_PORT="${PROBE_PORT:-22}"
 SOCK=/tmp/rl-base.sock
 # Where per-run evidence lands. Defect 5: this used to be `$(dirname "$0")` — the repo's own
 # `scripts/` directory — so a soak littered the working tree with `base-*.txt` and, worse, wrote
@@ -211,6 +218,47 @@ wait_for_port_listening() {                # bounded: ~6 s, S normally binds in 
   return 1
 }
 
+# *** DEFECT 9: AN UNREACHABLE C WAS SCORED AS A FAILURE OF THE ARM. ***
+# Defect 8 taught the loop to abort when *S* fails to start. It said nothing about *C*, and on
+# 2026-09-02 that cost a whole 400-run control arm: the LAN was being migrated onto a VLAN under the
+# run, apollo moved to 172.16.20.10/24 while S stayed on 192.168.1.0/24, and from attempt 36 onward C
+# could not reach S at all. Thirteen attempts failed with "Could not resolve hostname apollo" and 345
+# more ran `rayland-c` against an S it could not dial. Every one of those 358 was written down as a
+# FAILURE OF THE SHIPPING CONFIGURATION -- a config with 480 prior clean runs -- producing the
+# preposterous headline "35 clean, 365 failed". Only the absurdity of the number made anyone look.
+#
+# The rule this enforces is the same one defect 8 established and this file keeps having to relearn:
+# **a harness may lose a run; it may never invent one.** Anything that is not the application's own
+# verdict aborts the sweep instead of entering the denominator.
+preflight() {
+  # 1. Is C reachable at all, and is it the host we think it is?
+  local tok
+  tok=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$C_HOST" 'echo RAYLAND_PREFLIGHT_OK' 2>&1) || true
+  case "$tok" in
+    *RAYLAND_PREFLIGHT_OK*) ;;
+    *) echo "ABORTING before the first run: cannot reach C ($C_HOST) over ssh." >&2
+       echo "  ssh said: $tok" >&2; return 1 ;;
+  esac
+  # 2. Can C actually reach S on the port the relay will use? This is the check whose absence voided
+  #    the 2026-09-02 control arm. A route can exist in one direction only; ssh working proves
+  #    dop561 -> apollo, and says nothing about apollo -> dop561, which is the direction C dials.
+  local probe
+  probe=$(ssh -o BatchMode=yes "$C_HOST" "timeout 5 bash -c '</dev/tcp/$S_IP/$PROBE_PORT' 2>/dev/null && echo REACH_OK || echo REACH_FAIL" 2>/dev/null)
+  case "$probe" in
+    *REACH_OK*) ;;
+    *) echo "ABORTING before the first run: C cannot reach S at $S_IP:$PROBE_PORT." >&2
+       echo "  C dials S over the network; a one-way route (ssh works, the reverse does not) is" >&2
+       echo "  exactly what voided the 2026-09-02 control arm. Fix the route, or set S_IP." >&2
+       return 1 ;;
+  esac
+  return 0
+}
+
+# Run the preconditions BEFORE any attempt is scored. Placed here rather than earlier because bash
+# needs the definition first -- an earlier draft called it above its own definition, which would have
+# aborted every run with "preflight: command not found".
+preflight || exit 1
+
 for i in $(seq 1 "$TRIES"); do
   keep_s_log=0                             # per-iteration; set if S's teardown dies unexpectedly
   ssh "$C_HOST" 'rm -rf /tmp/icosa-base && mkdir -p /tmp/icosa-base && rm -f /tmp/cores/core.*'
@@ -265,6 +313,21 @@ for i in $(seq 1 "$TRIES"); do
     keep_s_log=1
   fi
   line=$(grep -oE 'rc=[0-9]+ frames=[0-9]+ cores=[0-9]+' "$LOG/base-$i.txt" | tail -1)
+  # No verdict line at all means the ssh or the remote shell failed, so the application never ran and
+  # there is NOTHING to score. Defect 9: this used to fall through to `${fr:-0}` -> 0 -> "FAILURE".
+  if [ -z "$line" ]; then
+    echo "ABORTING at attempt $i: no verdict from C -- the application never ran. C said:" >&2
+    sed 's/^/    /' "$LOG/base-$i.txt" >&2
+    exit 1
+  fi
+  # C reaching S is a precondition, not a result. If S never saw a connection, the run measured the
+  # network, not the arm.
+  if ! grep -q 'C connected' "$LOG/base-s-$i.log" 2>/dev/null; then
+    echo "ABORTING at attempt $i: C never connected to S ($S_IP:$PORT)." >&2
+    echo "  That is the network, not the configuration under test. S's log:" >&2
+    sed 's/^/    /' "$LOG/base-s-$i.log" >&2
+    exit 1
+  fi
   fr=$(echo "$line" | grep -oE 'frames=[0-9]+' | cut -d= -f2)
   co=$(echo "$line" | grep -oE 'cores=[0-9]+' | cut -d= -f2)
   if [ "${fr:-0}" -ne 120 ] || [ "${co:-0}" -gt 0 ]; then
