@@ -1,0 +1,41 @@
+From 4cd02189eba0473722907293730c5176cbdcef84 Mon Sep 17 00:00:00 2001
+From: Roland Nagtegaal <perpetualbits@gmail.com>
+Date: Wed, 2 Sep 2026 02:25:08 +0200
+Subject: [PATCH] vkgears: guard the optional wl_seat on teardown
+
+fini_display() calls wl_seat_destroy(keyboard_data.seat) unconditionally,
+but a wl_seat is optional: registry_handle_global() only assigns the seat
+when the compositor advertises one. A compositor with no input devices --
+headless weston, for instance -- advertises none, keyboard_data.seat stays
+NULL, and the demo segfaults on exit.
+
+The keyboard immediately above it is already guarded the same way; only
+the seat was missed.
+
+Reproduced with vkgears against a seatless compositor: stock exits 139
+(SIGSEGV), guarded exits cleanly at 60.062 FPS, same compositor, back to
+back.
+---
+ src/vulkan/wsi/wayland.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/vulkan/wsi/wayland.c b/src/vulkan/wsi/wayland.c
+index 56ef2b3..185daec 100644
+--- a/src/vulkan/wsi/wayland.c
++++ b/src/vulkan/wsi/wayland.c
+@@ -277,7 +277,11 @@ fini_display()
+ 
+    libdecor_unref(decor_context);
+ 
+-   wl_seat_destroy(keyboard_data.seat);
++   /* A wl_seat is optional: a compositor with no input devices advertises
++    * none, leaving keyboard_data.seat NULL, and wl_seat_destroy() would
++    * dereference it. */
++   if (keyboard_data.seat)
++      wl_seat_destroy(keyboard_data.seat);
+    xkb_context_unref(keyboard_data.xkb_context);
+    wl_compositor_destroy(compositor);
+    wl_display_flush(display);
+-- 
+2.53.0
+

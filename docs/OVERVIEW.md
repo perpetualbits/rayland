@@ -1000,11 +1000,27 @@ Verified after the fixes: 10/10 and 4/4 clean, no leaks, provenance printed. See
   read, and a write landing in that window is *lost* rather than deferred — silent corruption of the
   mapped memory the relay exists to carry faithfully. See `docs/data/2026-09-01-dirty-tracking/`.
 - **The ~1 s stall on mouse entry/exit is FIXED — in `vkcube`, and demonstrated** (2026-09-01).
-  `docs/patches/vkcube-only-resize-on-actual-size-change.patch` guards the swapchain rebuild on an
+  **SUBMITTED UPSTREAM 2026-09-02: [KhronosGroup/Vulkan-Tools#1250](https://github.com/KhronosGroup/Vulkan-Tools/pull/1250).**
+  Rebased and verified against current `main` first — the upstream `handle_surface_configure()` is
+  byte-identical to the version the patch was written against, and `demo->swapchain_ready` still
+  exists. `docs/patches/vkcube-only-resize-on-actual-size-change.patch` guards the swapchain rebuild on an
   actual size change. Over Rayland, milkv → dop561, 60 s each, pointer crossing only: **stock 178
   configures → 92 rebuilds → 9 stalls, worst 1,117 ms; patched 392 configures (391 same-size) → 1
   rebuild → 0 stalls, worst 104 ms**, and **4.3× more frames in the same wall clock**. Validated
   natively on COSMIC first. See `docs/data/2026-09-01-vkcube-stall-fixed/`.
+- **The mesa-demos `vkgears` NULL-seat fix is REBASED AND READY, but CANNOT BE SUBMITTED FROM HERE.**
+  `docs/patches/mesa-demos-vkgears-guard-null-seat.patch`. Upstream is
+  `gitlab.freedesktop.org/mesa/demos`, and **this machine has no freedesktop GitLab credentials of any
+  kind** — no `glab`, no netrc entry, no credential helper. The patch is prepared as a git commit
+  against current upstream `main` and needs a human with an fd.o account to open the merge request.
+  **Half of the original fix is already obsolete and that is why rebasing mattered:** upstream has
+  restructured `init_display()`, so `wl_seat_get_keyboard()` is now called from
+  `seat_handle_capabilities()` behind a `WL_SEAT_CAPABILITY_KEYBOARD` test — the init half is fixed
+  there already, differently and better. **The `fini_display()` half is still live upstream:**
+  `wl_seat_destroy(keyboard_data.seat)` is unguarded, while the `wl_keyboard` immediately above it
+  *is* guarded, and `registry_handle_global()` only assigns the seat when the compositor advertises
+  one. A seatless compositor therefore still segfaults `vkgears` on exit. Submitting the 9.0.0-era
+  patch unrebased would have proposed re-fixing something already fixed.
 - **AND ORDINARY APPLICATIONS WILL NOT HAVE THIS PROBLEM — `vkcube` is the outlier**, settled from
   source rather than opinion. `vkcube` calls `demo_resize()` on every `xdg_surface.configure` with no
   size check and marks `states UNUSED`. **`vkgears` (mesa-demos), a different app on the same path,

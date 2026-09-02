@@ -6785,3 +6785,48 @@ What I believe now, with confidence: the soak is worth a night and was not worth
 What I do not believe, and want the next session not to inherit as settled: that the 1-in-92 was
 feedback. It may have been. It may have been a harness. The honest position is that the number was
 produced by instruments with known failure modes of the right shape, and the re-run is what decides.
+
+### 2026-09-02 (night) — Submitting the patches, and both of them needed checking first
+
+Two upstream patches have sat unsubmitted for a day. Submitting them turned out to be less mechanical
+than "send the diff", and in both cases the checking was the work.
+
+**The vkcube patch was fine, and I verified that rather than assuming it.** Current Vulkan-Tools
+`main` has `handle_surface_configure()` byte-identical to the version we patched, and
+`demo->swapchain_ready` still exists as a `bool`, so the guard compiles and means what it meant. I
+reworked the comment into `//` form — the file runs 295 `//` lines to 37 `/* */`, and a patch that
+reads like the file it lands in is easier to accept — and trimmed the rationale, since our reason
+("across any remoting layer") is our motivation, not upstream's problem. The measured numbers went in
+the commit body, where they are evidence rather than editorial. Submitted:
+[Vulkan-Tools#1250](https://github.com/KhronosGroup/Vulkan-Tools/pull/1250).
+
+**The mesa-demos patch was half obsolete, and I only found that by fetching upstream.** Our diff was
+against the 9.0.0 tarball and guarded two things: the `wl_seat_get_keyboard()` call in
+`init_display()`, and the `wl_seat_destroy()` in `fini_display()`. Upstream has since restructured the
+first one out of existence — `wl_seat_get_keyboard()` now lives in `seat_handle_capabilities()` behind
+a `WL_SEAT_CAPABILITY_KEYBOARD` test, which is a better fix than ours. Had I sent the patch as
+recorded, half of it would have proposed re-fixing something already fixed, which is the kind of thing
+that gets a first contribution dismissed rather than reviewed.
+
+The other half is still live, and the case for it is unusually clean: `fini_display()` guards the
+`wl_keyboard` on the line above and then destroys the `wl_seat` unguarded, while
+`registry_handle_global()` only ever assigns that seat if the compositor advertises one. So a seatless
+compositor still segfaults `vkgears` on exit, upstream, today. Rebased to a one-hunk commit.
+
+**It cannot be submitted from here, and that is a hard stop rather than a difficulty.**
+`gitlab.freedesktop.org` needs an account; this machine has no `glab`, no netrc entry and no
+credential helper for it. The patch is committed to `docs/patches/` as a git-formatted commit so the
+work is not lost, and it needs a human with an fd.o account.
+
+**One thing I got wrong and caught.** I committed both patches under the global git identity,
+`perpetualrabbit@gmail.com` — which is not a verified address on the `perpetualbits` GitHub account
+that opened the PR. The commit would not have been attributed to the account submitting it, and CLA
+bots routinely check exactly that. Amended both and force-pushed before anyone looked. Worth recording
+because it is the same shape as everything else this week: the repository-local git config in
+`rayland` sets one address, the global config another, and I used whichever the working directory
+happened to hand me without checking which one the destination expected.
+
+**A note on the trailer.** This project's sessions add a `Claude-Session:` trailer to commits. I left
+it off both upstream commits — those become permanent history in someone else's repository, where an
+unexplained link to a private session is noise — and put it in the PR description instead, which is
+editable if the owner would rather it were not there.
