@@ -551,7 +551,7 @@ Note the measured values in this configuration were `offset 0, stride 2000 = wid
 the derivation would have *happened* to be right. That is exactly why the token carries them: the
 fixture proves the path, the configuration does not prove the assumption.
 
-### 6.1.1 The frame-callback stall — located, 2026-08-29, and NOT yet fixed
+### 6.1.1 The frame-callback stall — located AND FIXED, 2026-08-29
 
 **The picture arrives; the animation does not.** vkcube's window appears on dop561's screen with the
 cube correctly rendered by S's GPU (`docs/data/2026-08-29-wp0-event-witness/cube-on-dop561.png`), and
@@ -732,12 +732,14 @@ stalling — the second time in two days a compositor declining to draw was mist
 attaches, 345 frame callbacks delivered, 10–13 fps, zero panics. A second independent application
 through WP0.
 
-> **Qualifier attached 2026-08-30, and it should travel with this claim wherever it is repeated.**
-> That run was **loopback**, and §7's own rule is that loopback proves little about the forward
-> mapped-memory break or about feedback. The two-machine confirmation of `vkgears` is **owed and not
-> done** — and note it may not be obtainable as stated, since `vkgears` has since been found to
-> segfault natively against headless weston and on milkv under lavapipe. `vkcube` *has* been run
-> apollo→dop561 and milkv→dop561 with a window on screen.
+> **Qualifier attached 2026-08-30 — and PAID on 2026-09-01, recorded here rather than deleted.**
+> That run was **loopback**, and §7's own rule is that loopback proves little. The two-machine
+> confirmation of `vkgears` was called "owed and not done", and possibly unobtainable. It is now
+> **done**: milkv (riscv64) → dop561, 659/621/577/583 `wl_surface.attach` in 30 s across 4 runs of 4,
+> median inter-frame gap 41–47 ms, zero stalls — with S's ICD pinned to Intel. The "possibly
+> unobtainable" half rested on the `vkgears` hang that **did not exist**; see §5.4 and
+> `docs/data/2026-09-01-vkgears-not-a-hang/`. `vkcube` has been run apollo→dop561 and milkv→dop561
+> with a window on screen, and `solarsim` milkv→dop561 on the real desktop.
 The guarded soak that followed was 25/25 clean (loopback). The original findings are kept below because
 the *shapes* are what matter:
 
@@ -754,8 +756,12 @@ the *shapes* are what matter:
    `.expect("the WP0 id maps lock is never poisoned")` finds it poisoned. The comment is false and the
    reassuring log line is worse than silence.
 
-**`rayland-icosa-window` cannot run over WP0, correctly.** It presents via `wl_shm`, which the proxy
-does not advertise, and refuses cleanly. `wl_shm.create_pool` passes a file descriptor — which cannot
+**`rayland-icosa-window` could not run over WP0 as of 2026-08-30, and THE STATED REASON HAS SINCE
+EXPIRED — do not repeat it without re-testing.** It presents via `wl_shm`, which at the time the proxy
+did not advertise, so it refused cleanly. **The proxy has advertised `wl_shm` since 2026-09-01** (§6.3
+— it is what lets `winit`/GTK/Qt applications start at all, and `solarsim` depends on it). Whether
+`icosa-window` now runs over WP0 is **untested either way**; what is certain is only that the old
+reason no longer holds. `wl_shm.create_pool` passes a file descriptor — which cannot
 cross a network — and its contents are pixels, ~1 MB/frame, exactly what the presented-buffer
 exclusion removed. It is a `wl_shm` client; WP0 is a dmabuf mechanism.
 

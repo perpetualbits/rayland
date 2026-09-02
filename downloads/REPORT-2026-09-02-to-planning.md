@@ -23,6 +23,141 @@ real work, but not the measurement the night was for.
 
 ---
 
+## 0. What has actually been achieved — the arc, not the session
+
+*Added after the first draft of this report was correctly criticised for scoping itself to one
+night's work and omitting the results that matter. The section above describes an evening; this one
+describes where the project got to.*
+
+### 0.1 The thesis is proven, four times, by unmodified applications
+
+**An application runs on a weak remote machine, is rendered by S's GPU, and appears in its own window
+on S's real desktop — with commands crossing the network, not pixels.**
+
+| Application | What it is | Status |
+|---|---|---|
+| `vkcube` | the standard Vulkan demo | apollo→dop561 **and milkv→dop561**, window on screen, spinning |
+| `vkgears` | mesa-demos, a *second* independent app | milkv→dop561: **659/621/577/583 attaches in 30 s**, 4 runs of 4, gap 41–47 ms, zero stalls |
+| `solarsim` | an unmodified **wgpu/winit** application — a real toolkit app | milkv→dop561 on the real desktop, 169 frames in ~120 s |
+| `icosa-cpu` / `icosa-gpu` | our own fixtures | **bit-identical to native**, 0 differing frames in 1,200 over 10 runs with the board as C |
+
+**Two different display paths, and the distinction matters to a planner:**
+
+- **WP0** — the application's *own* Wayland session is proxied to S's compositor and the swapchain
+  buffer is named by a `BufferToken` instead of an fd. **Zero-copy dma-buf.** This is `vkcube`,
+  `vkgears`, `solarsim`.
+- **(c)1/(c)2 presentation** — S presents the application's *readback* buffer via `wl_shm`. This is
+  `icosa-remote-demo.sh`. It is the path WP0 exists to retire, and it still works.
+
+The icosa fixtures earn their place separately: they are the only ones that prove **correctness**
+rather than liveness, because they are bit-compared against a native run.
+
+### 0.2 On a capable C, Rayland runs at NATIVE frame rate over a real network
+
+**This is the single strongest result the project has and it was missing from the first draft.**
+
+With **dionysus** (x86_64, 8 cores) as C → dop561, over a real network: **25 ms median inter-frame gap
+in 8 runs out of 8.** Native `vkcube` on the same compositor with no Rayland in the path:
+**25.39 ms (p10 25.23, p90 25.56) = 39.4 fps.**
+
+The relayed application is sitting on **the compositor's repaint timer, not on Rayland's cost.** The
+contrast with milkv states the project's premise in one line: the identical blob diff over identical
+bytes is **0.98 ms / 17.4% of wall clock on dionysus** and **6.38 ms / 56.8% on milkv**.
+
+(Caveat that must travel with the number: headless weston paces at ~25.4 ms, so **~40 fps is the
+harness ceiling** and 60 fps cannot be demonstrated against it on any machine.)
+
+### 0.3 No pixels cross the network — a claim that was false until it was measured
+
+The return path was shipping **every rendered frame back to C at ~877 KB/frame** — a frame-sized
+payload per frame, to a machine with no display, in the project whose thesis is that pixels do not
+cross the network. The (c)2 return path ships whatever S's GPU wrote into any blob and cannot tell a
+swapchain image from a readback; only WP0's token path knows which is which.
+
+| | before | after |
+|---|---:|---:|
+| S→C per frame | ~877 KB | **~1.9 KB** |
+| S→C, A/B'd inside one binary | 307,776 B/frame | **219 B/frame — 1,406×** |
+| C→S, same A/B | 3,723 B/frame | 3,594 B/frame — **1.04×, i.e. unchanged** |
+
+**Why it survived: the display was already zero-copy, so the waste had no symptom and every test
+passed.** The harness's own header asserted "No pixels cross the network" — false on every run. It was
+found because the owner asked.
+
+### 0.4 The ~1 second mouse-crossing stall is fixed — with two honest asterisks
+
+**Measured, milkv→dop561, 60 s each, pointer crossing only:**
+
+| | configures | swapchain rebuilds | stalls | worst |
+|---|---:|---:|---:|---:|
+| stock `vkcube` | 178 | 92 | **9** | **1,117 ms** |
+| patched | 392 (391 same-size) | **1** | **0** | 104 ms |
+
+**and 4.3× more frames in the same wall clock.**
+
+**Asterisk 1 — the fix is in the application, not in Rayland.** `vkcube` calls `demo_resize()` on
+every `xdg_surface.configure` with no size check; COSMIC sends one on every focus change; focus
+follows the pointer. Natively that costs ~1 ms and nobody notices; over the relay a swapchain
+recreation is hundreds of synchronous round trips ≈ 1 s. **`vkcube` is the outlier, settled from
+source:** `vkgears` already records the size, compares, and rebuilds only on a real change — the
+ordinary WSI pattern toolkits follow. **Do not generalise vkcube's stall into a Rayland limitation.**
+A proxy-side mitigation (withhold a same-size configure) was considered and **deliberately rejected**:
+that is the proxy deciding an activation change is not worth telling the application, which is false
+for anything that renders focus.
+
+**Asterisk 2 — the patch is NOT upstream.** `docs/patches/vkcube-only-resize-on-actual-size-change.patch`
+is unsubmitted, as is the `fini_display` fix for mesa-demos.
+
+**And resizing still stalls, and that one IS ours** — 5.1 s and 4.7 s measured on milkv for larger
+windows. A resize is a *legitimate* swapchain rebuild; there is no application bug to patch. It is the
+synchronous round-trip cost applied to the few hundred calls a rebuild makes. **Unfixed.**
+
+### 0.5 Performance work, including what did not pay
+
+| Change | Result |
+|---|---|
+| Presented-resource exclusion | **1,406×** less return traffic |
+| `shm::DIFF_CHUNK` 64 → 4096 on C | **1.48× on milkv** (release, real network, complete separation, p=0.0015); **clean null on x86_64** |
+| `reply_arena_fence_signaled` → `memchr` | lock-held p50 **8×**, p99 **16×** |
+| Forward message coalescing | **6.1×** fewer messages, **5.4×** less time in `send()` |
+| Readback gap-threshold coalescing | ~5000 → **~180** messages/frame, still bit-identical |
+| Teardown `SIGABRT` (libepoxy) | ~21% of teardowns → **0** |
+
+**The honest half, which a plan needs more than the wins:** the two 5–8× mechanism fixes (S's lock
+contention, C's message flood) **each moved the median frame gap by nothing measurable.** Frame time
+is not bound by CPU work on either side — it is a serialized latency chain, and what remains in it is
+the **number** of round trips per frame and each one's fixed cost. **Both poll intervals have been
+swept factorially and neither is the term.** Four candidates are now eliminated by measurement rather
+than left unexplored.
+
+### 0.6 Correctness and robustness
+
+- **0 stale frames across 20 real-network runs** after the G' completion barrier — the (c)2 readback
+  return path, which took three recorded dead ends to get right.
+- **59/60 WP0 runs clean**, the one failure an artefact of the failure *definition* → **0 genuine
+  defects in 60**.
+- **0 differing frames in 1,200**, 10 runs, board as C.
+- **`wl_shm` implemented** — `winit`, GTK and Qt treat it as **fatal at event-loop creation**, so
+  every toolkit application aborted before creating a window or reaching Vulkan. This is what lets an
+  ordinary application start at all.
+- **`wl_keyboard.keymap` fixed** — it was dropped because it carries an fd, and the cost was not "no
+  keyboard" but a **hung application**: anything creating a `wl_keyboard` waits for its keymap.
+- Recycled-id race, version inheritance across three instances, and a cached handle to a destroyed
+  dmabuf global — all fixed and guarded.
+
+### 0.7 What it would be dishonest to claim
+
+- **Resize stalls, and it is ours.** Unfixed.
+- **Both upstream patches are unsubmitted.**
+- **60 fps on milkv is parked** — the board's ceiling with a *perfect* scan is ~36 fps, below the
+  harness compositor's own floor, and riscv64 cannot do dirty-page tracking (kernel 5.15).
+- **Multi-queue is unsupported.**
+- **`rayland-icosa-window` over WP0 is untested.** It used to refuse because the proxy did not
+  advertise `wl_shm`; **it now does**, so the stated reason has expired and nobody has re-tried.
+- **The Venus feedback question is open** — see §2 and §3.
+
+---
+
 ## 1. The queued experiment could not have run
 
 The command printed in `OVERVIEW.md` §6.2, in the handover, in the diary, and in the harness's **own
