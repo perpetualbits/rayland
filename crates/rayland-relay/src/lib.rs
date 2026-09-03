@@ -65,6 +65,8 @@ pub use frame::{MAX_FRAME_BYTES, RelayError, read_msg, write_msg};
 // return path's stages against one clock. Diagnostic; see the module's own docs for why it lives in
 // this otherwise pure-data crate and how it stays inside the crate's purity contract.
 /// Merging nearly-adjacent changed byte ranges, and the safety rule both directions share.
+/// The one place both sides of the WP0 proxy agree on which Wayland interfaces exist.
+pub mod interfaces;
 pub mod ranges;
 
 /// An ordered, timestamped event recorder cheap enough to leave on a latency-critical path.
