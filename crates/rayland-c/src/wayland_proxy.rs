@@ -241,6 +241,7 @@ use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_v1::ZwpLi
 use wayland_protocols::xdg::shell::server::xdg_wm_base::XdgWmBase;
 use wayland_server::protocol::wl_compositor::WlCompositor;
 use wayland_server::protocol::wl_seat::WlSeat;
+use wayland_protocols::wp::cursor_shape::v1::server::wp_cursor_shape_manager_v1::WpCursorShapeManagerV1;
 use wayland_protocols::xdg::decoration::zv1::server::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1;
 use wayland_protocols::xdg::xdg_output::zv1::server::zxdg_output_manager_v1::ZxdgOutputManagerV1;
 use wayland_server::protocol::wl_output::WlOutput;
@@ -287,6 +288,7 @@ const SERVER_DESCRIPTOR_NAMES: &[&str] = &[
     "wl_output",
     "zxdg_output_manager_v1",
     "zxdg_decoration_manager_v1",
+    "wp_cursor_shape_manager_v1",
 ];
 
 fn server_interface_by_name(
@@ -303,6 +305,7 @@ fn server_interface_by_name(
         "wl_output" => WlOutput::interface(),
         "zxdg_output_manager_v1" => ZxdgOutputManagerV1::interface(),
         "zxdg_decoration_manager_v1" => ZxdgDecorationManagerV1::interface(),
+        "wp_cursor_shape_manager_v1" => WpCursorShapeManagerV1::interface(),
         _ => return None,
     })
 }

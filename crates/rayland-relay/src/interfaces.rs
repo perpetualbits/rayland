@@ -122,7 +122,23 @@ pub const SUPPORTED: &[InterfaceSpec] = &[
         fds: FdPolicy::Transparent,
         kind: Kind::Global,
     },
+    // Lets a client NAME a cursor ("default", "text", ...) instead of supplying pixels. This is the
+    // interface behind the cursor that never appeared in the 2026-09-01 solarsim acceptance run:
+    // with no way to name a shape, and no shm cursor path, the pointer had nothing to show.
+    InterfaceSpec {
+        name: "wp_cursor_shape_manager_v1",
+        max_version: u32::MAX,
+        fds: FdPolicy::Transparent,
+        kind: Kind::Global,
+    },
     // --- Objects created from those globals, which S must also be able to name ---------------
+    // From `wp_cursor_shape_manager_v1.get_pointer`.
+    InterfaceSpec {
+        name: "wp_cursor_shape_device_v1",
+        max_version: u32::MAX,
+        fds: FdPolicy::Transparent,
+        kind: Kind::Child,
+    },
     // From `zxdg_decoration_manager_v1.get_toplevel_decoration`.
     InterfaceSpec {
         name: "zxdg_toplevel_decoration_v1",

@@ -1822,6 +1822,8 @@ const KNOWN_INTERFACE_NAMES: &[&str] = &[
     "zxdg_output_v1",
     "zxdg_decoration_manager_v1",
     "zxdg_toplevel_decoration_v1",
+    "wp_cursor_shape_manager_v1",
+    "wp_cursor_shape_device_v1",
     "xdg_wm_base",
     "xdg_surface",
     "xdg_toplevel",
@@ -1829,6 +1831,10 @@ const KNOWN_INTERFACE_NAMES: &[&str] = &[
     "zwp_linux_buffer_params_v1",
 ];
 
+use wayland_protocols::wp::cursor_shape::v1::client::{
+    wp_cursor_shape_device_v1::WpCursorShapeDeviceV1,
+    wp_cursor_shape_manager_v1::WpCursorShapeManagerV1,
+};
 use wayland_protocols::xdg::decoration::zv1::client::{
     zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
     zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
@@ -1865,6 +1871,10 @@ fn interface_by_name(name: &str) -> Option<&'static Interface> {
         // `get_toplevel_decoration` creates.
         "zxdg_decoration_manager_v1" => ZxdgDecorationManagerV1::interface(),
         "zxdg_toplevel_decoration_v1" => ZxdgToplevelDecorationV1::interface(),
+        // Naming a cursor shape instead of supplying pixels, and the per-pointer object
+        // `get_pointer` creates.
+        "wp_cursor_shape_manager_v1" => WpCursorShapeManagerV1::interface(),
+        "wp_cursor_shape_device_v1" => WpCursorShapeDeviceV1::interface(),
         "xdg_wm_base" => XdgWmBase::interface(),
         "xdg_surface" => XdgSurface::interface(),
         "xdg_toplevel" => XdgToplevel::interface(),
