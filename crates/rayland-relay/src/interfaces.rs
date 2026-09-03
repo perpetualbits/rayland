@@ -131,7 +131,37 @@ pub const SUPPORTED: &[InterfaceSpec] = &[
         fds: FdPolicy::Transparent,
         kind: Kind::Global,
     },
+    // Source-crop and destination-size for a surface: half of fractional scaling.
+    InterfaceSpec {
+        name: "wp_viewporter",
+        max_version: u32::MAX,
+        fds: FdPolicy::Transparent,
+        kind: Kind::Global,
+    },
+    // The other half: tells the client the fractional scale the compositor wants. Paired with
+    // `wp_viewporter` for the same reason `wl_output` and `zxdg_output_manager_v1` are paired --
+    // knowing the scale is useless without the means to render at it.
+    InterfaceSpec {
+        name: "wp_fractional_scale_manager_v1",
+        max_version: u32::MAX,
+        fds: FdPolicy::Transparent,
+        kind: Kind::Global,
+    },
     // --- Objects created from those globals, which S must also be able to name ---------------
+    // From `wp_viewporter.get_viewport`.
+    InterfaceSpec {
+        name: "wp_viewport",
+        max_version: u32::MAX,
+        fds: FdPolicy::Transparent,
+        kind: Kind::Child,
+    },
+    // From `wp_fractional_scale_manager_v1.get_fractional_scale`.
+    InterfaceSpec {
+        name: "wp_fractional_scale_v1",
+        max_version: u32::MAX,
+        fds: FdPolicy::Transparent,
+        kind: Kind::Child,
+    },
     // From `wp_cursor_shape_manager_v1.get_pointer`.
     InterfaceSpec {
         name: "wp_cursor_shape_device_v1",

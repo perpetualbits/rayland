@@ -1824,6 +1824,10 @@ const KNOWN_INTERFACE_NAMES: &[&str] = &[
     "zxdg_toplevel_decoration_v1",
     "wp_cursor_shape_manager_v1",
     "wp_cursor_shape_device_v1",
+    "wp_viewporter",
+    "wp_viewport",
+    "wp_fractional_scale_manager_v1",
+    "wp_fractional_scale_v1",
     "xdg_wm_base",
     "xdg_surface",
     "xdg_toplevel",
@@ -1831,6 +1835,13 @@ const KNOWN_INTERFACE_NAMES: &[&str] = &[
     "zwp_linux_buffer_params_v1",
 ];
 
+use wayland_protocols::wp::fractional_scale::v1::client::{
+    wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
+    wp_fractional_scale_v1::WpFractionalScaleV1,
+};
+use wayland_protocols::wp::viewporter::client::{
+    wp_viewport::WpViewport, wp_viewporter::WpViewporter,
+};
 use wayland_protocols::wp::cursor_shape::v1::client::{
     wp_cursor_shape_device_v1::WpCursorShapeDeviceV1,
     wp_cursor_shape_manager_v1::WpCursorShapeManagerV1,
@@ -1875,6 +1886,11 @@ fn interface_by_name(name: &str) -> Option<&'static Interface> {
         // `get_pointer` creates.
         "wp_cursor_shape_manager_v1" => WpCursorShapeManagerV1::interface(),
         "wp_cursor_shape_device_v1" => WpCursorShapeDeviceV1::interface(),
+        // Fractional scaling: the scale the compositor wants, and the viewport that renders at it.
+        "wp_viewporter" => WpViewporter::interface(),
+        "wp_viewport" => WpViewport::interface(),
+        "wp_fractional_scale_manager_v1" => WpFractionalScaleManagerV1::interface(),
+        "wp_fractional_scale_v1" => WpFractionalScaleV1::interface(),
         "xdg_wm_base" => XdgWmBase::interface(),
         "xdg_surface" => XdgSurface::interface(),
         "xdg_toplevel" => XdgToplevel::interface(),
