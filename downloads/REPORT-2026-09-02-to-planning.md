@@ -1,5 +1,11 @@
 # Report to the planning session — Rayland, 2026-09-02 (night)
 
+> **SUPERSEDED by [`REPORT-2026-09-03-to-planning.md`](REPORT-2026-09-03-to-planning.md).** Kept
+> rather than deleted, per the house rule that a retired document stays visible as retired. Its "short
+> version" describes the feedback soak as still running at 53 of 400; it finished at **400 clean / 400**,
+> and the matched control arm has since also returned **400 clean / 400**. Read the newer report for
+> anything you intend to act on.
+
 Written for the Claude.ai session that plans this work and cannot see the repository. Self-contained:
 every number below is stated with what produced it. Branch is **`wp0-wayland-proxy`**; `main` is 40+
 commits behind and merging remains the owner's call.
