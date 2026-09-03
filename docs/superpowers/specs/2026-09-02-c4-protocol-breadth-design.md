@@ -1,6 +1,12 @@
 # (c)4a: Wayland protocol breadth — what real applications actually ask for
 
-**Status:** design, 2026-09-02. Supersedes nothing; this is the first spec for arc (c) phase 4.
+**Status:** design, 2026-09-02. **IMPLEMENTED 2026-09-03 — Tasks 1–11 of 12 built and committed;
+Task 12 (acceptance) is owed and needs the two machines.** The problem statement below describes the
+state at design time (a five-global registry); WP0 now advertises **eighteen** globals and states two
+refusals with their reasons. Left as written rather than rewritten, per the house pattern for a
+document whose moment has passed. Plan and outcome:
+[`../plans/2026-09-02-c4a-protocol-breadth.md`](../plans/2026-09-02-c4a-protocol-breadth.md).
+Supersedes nothing; this is the first spec for arc (c) phase 4.
 **Acceptance application:** `solarsim` (unmodified wgpu/winit, Vulkan).
 **Explicitly deferred to a later phase:** OpenGL via Zink, and with it `rt`.
 

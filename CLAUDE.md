@@ -494,7 +494,22 @@ effort goes next:
   [`docs/design/2026-07-22-wp0-wayland-proxy-first-light.md`](docs/design/2026-07-22-wp0-wayland-proxy-first-light.md)
   and its `-plan` companion.
 - **(c)3 — content-addressed assets.**
-- **(c)4 — real/complex applications; GL via Zink.**
+- **(c)4a — Wayland protocol breadth** *(built 2026-09-03; acceptance owed)*: WP0 served a
+  **five-global** registry while a real toolkit application asks for nineteen, and the missing ones
+  were not skipped — C never advertised them, so the application silently ran degraded. The root
+  defect was that the supported set was written down **twice** (C's `create_global` calls, S's
+  `interface_by_name`), which is exactly the `wl_shm` drift. There is now **one shared `SUPPORTED`
+  table in `rayland-relay`** carrying each interface's name, version cap, `FdPolicy` and `Kind`; C
+  advertises from it and S is tested against it both ways, verified by mutation. Globals went 5 → 18
+  and `solarsim`'s bind gap 14 → 1, the remaining one being a *stated* refusal. `scripts/wp0-bind-gap.sh`
+  answers "what does this application ask for that we do not offer" for any application. **"Resolves"
+  is not "works":** acceptance (Task 12 — `solarsim` on milkv shown on dop561 with correct scale,
+  decorations and cursor) is **not yet run**. See
+  [`docs/superpowers/specs/2026-09-02-c4-protocol-breadth-design.md`](docs/superpowers/specs/2026-09-02-c4-protocol-breadth-design.md).
+- **(c)4b — real/complex applications; GL via Zink.** Its acceptance application is **`rt`**, which
+  **cannot run over Rayland today**: it is an OpenGL program (`choose_backend` returns
+  `BackendKind::Gl` on Wayland; zero Vulkan lines in its protocol trace), so it needs Zink before it
+  needs anything else.
 
 ## License
 

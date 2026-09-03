@@ -7090,3 +7090,62 @@ single sample cannot classify it. I over-read one measurement — the project's 
 lesson, applied to me, about a line I had just added to stop exactly that. Neither arm can be
 attributed to a characterised link; both used the same address, which is what makes them comparable
 to each other and to nothing else.
+
+### 2026-09-03 (c)4a — Eleven tasks, a gap from fourteen to one, and a flaw the work caught in its own foundation
+
+(c)4a is built: tasks 1 through 11 of twelve, committed one at a time, each verified before the next
+began. The twelfth — acceptance — is owed and needs both machines.
+
+The shape of it is worth recording because it is not the shape I expected when scoping. I thought this
+phase was "add fourteen interfaces". It was mostly "stop the supported set being written down twice",
+and the fourteen fell out of that almost mechanically once the mechanism existed. Tasks 1–4 built the
+mechanism and took the bulk of the effort; tasks 5–11 added every interface `solarsim` asks for and
+were each a table entry plus one line per side.
+
+**The gap fell 14 → 12 → 11 → 10 → 8 → 7 → 1, and I measured it after every single task rather than
+at the end.** Every step hit the number the plan had predicted. That is a duller experience than
+debugging and I think it is the point: the plan was written against a measurement, so executing it
+produced no surprises about *what* to add. The surprises were all about the mechanism.
+
+**The best moment was Task 5 catching a flaw in Task 3, which I had written the same afternoon.**
+Adding `wl_output` to the shared table made S's guard fire and left C's green. C was deciding which
+table entries were globals from `GLOBAL_INTERFACE_NAMES` — a **second hand-maintained list**, which I
+had introduced while building the thing whose entire purpose is that there should be one list. So
+adding a global to the table and forgetting the list meant C silently did not advertise it, with every
+test passing. That is the `wl_shm` drift exactly, one interface later, in the code written to end it.
+
+I want to be precise about why I did not see it. When I wrote Task 3 the list looked like a *detail of
+C* — "which of these names are globals rather than child objects" — rather than a fact about the
+interface, and facts about the interface were what I had put in the table. It is the same category
+error the original bug is: the thing you consider incidental is the thing that drifts. The distinction
+is now `Kind::Global` / `Kind::Child` in the table, C derives its globals from it, and the second list
+is gone.
+
+**One test I rewrote rather than updated, and the reasoning generalises.** Task 3 left a guard pinning
+that exactly five globals were advertised at exactly their versions — the proof its refactor was
+behaviour-preserving. By Task 5 there were seven and it failed, correctly. Changing the `5` to a `7`
+would have kept it green and made it a restatement of the table it was supposed to guard. What it is
+actually worth is the **version caps**: the dma-buf v3 cap is load-bearing because Mesa's v4 path
+hands out formats through a file descriptor, which cannot cross a network. So it now asserts those by
+value and lets the count grow. A test that has to be edited every time the thing it guards changes is
+not guarding it.
+
+**What the phase actually delivered, stated so it is not overread.** C prints its whole registry
+decision at startup — eighteen globals with versions, and two withheld *with their reasons*. That is
+the deliverable. The fourteen absences were never a bug: withholding an optional Wayland global is
+correct behaviour and applications cope. The bug was that an absence and an oversight were
+indistinguishable, and `solarsim` ran for two days without its display scale, decorations, cursor
+shape, fractional scaling or presentation timing while every test passed.
+
+**And what it did not deliver.** "Resolves" is not "works". Every one of these tasks proves a bind
+succeeds; not one proves an event flows back correctly, or that the application does anything sensible
+with what it now receives. The spec says this in as many words and I am repeating it here because the
+gap number is seductive: 14 → 1 reads like completion and is not. Acceptance is `solarsim` on milkv
+displayed on dop561 with the scale right, decorations present and the cursor visible — checked by
+looking, because that is the only check that can tell the difference.
+
+One smaller thing worth keeping. The old test for "an interface we have never heard of" used
+`wl_data_device_manager` as its example. That interface is now *known but refused* — S names it, C
+declines to advertise it, with a reason. So the example moved to `zwp_tablet_manager_v2`. "We decided
+against this" and "we have never considered this" are different answers, and a codebase that conflates
+them is back where this phase started.

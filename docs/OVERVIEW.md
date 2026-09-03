@@ -290,7 +290,8 @@ fully supersedes it.
 | (c)2 · Mapped memory and the readback return path | **done** |
 | **WP0 · Wayland proxy first light** | **ACTIVE** — 4.3 and 4.5 done; commit gating and hardening remain |
 | (c)3 · Content-addressed assets | planned |
-| (c)4 · Real/complex applications; GL via Zink | planned |
+| (c)4a · Wayland protocol breadth | **11 of 12 tasks built** (2026-09-03); acceptance owed |
+| (c)4b · Real/complex applications; GL via Zink | planned |
 | SP4 · Adaptive L3, session/security (SSH bootstrap, sandboxing) | planned |
 | SP5 · Proxy completeness (Sommelier/waypipe-grade Wayland coverage) | planned |
 | Audio | planned, separate track (transport reservations already made) |
@@ -765,6 +766,55 @@ reason no longer holds. `wl_shm.create_pool` passes a file descriptor — which 
 cross a network — and its contents are pixels, ~1 MB/frame, exactly what the presented-buffer
 exclusion removed. It is a `wl_shm` client; WP0 is a dmabuf mechanism.
 
+### 6.1.6 (c)4a · Wayland protocol breadth — built 2026-09-03, acceptance owed
+
+**WP0 worked on a five-global registry while a real toolkit application asked for nineteen.** Measured
+by tracing `wl_registry.bind` against the live compositor: `solarsim` (Vulkan, wgpu/winit) binds 19,
+`rt` binds 25, WP0 offered 5. The missing ones were **not** skipped — C never advertised them, so the
+application adapted, which is correct Wayland behaviour. **The defect was that the absence was
+unrecorded**, so a deliberate omission and an oversight looked identical. `solarsim` had been running
+without its display's scale factor, decorations, cursor shape, fractional scaling and presentation
+timing, and nothing said so.
+
+**The root defect was that the supported set was written down twice** — C's `create_global` calls over
+`wayland-server` descriptors, S's `interface_by_name` over `wayland-client` ones, with nothing tying
+them together. *That drift is the `wl_shm` bug*: added to C on 2026-09-01, forgotten in S, detected by
+a human noticing an absent cursor.
+
+**Now:** one shared `SUPPORTED` table in `rayland-relay` (pure data, both sides depend on it) carrying
+each interface's name, version cap, `FdPolicy` and `Kind`. C advertises from it; S is tested against it
+in both directions. **The gap fell 14 → 1 across six tasks, verified by measurement after each**, and
+the remaining 1 is a stated refusal:
+
+| | |
+|---|---|
+| globals advertised | **18** (was 5) |
+| `solarsim` bind gap | **1**, and it is `Refused` with a reason |
+| refused, with reasons printed at startup | `wp_linux_drm_syncobj_manager_v1` (carries a DRM syncobj fd; cross-machine explicit GPU sync is undesigned), `wl_data_device_manager` (clipboard/DnD over app-created fds; its own phase) |
+
+**Two mechanisms are worth knowing about because they are reusable.**
+`scripts/wp0-bind-gap.sh` answers *"what does this application ask for that WP0 does not offer?"* for
+**any** application, by diffing a real-compositor trace against the table — it refuses to run against
+a headless compositor (no `wl_seat` means blind to a whole class) and fails loudly on zero parsed
+binds, because an empty gap must mean nothing is missing and never that the parser did not match. And
+the two-sided consistency test is **verified by mutation**: deleting the `wl_shm` arm reproduces the
+2026-09-01 bug as a named test failure. The test it replaced enumerated the names it expected, so it
+could only catch a name someone remembered to add in two places at once.
+
+**What this does NOT establish, and the spec says so in as many words: "resolves" is not "works".**
+Adding an interface makes a bind succeed. It does not prove events flow back correctly or that the
+application does anything sensible with them. **Task 12 — acceptance — is owed**, and it is not a
+list: it is `solarsim` on milkv displayed on dop561, with correct scale, decorations present and the
+cursor visible, checked by looking. Until that runs, this phase has built a mechanism and measured a
+gap, not delivered a working feature.
+
+**A finding that reordered the roadmap.** `rt` — the owner's own terminal, and the natural acceptance
+application — **cannot run over Rayland at all**. `choose_backend` returns `BackendKind::Gl` for any
+non-X11 display, and its protocol trace holds **zero** Vulkan lines against 2,143 on Mesa's EGL
+queues. Rayland relays Vulkan; an OpenGL application emits no Venus stream. Choosing `rt` would have
+made GL-via-Zink a prerequisite of (c)4a's own acceptance test. `rt` is now (c)4b's acceptance
+application; `solarsim` is (c)4a's.
+
 ## 6.2 THE QUEUED EXPERIMENT IS DONE — the feedback arm is clean through 400 runs
 
 ```
@@ -1195,7 +1245,7 @@ Verified after the fixes: 10/10 and 4/4 clean, no leaks, provenance printed. See
   fixture's uninterceptable mapped writes still reach S**. What (c)2 proved is the **readback return
   path**. The forward case — a true network, where those writes *cannot* reach S — is the fixture's
   original purpose and is **still waiting**. `docs/icosa-fixtures.md` explains why it did not bite.
-- **(c)3 content-addressed assets**, **(c)4 real applications and GL via Zink**, then the SP4/SP5
+- **(c)3 content-addressed assets**, **(c)4b real applications and GL via Zink**, then the SP4/SP5
   hardening tracks and audio.
 
 ---
