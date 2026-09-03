@@ -65,8 +65,15 @@ pub const SUPPORTED: &[InterfaceSpec] = &[
     InterfaceSpec { name: "wl_compositor", max_version: u32::MAX, fds: FdPolicy::Transparent },
     InterfaceSpec { name: "xdg_wm_base", max_version: u32::MAX, fds: FdPolicy::Transparent },
     InterfaceSpec { name: "wl_seat", max_version: u32::MAX, fds: FdPolicy::Transparent },
-    // Capped at v3 so Mesa takes the fd-free format path; v4+ hands out a format *table* in a
-    // descriptor, which is exactly the thing that cannot cross a network.
+    // **Capped at v3 on purpose, and the cap is load-bearing (WP0 Task 4.4).**
+    //
+    // The interface descriptor supports higher versions, but Mesa's Venus WSI opts into the **v4
+    // feedback** path (`get_default_feedback`) whenever the bound version is >= 4, and that path
+    // delivers its supported formats through a `format_table` **file descriptor** the client
+    // `mmap`s (`wsi_common_wayland.c:917-928`). A file descriptor cannot cross a network. At v3
+    // Mesa falls back to the plain `modifier` event (`:830-852`) -- three integers and no fd, a
+    // complete path in this Mesa. So WP0 advertises exactly v3, forcing the fd-free path, and
+    // answers the format query itself (`rayland_c::wayland_proxy::advertise_dmabuf_formats`).
     InterfaceSpec {
         name: "zwp_linux_dmabuf_v1",
         max_version: 3,

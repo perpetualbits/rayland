@@ -243,6 +243,35 @@ use wayland_server::protocol::wl_compositor::WlCompositor;
 use wayland_server::protocol::wl_seat::WlSeat;
 use wayland_server::protocol::wl_shm::WlShm;
 
+/// Every interface in the shared table that is a **global** — something the application binds from
+/// the registry, as opposed to a child object created by a request. Only these are advertised.
+///
+/// Kept beside [`server_interface_by_name`] so the two are edited together, and walked by the
+/// consistency tests so a name here without a descriptor, or without a table entry, is a build
+/// failure rather than a missing global nobody notices.
+const GLOBAL_INTERFACE_NAMES: &[&str] =
+    &["wl_compositor", "xdg_wm_base", "zwp_linux_dmabuf_v1", "wl_seat", "wl_shm"];
+
+/// Map a wire interface name to the `wayland-server` descriptor `create_global` needs.
+///
+/// The mirror of `rayland-s`'s `interface_by_name`, and it must be a separate function for a reason
+/// worth stating: `WlCompositor` in `wayland-server` and `WlCompositor` in `wayland-client` are
+/// different Rust types with different `&'static Interface` values, so the two sides cannot share
+/// one map. What they share is `rayland_relay::interfaces::SUPPORTED`, and the tests hold both maps
+/// to it — which is what the 2026-09-01 `wl_shm` drift got past.
+fn server_interface_by_name(
+    name: &str,
+) -> Option<&'static wayland_server::backend::protocol::Interface> {
+    Some(match name {
+        "wl_compositor" => WlCompositor::interface(),
+        "xdg_wm_base" => XdgWmBase::interface(),
+        "zwp_linux_dmabuf_v1" => ZwpLinuxDmabufV1::interface(),
+        "wl_seat" => WlSeat::interface(),
+        "wl_shm" => WlShm::interface(),
+        _ => return None,
+    })
+}
+
 /// Where the proxy sends the application's translated Wayland requests.
 ///
 /// This is the seam between the proxy and S. In WP0 Task 3b it is satisfied by a **stub collector** (the
@@ -406,16 +435,12 @@ const OP_PARAMS_CREATE: u16 = 2;
 /// `zwp_linux_buffer_params_v1.create_immed` — creates the `wl_buffer` synchronously (opcode 3).
 const OP_PARAMS_CREATE_IMMED: u16 = 3;
 
-/// The version the proxy advertises `zwp_linux_dmabuf_v1` at — **capped at 3 on purpose**.
-///
-/// # Why the cap is load-bearing (WP0 Task 4.4)
-/// The interface descriptor supports higher versions, but Mesa's Venus WSI opts into the **v4 feedback**
-/// path (`get_default_feedback`) whenever the bound version is `>= 4`, and that path delivers its supported
-/// formats through a `format_table` **file descriptor** the client `mmap`s (`wsi_common_wayland.c:917-928`).
-/// A file descriptor cannot cross a network. At v3 Mesa falls back to the plain `modifier` event
-/// (`:830-852`), which is three integers and no fd — a complete path in this Mesa. So the proxy advertises
-/// exactly v3, forcing the fd-free path, and answers the format query itself (see [`advertise_dmabuf_formats`]).
-const DMABUF_MAX_VERSION: u32 = 3;
+// The version `zwp_linux_dmabuf_v1` is advertised at is **capped at 3 on purpose**, and both the
+// cap and the reasoning for it now live in `rayland_relay::interfaces::SUPPORTED` — the one place C
+// and S agree on the supported set. Read the entry there before changing it: the short version is
+// that Mesa's v4 feedback path delivers formats through a file descriptor, which cannot cross a
+// network. The cap used to be a constant here; it moved when advertisement became table-driven, and
+// keeping a duplicate would be two numbers to disagree.
 
 /// The `wl_shm` version advertised to the application.
 ///
@@ -1270,15 +1295,39 @@ pub fn run_with_events(
     // Advertise each global at the descriptor's max version (`u32::MAX` is clamped down to it), *except*
     // `zwp_linux_dmabuf_v1`, which is capped at v3 so Mesa takes the fd-free format path — see
     // [`DMABUF_MAX_VERSION`].
-    create_global::<WlCompositor>(&handle, u32::MAX);
-    create_global::<XdgWmBase>(&handle, u32::MAX);
-    create_global::<ZwpLinuxDmabufV1>(&handle, DMABUF_MAX_VERSION);
-    create_global::<WlSeat>(&handle, u32::MAX);
+    // Advertise from the shared table rather than from five hardcoded calls, so C and S cannot
+    // disagree about the supported set (see `rayland_relay::interfaces`). Child-object interfaces in
+    // the table are skipped: they are created by requests, not bound from the registry.
+    for spec in rayland_relay::interfaces::advertised() {
+        if !GLOBAL_INTERFACE_NAMES.contains(&spec.name) {
+            continue;
+        }
+        let Some(iface) = server_interface_by_name(spec.name) else {
+            // Unreachable in a tested build — `every_advertised_global_has_a_server_descriptor`
+            // fails first — but reported rather than ignored, because a silently absent global is
+            // the exact failure mode this phase exists to end.
+            wp_log(&format!(
+                "registry: `{}` is in the shared table but C has no descriptor; NOT advertised",
+                spec.name
+            ));
+            continue;
+        };
+        let version = spec.max_version.min(iface.version);
+        create_global(&handle, iface, spec.max_version);
+        wp_log(&format!("registry: advertising {} v{version}", spec.name));
+    }
+    // State what was deliberately withheld, and why. A withheld global is correct Wayland behaviour
+    // — applications cope with an absent optional global — but an *unrecorded* absence is
+    // indistinguishable from an oversight, which is how fourteen interfaces went missing unnoticed.
+    for spec in rayland_relay::interfaces::SUPPORTED {
+        if let rayland_relay::interfaces::FdPolicy::Refused(reason) = spec.fds {
+            wp_log(&format!("registry: NOT advertising {} — {reason}", spec.name));
+        }
+    }
     // **Advertised at version 1, deliberately.** Version 2 adds only `wl_shm.release`, which nothing
     // here needs, and clients bind the minimum of what they want and what is offered — so the lower
     // version is the conservative choice rather than a limitation. Without this global at all, `winit`
     // aborts with `Bind(NotPresent)` before it creates a window or reaches Vulkan.
-    create_global::<WlShm>(&handle, SHM_MAX_VERSION);
     // Where the application dials in. WP0 serves exactly one such socket.
     let listener = UnixListener::bind(&socket_path)?;
     // The dispatch loop owns this state; it is threaded to every callback by the backend.
@@ -1302,8 +1351,11 @@ pub fn run_with_events(
 /// `max_version` caps the advertisement below that — pass `u32::MAX` to advertise the full descriptor
 /// version, or a specific cap (as WP0 does for `zwp_linux_dmabuf_v1`; see [`DMABUF_MAX_VERSION`]). The
 /// `.min` guarantees the proxy never advertises a version the descriptor cannot actually serve.
-fn create_global<R: Resource>(handle: &Handle, max_version: u32) -> GlobalId {
-    let iface = R::interface();
+fn create_global(
+    handle: &Handle,
+    iface: &'static wayland_server::backend::protocol::Interface,
+    max_version: u32,
+) -> GlobalId {
     let version = max_version.min(iface.version);
     handle.create_global::<ProxyState>(
         iface,
@@ -1746,6 +1798,78 @@ mod tests {
     //! ones with actual mapping logic worth pinning: the value scalars, and — the subtle one — `Str`'s
     //! NUL handling and its null-vs-present distinction.
     use super::synthesize_keymap_fd;
+    use super::{
+        GLOBAL_INTERFACE_NAMES, SHM_MAX_VERSION, WlCompositor, WlSeat, XdgWmBase,
+        server_interface_by_name,
+    };
+    use wayland_server::Resource as _;
+
+    /// C must be able to name every global the shared table says to advertise.
+    ///
+    /// The mirror of S's `every_supported_interface_resolves`. Child-object interfaces
+    /// (`wl_surface` and friends) are in the table but are not globals — they are created by
+    /// requests, not bound from the registry — so only `GLOBAL_INTERFACE_NAMES` entries are checked.
+    #[test]
+    fn every_advertised_global_has_a_server_descriptor() {
+        for spec in rayland_relay::interfaces::advertised() {
+            if !GLOBAL_INTERFACE_NAMES.contains(&spec.name) {
+                continue;
+            }
+            let iface = server_interface_by_name(spec.name).unwrap_or_else(|| {
+                panic!(
+                    "`{}` is advertised by the shared table but C has no server descriptor for it",
+                    spec.name
+                )
+            });
+            assert_eq!(iface.name, spec.name, "descriptor name must match the lookup key");
+        }
+    }
+
+    /// The same for `wl_shm`, whose v1 cap is also explained here and advertised from the table.
+    #[test]
+    fn shm_cap_matches_the_shared_table() {
+        assert_eq!(
+            rayland_relay::interfaces::spec_for("wl_shm").expect("shm is in the table").max_version,
+            SHM_MAX_VERSION
+        );
+    }
+
+    /// Every name in `GLOBAL_INTERFACE_NAMES` is in the shared table, so the two cannot drift.
+    #[test]
+    fn every_global_name_is_in_the_shared_table() {
+        for name in GLOBAL_INTERFACE_NAMES {
+            assert!(
+                rayland_relay::interfaces::spec_for(name).is_some(),
+                "C lists `{name}` as a global but it is not in rayland_relay::interfaces::SUPPORTED"
+            );
+        }
+    }
+
+    /// The five globals WP0 served before this phase are still advertised, at the same versions.
+    ///
+    /// Task 3 replaces five hardcoded `create_global` calls with a table walk; this is the guard
+    /// that the replacement is behaviour-preserving rather than merely compiling.
+    #[test]
+    fn the_advertised_globals_are_unchanged_by_the_table_walk() {
+        let mut got: Vec<(&str, u32)> = rayland_relay::interfaces::advertised()
+            .filter(|s| GLOBAL_INTERFACE_NAMES.contains(&s.name))
+            .map(|s| {
+                let iface = server_interface_by_name(s.name).expect("descriptor exists");
+                (s.name, s.max_version.min(iface.version))
+            })
+            .collect();
+        got.sort();
+        let mut want = vec![
+            ("wl_compositor", WlCompositor::interface().version),
+            ("wl_seat", WlSeat::interface().version),
+            ("wl_shm", SHM_MAX_VERSION),
+            ("xdg_wm_base", XdgWmBase::interface().version),
+            ("zwp_linux_dmabuf_v1", 3),
+        ];
+        want.sort();
+        assert_eq!(got, want);
+    }
+
     use std::io::Read;
     use std::os::fd::AsRawFd;
 
