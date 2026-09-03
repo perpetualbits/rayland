@@ -241,16 +241,11 @@ use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_v1::ZwpLi
 use wayland_protocols::xdg::shell::server::xdg_wm_base::XdgWmBase;
 use wayland_server::protocol::wl_compositor::WlCompositor;
 use wayland_server::protocol::wl_seat::WlSeat;
+use wayland_protocols::xdg::xdg_output::zv1::server::zxdg_output_manager_v1::ZxdgOutputManagerV1;
+use wayland_server::protocol::wl_output::WlOutput;
 use wayland_server::protocol::wl_shm::WlShm;
 
-/// Every interface in the shared table that is a **global** — something the application binds from
-/// the registry, as opposed to a child object created by a request. Only these are advertised.
-///
-/// Kept beside [`server_interface_by_name`] so the two are edited together, and walked by the
-/// consistency tests so a name here without a descriptor, or without a table entry, is a build
-/// failure rather than a missing global nobody notices.
-const GLOBAL_INTERFACE_NAMES: &[&str] =
-    &["wl_compositor", "xdg_wm_base", "zwp_linux_dmabuf_v1", "wl_seat", "wl_shm"];
+
 
 /// Map a wire interface name to the `wayland-server` descriptor `create_global` needs.
 ///
@@ -270,10 +265,27 @@ const GLOBAL_INTERFACE_NAMES: &[&str] =
 /// created by requests, not bound from the registry, so they are not globals and an application
 /// never asks for them by name.
 pub fn advertised_globals() -> impl Iterator<Item = &'static str> {
-    rayland_relay::interfaces::advertised()
-        .map(|s| s.name)
-        .filter(|n| GLOBAL_INTERFACE_NAMES.contains(n))
+    rayland_relay::interfaces::advertised_globals().map(|s| s.name)
 }
+
+/// Every name [`server_interface_by_name`] answers to, so the consistency test can walk them.
+///
+/// `cfg(test)` because nothing outside the test needs it: the *advertisement* is driven by the
+/// shared table, and this list exists only so a test can check the map has nothing the table lacks.
+/// Gated rather than `allow(dead_code)` so it cannot quietly acquire a runtime use.
+///
+/// Rust cannot enumerate a `match`'s arms. Keep this in step with the `match` below; the tests hold
+/// both to `rayland_relay::interfaces::SUPPORTED`.
+#[cfg(test)]
+const SERVER_DESCRIPTOR_NAMES: &[&str] = &[
+    "wl_compositor",
+    "xdg_wm_base",
+    "zwp_linux_dmabuf_v1",
+    "wl_seat",
+    "wl_shm",
+    "wl_output",
+    "zxdg_output_manager_v1",
+];
 
 fn server_interface_by_name(
     name: &str,
@@ -284,6 +296,10 @@ fn server_interface_by_name(
         "zwp_linux_dmabuf_v1" => ZwpLinuxDmabufV1::interface(),
         "wl_seat" => WlSeat::interface(),
         "wl_shm" => WlShm::interface(),
+        // The output pair. `zxdg_output_v1` is deliberately absent: it is created by
+        // `get_xdg_output`, never bound, so C has no global to advertise for it.
+        "wl_output" => WlOutput::interface(),
+        "zxdg_output_manager_v1" => ZxdgOutputManagerV1::interface(),
         _ => return None,
     })
 }
@@ -1314,10 +1330,7 @@ pub fn run_with_events(
     // Advertise from the shared table rather than from five hardcoded calls, so C and S cannot
     // disagree about the supported set (see `rayland_relay::interfaces`). Child-object interfaces in
     // the table are skipped: they are created by requests, not bound from the registry.
-    for spec in rayland_relay::interfaces::advertised() {
-        if !GLOBAL_INTERFACE_NAMES.contains(&spec.name) {
-            continue;
-        }
+    for spec in rayland_relay::interfaces::advertised_globals() {
         let Some(iface) = server_interface_by_name(spec.name) else {
             // Unreachable in a tested build — `every_advertised_global_has_a_server_descriptor`
             // fails first — but reported rather than ignored, because a silently absent global is
@@ -1815,7 +1828,7 @@ mod tests {
     //! NUL handling and its null-vs-present distinction.
     use super::synthesize_keymap_fd;
     use super::{
-        GLOBAL_INTERFACE_NAMES, SHM_MAX_VERSION, WlCompositor, WlSeat, XdgWmBase,
+        SERVER_DESCRIPTOR_NAMES, SHM_MAX_VERSION, WlCompositor, WlSeat, XdgWmBase,
         server_interface_by_name,
     };
     use wayland_server::Resource as _;
@@ -1827,10 +1840,7 @@ mod tests {
     /// requests, not bound from the registry — so only `GLOBAL_INTERFACE_NAMES` entries are checked.
     #[test]
     fn every_advertised_global_has_a_server_descriptor() {
-        for spec in rayland_relay::interfaces::advertised() {
-            if !GLOBAL_INTERFACE_NAMES.contains(&spec.name) {
-                continue;
-            }
+        for spec in rayland_relay::interfaces::advertised_globals() {
             let iface = server_interface_by_name(spec.name).unwrap_or_else(|| {
                 panic!(
                     "`{}` is advertised by the shared table but C has no server descriptor for it",
@@ -1850,40 +1860,55 @@ mod tests {
         );
     }
 
-    /// Every name in `GLOBAL_INTERFACE_NAMES` is in the shared table, so the two cannot drift.
+    /// C's descriptor map contains nothing the table does not tag as a global.
+    ///
+    /// The other direction of `every_advertised_global_has_a_server_descriptor`. A descriptor C can
+    /// build for something the table calls a child object is dead weight; for something the table
+    /// does not name at all, it is drift.
     #[test]
-    fn every_global_name_is_in_the_shared_table() {
-        for name in GLOBAL_INTERFACE_NAMES {
-            assert!(
-                rayland_relay::interfaces::spec_for(name).is_some(),
-                "C lists `{name}` as a global but it is not in rayland_relay::interfaces::SUPPORTED"
+    fn every_server_descriptor_is_a_table_global() {
+        for name in SERVER_DESCRIPTOR_NAMES {
+            let spec = rayland_relay::interfaces::spec_for(name).unwrap_or_else(|| {
+                panic!("C has a server descriptor for `{name}`, which is not in SUPPORTED")
+            });
+            assert_eq!(
+                spec.kind,
+                rayland_relay::interfaces::Kind::Global,
+                "C advertises `{name}`, so the table must tag it Global, not Child"
             );
         }
     }
 
-    /// The five globals WP0 served before this phase are still advertised, at the same versions.
+    /// The five globals WP0 served before (c)4a are still advertised, at exactly their historical
+    /// versions.
     ///
-    /// Task 3 replaces five hardcoded `create_global` calls with a table walk; this is the guard
-    /// that the replacement is behaviour-preserving rather than merely compiling.
+    /// This began as the guard that Task 3's table walk was behaviour-preserving, and it is kept —
+    /// with the count no longer frozen — because its remaining value is the **version caps**. The
+    /// dma-buf v3 cap is load-bearing (Mesa's v4 path hands out formats through an fd, which cannot
+    /// cross a network) and the `wl_shm` v1 cap is deliberate. Adding interfaces must never quietly
+    /// change either, so they are asserted by value rather than derived from the table they guard.
     #[test]
-    fn the_advertised_globals_are_unchanged_by_the_table_walk() {
-        let mut got: Vec<(&str, u32)> = rayland_relay::interfaces::advertised()
-            .filter(|s| GLOBAL_INTERFACE_NAMES.contains(&s.name))
-            .map(|s| {
-                let iface = server_interface_by_name(s.name).expect("descriptor exists");
-                (s.name, s.max_version.min(iface.version))
-            })
-            .collect();
-        got.sort();
-        let mut want = vec![
+    fn the_pre_existing_globals_keep_their_versions() {
+        let advertised: std::collections::HashMap<&str, u32> =
+            rayland_relay::interfaces::advertised_globals()
+                .map(|s| {
+                    let iface = server_interface_by_name(s.name).expect("descriptor exists");
+                    (s.name, s.max_version.min(iface.version))
+                })
+                .collect();
+        for (name, want) in [
             ("wl_compositor", WlCompositor::interface().version),
             ("wl_seat", WlSeat::interface().version),
             ("wl_shm", SHM_MAX_VERSION),
             ("xdg_wm_base", XdgWmBase::interface().version),
             ("zwp_linux_dmabuf_v1", 3),
-        ];
-        want.sort();
-        assert_eq!(got, want);
+        ] {
+            assert_eq!(
+                advertised.get(name),
+                Some(&want),
+                "`{name}` must still be advertised at v{want}"
+            );
+        }
     }
 
     use std::io::Read;

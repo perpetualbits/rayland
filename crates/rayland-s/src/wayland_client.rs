@@ -79,7 +79,8 @@ use wayland_client::backend::{Backend, ObjectData, ObjectId, WaylandError};
 // Interface descriptors for every object WP0 replays. Named so `interface_by_name` can map a wire
 // interface string to the linked `&'static Interface` that `send_request`'s `child_spec` requires.
 use wayland_client::protocol::{
-    wl_buffer::WlBuffer, wl_callback::WlCallback, wl_compositor::WlCompositor, wl_region::WlRegion,
+    wl_buffer::WlBuffer, wl_callback::WlCallback, wl_compositor::WlCompositor,
+    wl_output::WlOutput, wl_region::WlRegion,
     wl_shm::WlShm, wl_shm_pool::WlShmPool,
     wl_registry::WlRegistry, wl_seat::WlSeat, wl_surface::WlSurface,
 };
@@ -1816,12 +1817,19 @@ const KNOWN_INTERFACE_NAMES: &[&str] = &[
     "wl_shm",
     "wl_shm_pool",
     "wl_seat",
+    "wl_output",
+    "zxdg_output_manager_v1",
+    "zxdg_output_v1",
     "xdg_wm_base",
     "xdg_surface",
     "xdg_toplevel",
     "zwp_linux_dmabuf_v1",
     "zwp_linux_buffer_params_v1",
 ];
+
+use wayland_protocols::xdg::xdg_output::zv1::client::{
+    zxdg_output_manager_v1::ZxdgOutputManagerV1, zxdg_output_v1::ZxdgOutputV1,
+};
 
 fn interface_by_name(name: &str) -> Option<&'static Interface> {
     Some(match name {
@@ -1840,6 +1848,13 @@ fn interface_by_name(name: &str) -> Option<&'static Interface> {
         "wl_shm" => WlShm::interface(),
         "wl_shm_pool" => WlShmPool::interface(),
         "wl_seat" => WlSeat::interface(),
+        // The output pair. `wl_output` carries S's real monitor geometry, mode, scale and refresh —
+        // correct to relay, because S's monitor is where the application is actually displayed.
+        // `zxdg_output_manager_v1` adds logical (compositor-space) geometry on top of it, and
+        // `zxdg_output_v1` is what its `get_xdg_output` creates.
+        "wl_output" => WlOutput::interface(),
+        "zxdg_output_manager_v1" => ZxdgOutputManagerV1::interface(),
+        "zxdg_output_v1" => ZxdgOutputV1::interface(),
         "xdg_wm_base" => XdgWmBase::interface(),
         "xdg_surface" => XdgSurface::interface(),
         "xdg_toplevel" => XdgToplevel::interface(),

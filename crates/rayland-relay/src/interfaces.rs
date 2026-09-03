@@ -42,6 +42,24 @@ pub enum FdPolicy {
     Refused(&'static str),
 }
 
+/// Whether an application obtains this interface by **binding a global**, or by a **request on an
+/// object it already holds**.
+///
+/// This distinction has to live in the table. Without it, C needs a second hand-maintained list of
+/// which names are globals — and a second list is a second thing to drift, which is the exact defect
+/// this module exists to end. The first draft of C's advertisement did keep such a list, and adding
+/// `wl_output` to the table while forgetting the list made C silently not advertise it while every
+/// test stayed green. Found while executing the plan, one interface later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// Advertised in the registry; the application binds it by name.
+    Global,
+    /// Created by a request on a parent object (`wl_compositor.create_surface`,
+    /// `zxdg_output_manager_v1.get_xdg_output`, …). Never advertised, but S must still be able to
+    /// name it to replay the request that creates it.
+    Child,
+}
+
 /// One interface WP0 knows about.
 #[derive(Debug, Clone, Copy)]
 pub struct InterfaceSpec {
@@ -53,6 +71,8 @@ pub struct InterfaceSpec {
     pub max_version: u32,
     /// See [`FdPolicy`].
     pub fds: FdPolicy,
+    /// See [`Kind`]. Decides whether C advertises this interface at all.
+    pub kind: Kind,
 }
 
 /// Every interface WP0 supports, in one place.
@@ -62,9 +82,9 @@ pub struct InterfaceSpec {
 /// entire point: the table and the two maps move together or the build goes red.
 pub const SUPPORTED: &[InterfaceSpec] = &[
     // --- Globals the application binds -------------------------------------------------------
-    InterfaceSpec { name: "wl_compositor", max_version: u32::MAX, fds: FdPolicy::Transparent },
-    InterfaceSpec { name: "xdg_wm_base", max_version: u32::MAX, fds: FdPolicy::Transparent },
-    InterfaceSpec { name: "wl_seat", max_version: u32::MAX, fds: FdPolicy::Transparent },
+    InterfaceSpec { name: "wl_compositor", max_version: u32::MAX, fds: FdPolicy::Transparent, kind: Kind::Global },
+    InterfaceSpec { name: "xdg_wm_base", max_version: u32::MAX, fds: FdPolicy::Transparent, kind: Kind::Global },
+    InterfaceSpec { name: "wl_seat", max_version: u32::MAX, fds: FdPolicy::Transparent, kind: Kind::Global },
     // **Capped at v3 on purpose, and the cap is load-bearing (WP0 Task 4.4).**
     //
     // The interface descriptor supports higher versions, but Mesa's Venus WSI opts into the **v4
@@ -78,26 +98,42 @@ pub const SUPPORTED: &[InterfaceSpec] = &[
         name: "zwp_linux_dmabuf_v1",
         max_version: 3,
         fds: FdPolicy::Substituted("BufferToken"),
+        kind: Kind::Global,
     },
     // v1 deliberately: v2 adds only `wl_shm.release`, which nothing here needs, and a client binds
     // the minimum of what it wants and what is offered.
-    InterfaceSpec { name: "wl_shm", max_version: 1, fds: FdPolicy::Substituted("ShmPool") },
+    InterfaceSpec { name: "wl_shm", max_version: 1, fds: FdPolicy::Substituted("ShmPool"), kind: Kind::Global },
+    // Scale, geometry, mode and refresh — of S's monitor, which is the display the application is
+    // actually on, so relaying S's real values is correct rather than a leak. Without it a toolkit
+    // assumes scale 1 and renders the wrong size on a HiDPI screen. Highest-impact entry in the gap.
+    InterfaceSpec { name: "wl_output", max_version: u32::MAX, fds: FdPolicy::Transparent, kind: Kind::Global },
+    // Adds logical (compositor-space) geometry to `wl_output`; paired with it for that reason.
+    InterfaceSpec {
+        name: "zxdg_output_manager_v1",
+        max_version: u32::MAX,
+        fds: FdPolicy::Transparent,
+        kind: Kind::Global,
+    },
     // --- Objects created from those globals, which S must also be able to name ---------------
-    InterfaceSpec { name: "wl_surface", max_version: u32::MAX, fds: FdPolicy::Transparent },
-    InterfaceSpec { name: "wl_region", max_version: u32::MAX, fds: FdPolicy::Transparent },
-    InterfaceSpec { name: "wl_callback", max_version: u32::MAX, fds: FdPolicy::Transparent },
-    InterfaceSpec { name: "wl_buffer", max_version: u32::MAX, fds: FdPolicy::Transparent },
+    // From `zxdg_output_manager_v1.get_xdg_output`. Not a global: never bound, only created.
+    InterfaceSpec { name: "zxdg_output_v1", max_version: u32::MAX, fds: FdPolicy::Transparent, kind: Kind::Child },
+    InterfaceSpec { name: "wl_surface", max_version: u32::MAX, fds: FdPolicy::Transparent, kind: Kind::Child },
+    InterfaceSpec { name: "wl_region", max_version: u32::MAX, fds: FdPolicy::Transparent, kind: Kind::Child },
+    InterfaceSpec { name: "wl_callback", max_version: u32::MAX, fds: FdPolicy::Transparent, kind: Kind::Child },
+    InterfaceSpec { name: "wl_buffer", max_version: u32::MAX, fds: FdPolicy::Transparent, kind: Kind::Child },
     InterfaceSpec {
         name: "wl_shm_pool",
         max_version: u32::MAX,
         fds: FdPolicy::Substituted("ShmPool"),
+        kind: Kind::Child,
     },
-    InterfaceSpec { name: "xdg_surface", max_version: u32::MAX, fds: FdPolicy::Transparent },
-    InterfaceSpec { name: "xdg_toplevel", max_version: u32::MAX, fds: FdPolicy::Transparent },
+    InterfaceSpec { name: "xdg_surface", max_version: u32::MAX, fds: FdPolicy::Transparent, kind: Kind::Child },
+    InterfaceSpec { name: "xdg_toplevel", max_version: u32::MAX, fds: FdPolicy::Transparent, kind: Kind::Child },
     InterfaceSpec {
         name: "zwp_linux_buffer_params_v1",
         max_version: u32::MAX,
         fds: FdPolicy::Substituted("BufferToken"),
+        kind: Kind::Child,
     },
 ];
 
@@ -118,6 +154,14 @@ pub fn advertised() -> impl Iterator<Item = &'static InterfaceSpec> {
 /// deliberately refused — a refused interface is present with [`FdPolicy::Refused`]. Callers that
 /// report to a human must distinguish the two, because "we decided against this" and "we have never
 /// considered this" are different answers.
+/// The entries C should advertise as registry globals: [`Kind::Global`] and not
+/// [`FdPolicy::Refused`].
+///
+/// This is the whole global list, derived from the one table. C has no second list to keep in step.
+pub fn advertised_globals() -> impl Iterator<Item = &'static InterfaceSpec> {
+    advertised().filter(|s| s.kind == Kind::Global)
+}
+
 pub fn spec_for(name: &str) -> Option<&'static InterfaceSpec> {
     SUPPORTED.iter().find(|s| s.name == name)
 }
@@ -171,6 +215,20 @@ mod tests {
         let advertised: Vec<_> = advertised().map(|s| s.name).collect();
         for name in ["wl_compositor", "xdg_wm_base", "zwp_linux_dmabuf_v1", "wl_seat", "wl_shm"] {
             assert!(advertised.contains(&name), "{name} is no longer advertised");
+        }
+    }
+
+    /// The five pre-existing globals are tagged `Global`, and the objects created from them are
+    /// tagged `Child`. A mis-tag is invisible at runtime — a `Child`-tagged global is simply never
+    /// advertised — so it is pinned here.
+    #[test]
+    fn the_global_child_split_is_right() {
+        let globals: Vec<_> = advertised_globals().map(|s| s.name).collect();
+        for name in ["wl_compositor", "xdg_wm_base", "zwp_linux_dmabuf_v1", "wl_seat", "wl_shm"] {
+            assert!(globals.contains(&name), "{name} must be advertised as a global");
+        }
+        for name in ["wl_surface", "wl_buffer", "wl_shm_pool", "xdg_surface", "xdg_toplevel"] {
+            assert!(!globals.contains(&name), "{name} is created by a request, not bound");
         }
     }
 
