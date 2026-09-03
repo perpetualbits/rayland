@@ -147,7 +147,24 @@ pub const SUPPORTED: &[InterfaceSpec] = &[
         fds: FdPolicy::Transparent,
         kind: Kind::Global,
     },
+    // Presentation timestamps from the compositor. Beyond closing the gap this is of independent
+    // value to the project: it is the only COMPOSITOR-SIDE measurement of when a frame was actually
+    // shown, and therefore an outside check on Rayland's own frame-time numbers, which have so far
+    // only ever been measured by Rayland.
+    InterfaceSpec {
+        name: "wp_presentation",
+        max_version: u32::MAX,
+        fds: FdPolicy::Transparent,
+        kind: Kind::Global,
+    },
     // --- Objects created from those globals, which S must also be able to name ---------------
+    // From `wp_presentation.feedback`, one per presented frame.
+    InterfaceSpec {
+        name: "wp_presentation_feedback",
+        max_version: u32::MAX,
+        fds: FdPolicy::Transparent,
+        kind: Kind::Child,
+    },
     // From `wp_viewporter.get_viewport`.
     InterfaceSpec {
         name: "wp_viewport",

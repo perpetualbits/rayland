@@ -1828,6 +1828,8 @@ const KNOWN_INTERFACE_NAMES: &[&str] = &[
     "wp_viewport",
     "wp_fractional_scale_manager_v1",
     "wp_fractional_scale_v1",
+    "wp_presentation",
+    "wp_presentation_feedback",
     "xdg_wm_base",
     "xdg_surface",
     "xdg_toplevel",
@@ -1835,6 +1837,9 @@ const KNOWN_INTERFACE_NAMES: &[&str] = &[
     "zwp_linux_buffer_params_v1",
 ];
 
+use wayland_protocols::wp::presentation_time::client::{
+    wp_presentation::WpPresentation, wp_presentation_feedback::WpPresentationFeedback,
+};
 use wayland_protocols::wp::fractional_scale::v1::client::{
     wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
     wp_fractional_scale_v1::WpFractionalScaleV1,
@@ -1891,6 +1896,9 @@ fn interface_by_name(name: &str) -> Option<&'static Interface> {
         "wp_viewport" => WpViewport::interface(),
         "wp_fractional_scale_manager_v1" => WpFractionalScaleManagerV1::interface(),
         "wp_fractional_scale_v1" => WpFractionalScaleV1::interface(),
+        // Compositor-side presentation timestamps, and the per-frame feedback object.
+        "wp_presentation" => WpPresentation::interface(),
+        "wp_presentation_feedback" => WpPresentationFeedback::interface(),
         "xdg_wm_base" => XdgWmBase::interface(),
         "xdg_surface" => XdgSurface::interface(),
         "xdg_toplevel" => XdgToplevel::interface(),
