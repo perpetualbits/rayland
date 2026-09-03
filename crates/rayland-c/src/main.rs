@@ -1019,6 +1019,19 @@ fn env_or(name: &str, default: &str) -> String {
 /// session fails. A stalled ring is *not* reported here — it exits the process from the watcher
 /// thread, because by then this thread is blocked inside [`serve_vtest`] and cannot be signalled.
 fn main() -> Result<()> {
+    // `--print-globals`: list the Wayland globals this build advertises, one per line, and exit.
+    //
+    // It exists for `scripts/wp0-bind-gap.sh`, which diffs what an application asks a real
+    // compositor for against what WP0 offers. Deriving that list from the shared table rather than
+    // hardcoding it in the script is the point: a report that carries its own copy of the answer
+    // drifts from the code it reports on, which is the failure this whole phase is about. Handled
+    // before any daemon setup so it needs no socket, no S, and no GPU.
+    if std::env::args().any(|a| a == "--print-globals") {
+        for name in rayland_c::wayland_proxy::advertised_globals() {
+            println!("{name}");
+        }
+        return Ok(());
+    }
     // Records the application's poll cycle when `RAYLAND_C1_RELAXSTAT` is set, and reports
     // periodically so a run the harness kills still leaves its record. Inert otherwise.
     rayland_c::relaxstat::start_reporter();

@@ -259,6 +259,22 @@ const GLOBAL_INTERFACE_NAMES: &[&str] =
 /// different Rust types with different `&'static Interface` values, so the two sides cannot share
 /// one map. What they share is `rayland_relay::interfaces::SUPPORTED`, and the tests hold both maps
 /// to it — which is what the 2026-09-01 `wl_shm` drift got past.
+/// The globals this build actually advertises, in advertisement order.
+///
+/// One function so the registry loop, the consistency tests and `rayland-c --print-globals` cannot
+/// give three different answers. `--print-globals` feeds `scripts/wp0-bind-gap.sh`, and a report
+/// carrying its own copy of the answer would drift from the code it reports on — which is the whole
+/// defect class this phase exists to close.
+///
+/// Child-object interfaces in the shared table (`wl_surface` and friends) are excluded: they are
+/// created by requests, not bound from the registry, so they are not globals and an application
+/// never asks for them by name.
+pub fn advertised_globals() -> impl Iterator<Item = &'static str> {
+    rayland_relay::interfaces::advertised()
+        .map(|s| s.name)
+        .filter(|n| GLOBAL_INTERFACE_NAMES.contains(n))
+}
+
 fn server_interface_by_name(
     name: &str,
 ) -> Option<&'static wayland_server::backend::protocol::Interface> {
