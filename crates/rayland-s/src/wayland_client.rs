@@ -80,7 +80,8 @@ use wayland_client::backend::{Backend, ObjectData, ObjectId, WaylandError};
 // interface string to the linked `&'static Interface` that `send_request`'s `child_spec` requires.
 use wayland_client::protocol::{
     wl_buffer::WlBuffer, wl_callback::WlCallback, wl_compositor::WlCompositor,
-    wl_fixes::WlFixes, wl_output::WlOutput, wl_region::WlRegion,
+    wl_data_device_manager::WlDataDeviceManager, wl_fixes::WlFixes, wl_output::WlOutput,
+    wl_region::WlRegion,
     wl_subcompositor::WlSubcompositor, wl_subsurface::WlSubsurface,
     wl_shm::WlShm, wl_shm_pool::WlShmPool,
     wl_registry::WlRegistry, wl_seat::WlSeat, wl_surface::WlSurface,
@@ -1843,6 +1844,8 @@ const KNOWN_INTERFACE_NAMES: &[&str] = &[
     "zwp_text_input_manager_v3",
     "zwp_text_input_v3",
     "wl_fixes",
+    "wp_linux_drm_syncobj_manager_v1",
+    "wl_data_device_manager",
     "xdg_wm_base",
     "xdg_surface",
     "xdg_toplevel",
@@ -1850,6 +1853,7 @@ const KNOWN_INTERFACE_NAMES: &[&str] = &[
     "zwp_linux_buffer_params_v1",
 ];
 
+use wayland_protocols::wp::linux_drm_syncobj::v1::client::wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1;
 use wayland_protocols::wp::pointer_constraints::zv1::client::{
     zwp_confined_pointer_v1::ZwpConfinedPointerV1, zwp_locked_pointer_v1::ZwpLockedPointerV1,
     zwp_pointer_constraints_v1::ZwpPointerConstraintsV1,
@@ -1940,6 +1944,11 @@ fn interface_by_name(name: &str) -> Option<&'static Interface> {
         "zwp_text_input_manager_v3" => ZwpTextInputManagerV3::interface(),
         "zwp_text_input_v3" => ZwpTextInputV3::interface(),
         "wl_fixes" => WlFixes::interface(),
+        // Named but NOT advertised (FdPolicy::Refused). S must still resolve them: the table is
+        // the supported set, and "supported" is not "advertised". If either is ever given a
+        // substitution and advertised, the descriptor is already here.
+        "wp_linux_drm_syncobj_manager_v1" => WpLinuxDrmSyncobjManagerV1::interface(),
+        "wl_data_device_manager" => WlDataDeviceManager::interface(),
         "xdg_wm_base" => XdgWmBase::interface(),
         "xdg_surface" => XdgSurface::interface(),
         "xdg_toplevel" => XdgToplevel::interface(),
@@ -1989,11 +1998,27 @@ mod tests {
     }
 
     /// An interface WP0 has never heard of resolves to `None`, so its request is skipped rather
-    /// than mis-created. `wl_data_device_manager` is the standing example: clipboard and
-    /// drag-and-drop transfer data over descriptors the application creates.
+    /// than mis-created.
+    ///
+    /// The example used to be `wl_data_device_manager`, which is now *known but refused* — S names
+    /// it, C does not advertise it. That distinction is the point: "we decided against this" and
+    /// "we have never considered this" are different answers, and only the second lands here.
     #[test]
     fn an_unknown_interface_resolves_to_none() {
-        assert!(interface_by_name("wl_data_device_manager").is_none());
+        assert!(interface_by_name("zwp_tablet_manager_v2").is_none());
+        assert!(rayland_relay::interfaces::spec_for("zwp_tablet_manager_v2").is_none());
+    }
+
+    /// A refused interface IS named by S and is NOT advertised by C.
+    #[test]
+    fn refused_interfaces_are_known_but_not_advertised() {
+        for name in ["wp_linux_drm_syncobj_manager_v1", "wl_data_device_manager"] {
+            assert!(interface_by_name(name).is_some(), "S must still name refused `{name}`");
+            assert!(
+                !rayland_relay::interfaces::advertised_globals().any(|s| s.name == name),
+                "`{name}` is Refused and must not be advertised"
+            );
+        }
     }
 
     /// Event-name lookup resolves a real opcode and refuses an out-of-range one instead of panicking.

@@ -298,6 +298,24 @@ pub const SUPPORTED: &[InterfaceSpec] = &[
         fds: FdPolicy::Substituted("BufferToken"),
         kind: Kind::Child,
     },
+    // --- Known, and deliberately NOT advertised ------------------------------------------------
+    // These are the reason `FdPolicy::Refused` exists. Withholding an optional global is CORRECT
+    // Wayland behaviour -- applications cope -- so the defect was never the absence. It was that an
+    // absence and an oversight looked identical. Both are now stated at startup, with why.
+    InterfaceSpec {
+        name: "wp_linux_drm_syncobj_manager_v1",
+        max_version: u32::MAX,
+        fds: FdPolicy::Refused(
+            "carries a DRM syncobj fd; cross-machine explicit GPU sync is undesigned",
+        ),
+        kind: Kind::Global,
+    },
+    InterfaceSpec {
+        name: "wl_data_device_manager",
+        max_version: u32::MAX,
+        fds: FdPolicy::Refused("clipboard/DnD transfer over app-created fds; its own phase"),
+        kind: Kind::Global,
+    },
 ];
 
 /// The entries `rayland-c` should advertise in the application's registry: everything that is not
