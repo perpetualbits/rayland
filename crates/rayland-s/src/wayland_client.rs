@@ -1820,6 +1820,8 @@ const KNOWN_INTERFACE_NAMES: &[&str] = &[
     "wl_output",
     "zxdg_output_manager_v1",
     "zxdg_output_v1",
+    "zxdg_decoration_manager_v1",
+    "zxdg_toplevel_decoration_v1",
     "xdg_wm_base",
     "xdg_surface",
     "xdg_toplevel",
@@ -1827,6 +1829,10 @@ const KNOWN_INTERFACE_NAMES: &[&str] = &[
     "zwp_linux_buffer_params_v1",
 ];
 
+use wayland_protocols::xdg::decoration::zv1::client::{
+    zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
+    zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
+};
 use wayland_protocols::xdg::xdg_output::zv1::client::{
     zxdg_output_manager_v1::ZxdgOutputManagerV1, zxdg_output_v1::ZxdgOutputV1,
 };
@@ -1855,6 +1861,10 @@ fn interface_by_name(name: &str) -> Option<&'static Interface> {
         "wl_output" => WlOutput::interface(),
         "zxdg_output_manager_v1" => ZxdgOutputManagerV1::interface(),
         "zxdg_output_v1" => ZxdgOutputV1::interface(),
+        // Server- vs client-side decoration negotiation, and the per-toplevel object
+        // `get_toplevel_decoration` creates.
+        "zxdg_decoration_manager_v1" => ZxdgDecorationManagerV1::interface(),
+        "zxdg_toplevel_decoration_v1" => ZxdgToplevelDecorationV1::interface(),
         "xdg_wm_base" => XdgWmBase::interface(),
         "xdg_surface" => XdgSurface::interface(),
         "xdg_toplevel" => XdgToplevel::interface(),

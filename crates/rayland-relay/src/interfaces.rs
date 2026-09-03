@@ -114,7 +114,22 @@ pub const SUPPORTED: &[InterfaceSpec] = &[
         fds: FdPolicy::Transparent,
         kind: Kind::Global,
     },
+    // Negotiates server- versus client-side decorations. Without it winit falls back to drawing its
+    // own, or to none, and the window looks unlike every other window on S's desktop.
+    InterfaceSpec {
+        name: "zxdg_decoration_manager_v1",
+        max_version: u32::MAX,
+        fds: FdPolicy::Transparent,
+        kind: Kind::Global,
+    },
     // --- Objects created from those globals, which S must also be able to name ---------------
+    // From `zxdg_decoration_manager_v1.get_toplevel_decoration`.
+    InterfaceSpec {
+        name: "zxdg_toplevel_decoration_v1",
+        max_version: u32::MAX,
+        fds: FdPolicy::Transparent,
+        kind: Kind::Child,
+    },
     // From `zxdg_output_manager_v1.get_xdg_output`. Not a global: never bound, only created.
     InterfaceSpec { name: "zxdg_output_v1", max_version: u32::MAX, fds: FdPolicy::Transparent, kind: Kind::Child },
     InterfaceSpec { name: "wl_surface", max_version: u32::MAX, fds: FdPolicy::Transparent, kind: Kind::Child },

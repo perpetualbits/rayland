@@ -241,6 +241,7 @@ use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_v1::ZwpLi
 use wayland_protocols::xdg::shell::server::xdg_wm_base::XdgWmBase;
 use wayland_server::protocol::wl_compositor::WlCompositor;
 use wayland_server::protocol::wl_seat::WlSeat;
+use wayland_protocols::xdg::decoration::zv1::server::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1;
 use wayland_protocols::xdg::xdg_output::zv1::server::zxdg_output_manager_v1::ZxdgOutputManagerV1;
 use wayland_server::protocol::wl_output::WlOutput;
 use wayland_server::protocol::wl_shm::WlShm;
@@ -285,6 +286,7 @@ const SERVER_DESCRIPTOR_NAMES: &[&str] = &[
     "wl_shm",
     "wl_output",
     "zxdg_output_manager_v1",
+    "zxdg_decoration_manager_v1",
 ];
 
 fn server_interface_by_name(
@@ -300,6 +302,7 @@ fn server_interface_by_name(
         // `get_xdg_output`, never bound, so C has no global to advertise for it.
         "wl_output" => WlOutput::interface(),
         "zxdg_output_manager_v1" => ZxdgOutputManagerV1::interface(),
+        "zxdg_decoration_manager_v1" => ZxdgDecorationManagerV1::interface(),
         _ => return None,
     })
 }
