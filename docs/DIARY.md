@@ -7034,3 +7034,59 @@ independent mechanisms moving by the same factor", when the first is `icosa-cpu`
 other people's work. The same-fixture figure is 3.2×, and it was in the table two sections above the
 whole time. The conclusion survives and reads better honestly: the range is 3.2–5.1×, all of it well
 under the ~12× FPU gap, so the relay scales sub-linearly against the raw arithmetic difference.
+
+### 2026-09-03 (control arm) — Both arms are zero, and the question that has been queued for weeks is answered
+
+`RESULT [arm: no_multi_ring,no_fence_feedback,no_semaphore_feedback,no_event_feedback,no_query_feedback]:
+400 clean, 0 failed, out of 400`. Verified the way this project now verifies things: 400 files,
+contiguous, every one reading exactly `rc=0 frames=120 cores=0`, zero setup retries, both machines
+clean afterwards. Against yesterday's feedback arm at 400/400, that is **Fisher exact p = 1.0 — no
+detectable difference between the arms**, each under 0.75% at 95%. Pooled, shipping is 0 in 880 and
+feedback-on is 1 in 492.
+
+So: **enabling semaphore, event and query feedback does not measurably harm reliability**, and that
+was the only stated reason for keeping them off. The 1-in-92 stays unexplained, but it now sits
+against 400 clean runs of the very arm it was charged to *and* a matched control, which makes
+"feedback causes session loss" a poor fit and a one-off a good one.
+
+What I want to resist is calling this a licence to flip the flags. **The 1.23× has never been
+measured where it would be claimed.** It is an `icosa-gpu` figure taken over loopback; both soaks ran
+`icosa-cpu` over a network. The reliability question and the speed question have been answered on
+different workloads and different topologies, and only one of them is answered. The next step is not
+adoption, it is re-measuring 1.23× on the real network — and if it turns out to be 1.03×, as
+`ship()`'s batching did, then there is nothing to adopt and the whole thread closes for a better
+reason than fear.
+
+**Three asymmetries between the arms, all recorded in `COMPARABILITY.md` beside the data rather than
+in my head.** The control ran a `rayland-c` nine lines different, entirely inside a `BLOBSCAN`-gated
+block that does not execute in a soak. The control could record a `rayland-c` core and the feedback
+arm could not, because the `ulimit` ordering fix landed between them — so a *late* daemon abort, one
+after the application had already produced its 120 frames, would have passed in one arm and failed in
+the other. I checked explicitly for that shape and found none, which is the only reason I am willing
+to compare them. And the control had a setup-retry mechanism the feedback arm lacked; it used it zero
+times.
+
+**The first attempt at this control arm is worth its own paragraph, because it is the fix working.**
+It aborted at attempt 16 of 400 on a transient link drop and reported `PARTIAL RESULT: 15 clean, 0
+failed, out of 15`. The same event two days ago, on the pre-fix harness, produced "35 clean, 365
+failed" — 365 fabricated failures charged to the shipping configuration, which I only questioned
+because the number was absurd. This time the harness scored nothing it had not measured. That is
+worth more than the result it was collecting.
+
+It also showed the guard was too brittle to finish the job, which is a different problem from being
+wrong. A 400-run sweep that stops on the first blip never completes, and this link has now dropped
+twice in two days. So there is a third option between inventing a run and losing the sweep:
+**re-attempt it**. A run that produced a verdict is data whatever the verdict; a run that never got
+that far measured the network and must not enter the denominator in either direction. Bounded at
+five, counted, and printed with the result — a run needing forty retries is telling you about the
+link, and hiding that would be its own lie. Both the retry and the cap were verified by induction:
+holding the relay port made it retry twice and then abort with `Exhausted 2 setup retries`, and the
+aborted run reported `0 clean, 0 failed, out of 0`.
+
+**One thing I got wrong today and want on the record.** Yesterday I wrote that `.192` "now measures
+wired-class, the label is stale", on one 5-ping sample. Three samples have since given 0.80, 1.26 and
+3.75 ms average, spanning both classes. The honest statement is that the path is *variable* and a
+single sample cannot classify it. I over-read one measurement — the project's own most-repeated
+lesson, applied to me, about a line I had just added to stop exactly that. Neither arm can be
+attributed to a characterised link; both used the same address, which is what makes them comparable
+to each other and to nothing else.

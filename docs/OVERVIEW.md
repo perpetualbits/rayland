@@ -316,7 +316,7 @@ reason against rather than re-deriving.
 | Readback message count after gap-threshold coalescing | ~5000 → **~180 messages/frame**, still bit-identical, still 0 stale |
 | Batching `ship()`'s per-message lock and flush | **1.03×** — i.e. not the bottleneck |
 | Venus semaphore/event/query feedback, loopback | **1.23×** (median `draw_readback` 48.7 ms → 39.5 ms, 120/120 bit-identical) |
-| Feedback-arm failures | **0 in 400** (2026-09-02, fixed harness, real network) → <0.75% at 95%; pooled with the earlier hunt, **1 in 492**. Supersedes the 1-in-92 framing |
+| Feedback vs shipping, matched arms | **400/400 clean each** (2026-09-02/03, same harness, same link). Fisher p = 1.0 — **no detectable difference**. Pooled: shipping 0 in 880, feedback-on 1 in 492 |
 | `VK_ERROR_DEVICE_LOST` on `vkQueueSubmit` | NVIDIA RTX A500 **7/14** runs lost; Intel Iris Xe **0/10** |
 | Teardown `SIGABRT` (libepoxy, from `virgl_renderer_cleanup`) | was ~21%, **fixed** |
 | **WP0 return traffic, presented-buffer exclusion off / on** | **307,776 B → 219 B per frame: 1,406×** (5 frame-matched runs a side, A/B inside one binary) |
@@ -822,7 +822,41 @@ never says `C connected`, **aborts the sweep instead of being scored**. Verified
 the currently-broken route: it refuses with a diagnosis instead of inventing 400 data points. The rule
 this keeps re-establishing: **a harness may lose a run; it may never invent one.**
 
-**The control arm therefore remains OWED**, and needs the network settled first.
+**THE CONTROL ARM IS DONE — 2026-09-03: `400 clean, 0 failed, out of 400`.** Verified per-attempt
+(400 contiguous files, every one `rc=0 frames=120 cores=0`), zero setup retries, both machines clean
+afterwards. So the comparison the project has wanted for weeks now exists on one instrument:
+
+| arm | result | rate at 95% (rule of three) |
+|---|---|---|
+| semaphore/event/query feedback **ON** (`no_multi_ring,no_fence_feedback`) | **400 / 400 clean** | < 0.75% |
+| shipping (all five flags off) | **400 / 400 clean** | < 0.75% |
+
+**Fisher exact: p = 1.0. There is no detectable difference between the arms.** Pooled with the
+earlier work: shipping is **0 in 880**, feedback-on **1 in 492**.
+
+**What this settles, and what it does not.** It settles that enabling semaphore, event and query
+feedback does not measurably harm reliability — which was the *only* stated reason for keeping them
+off. It does **not** explain the original 1-in-92 failure, which remains unexplained; what has
+changed is that a single unattributed loss now sits against 400 clean runs of the arm it was charged
+to *and* a matched 400-run control, so "feedback causes session loss" is a poor fit and a one-off is
+a good one.
+
+**It also does not measure speed.** The 1.23× is an `icosa-gpu` **loopback** figure; both soaks ran
+`icosa-cpu` over the network. **Before adopting the flags, re-measure the 1.23× where it would be
+claimed** — that number has never been taken on a real network, and it is the entire reason to
+change anything.
+
+**Three asymmetries between the arms, recorded rather than buried** (`COMPARABILITY.md` sits with the
+data). The control ran a `rayland-c` differing by nine lines in `blob_sync.rs`, all inside a
+`BLOBSCAN`-gated block that does not execute here. The control could record a `rayland-c` core and
+the feedback arm could not (the `ulimit` ordering fix) — so a *late* daemon abort would have passed
+in one arm and failed in the other; the verification checked explicitly for that shape and found
+none. And the control had a setup-retry mechanism the feedback arm lacked; it used zero.
+
+**The link is attested only by an address.** Both arms used `192.168.1.192`, documented as WiFi in
+July. Measured on 2026-09-02–03 it returned 0.80, 1.26 and 3.75 ms average — spanning wired- and
+WiFi-class — so the path is variable and neither arm can be attributed to a characterised link. The
+harness now records RTT per run; these two do not have one.
 
 *Historical framing, kept because the reasoning matters:* the semaphore/event/query feedback arm was
 **worth 1.23×**, held back by exactly one unexplained failure (1/92) against a shipping arm clean
