@@ -80,7 +80,8 @@ use wayland_client::backend::{Backend, ObjectData, ObjectId, WaylandError};
 // interface string to the linked `&'static Interface` that `send_request`'s `child_spec` requires.
 use wayland_client::protocol::{
     wl_buffer::WlBuffer, wl_callback::WlCallback, wl_compositor::WlCompositor,
-    wl_output::WlOutput, wl_region::WlRegion,
+    wl_fixes::WlFixes, wl_output::WlOutput, wl_region::WlRegion,
+    wl_subcompositor::WlSubcompositor, wl_subsurface::WlSubsurface,
     wl_shm::WlShm, wl_shm_pool::WlShmPool,
     wl_registry::WlRegistry, wl_seat::WlSeat, wl_surface::WlSurface,
 };
@@ -1830,6 +1831,18 @@ const KNOWN_INTERFACE_NAMES: &[&str] = &[
     "wp_fractional_scale_v1",
     "wp_presentation",
     "wp_presentation_feedback",
+    "wl_subcompositor",
+    "wl_subsurface",
+    "xdg_activation_v1",
+    "xdg_activation_token_v1",
+    "zwp_pointer_constraints_v1",
+    "zwp_locked_pointer_v1",
+    "zwp_confined_pointer_v1",
+    "zwp_relative_pointer_manager_v1",
+    "zwp_relative_pointer_v1",
+    "zwp_text_input_manager_v3",
+    "zwp_text_input_v3",
+    "wl_fixes",
     "xdg_wm_base",
     "xdg_surface",
     "xdg_toplevel",
@@ -1837,6 +1850,20 @@ const KNOWN_INTERFACE_NAMES: &[&str] = &[
     "zwp_linux_buffer_params_v1",
 ];
 
+use wayland_protocols::wp::pointer_constraints::zv1::client::{
+    zwp_confined_pointer_v1::ZwpConfinedPointerV1, zwp_locked_pointer_v1::ZwpLockedPointerV1,
+    zwp_pointer_constraints_v1::ZwpPointerConstraintsV1,
+};
+use wayland_protocols::wp::relative_pointer::zv1::client::{
+    zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1,
+    zwp_relative_pointer_v1::ZwpRelativePointerV1,
+};
+use wayland_protocols::wp::text_input::zv3::client::{
+    zwp_text_input_manager_v3::ZwpTextInputManagerV3, zwp_text_input_v3::ZwpTextInputV3,
+};
+use wayland_protocols::xdg::activation::v1::client::{
+    xdg_activation_token_v1::XdgActivationTokenV1, xdg_activation_v1::XdgActivationV1,
+};
 use wayland_protocols::wp::presentation_time::client::{
     wp_presentation::WpPresentation, wp_presentation_feedback::WpPresentationFeedback,
 };
@@ -1899,6 +1926,20 @@ fn interface_by_name(name: &str) -> Option<&'static Interface> {
         // Compositor-side presentation timestamps, and the per-frame feedback object.
         "wp_presentation" => WpPresentation::interface(),
         "wp_presentation_feedback" => WpPresentationFeedback::interface(),
+        // Subsurfaces, focus transfer, pointer lock/confine, relative motion, input methods, and
+        // wl_fixes -- all pure request/event relaying, no descriptors anywhere.
+        "wl_subcompositor" => WlSubcompositor::interface(),
+        "wl_subsurface" => WlSubsurface::interface(),
+        "xdg_activation_v1" => XdgActivationV1::interface(),
+        "xdg_activation_token_v1" => XdgActivationTokenV1::interface(),
+        "zwp_pointer_constraints_v1" => ZwpPointerConstraintsV1::interface(),
+        "zwp_locked_pointer_v1" => ZwpLockedPointerV1::interface(),
+        "zwp_confined_pointer_v1" => ZwpConfinedPointerV1::interface(),
+        "zwp_relative_pointer_manager_v1" => ZwpRelativePointerManagerV1::interface(),
+        "zwp_relative_pointer_v1" => ZwpRelativePointerV1::interface(),
+        "zwp_text_input_manager_v3" => ZwpTextInputManagerV3::interface(),
+        "zwp_text_input_v3" => ZwpTextInputV3::interface(),
+        "wl_fixes" => WlFixes::interface(),
         "xdg_wm_base" => XdgWmBase::interface(),
         "xdg_surface" => XdgSurface::interface(),
         "xdg_toplevel" => XdgToplevel::interface(),

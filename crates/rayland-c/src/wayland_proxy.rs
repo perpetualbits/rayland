@@ -243,11 +243,17 @@ use wayland_server::protocol::wl_compositor::WlCompositor;
 use wayland_server::protocol::wl_seat::WlSeat;
 use wayland_protocols::wp::cursor_shape::v1::server::wp_cursor_shape_manager_v1::WpCursorShapeManagerV1;
 use wayland_protocols::wp::fractional_scale::v1::server::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1;
+use wayland_protocols::wp::pointer_constraints::zv1::server::zwp_pointer_constraints_v1::ZwpPointerConstraintsV1;
 use wayland_protocols::wp::presentation_time::server::wp_presentation::WpPresentation;
+use wayland_protocols::wp::relative_pointer::zv1::server::zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1;
+use wayland_protocols::wp::text_input::zv3::server::zwp_text_input_manager_v3::ZwpTextInputManagerV3;
+use wayland_protocols::xdg::activation::v1::server::xdg_activation_v1::XdgActivationV1;
 use wayland_protocols::wp::viewporter::server::wp_viewporter::WpViewporter;
 use wayland_protocols::xdg::decoration::zv1::server::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1;
 use wayland_protocols::xdg::xdg_output::zv1::server::zxdg_output_manager_v1::ZxdgOutputManagerV1;
+use wayland_server::protocol::wl_fixes::WlFixes;
 use wayland_server::protocol::wl_output::WlOutput;
+use wayland_server::protocol::wl_subcompositor::WlSubcompositor;
 use wayland_server::protocol::wl_shm::WlShm;
 
 
@@ -295,6 +301,12 @@ const SERVER_DESCRIPTOR_NAMES: &[&str] = &[
     "wp_viewporter",
     "wp_fractional_scale_manager_v1",
     "wp_presentation",
+    "wl_subcompositor",
+    "xdg_activation_v1",
+    "zwp_pointer_constraints_v1",
+    "zwp_relative_pointer_manager_v1",
+    "zwp_text_input_manager_v3",
+    "wl_fixes",
 ];
 
 fn server_interface_by_name(
@@ -315,6 +327,12 @@ fn server_interface_by_name(
         "wp_viewporter" => WpViewporter::interface(),
         "wp_fractional_scale_manager_v1" => WpFractionalScaleManagerV1::interface(),
         "wp_presentation" => WpPresentation::interface(),
+        "wl_subcompositor" => WlSubcompositor::interface(),
+        "xdg_activation_v1" => XdgActivationV1::interface(),
+        "zwp_pointer_constraints_v1" => ZwpPointerConstraintsV1::interface(),
+        "zwp_relative_pointer_manager_v1" => ZwpRelativePointerManagerV1::interface(),
+        "zwp_text_input_manager_v3" => ZwpTextInputManagerV3::interface(),
+        "wl_fixes" => WlFixes::interface(),
         _ => return None,
     })
 }

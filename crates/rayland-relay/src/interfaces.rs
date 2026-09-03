@@ -157,7 +157,92 @@ pub const SUPPORTED: &[InterfaceSpec] = &[
         fds: FdPolicy::Transparent,
         kind: Kind::Global,
     },
+    // Subsurfaces: a video pane or GL canvas inside application chrome.
+    InterfaceSpec {
+        name: "wl_subcompositor",
+        max_version: u32::MAX,
+        fds: FdPolicy::Transparent,
+        kind: Kind::Global,
+    },
+    // Request or transfer focus -- "open this window and raise it".
+    InterfaceSpec {
+        name: "xdg_activation_v1",
+        max_version: u32::MAX,
+        fds: FdPolicy::Transparent,
+        kind: Kind::Global,
+    },
+    // Pointer lock and confinement, needed by anything with a 3D camera.
+    InterfaceSpec {
+        name: "zwp_pointer_constraints_v1",
+        max_version: u32::MAX,
+        fds: FdPolicy::Transparent,
+        kind: Kind::Global,
+    },
+    // Unaccelerated pointer deltas, the companion to a locked pointer.
+    InterfaceSpec {
+        name: "zwp_relative_pointer_manager_v1",
+        max_version: u32::MAX,
+        fds: FdPolicy::Transparent,
+        kind: Kind::Global,
+    },
+    // Input methods. Without it there is no CJK or emoji entry at all.
+    InterfaceSpec {
+        name: "zwp_text_input_manager_v3",
+        max_version: u32::MAX,
+        fds: FdPolicy::Transparent,
+        kind: Kind::Global,
+    },
+    // Lets a client destroy a wl_registry; libwayland's own globals helper uses it.
+    InterfaceSpec {
+        name: "wl_fixes",
+        max_version: u32::MAX,
+        fds: FdPolicy::Transparent,
+        kind: Kind::Global,
+    },
     // --- Objects created from those globals, which S must also be able to name ---------------
+    // From wl_subcompositor.get_subsurface.
+    InterfaceSpec {
+        name: "wl_subsurface",
+        max_version: u32::MAX,
+        fds: FdPolicy::Transparent,
+        kind: Kind::Child,
+    },
+    // From xdg_activation_v1.get_activation_token.
+    InterfaceSpec {
+        name: "xdg_activation_token_v1",
+        max_version: u32::MAX,
+        fds: FdPolicy::Transparent,
+        kind: Kind::Child,
+    },
+    // From zwp_pointer_constraints_v1.lock_pointer.
+    InterfaceSpec {
+        name: "zwp_locked_pointer_v1",
+        max_version: u32::MAX,
+        fds: FdPolicy::Transparent,
+        kind: Kind::Child,
+    },
+    // From zwp_pointer_constraints_v1.confine_pointer.
+    InterfaceSpec {
+        name: "zwp_confined_pointer_v1",
+        max_version: u32::MAX,
+        fds: FdPolicy::Transparent,
+        kind: Kind::Child,
+    },
+    // From zwp_relative_pointer_manager_v1.get_relative_pointer.
+    InterfaceSpec {
+        name: "zwp_relative_pointer_v1",
+        max_version: u32::MAX,
+        fds: FdPolicy::Transparent,
+        kind: Kind::Child,
+    },
+    // From zwp_text_input_manager_v3.get_text_input.
+    InterfaceSpec {
+        name: "zwp_text_input_v3",
+        max_version: u32::MAX,
+        fds: FdPolicy::Transparent,
+        kind: Kind::Child,
+    },
+
     // From `wp_presentation.feedback`, one per presented frame.
     InterfaceSpec {
         name: "wp_presentation_feedback",
