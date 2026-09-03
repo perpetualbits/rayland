@@ -1801,6 +1801,28 @@ fn precheck_request(
 /// The set is exactly the interfaces WP0 replays (spec §6): the globals the app binds and the objects it
 /// creates from them. An unknown name returns `None` — the request or bind naming it is skipped rather
 /// than replayed, since without the descriptor the backend cannot create the object.
+/// Every name [`interface_by_name`] answers to.
+///
+/// Rust cannot enumerate a `match`'s arms, so this list exists to let the consistency test walk
+/// them. **Keep it in step with the `match` below**: a name here the `match` lacks fails
+/// `every_supported_interface_resolves` if the table names it, and a `match` arm missing here is
+/// caught the first time anything binds it. Both are better than the silence this replaces.
+const KNOWN_INTERFACE_NAMES: &[&str] = &[
+    "wl_compositor",
+    "wl_surface",
+    "wl_region",
+    "wl_callback",
+    "wl_buffer",
+    "wl_shm",
+    "wl_shm_pool",
+    "wl_seat",
+    "xdg_wm_base",
+    "xdg_surface",
+    "xdg_toplevel",
+    "zwp_linux_dmabuf_v1",
+    "zwp_linux_buffer_params_v1",
+];
+
 fn interface_by_name(name: &str) -> Option<&'static Interface> {
     Some(match name {
         "wl_compositor" => WlCompositor::interface(),
@@ -1831,32 +1853,46 @@ fn interface_by_name(name: &str) -> Option<&'static Interface> {
 mod tests {
     use super::*;
 
+    /// Every interface the shared table names must resolve here, or S cannot replay a bind of it.
+    ///
+    /// This replaces a test that listed the thirteen names it expected and asserted they resolve.
+    /// That test passed for a day while `wl_shm` was missing, because the name was absent from both
+    /// the code and the test — it could only ever catch a name someone remembered to add in two
+    /// places at once. This one compares against a list maintained for a *different* purpose (C's
+    /// advertisement), so forgetting one side is a failure rather than a silence.
     #[test]
-    fn interface_registry_maps_the_wp0_interfaces() {
-        // Every interface WP0 binds or creates must resolve, or its request cannot be replayed.
-        for name in [
-            "wl_compositor",
-            "wl_surface",
-            "wl_region",
-            "wl_callback",
-            "wl_buffer",
-            "wl_shm",
-            "wl_shm_pool",
-            "wl_seat",
-            "xdg_wm_base",
-            "xdg_surface",
-            "xdg_toplevel",
-            "zwp_linux_dmabuf_v1",
-            "zwp_linux_buffer_params_v1",
-        ] {
-            let iface =
-                interface_by_name(name).unwrap_or_else(|| panic!("no descriptor for {name}"));
-            assert_eq!(
-                iface.name, name,
-                "descriptor name must match the lookup key"
+    fn every_supported_interface_resolves() {
+        for spec in rayland_relay::interfaces::SUPPORTED {
+            let iface = interface_by_name(spec.name).unwrap_or_else(|| {
+                panic!(
+                    "`{}` is in rayland_relay::interfaces::SUPPORTED but S has no linked \
+                     descriptor for it, so a bind would be dropped mid-session",
+                    spec.name
+                )
+            });
+            assert_eq!(iface.name, spec.name, "descriptor name must match the lookup key");
+        }
+    }
+
+    /// And nothing resolves here that the table does not name.
+    ///
+    /// A descriptor S can build but C never advertises is dead code at best; at worst it is an
+    /// interface added on one side only, which is the same drift in the other direction.
+    #[test]
+    fn nothing_resolves_that_the_table_does_not_name() {
+        for name in KNOWN_INTERFACE_NAMES {
+            assert!(
+                rayland_relay::interfaces::spec_for(name).is_some(),
+                "S resolves `{name}` but it is not in rayland_relay::interfaces::SUPPORTED"
             );
         }
-        // An interface WP0 does not handle resolves to None, so its request is skipped, not mis-created.
+    }
+
+    /// An interface WP0 has never heard of resolves to `None`, so its request is skipped rather
+    /// than mis-created. `wl_data_device_manager` is the standing example: clipboard and
+    /// drag-and-drop transfer data over descriptors the application creates.
+    #[test]
+    fn an_unknown_interface_resolves_to_none() {
         assert!(interface_by_name("wl_data_device_manager").is_none());
     }
 
