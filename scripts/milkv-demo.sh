@@ -17,7 +17,9 @@ set -uo pipefail
 
 SECONDS_TO_RUN="${SECONDS_TO_RUN:-120}"
 PORT="${PORT:-9412}"
-C_HOST="${C_HOST:-milkv.localdomain}"
+# The board name. milkv.localdomain stopped resolving when the fleet moved onto VLANs on
+# 2026-09-04 while plain milkv kept working, so prefer whichever resolves. C_HOST= overrides.
+C_HOST="${C_HOST:-$(getent hosts milkv >/dev/null 2>&1 && echo milkv || echo milkv.localdomain)}"
 C_BIN="${C_BIN:-/tmp/rv-c-HIER}"
 S_BIN="${S_BIN:-/tmp/s-NEW}"
 APP="${APP:-/usr/bin/vkcube}"

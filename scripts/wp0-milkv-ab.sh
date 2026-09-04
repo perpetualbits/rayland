@@ -40,7 +40,9 @@ set -uo pipefail
 PAIRS="${PAIRS:-6}"
 SECS="${SECS:-25}"
 PORT="${PORT:-9411}"
-C_HOST="${C_HOST:-milkv.localdomain}"
+# The board name. milkv.localdomain stopped resolving when the fleet moved onto VLANs on
+# 2026-09-04 while plain milkv kept working, so prefer whichever resolves. C_HOST= overrides.
+C_HOST="${C_HOST:-$(getent hosts milkv >/dev/null 2>&1 && echo milkv || echo milkv.localdomain)}"
 # The two arms. Cross-built on the laptop; see the header.
 A_BIN="${A_BIN:-/tmp/rv-c-BEFORE}"
 B_BIN="${B_BIN:-/tmp/rv-c-AFTER}"
