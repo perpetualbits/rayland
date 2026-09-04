@@ -7214,3 +7214,49 @@ would actually be claimed is about 8%, and not significant. Enabling a configura
 historically unexplained session loss, for an ~8% frame-time gain that may be zero, is a judgement
 rather than a measurement — but it is a much thinner case than it was this morning. n = 31 per arm
 would resolve a 10% effect in about an hour, if the owner would rather have it closed than weakened.
+
+### 2026-09-04 (closing) — The feedback question is finished, and the design caught two things the data would not have
+
+`1.008×, p = 0.53, CI 0.944–1.114`, over 31 pairs, 62 of 62 relay-verified, zero re-attempts on either
+arm. The loopback 1.23× is excluded. **Do not enable the flags.** That is the whole answer, and it is
+duller than either thing I predicted along the way.
+
+What I want recorded is the two places the *method* did work, because both were close calls.
+
+**The first n=31 attempt aborted at run 13 of 62, and it was right to.** A fixture failed Vulkan
+initialisation, never connected, and the witness caught it. My protocol said any non-passing run is a
+hard stop, so it stopped. Then the interesting part: that protocol is **unrunnable**. One transient in
+fourteen runs means a 62-run hard-stop sweep essentially never finishes, and I would have discovered
+this by simply re-running until one completed — which is dropping bad runs with extra steps and a
+clear conscience. Amending it in the open, before collecting more data, is the only version of that
+which is not quietly self-serving.
+
+The amendment draws the line where the soak harness already draws it, and I think the line is the
+general one: **a run that produced no sample may be re-attempted; a run that produced a bad sample may
+not.** An init failure measured the machines. Stale frames measured the relay, and retrying that away
+would be falsification.
+
+But the amendment needed its own guard, and this is the part I nearly missed. A retry mechanism can
+*absorb the effect under test*: if feedback made sessions fail more often, retries would quietly
+smooth that into a clean timing comparison and I would report a null with the actual finding sitting
+in the discard pile. So retries are counted **per arm** and were declared, in advance, to outrank the
+timing number if they came out skewed. They came out `A=0, B=0`, which is itself a small independent
+reliability result — but the value was in having decided beforehand what a skew would have meant.
+
+**The second close call was the first pair of the n=10 run, which was 1.24×.** Almost exactly the
+loopback claim. Three times before, this project has been flattered by a small sample and caught by a
+later re-run, after the number was written down. This time the pre-registration held the line and the
+effect evaporated: 1.077× at n=10, 1.008× at n=31. Had I peeked, I would have stopped at "confirmed"
+and been wrong in the direction I wanted.
+
+On predictions: I registered ≥1.23× and was wrong. I then registered 1.00–1.10×, near 1.05×, and was
+right at 1.008×. Both are in the record. A prediction that only gets written down when it turns out
+well is not a prediction, and the first one is the more useful of the two — it is the one that shows
+the reasoning ("removing round trips should pay more when round trips cost more") was plausible and
+still false.
+
+The whole thread, end to end, cost a day and produced a negative result: the shipping configuration
+stays exactly as it was. That is not nothing. The 1.23× had been sitting in `OVERVIEW.md` for weeks as
+a standing reason to change something, with an unexplained failure as the only thing holding it back —
+so the project was carrying both a temptation and a fear, and neither survived measurement. What
+replaces them is a number with a confidence interval and a decision that does not need revisiting.

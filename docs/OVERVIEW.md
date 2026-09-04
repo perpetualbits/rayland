@@ -317,7 +317,7 @@ reason against rather than re-deriving.
 | Readback message count after gap-threshold coalescing | ~5000 → **~180 messages/frame**, still bit-identical, still 0 stale |
 | Batching `ship()`'s per-message lock and flush | **1.03×** — i.e. not the bottleneck |
 | Venus semaphore/event/query feedback, loopback | **1.23×** (median `draw_readback` 48.7 ms → 39.5 ms, 120/120 bit-identical) |
-| Same, **re-measured on a real network** (2026-09-04, pre-registered, n=10/arm) | **1.077×, p = 0.33**, CI 0.895–1.273 — the loopback figure does not reproduce, and is not refuted either |
+| Same, **re-measured on a real network** (2026-09-04, pre-registered, n=10 then n=31/arm) | **1.008×, p = 0.53**, CI 0.944–1.114 — **the loopback figure is excluded**; question CLOSED, flags stay off |
 | Feedback vs shipping, matched arms | **400/400 clean each** (2026-09-02/03, same harness, same link). Fisher p = 1.0 — **no detectable difference**. Pooled: shipping 0 in 880, feedback-on 1 in 492 |
 | `VK_ERROR_DEVICE_LOST` on `vkQueueSubmit` | NVIDIA RTX A500 **7/14** runs lost; Intel Iris Xe **0/10** |
 | Teardown `SIGABRT` (libepoxy, from `virgl_renderer_cleanup`) | was ~21%, **fixed** |
@@ -908,10 +908,19 @@ evidence against it. **But it is not refuted:** the CI reaches 1.273×, so a rea
 excluded. The honest position is that the effect is probably smaller than loopback, plausibly zero,
 and not separable from either by this data.
 
-**For the decision:** the only remaining reason to enable the three flags was the 1.23×, reliability
-being settled at p = 1.0. The best estimate where it would be claimed is **~8%, not significant**.
-`n = 31` per arm would resolve a 10% effect at 80% power (~1 hour) if the question is worth closing
-rather than leaving weakened. Evidence: `docs/data/2026-09-04-feedback-1v23-realnet/`.
+**CLOSED at n = 31 per arm, same day.** A second pre-registered run, 62 of 62 relay-verified with
+**zero re-attempts on either arm**: A 18.90 ms vs B 18.75 ms = **1.008×**, Mann–Whitney **p = 0.53**,
+bootstrap 95% CI **0.944–1.114**.
+
+**The loopback 1.23× is now excluded outright** — two independent experiments failed to find it and
+the larger one rules it out. The point estimate is indistinguishable from no effect; any benefit is at
+most ~11%, and the interval equally admits a 6% *penalty*.
+
+**THE DECISION: do not enable `no_semaphore_feedback` / `no_event_feedback` / `no_query_feedback`.**
+Reliability identical (Fisher p = 1.0), speed 1.008×, and zero re-attempts means no arm-dependent
+failure signal. The case for enabling rested entirely on a loopback number that does not transfer.
+**The shipping configuration stays, and this question is finished.** Evidence:
+`docs/data/2026-09-04-feedback-1v23-realnet/`.
 
 **A method note that outlives the number.** The first attempt at this experiment **measured nothing**:
 a comment inside a shell line continuation terminated the environment assignments, so the fixture ran
