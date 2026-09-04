@@ -113,10 +113,25 @@ for run in $(seq 1 "$RUNS"); do
     RAYLAND_C1_S_ADDR=$S_IP:$PORT RAYLAND_C1_SOCKET=$SOCK nohup /tmp/rayland-c >/tmp/rayland-c-icosa.log 2>&1 &
     echo \$! > /tmp/rayland-c.pid
     sleep 3
+    # stdout is the fixture's per-frame CSV and must stay CLEAN: merging stderr into it (as this did
+    # until 2026-09-02) folds VN_DEBUG=vtest spew through the same file the analysis parses.
+    #
+    # *** TWO RULES FOR THIS BLOCK, BOTH PAID FOR ON 2026-09-04. ***
+    #
+    # 1. NEVER PUT A COMMENT BETWEEN THESE CONTINUED LINES. A comment sat between the assignments
+    #    and the env command, and bash joins a backslash-newline before it sees the hash -- so the
+    #    assignments terminated at the comment and env ran as a SEPARATE command with none of them
+    #    set. No VK_ICD_FILENAMES, no VTEST_SOCKET_NAME, no VN_PERF: the fixture rendered on
+    #    apollo's OWN GPU and never touched Rayland. It still produced 120 frames and a plausible
+    #    CSV, so a 20-run A/B measured apollo rendering locally, twice, and reported a null.
+    #    Comments go above the whole command, never inside it.
+    #
+    # 2. NO BACKTICKS ANYWHERE IN THIS REMOTE BLOCK. It is a double-quoted ssh string, so bash runs
+    #    backticked text as a command substitution before sending it. The first version of rule 1
+    #    quoted the command name in backticks and thereby executed it on C. Same trap caught the
+    #    soak harness the same day. Name commands in plain text here.
     VN_DEBUG=vtest VN_PERF="$VN_PERF_SETTING" \
     VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/virtio_icd.json VTEST_SOCKET_NAME=$SOCK \
-    # stdout is the fixture's per-frame CSV and must stay CLEAN: merging stderr into it (as this
-    # did until 2026-09-02) folds VN_DEBUG=vtest spew through the same file the analysis parses.
     env -u VK_LOADER_DRIVERS_SELECT /tmp/$FIXTURE /tmp/icosa-relay >/tmp/icosa-relay.csv 2>/tmp/icosa-relay.stderr &
     app_pid=\$!; echo \$app_pid > /tmp/rayland-app.pid
     wait \$app_pid || echo APP_EXIT_NONZERO
@@ -134,6 +149,22 @@ for run in $(seq 1 "$RUNS"); do
     rm -f /tmp/rayland-c.pid /tmp/rayland-app.pid
   "
   sleep 1
+  # *** WITNESS: prove the fixture actually went through Rayland. ***
+  # 120 frames and a well-formed CSV are NOT evidence of that -- on 2026-09-04 a broken line
+  # continuation made the fixture render natively on C's own GPU, and it produced both.
+  #
+  # ASK THE RELAY, NOT A PROXY FOR IT. The first version of this witness looked for Venus debug
+  # output on the fixture's stderr, assuming VN_DEBUG=vtest is loud there. It is not -- that stream
+  # is empty on a perfectly good run -- so the guard aborted CORRECT runs, and the tempting next
+  # step would have been to delete it. rayland-c states in its own log whether it relayed a session,
+  # so ask that. Instrument the event, not something that usually accompanies it.
+  if ! ssh "$C_HOST" 'grep -qE "batches relayed|watching command ring" /tmp/rayland-c-icosa.log 2>/dev/null'; then
+    echo "  *** RUN $run DID NOT GO THROUGH RAYLAND ***" >&2
+    echo "  rayland-c's log on $C_HOST records no relayed session, so the fixture rendered on C's" >&2
+    echo "  own GPU. Any timing or stale-frame number from this run describes C, not Rayland." >&2
+    echo "  Aborting rather than recording it." >&2
+    exit 1
+  fi
   rm -rf /tmp/icosa-relay && scp -q -r "$C_HOST:/tmp/icosa-relay" /tmp/icosa-relay
   # *** FETCH THE CSV, PER RUN. ***
   # This script exists to collect the fixture's own per-frame instrumentation, and until
