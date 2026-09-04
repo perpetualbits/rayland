@@ -317,6 +317,7 @@ reason against rather than re-deriving.
 | Readback message count after gap-threshold coalescing | ~5000 → **~180 messages/frame**, still bit-identical, still 0 stale |
 | Batching `ship()`'s per-message lock and flush | **1.03×** — i.e. not the bottleneck |
 | Venus semaphore/event/query feedback, loopback | **1.23×** (median `draw_readback` 48.7 ms → 39.5 ms, 120/120 bit-identical) |
+| Same, **re-measured on a real network** (2026-09-04, pre-registered, n=10/arm) | **1.077×, p = 0.33**, CI 0.895–1.273 — the loopback figure does not reproduce, and is not refuted either |
 | Feedback vs shipping, matched arms | **400/400 clean each** (2026-09-02/03, same harness, same link). Fisher p = 1.0 — **no detectable difference**. Pooled: shipping 0 in 880, feedback-on 1 in 492 |
 | `VK_ERROR_DEVICE_LOST` on `vkQueueSubmit` | NVIDIA RTX A500 **7/14** runs lost; Intel Iris Xe **0/10** |
 | Teardown `SIGABRT` (libepoxy, from `virgl_renderer_cleanup`) | was ~21%, **fixed** |
@@ -891,10 +892,35 @@ changed is that a single unattributed loss now sits against 400 clean runs of th
 to *and* a matched 400-run control, so "feedback causes session loss" is a poor fit and a one-off is
 a good one.
 
-**It also does not measure speed.** The 1.23× is an `icosa-gpu` **loopback** figure; both soaks ran
-`icosa-cpu` over the network. **Before adopting the flags, re-measure the 1.23× where it would be
-claimed** — that number has never been taken on a real network, and it is the entire reason to
-change anything.
+**It also does not measure speed — and the speed question has since been asked, 2026-09-04.** The
+1.23× was an `icosa-gpu` **loopback** figure. Re-measured where it would be claimed (real network,
+apollo → dop561, pre-registered, n = 10 per arm, interleaved, all runs relay-verified):
+
+| | |
+|---|---|
+| A shipping / B feedback-on | 20.95 ms / 19.45 ms → **1.077×** |
+| Mann–Whitney two-sided | **p = 0.33** |
+| bootstrap 95% CI | **0.895× – 1.273×** |
+
+**The loopback 1.23× is not reproduced.** The design was powered for it — pooled SD 2.50 ms on a
+19.6 ms mean means n = 7 per arm detects 23% at 80% power, and 10 were used — so failing to find it is
+evidence against it. **But it is not refuted:** the CI reaches 1.273×, so a real ~1.2× effect cannot be
+excluded. The honest position is that the effect is probably smaller than loopback, plausibly zero,
+and not separable from either by this data.
+
+**For the decision:** the only remaining reason to enable the three flags was the 1.23×, reliability
+being settled at p = 1.0. The best estimate where it would be claimed is **~8%, not significant**.
+`n = 31` per arm would resolve a 10% effect at 80% power (~1 hour) if the question is worth closing
+rather than leaving weakened. Evidence: `docs/data/2026-09-04-feedback-1v23-realnet/`.
+
+**A method note that outlives the number.** The first attempt at this experiment **measured nothing**:
+a comment inside a shell line continuation terminated the environment assignments, so the fixture ran
+with no Venus ICD and no vtest socket — it rendered on C's own GPU and never touched Rayland, while
+still producing 120 well-formed frames and a plausible CSV. Twenty runs were collected that way and
+reported a null. The harness now carries a **witness**: a run must show in `rayland-c`'s own log that
+it relayed a session, or the sweep aborts rather than record a number. And the pre-registration earned
+its keep on the very first pair, which alone was **1.24×** — stopping there would have "confirmed" the
+hypothesis.
 
 **Three asymmetries between the arms, recorded rather than buried** (`COMPARABILITY.md` sits with the
 data). The control ran a `rayland-c` differing by nine lines in `blob_sync.rs`, all inside a

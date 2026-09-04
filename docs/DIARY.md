@@ -7149,3 +7149,68 @@ One smaller thing worth keeping. The old test for "an interface we have never he
 declines to advertise it, with a reason. So the example moved to `zwp_tablet_manager_v2`. "We decided
 against this" and "we have never considered this" are different answers, and a codebase that conflates
 them is back where this phase started.
+
+### 2026-09-04 — I measured nothing for twenty runs, then measured something and it was not what I predicted
+
+Two experiments today. The first produced no data at all and I did not notice until it had produced
+twenty runs of it.
+
+**The bug was mine, in a harness I had fixed the day before.** Repairing a peer-review finding, I put
+an explanatory comment between two continued lines:
+
+```
+VN_DEBUG=vtest VN_PERF="$VN_PERF_SETTING" \
+VK_ICD_FILENAMES=.../virtio_icd.json VTEST_SOCKET_NAME=$SOCK \
+# stdout is the fixture's per-frame CSV and must stay CLEAN: ...
+env -u VK_LOADER_DRIVERS_SELECT /tmp/$FIXTURE ...
+```
+
+Bash joins the backslash-newline before it sees the hash, so the assignments end at the comment and
+`env` runs as a separate command with none of them set. No Venus ICD, no vtest socket, no `VN_PERF`.
+**The fixture rendered on apollo's own GPU and never touched Rayland** — and produced 120 well-formed
+frames and a plausible CSV while doing it.
+
+What I want recorded is not the bug but how thoroughly I ignored the evidence. `draw_readback` came
+back at 3.43 ms where this project's own table says 10.1 for that fixture and machine. Both arms were
+identical to three significant figures, which for a mechanism that supposedly changes frame time by
+23% should have stopped me on its own. `VN_PERF` did not appear in the logs when I grepped for it, and
+I noted the empty output and moved on. And my driver's per-run progress line printed `stale=` blank
+for all twenty runs, because the pattern I wrote did not match the wording the harness actually uses
+— **I built a check against exactly this failure and then read its blank output as success.** That is
+the `grep -c` lesson from my own handover, committed by me, on the day I had been quoting it.
+
+Then, fixing it, I made the *same* mistake twice more in twenty minutes. My replacement comment
+quoted a command name in backticks — inside a double-quoted `ssh` string, where bash runs backticked
+text as a command substitution — which is the trap that caught the soak harness that morning, and I
+hit it in a comment I was writing to warn about a different trap. And my first witness looked for
+Venus debug output on the fixture's stderr, which is **empty on a perfectly good run**, so it aborted
+correct runs; the tempting next move would have been to delete the guard as broken. It now asks
+`rayland-c`'s own log whether it relayed a session. Instrument the event, not something that usually
+accompanies it.
+
+**The corrected experiment then contradicted my registered prediction, which is the point of
+registering one.** I had written, in advance and in the file: feedback removes synchronous round
+trips, so its benefit scales with per-trip cost, so on a network the effect should be *at least* the
+loopback 1.23×. Measured: **1.077×, p = 0.33, bootstrap CI 0.895–1.273**.
+
+I have been careful about how to state that, because there are two overstatements available and they
+are equally wrong. The design *was* powered for what it went looking for — pooled SD of 2.50 ms on a
+19.6 ms mean means n = 7 per arm detects 23% at 80% power, and I used 10 — so failing to find the
+effect is genuine evidence against it. But the CI reaches 1.273, so a real ~1.2× is **not excluded**.
+Calling this "refuted" would overstate it by precisely as much as calling 1.077× a win would. The
+honest sentence is: the effect is probably smaller than the loopback figure, plausibly zero, and this
+data cannot separate it from either.
+
+**The pre-registration paid for itself on the very first pair, and I want that on the record because
+it is the first time.** Run 1 alone was **1.24×** — almost exactly the loopback claim. Had I peeked, or
+had I not fixed n in advance, I would have had my confirmation and stopped. This project has been
+flattered by a small sample three times (1.78× that was a null, 1.28× that was 1.03×, a win at n=3
+that vanished at n=11), and every previous time it was a *later re-run* that caught it, after the
+number had been written down. This is the first time the design caught it before it became a claim.
+
+Where that leaves the feedback question: the only remaining reason to enable the three flags was the
+1.23×, reliability having been settled at Fisher p = 1.0. The best estimate of the benefit where it
+would actually be claimed is about 8%, and not significant. Enabling a configuration that carries one
+historically unexplained session loss, for an ~8% frame-time gain that may be zero, is a judgement
+rather than a measurement — but it is a much thinner case than it was this morning. n = 31 per arm
+would resolve a 10% effect in about an hour, if the owner would rather have it closed than weakened.
