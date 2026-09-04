@@ -1944,7 +1944,7 @@ fn interface_by_name(name: &str) -> Option<&'static Interface> {
         "zwp_text_input_manager_v3" => ZwpTextInputManagerV3::interface(),
         "zwp_text_input_v3" => ZwpTextInputV3::interface(),
         "wl_fixes" => WlFixes::interface(),
-        // Named but NOT advertised (FdPolicy::Refused). S must still resolve them: the table is
+        // Named but NOT advertised (RelayPolicy::Refused). S must still resolve them: the table is
         // the supported set, and "supported" is not "advertised". If either is ever given a
         // substitution and advertised, the descriptor is already here.
         "wp_linux_drm_syncobj_manager_v1" => WpLinuxDrmSyncobjManagerV1::interface(),

@@ -21,7 +21,13 @@
 //! never link a GPU stack. Sharing the *names*, version caps and fd policy is the most that is true,
 //! and it is enough to make the two maps testable against each other.
 
-/// What an interface does about file descriptors.
+/// Whether an interface can be relayed as-is, needs a substitution, or cannot be relayed at all.
+///
+/// Renamed from `FdPolicy` on 2026-09-04. File descriptors were the only known reason an interface
+/// could not cross the network, so the old name was accurate until `wl_fixes` proved it was not:
+/// its sole request takes a **`wl_registry`**, an object the proxy deliberately does not mirror, and
+/// it carries no descriptor at all. A name that describes only the first reason found is a name that
+/// will be wrong again.
 ///
 /// This project's founding constraint is that **a file descriptor cannot cross a network**. WP0
 /// already answers that three times, and those answers form a family: `BufferToken` sends a *name*
@@ -29,7 +35,7 @@
 /// *size*. Every interface must declare which case it is, so that "this one carries an fd and we
 /// have not designed a substitution" is a recorded decision rather than an oversight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FdPolicy {
+pub enum RelayPolicy {
     /// Carries no file descriptors; requests and events relay unchanged.
     Transparent,
     /// Carries a descriptor with a designed replacement. The payload names the substitution, for
@@ -69,8 +75,8 @@ pub struct InterfaceSpec {
     /// supports. A cap belongs here, as data, because this project has hit version-inheritance
     /// bugs three times and a cap that lives in code is a cap somebody has to remember.
     pub max_version: u32,
-    /// See [`FdPolicy`].
-    pub fds: FdPolicy,
+    /// See [`RelayPolicy`].
+    pub relay: RelayPolicy,
     /// See [`Kind`]. Decides whether C advertises this interface at all.
     pub kind: Kind,
 }
@@ -82,9 +88,9 @@ pub struct InterfaceSpec {
 /// entire point: the table and the two maps move together or the build goes red.
 pub const SUPPORTED: &[InterfaceSpec] = &[
     // --- Globals the application binds -------------------------------------------------------
-    InterfaceSpec { name: "wl_compositor", max_version: u32::MAX, fds: FdPolicy::Transparent, kind: Kind::Global },
-    InterfaceSpec { name: "xdg_wm_base", max_version: u32::MAX, fds: FdPolicy::Transparent, kind: Kind::Global },
-    InterfaceSpec { name: "wl_seat", max_version: u32::MAX, fds: FdPolicy::Transparent, kind: Kind::Global },
+    InterfaceSpec { name: "wl_compositor", max_version: u32::MAX, relay: RelayPolicy::Transparent, kind: Kind::Global },
+    InterfaceSpec { name: "xdg_wm_base", max_version: u32::MAX, relay: RelayPolicy::Transparent, kind: Kind::Global },
+    InterfaceSpec { name: "wl_seat", max_version: u32::MAX, relay: RelayPolicy::Transparent, kind: Kind::Global },
     // **Capped at v3 on purpose, and the cap is load-bearing (WP0 Task 4.4).**
     //
     // The interface descriptor supports higher versions, but Mesa's Venus WSI opts into the **v4
@@ -97,21 +103,21 @@ pub const SUPPORTED: &[InterfaceSpec] = &[
     InterfaceSpec {
         name: "zwp_linux_dmabuf_v1",
         max_version: 3,
-        fds: FdPolicy::Substituted("BufferToken"),
+        relay: RelayPolicy::Substituted("BufferToken"),
         kind: Kind::Global,
     },
     // v1 deliberately: v2 adds only `wl_shm.release`, which nothing here needs, and a client binds
     // the minimum of what it wants and what is offered.
-    InterfaceSpec { name: "wl_shm", max_version: 1, fds: FdPolicy::Substituted("ShmPool"), kind: Kind::Global },
+    InterfaceSpec { name: "wl_shm", max_version: 1, relay: RelayPolicy::Substituted("ShmPool"), kind: Kind::Global },
     // Scale, geometry, mode and refresh — of S's monitor, which is the display the application is
     // actually on, so relaying S's real values is correct rather than a leak. Without it a toolkit
     // assumes scale 1 and renders the wrong size on a HiDPI screen. Highest-impact entry in the gap.
-    InterfaceSpec { name: "wl_output", max_version: u32::MAX, fds: FdPolicy::Transparent, kind: Kind::Global },
+    InterfaceSpec { name: "wl_output", max_version: u32::MAX, relay: RelayPolicy::Transparent, kind: Kind::Global },
     // Adds logical (compositor-space) geometry to `wl_output`; paired with it for that reason.
     InterfaceSpec {
         name: "zxdg_output_manager_v1",
         max_version: u32::MAX,
-        fds: FdPolicy::Transparent,
+        relay: RelayPolicy::Transparent,
         kind: Kind::Global,
     },
     // Negotiates server- versus client-side decorations. Without it winit falls back to drawing its
@@ -119,7 +125,7 @@ pub const SUPPORTED: &[InterfaceSpec] = &[
     InterfaceSpec {
         name: "zxdg_decoration_manager_v1",
         max_version: u32::MAX,
-        fds: FdPolicy::Transparent,
+        relay: RelayPolicy::Transparent,
         kind: Kind::Global,
     },
     // Lets a client NAME a cursor ("default", "text", ...) instead of supplying pixels. This is the
@@ -128,14 +134,14 @@ pub const SUPPORTED: &[InterfaceSpec] = &[
     InterfaceSpec {
         name: "wp_cursor_shape_manager_v1",
         max_version: u32::MAX,
-        fds: FdPolicy::Transparent,
+        relay: RelayPolicy::Transparent,
         kind: Kind::Global,
     },
     // Source-crop and destination-size for a surface: half of fractional scaling.
     InterfaceSpec {
         name: "wp_viewporter",
         max_version: u32::MAX,
-        fds: FdPolicy::Transparent,
+        relay: RelayPolicy::Transparent,
         kind: Kind::Global,
     },
     // The other half: tells the client the fractional scale the compositor wants. Paired with
@@ -144,7 +150,7 @@ pub const SUPPORTED: &[InterfaceSpec] = &[
     InterfaceSpec {
         name: "wp_fractional_scale_manager_v1",
         max_version: u32::MAX,
-        fds: FdPolicy::Transparent,
+        relay: RelayPolicy::Transparent,
         kind: Kind::Global,
     },
     // Presentation timestamps from the compositor. Beyond closing the gap this is of independent
@@ -154,49 +160,61 @@ pub const SUPPORTED: &[InterfaceSpec] = &[
     InterfaceSpec {
         name: "wp_presentation",
         max_version: u32::MAX,
-        fds: FdPolicy::Transparent,
+        relay: RelayPolicy::Transparent,
         kind: Kind::Global,
     },
     // Subsurfaces: a video pane or GL canvas inside application chrome.
     InterfaceSpec {
         name: "wl_subcompositor",
         max_version: u32::MAX,
-        fds: FdPolicy::Transparent,
+        relay: RelayPolicy::Transparent,
         kind: Kind::Global,
     },
     // Request or transfer focus -- "open this window and raise it".
     InterfaceSpec {
         name: "xdg_activation_v1",
         max_version: u32::MAX,
-        fds: FdPolicy::Transparent,
+        relay: RelayPolicy::Transparent,
         kind: Kind::Global,
     },
     // Pointer lock and confinement, needed by anything with a 3D camera.
     InterfaceSpec {
         name: "zwp_pointer_constraints_v1",
         max_version: u32::MAX,
-        fds: FdPolicy::Transparent,
+        relay: RelayPolicy::Transparent,
         kind: Kind::Global,
     },
     // Unaccelerated pointer deltas, the companion to a locked pointer.
     InterfaceSpec {
         name: "zwp_relative_pointer_manager_v1",
         max_version: u32::MAX,
-        fds: FdPolicy::Transparent,
+        relay: RelayPolicy::Transparent,
         kind: Kind::Global,
     },
     // Input methods. Without it there is no CJK or emoji entry at all.
     InterfaceSpec {
         name: "zwp_text_input_manager_v3",
         max_version: u32::MAX,
-        fds: FdPolicy::Transparent,
+        relay: RelayPolicy::Transparent,
         kind: Kind::Global,
     },
-    // Lets a client destroy a wl_registry; libwayland's own globals helper uses it.
+    // NOT RELAYABLE, and it took Task 12 to find out. `wl_fixes` has exactly one request,
+    // `destroy_registry`, whose argument is a **`wl_registry`** -- the one object the proxy
+    // deliberately does not mirror, because C serves the application's registry locally and S binds
+    // its own. A relayed `destroy_registry` therefore reaches S naming an object S has never heard
+    // of, `wayland-backend` panics on the null argument, and the poisoned connection kills the
+    // ENTIRE Wayland replay: the application keeps rendering and loses its window.
+    //
+    // It was added in Task 10 on the assumption that "carries no file descriptor" meant
+    // "transparently relayable". This entry is the counter-example, and the reason the enum above is
+    // no longer called `FdPolicy`. Serving it properly means answering `destroy_registry` locally on
+    // C, which is new mechanism rather than a table entry, so it is refused until someone designs it.
     InterfaceSpec {
         name: "wl_fixes",
         max_version: u32::MAX,
-        fds: FdPolicy::Transparent,
+        relay: RelayPolicy::Refused(
+            "its only request destroys a wl_registry, which the proxy does not mirror",
+        ),
         kind: Kind::Global,
     },
     // --- Objects created from those globals, which S must also be able to name ---------------
@@ -204,42 +222,42 @@ pub const SUPPORTED: &[InterfaceSpec] = &[
     InterfaceSpec {
         name: "wl_subsurface",
         max_version: u32::MAX,
-        fds: FdPolicy::Transparent,
+        relay: RelayPolicy::Transparent,
         kind: Kind::Child,
     },
     // From xdg_activation_v1.get_activation_token.
     InterfaceSpec {
         name: "xdg_activation_token_v1",
         max_version: u32::MAX,
-        fds: FdPolicy::Transparent,
+        relay: RelayPolicy::Transparent,
         kind: Kind::Child,
     },
     // From zwp_pointer_constraints_v1.lock_pointer.
     InterfaceSpec {
         name: "zwp_locked_pointer_v1",
         max_version: u32::MAX,
-        fds: FdPolicy::Transparent,
+        relay: RelayPolicy::Transparent,
         kind: Kind::Child,
     },
     // From zwp_pointer_constraints_v1.confine_pointer.
     InterfaceSpec {
         name: "zwp_confined_pointer_v1",
         max_version: u32::MAX,
-        fds: FdPolicy::Transparent,
+        relay: RelayPolicy::Transparent,
         kind: Kind::Child,
     },
     // From zwp_relative_pointer_manager_v1.get_relative_pointer.
     InterfaceSpec {
         name: "zwp_relative_pointer_v1",
         max_version: u32::MAX,
-        fds: FdPolicy::Transparent,
+        relay: RelayPolicy::Transparent,
         kind: Kind::Child,
     },
     // From zwp_text_input_manager_v3.get_text_input.
     InterfaceSpec {
         name: "zwp_text_input_v3",
         max_version: u32::MAX,
-        fds: FdPolicy::Transparent,
+        relay: RelayPolicy::Transparent,
         kind: Kind::Child,
     },
 
@@ -247,65 +265,65 @@ pub const SUPPORTED: &[InterfaceSpec] = &[
     InterfaceSpec {
         name: "wp_presentation_feedback",
         max_version: u32::MAX,
-        fds: FdPolicy::Transparent,
+        relay: RelayPolicy::Transparent,
         kind: Kind::Child,
     },
     // From `wp_viewporter.get_viewport`.
     InterfaceSpec {
         name: "wp_viewport",
         max_version: u32::MAX,
-        fds: FdPolicy::Transparent,
+        relay: RelayPolicy::Transparent,
         kind: Kind::Child,
     },
     // From `wp_fractional_scale_manager_v1.get_fractional_scale`.
     InterfaceSpec {
         name: "wp_fractional_scale_v1",
         max_version: u32::MAX,
-        fds: FdPolicy::Transparent,
+        relay: RelayPolicy::Transparent,
         kind: Kind::Child,
     },
     // From `wp_cursor_shape_manager_v1.get_pointer`.
     InterfaceSpec {
         name: "wp_cursor_shape_device_v1",
         max_version: u32::MAX,
-        fds: FdPolicy::Transparent,
+        relay: RelayPolicy::Transparent,
         kind: Kind::Child,
     },
     // From `zxdg_decoration_manager_v1.get_toplevel_decoration`.
     InterfaceSpec {
         name: "zxdg_toplevel_decoration_v1",
         max_version: u32::MAX,
-        fds: FdPolicy::Transparent,
+        relay: RelayPolicy::Transparent,
         kind: Kind::Child,
     },
     // From `zxdg_output_manager_v1.get_xdg_output`. Not a global: never bound, only created.
-    InterfaceSpec { name: "zxdg_output_v1", max_version: u32::MAX, fds: FdPolicy::Transparent, kind: Kind::Child },
-    InterfaceSpec { name: "wl_surface", max_version: u32::MAX, fds: FdPolicy::Transparent, kind: Kind::Child },
-    InterfaceSpec { name: "wl_region", max_version: u32::MAX, fds: FdPolicy::Transparent, kind: Kind::Child },
-    InterfaceSpec { name: "wl_callback", max_version: u32::MAX, fds: FdPolicy::Transparent, kind: Kind::Child },
-    InterfaceSpec { name: "wl_buffer", max_version: u32::MAX, fds: FdPolicy::Transparent, kind: Kind::Child },
+    InterfaceSpec { name: "zxdg_output_v1", max_version: u32::MAX, relay: RelayPolicy::Transparent, kind: Kind::Child },
+    InterfaceSpec { name: "wl_surface", max_version: u32::MAX, relay: RelayPolicy::Transparent, kind: Kind::Child },
+    InterfaceSpec { name: "wl_region", max_version: u32::MAX, relay: RelayPolicy::Transparent, kind: Kind::Child },
+    InterfaceSpec { name: "wl_callback", max_version: u32::MAX, relay: RelayPolicy::Transparent, kind: Kind::Child },
+    InterfaceSpec { name: "wl_buffer", max_version: u32::MAX, relay: RelayPolicy::Transparent, kind: Kind::Child },
     InterfaceSpec {
         name: "wl_shm_pool",
         max_version: u32::MAX,
-        fds: FdPolicy::Substituted("ShmPool"),
+        relay: RelayPolicy::Substituted("ShmPool"),
         kind: Kind::Child,
     },
-    InterfaceSpec { name: "xdg_surface", max_version: u32::MAX, fds: FdPolicy::Transparent, kind: Kind::Child },
-    InterfaceSpec { name: "xdg_toplevel", max_version: u32::MAX, fds: FdPolicy::Transparent, kind: Kind::Child },
+    InterfaceSpec { name: "xdg_surface", max_version: u32::MAX, relay: RelayPolicy::Transparent, kind: Kind::Child },
+    InterfaceSpec { name: "xdg_toplevel", max_version: u32::MAX, relay: RelayPolicy::Transparent, kind: Kind::Child },
     InterfaceSpec {
         name: "zwp_linux_buffer_params_v1",
         max_version: u32::MAX,
-        fds: FdPolicy::Substituted("BufferToken"),
+        relay: RelayPolicy::Substituted("BufferToken"),
         kind: Kind::Child,
     },
     // --- Known, and deliberately NOT advertised ------------------------------------------------
-    // These are the reason `FdPolicy::Refused` exists. Withholding an optional global is CORRECT
+    // These are the reason `RelayPolicy::Refused` exists. Withholding an optional global is CORRECT
     // Wayland behaviour -- applications cope -- so the defect was never the absence. It was that an
     // absence and an oversight looked identical. Both are now stated at startup, with why.
     InterfaceSpec {
         name: "wp_linux_drm_syncobj_manager_v1",
         max_version: u32::MAX,
-        fds: FdPolicy::Refused(
+        relay: RelayPolicy::Refused(
             "carries a DRM syncobj fd; cross-machine explicit GPU sync is undesigned",
         ),
         kind: Kind::Global,
@@ -313,30 +331,30 @@ pub const SUPPORTED: &[InterfaceSpec] = &[
     InterfaceSpec {
         name: "wl_data_device_manager",
         max_version: u32::MAX,
-        fds: FdPolicy::Refused("clipboard/DnD transfer over app-created fds; its own phase"),
+        relay: RelayPolicy::Refused("clipboard/DnD transfer over app-created fds; its own phase"),
         kind: Kind::Global,
     },
 ];
 
 /// The entries `rayland-c` should advertise in the application's registry: everything that is not
-/// [`FdPolicy::Refused`].
+/// [`RelayPolicy::Refused`].
 ///
 /// Note this yields child-object interfaces too (`wl_surface` and friends). Advertising is done by
 /// the caller only for entries that are *globals*; this iterator is the policy filter, not the
 /// global list. The caller pairs it with its own descriptor map, and an entry with no server-side
 /// descriptor is simply not advertised — which the consistency tests then catch.
 pub fn advertised() -> impl Iterator<Item = &'static InterfaceSpec> {
-    SUPPORTED.iter().filter(|s| !matches!(s.fds, FdPolicy::Refused(_)))
+    SUPPORTED.iter().filter(|s| !matches!(s.relay, RelayPolicy::Refused(_)))
 }
 
 /// Look one interface up by its wire name.
 ///
 /// Returns `None` for an interface WP0 has never heard of, which is different from one it has
-/// deliberately refused — a refused interface is present with [`FdPolicy::Refused`]. Callers that
+/// deliberately refused — a refused interface is present with [`RelayPolicy::Refused`]. Callers that
 /// report to a human must distinguish the two, because "we decided against this" and "we have never
 /// considered this" are different answers.
 /// The entries C should advertise as registry globals: [`Kind::Global`] and not
-/// [`FdPolicy::Refused`].
+/// [`RelayPolicy::Refused`].
 ///
 /// This is the whole global list, derived from the one table. C has no second list to keep in step.
 pub fn advertised_globals() -> impl Iterator<Item = &'static InterfaceSpec> {
@@ -367,7 +385,7 @@ mod tests {
     fn advertised_excludes_only_refused() {
         let advertised: Vec<_> = advertised().map(|s| s.name).collect();
         for spec in SUPPORTED {
-            let is_refused = matches!(spec.fds, FdPolicy::Refused(_));
+            let is_refused = matches!(spec.relay, RelayPolicy::Refused(_));
             assert_eq!(
                 !is_refused,
                 advertised.contains(&spec.name),
@@ -383,7 +401,7 @@ mod tests {
     #[test]
     fn refused_entries_state_a_reason() {
         for spec in SUPPORTED {
-            if let FdPolicy::Refused(reason) = spec.fds {
+            if let RelayPolicy::Refused(reason) = spec.relay {
                 assert!(!reason.is_empty(), "{} is Refused with no reason", spec.name);
             }
         }

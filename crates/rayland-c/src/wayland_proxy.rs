@@ -1382,7 +1382,7 @@ pub fn run_with_events(
     // — applications cope with an absent optional global — but an *unrecorded* absence is
     // indistinguishable from an oversight, which is how fourteen interfaces went missing unnoticed.
     for spec in rayland_relay::interfaces::SUPPORTED {
-        if let rayland_relay::interfaces::FdPolicy::Refused(reason) = spec.fds {
+        if let rayland_relay::interfaces::RelayPolicy::Refused(reason) = spec.relay {
             wp_log(&format!("registry: NOT advertising {} — {reason}", spec.name));
         }
     }
